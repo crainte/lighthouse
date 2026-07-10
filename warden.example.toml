@@ -1,0 +1,25 @@
+# Warden standalone config example.
+# Run: warden standalone --config warden.example.toml
+
+[agent]
+agent_id = "local-01"
+flush_secs = 5
+
+[coordinator]
+listen = "0.0.0.0:8080"
+db_path = "warden.duckdb"
+# alert_webhook = "https://hooks.slack.com/services/..."
+
+[[checks]]
+name = "example-http"
+type = "http"
+target = "https://example.com"
+interval_secs = 30
+timeout_secs = 10
+
+[[checks]]
+name = "github"
+type = "http"
+target = "https://github.com"
+interval_secs = 60
+timeout_secs = 10

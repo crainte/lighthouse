@@ -66,6 +66,11 @@ impl Coordinator {
         }
     }
 
+    /// Read recent history for a check (newest first). Used by the UI/API.
+    pub fn history(&self, check_id: &str, limit: usize) -> anyhow::Result<Vec<storage::HistoryRow>> {
+        self.inner.storage.lock().history(check_id, limit)
+    }
+
     pub fn router(self) -> Router {
         Router::new()
             .route("/api/v1/results", post(ingest_handler))
