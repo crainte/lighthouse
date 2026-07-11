@@ -1,0 +1,94 @@
+import { describe, it, expect } from 'vitest';
+import {
+  statusColor,
+  formatUptime,
+  formatLatency,
+  formatRelativeTime,
+  sortChecks,
+} from './format';
+import type { Check } from './api';
+
+describe('statusColor', () => {
+  it('maps each status to a distinct color', () => {
+    expect(statusColor('up')).toBe('#3fb950');
+    expect(statusColor('down')).toBe('#f85149');
+    expect(statusColor('unknown')).toBe('#8b949e');
+  });
+});
+
+describe('formatUptime', () => {
+  it('renders a fraction as a one-decimal percent', () => {
+    expect(formatUptime(0.987)).toBe('98.7%');
+    expect(formatUptime(1)).toBe('100.0%');
+    expect(formatUptime(0)).toBe('0.0%');
+    expect(formatUptime(0.5)).toBe('50.0%');
+  });
+  it('renders a dash for missing values', () => {
+    expect(formatUptime(null)).toBe('—');
+    expect(formatUptime(undefined)).toBe('—');
+  });
+});
+
+describe('formatLatency', () => {
+  it('renders sub-second latency in ms', () => {
+    expect(formatLatency(42)).toBe('42 ms');
+    expect(formatLatency(0)).toBe('0 ms');
+    expect(formatLatency(999)).toBe('999 ms');
+  });
+  it('renders second-scale latency in seconds', () => {
+    expect(formatLatency(1500)).toBe('1.50 s');
+    expect(formatLatency(1000)).toBe('1.00 s');
+  });
+  it('renders a dash for missing values', () => {
+    expect(formatLatency(null)).toBe('—');
+    expect(formatLatency(undefined)).toBe('—');
+  });
+});
+
+describe('formatRelativeTime', () => {
+  const now = 1_720_000_000_000;
+  it('renders recent times as "just now"', () => {
+    expect(formatRelativeTime(now, now)).toBe('just now');
+    expect(formatRelativeTime(now - 5_000, now)).toBe('just now');
+  });
+  it('renders seconds, minutes, hours, days', () => {
+    expect(formatRelativeTime(now - 30_000, now)).toBe('30s ago');
+    expect(formatRelativeTime(now - 5 * 60_000, now)).toBe('5m ago');
+    expect(formatRelativeTime(now - 3 * 3_600_000, now)).toBe('3h ago');
+    expect(formatRelativeTime(now - 2 * 86_400_000, now)).toBe('2d ago');
+  });
+  it('treats future timestamps as "just now"', () => {
+    expect(formatRelativeTime(now + 10_000, now)).toBe('just now');
+  });
+});
+
+describe('sortChecks', () => {
+  const checks: Check[] = [
+    { check_id: 'beta', status: 'up', latency_ms: 10, last_check: 3, uptime_24h: 0.9 },
+    { check_id: 'alpha', status: 'down', latency_ms: 20, last_check: 1, uptime_24h: 0.5 },
+    { check_id: 'gamma', status: 'unknown', latency_ms: 30, last_check: 2, uptime_24h: 0.99 },
+  ];
+
+  it('sorts by name ascending and descending without mutating input', () => {
+    const asc = sortChecks(checks, 'name', 'asc');
+    expect(asc.map((c) => c.check_id)).toEqual(['alpha', 'beta', 'gamma']);
+    const desc = sortChecks(checks, 'name', 'desc');
+    expect(desc.map((c) => c.check_id)).toEqual(['gamma', 'beta', 'alpha']);
+    // input untouched
+    expect(checks.map((c) => c.check_id)).toEqual(['beta', 'alpha', 'gamma']);
+  });
+
+  it('sorts by status rank up < unknown < down ascending', () => {
+    const asc = sortChecks(checks, 'status', 'asc');
+    expect(asc.map((c) => c.status)).toEqual(['up', 'unknown', 'down']);
+    const desc = sortChecks(checks, 'status', 'desc');
+    expect(desc.map((c) => c.status)).toEqual(['down', 'unknown', 'up']);
+  });
+
+  it('sorts by uptime numerically', () => {
+    const asc = sortChecks(checks, 'uptime', 'asc');
+    expect(asc.map((c) => c.uptime_24h)).toEqual([0.5, 0.9, 0.99]);
+    const desc = sortChecks(checks, 'uptime', 'desc');
+    expect(desc.map((c) => c.uptime_24h)).toEqual([0.99, 0.9, 0.5]);
+  });
+});
