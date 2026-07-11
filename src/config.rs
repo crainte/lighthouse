@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::path::Path;
 use std::time::Duration;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub agent: AgentConfig,
@@ -58,7 +58,14 @@ impl CheckConfig {
 }
 
 impl Config {
+    /// Load config from `path`. If the file does not exist, fall back to
+    /// built-in defaults (coordinator on 0.0.0.0:8080, no checks) so the binary
+    /// runs out of the box — e.g. `docker run` with no mounted config.
     pub fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            tracing::info!(path = %path.display(), "config not found, using defaults");
+            return Ok(Config::default());
+        }
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
         let cfg: Config = toml::from_str(&text).context("parsing config TOML")?;
