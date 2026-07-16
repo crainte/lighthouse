@@ -35,6 +35,16 @@ pub struct AlertRow {
     pub timestamp: i64, // unix millis
 }
 
+/// One day's uptime bucket for the status-page bar strip.
+/// `bucket 0` is the oldest day, `bucket days-1` is today.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DayUptime {
+    pub day_start: i64,        // unix millis of the day-window start (exclusive lower bound)
+    pub uptime: Option<f64>,   // fraction 0.0..=1.0, or None when the day has no data
+    pub up: u32,
+    pub total: u32,
+}
+
 impl Storage {
     /// Open (or create) the database at `path` and ensure the schema exists.
     /// `path` may be ":memory:" for tests.
@@ -172,7 +182,51 @@ impl Storage {
         Ok(rows)
     }
 
-    /// Seed synthetic data spanning the 24h before `now_millis` when the store
+    /// Daily uptime buckets for a check over the `days` days ending at `now_millis`,
+    /// oldest-first. Bucket `i` covers `(now - (days-i)*DAY, now - (days-1-i)*DAY]`;
+    /// the last bucket ends at `now`. A day with no results has `uptime == None`.
+    /// Always returns exactly `days` buckets.
+    pub fn daily_uptime(&self, check_id: &str, days: usize, now_millis: i64) -> Result<Vec<DayUptime>> {
+        const DAY: i64 = 86_400_000;
+        let days_i = days as i64;
+        let lower = now_millis - days_i * DAY; // exclusive
+
+        let mut up = vec![0u32; days];
+        let mut total = vec![0u32; days];
+
+        let mut stmt = self.conn.prepare(
+            "SELECT ts_millis, status FROM check_results
+             WHERE check_id = ? AND ts_millis > ? AND ts_millis <= ?",
+        )?;
+        let rows = stmt.query_map(duckdb::params![check_id, lower, now_millis], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for r in rows {
+            let (ts, status) = r?;
+            // days ago: 0 = today. In range guarantees 0 <= d < days.
+            let d = ((now_millis - ts) / DAY) as usize;
+            let i = days - 1 - d;
+            total[i] += 1;
+            if Status::from_db(&status) == Status::Up {
+                up[i] += 1;
+            }
+        }
+
+        let buckets = (0..days)
+            .map(|i| {
+                let t = total[i];
+                DayUptime {
+                    day_start: now_millis - (days_i - i as i64) * DAY,
+                    up: up[i],
+                    total: t,
+                    uptime: if t > 0 { Some(up[i] as f64 / t as f64) } else { None },
+                }
+            })
+            .collect();
+        Ok(buckets)
+    }
+
+    /// Seed synthetic data spanning ~90 days before `now_millis` when the store
     /// is empty. Idempotent: a no-op when check_results already has rows.
     /// Returns true if seeding occurred.
     pub fn seed_mock(&self, now_millis: i64) -> Result<bool> {
@@ -182,28 +236,40 @@ impl Storage {
             return Ok(false);
         }
 
-        // A handful of realistic-looking checks. One ("redis-cache") suffers a
-        // brief outage mid-window with matching alerts, the rest stay healthy.
         let checks = ["api-gateway", "postgres-primary", "redis-cache", "web-frontend"];
-        let step = 30 * 60 * 1000i64; // one sample every 30 min
-        let points = 48; // 24h of history
-        let mut rows: Vec<(CheckResult, Status)> = Vec::new();
+        let days = 90usize;
+        let per_day = 6usize; // one sample every 4h
+        let points = days * per_day;
+        let step = 24 * 60 * 60 * 1000i64 / per_day as i64; // 4h in millis
+        let ts_at = |i: usize| now_millis - (points - 1 - i) as i64 * step;
 
+        // Outage windows expressed as (check, inclusive day range) where the
+        // check reports DOWN. day 0 is the oldest, day 89 is today.
+        let is_down = |name: &str, day: usize| -> bool {
+            match name {
+                // A full bad day ~30 days ago plus a recent blip.
+                "redis-cache" => day == 60 || day == 88,
+                // One brief outage ~20 days ago.
+                "api-gateway" => day == 70,
+                _ => false,
+            }
+        };
+
+        let mut rows: Vec<(CheckResult, Status)> = Vec::new();
         for name in checks {
             for i in 0..points {
-                let ts = now_millis - (points - 1 - i) * step;
-                // redis-cache is DOWN for a 3-sample stretch near the middle.
-                let down = name == "redis-cache" && (20..23).contains(&i);
+                let day = i / per_day;
+                let down = is_down(name, day);
                 let (status, code, latency) = if down {
                     (Status::Down, Some(503u16), 0)
                 } else {
-                    (Status::Up, Some(200u16), 20 + (i % 7) * 5)
+                    (Status::Up, Some(200u16), 20 + ((i % 7) * 5) as i64)
                 };
                 rows.push((
                     CheckResult {
                         check_id: name.to_string(),
                         agent_id: "seed".to_string(),
-                        timestamp: chrono::DateTime::from_timestamp_millis(ts).unwrap(),
+                        timestamp: chrono::DateTime::from_timestamp_millis(ts_at(i)).unwrap(),
                         latency_ms: latency as u64,
                         status_code: code,
                         error: if down { Some("503 Service Unavailable".into()) } else { None },
@@ -214,11 +280,18 @@ impl Storage {
         }
         self.insert_results(&rows)?;
 
-        // Alerts for the redis-cache outage: down at sample 20, recovery at 23.
-        let down_ts = now_millis - (points - 1 - 20) * step;
-        let up_ts = now_millis - (points - 1 - 23) * step;
-        self.insert_alert("redis-cache", Status::Up, Status::Down, down_ts)?;
-        self.insert_alert("redis-cache", Status::Down, Status::Up, up_ts)?;
+        // Matching alerts (down at the first sample of the bad day, recovery the
+        // first sample after it) so the incidents list mirrors the bars.
+        let mut alert = |name: &str, down_day: usize| -> Result<()> {
+            let down_ts = ts_at(down_day * per_day);
+            let up_ts = ts_at((down_day + 1) * per_day);
+            self.insert_alert(name, Status::Up, Status::Down, down_ts)?;
+            self.insert_alert(name, Status::Down, Status::Up, up_ts)?;
+            Ok(())
+        };
+        alert("redis-cache", 60)?;
+        alert("redis-cache", 88)?;
+        alert("api-gateway", 70)?;
 
         Ok(true)
     }
@@ -358,5 +431,65 @@ mod tests {
         assert!(!s.seed_mock(now).unwrap(), "second seed is a no-op");
         let after = s.list_status(now).unwrap();
         assert_eq!(after.len(), seeded.len(), "idempotent seed adds no checks");
+    }
+
+    #[test]
+    fn daily_uptime_buckets_windows_filters_and_boundary() {
+        let s = Storage::open(":memory:").unwrap();
+        let now = 1_000_000_000_000i64;
+        let day = 86_400_000i64;
+
+        s.insert_results(&[
+            // Bucket 2 (today, (now-DAY, now]): 2 UP + 1 DOWN -> up=2, total=3.
+            (result("x", now, 10), Status::Up),
+            (result("x", now - 1000, 11), Status::Up),
+            (result("x", now - 2000, 12), Status::Down),
+            // Bucket 1 ((now-2*DAY, now-DAY]): nothing -> up=0, total=0, uptime=None.
+            // Bucket 0 ((now-3*DAY, now-2*DAY]): 1 UP -> up=1, total=1, uptime=Some(1.0).
+            (result("x", now - 2 * day - 1000, 13), Status::Up),
+            // Boundary: exactly at bucket 0's exclusive lower bound now-3*DAY -> excluded.
+            (result("x", now - 3 * day, 14), Status::Up),
+            // Decoy check "y" at now: must never count toward "x".
+            (result("y", now, 99), Status::Up),
+        ])
+        .unwrap();
+
+        let buckets = s.daily_uptime("x", 3, now).unwrap();
+        assert_eq!(buckets.len(), 3, "exactly `days` buckets, oldest-first");
+
+        // Bucket 0: oldest day; boundary row at now-3*DAY excluded, one UP remains.
+        assert_eq!(buckets[0].day_start, now - 3 * day);
+        assert_eq!(buckets[0].up, 1);
+        assert_eq!(buckets[0].total, 1, "row at exclusive lower bound now-3*DAY excluded");
+        assert_eq!(buckets[0].uptime, Some(1.0));
+
+        // Bucket 1: empty middle day.
+        assert_eq!(buckets[1].day_start, now - 2 * day);
+        assert_eq!(buckets[1].up, 0);
+        assert_eq!(buckets[1].total, 0);
+        assert_eq!(buckets[1].uptime, None, "no rows -> uptime None, not 0.0");
+
+        // Bucket 2: today; 2 UP + 1 DOWN; decoy "y" excluded.
+        assert_eq!(buckets[2].day_start, now - day);
+        assert_eq!(buckets[2].up, 2);
+        assert_eq!(buckets[2].total, 3, "decoy check \"y\" must not count");
+        let uptime = buckets[2].uptime.expect("today has data");
+        assert!((uptime - 2.0 / 3.0).abs() < 1e-9, "2 UP / 3 total, got {uptime}");
+    }
+
+    #[test]
+    fn daily_uptime_no_rows_returns_days_empty_buckets() {
+        let s = Storage::open(":memory:").unwrap();
+        let now = 1_000_000_000_000i64;
+        let day = 86_400_000i64;
+
+        let buckets = s.daily_uptime("absent", 4, now).unwrap();
+        assert_eq!(buckets.len(), 4, "always exactly `days` buckets even with no data");
+        for (i, b) in buckets.iter().enumerate() {
+            assert_eq!(b.day_start, now - (4 - i as i64) * day, "bucket {i} window start");
+            assert_eq!(b.up, 0);
+            assert_eq!(b.total, 0);
+            assert_eq!(b.uptime, None, "bucket {i} has no data");
+        }
     }
 }

@@ -120,6 +120,7 @@ impl Coordinator {
             .route("/api/v1/results", post(ingest_handler))
             .route("/api/v1/status", get(status_handler))
             .route("/api/v1/checks/:id/history", get(history_handler))
+            .route("/api/v1/checks/:id/uptime", get(uptime_handler))
             .route("/api/v1/alerts", get(alerts_handler))
             .route("/api/v1/ws", get(ws_handler))
             .with_state(self)
@@ -174,6 +175,27 @@ struct LimitQuery {
     limit: Option<usize>,
 }
 
+#[derive(Deserialize)]
+struct DaysQuery {
+    days: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct UptimeResponse {
+    check_id: String,
+    days: usize,
+    overall_uptime: Option<f64>,
+    buckets: Vec<UptimeBucketDto>,
+}
+
+#[derive(Serialize)]
+struct UptimeBucketDto {
+    day_start: i64,
+    uptime: Option<f64>,
+    up: u32,
+    total: u32,
+}
+
 // ---- Handlers ----
 
 async fn ingest_handler(State(coord): State<Coordinator>, Json(batch): Json<ResultBatch>) {
@@ -220,6 +242,34 @@ async fn history_handler(
                 })
                 .collect();
             Json(HistoryResponse { check_id: id, history }).into_response()
+        }
+        Err(e) => internal_error(e),
+    }
+}
+
+async fn uptime_handler(
+    State(coord): State<Coordinator>,
+    Path(id): Path<String>,
+    Query(q): Query<DaysQuery>,
+) -> Response {
+    let days = q.days.unwrap_or(90).clamp(1, 365);
+    let now = chrono::Utc::now().timestamp_millis();
+    match coord.inner.storage.lock().daily_uptime(&id, days, now) {
+        Ok(rows) => {
+            // Overall uptime = total UP across buckets / total samples (days with data only).
+            let up: u32 = rows.iter().map(|b| b.up).sum();
+            let total: u32 = rows.iter().map(|b| b.total).sum();
+            let overall_uptime = if total > 0 { Some(up as f64 / total as f64) } else { None };
+            let buckets = rows
+                .into_iter()
+                .map(|b| UptimeBucketDto {
+                    day_start: b.day_start,
+                    uptime: b.uptime,
+                    up: b.up,
+                    total: b.total,
+                })
+                .collect();
+            Json(UptimeResponse { check_id: id, days, overall_uptime, buckets }).into_response()
         }
         Err(e) => internal_error(e),
     }
