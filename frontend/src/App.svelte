@@ -4,6 +4,7 @@
     fetchStatus,
     fetchAlerts,
     fetchIncidents,
+    acknowledgeIncident,
     fetchUptime,
     fetchLatencySparkline,
     fetchAgents,
@@ -161,6 +162,16 @@
   function onExpired() {
     authenticated = false;
     adminView = 'login';
+  }
+
+  /** Acknowledge an open incident from the admin Incidents panel. */
+  async function acknowledge(incident: Incident) {
+    try {
+      const updated = await acknowledgeIncident(incident.id);
+      incidents = incidents.map((i) => (i.id === updated.id ? updated : i));
+    } catch (e) {
+      console.error('acknowledge failed', e);
+    }
   }
 
   // Shared window for both the uptime strip and the latency graph, so one
@@ -384,7 +395,7 @@
           <AlertsList {alerts} />
         {:else if panel === 'incidents'}
           <div class="panel-title">Incidents</div>
-          <IncidentsList {incidents} />
+          <IncidentsList {incidents} onAcknowledge={acknowledge} />
         {:else}
           <AdminPlaceholder
             title="Maintenance"

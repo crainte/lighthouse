@@ -778,28 +778,64 @@ pub async fn poster_loop(cfg: AgentConfig, mut rx: mpsc::Receiver<CheckResult>) 
     let client = reqwest::Client::new();
     let url = format!("{}/api/v1/results", cfg.coordinator_url);
     let token = cfg.resolved_token();
-    let mut batch = Vec::new();
+    let mut current = Vec::new();
+    // Batches whose POST failed, oldest first. A failed POST keeps its batch
+    // and retries on the next flush instead of dropping it, so a coordinator
+    // that blips for a minute does not silently eat the results that would
+    // have confirmed (or recovered) an outage. Bounded so an unreachable
+    // coordinator cannot grow an unbounded backlog in memory; when the cap is
+    // hit the OLDEST results are dropped, because the freshest observation is
+    // what the status page and the confirmation threshold act on.
+    let mut pending: std::collections::VecDeque<Vec<CheckResult>> = std::collections::VecDeque::new();
+    const MAX_PENDING_BATCHES: usize = 32;
     let mut flush = tokio::time::interval(std::time::Duration::from_secs(cfg.flush_secs));
 
     loop {
         tokio::select! {
             maybe = rx.recv() => match maybe {
-                Some(r) => batch.push(r),
+                Some(r) => current.push(r),
                 None => break, // producers gone
             },
             _ = flush.tick() => {
-                if batch.is_empty() { continue; }
-                let body = ResultBatch { results: std::mem::take(&mut batch) };
-                let mut req = client.post(&url).json(&body);
-                if let Some(t) = &token {
-                    req = req.bearer_auth(t);
+                if current.is_empty() && pending.is_empty() {
+                    continue;
                 }
-                match req.send().await {
-                    Ok(r) if r.status().is_success() => {}
-                    // A rejected batch is worth shouting about: a token mismatch
-                    // otherwise looks exactly like a check that stopped reporting.
-                    Ok(r) => warn!(status = %r.status(), "coordinator rejected results"),
-                    Err(e) => warn!(error = %e, "failed to post results, dropping batch"),
+                if !current.is_empty() {
+                    pending.push_back(std::mem::take(&mut current));
+                    while pending.len() > MAX_PENDING_BATCHES {
+                        warn!("result buffer full, dropping oldest batch");
+                        pending.pop_front();
+                    }
+                }
+                // Retry oldest first, so history reaches the coordinator in
+                // order and a recovered queue never reorders around a gap.
+                while let Some(front) = pending.pop_front() {
+                    let body = ResultBatch { results: front };
+                    let mut req = client.post(&url).json(&body);
+                    if let Some(t) = &token {
+                        req = req.bearer_auth(t);
+                    }
+                    match req.send().await {
+                        Ok(r) if r.status().is_success() => {}
+                        // A rejected batch is worth shouting about: a token
+                        // mismatch otherwise looks exactly like a check that
+                        // stopped reporting.
+                        Ok(r) => {
+                            warn!(status = %r.status(), "coordinator rejected results");
+                            // A 4xx will never succeed on retry; dropping it
+                            // avoids a per-flush hot loop. A 5xx is transient.
+                            if !r.status().is_server_error() {
+                                continue;
+                            }
+                            pending.push_front(body.results);
+                            break;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "failed to post results, keeping batch for retry");
+                            pending.push_front(body.results);
+                            break;
+                        }
+                    }
                 }
             }
         }

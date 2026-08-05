@@ -59,6 +59,7 @@
     ping: { ip_type: string; count: number | null };
     cert_warning_days: number | null;
     grace_secs: number | null;
+    failures_before_down: number | null;
     // Same reason as every other number here: cleared reads as empty, not zero.
     placement: { zones: string[]; regions: string[]; per_zone: number | null };
   };
@@ -97,6 +98,7 @@
       ping: { ip_type: 'any', count: 1 },
       cert_warning_days: 14,
       grace_secs: 300,
+      failures_before_down: 1,
       placement: { zones: [], regions: [], per_zone: 1 },
     };
   }
@@ -137,6 +139,7 @@
       ping: { ip_type: c.ping?.ip_type ?? d.ping.ip_type, count: c.ping?.count ?? d.ping.count },
       cert_warning_days: c.cert_warning_days ?? d.cert_warning_days,
       grace_secs: c.grace_secs ?? d.grace_secs,
+      failures_before_down: c.failures_before_down ?? d.failures_before_down,
       placement: {
         zones: [...(c.placement?.zones ?? [])],
         regions: [...(c.placement?.regions ?? [])],
@@ -384,9 +387,11 @@
       return (saveError = 'Ping count must be a whole number, at least 1.');
     if (k === 'ssl' && !whole(draft.cert_warning_days, 0))
       return (saveError = 'Certificate warning must be a whole number of days, at least 0.');
-    if (k === 'heartbeat' && !whole(draft.grace_secs, 10))
-      return (saveError = 'Grace must be a whole number of seconds, at least 10.');
-    if (!whole(draft.placement.per_zone, 1))
+      if (k === 'heartbeat' && !whole(draft.grace_secs, 10))
+        return (saveError = 'Grace must be a whole number of seconds, at least 10.');
+      if (!whole(draft.failures_before_down, 1))
+        return (saveError = 'Confirmation must be a whole number of probes, at least 1.');
+      if (!whole(draft.placement.per_zone, 1))
       return (saveError = 'Agents per zone must be a whole number, at least 1.');
 
     const trimmed = (v: string[]) => v.map((s) => s.trim()).filter(Boolean);
@@ -423,6 +428,7 @@
       ping: { ip_type: draft.ping.ip_type, count: draft.ping.count ?? 1 },
       cert_warning_days: draft.cert_warning_days ?? 14,
       grace_secs: draft.grace_secs ?? 300,
+      failures_before_down: draft.failures_before_down ?? 1,
       placement: {
         zones: trimmed(draft.placement.zones),
         regions: trimmed(draft.placement.regions),
@@ -620,6 +626,15 @@
             {/each}
           </select>
           <span class="field-note">How it reads before its first result lands.</span>
+        </label>
+
+        <label class="field">
+          <span class="field-label">Confirm DOWN after</span>
+          <input type="number" min="1" bind:value={draft.failures_before_down} />
+          <span class="field-note">
+            Consecutive failed probes before the check reads DOWN. 1 flips
+            immediately; 3 tolerates a flaky hop. Recovery is never delayed.
+          </span>
         </label>
 
         <div class="field wide switches">
@@ -1219,7 +1234,9 @@
   .field.wide {
     grid-column: span 2;
   }
-  .switches {
+  /* Same specificity as .field.wide (0,2,0) so the full-width intent wins:
+     .field.wide alone would override `1 / -1` with `span 2`. */
+  .field.switches {
     grid-column: 1 / -1;
     gap: 0.35rem;
   }
@@ -1251,7 +1268,7 @@
 
   /* Full width and boxed: placement is one decision made of four controls, and
      scattering them across the three-column grid reads as four unrelated ones. */
-  .placement {
+  .field.placement {
     grid-column: 1 / -1;
     gap: 0.45rem;
     border: 1px solid var(--border);

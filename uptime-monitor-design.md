@@ -824,11 +824,12 @@ Acceptable trade-off for query simplicity.
 - [ ] Lua eval for custom check logic
 
 Deferred from Phase 3, tracked here so it isn't lost:
-- [ ] Confirmation threshold before DOWN (`failures_before_down`) — one dropped
-      probe currently flips state on the next observation
-- [ ] A check whose first-ever observation is DOWN does not alert
+- [x] Confirmation threshold before DOWN (`failures_before_down`) — a check
+      flips DOWN only after N consecutive failed probes; recovery stays immediate
+- [x] A check whose first-ever observation is DOWN does not alert
       (`StateTracker` treats the first observation as a baseline)
-- [ ] Agent drops a result batch when the coordinator POST fails — no retry buffer
+- [x] Agent result batches are retained and retried when the coordinator POST
+      fails — bounded buffer, oldest dropped on overflow
 - [ ] `zone` / `region` on `CheckResult` (needed by the Phase 5/6 region tree)
 
 ### Phase 4: Notifications & Status Page

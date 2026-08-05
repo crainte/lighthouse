@@ -108,6 +108,7 @@ async fn agent_check_through_coordinator_fires_alert_on_up_to_down() {
             listen: "127.0.0.1:0".into(),
             db_path: ":memory:".into(),
             alert_webhook: Some(format!("http://{webhook_addr}/")),
+            retention: warden::config::RetentionConfig::default(),
         },
         &[],
     )

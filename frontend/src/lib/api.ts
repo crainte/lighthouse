@@ -190,6 +190,9 @@ export interface Incident {
   resolved_at: number | null;
   /** Why it went down, recorded at open. */
   details: string | null;
+  /** When an admin acknowledged it. `null` until then. */
+  acknowledged_at: number | null;
+  acknowledged_by: string | null;
 }
 
 export interface IncidentsResponse {
@@ -198,6 +201,15 @@ export interface IncidentsResponse {
 
 export function fetchIncidents(limit = 50): Promise<IncidentsResponse> {
   return getJson<IncidentsResponse>(`/api/v1/incidents?limit=${limit}`);
+}
+
+/** Acknowledge an open incident. Requires an admin session (cookie auth). */
+export async function acknowledgeIncident(id: string): Promise<Incident> {
+  const res = await fetch(`/api/v1/incidents/${encodeURIComponent(id)}/acknowledge`, {
+    method: 'POST',
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return (await res.json()).incident;
 }
 
 export function fetchCheckIncidents(

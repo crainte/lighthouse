@@ -82,6 +82,9 @@ export interface AdminCheck {
   cert_warning_days: number;
   /** Heartbeat: no ping within this window means DOWN. */
   grace_secs: number;
+  /** Consecutive DOWN probes that confirm an outage. 1 = flip on the first
+   *  failure; 3 = tolerate two flaky probes. Recovery is never delayed. */
+  failures_before_down: number;
 }
 
 /** What the editor sends. A create has no position yet — the server assigns the

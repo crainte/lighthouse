@@ -45,6 +45,16 @@ pub struct StatusRow {
     pub failure: Option<crate::models::FailureKind>,
 }
 
+/// The coordinator's CONFIRMED decision per check, materialized so the status
+/// page and a restarted process agree with the in-memory tracker.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CurrentStateRow {
+    pub check_id: String,
+    pub status: Status,
+    /// Consecutive DOWN observations toward `failures_before_down`.
+    pub consecutive_failures: u32,
+}
+
 /// A probe agent that has reported results, derived from observed `agent_id`s.
 /// There is no agent registry — an agent exists because it sent data.
 #[derive(Debug, Clone, PartialEq)]
@@ -109,6 +119,10 @@ pub struct IncidentRow {
     /// Why it went down: the failure kind when one is known, else the probe's
     /// own words. Recorded once, at open.
     pub details: Option<String>,
+    /// When an admin acknowledged the outage, unix millis. `None` until then.
+    pub acknowledged_at: Option<i64>,
+    /// The admin session name that acknowledged it, if one was recorded.
+    pub acknowledged_by: Option<String>,
 }
 
 /// One segment of the uptime strip. Not necessarily a day: the window is split
@@ -280,7 +294,21 @@ impl Storage {
                 status      VARCHAR NOT NULL,
                 started_at  BIGINT  NOT NULL,
                 resolved_at BIGINT,
-                details     VARCHAR
+                details     VARCHAR,
+                acknowledged_at BIGINT,
+                acknowledged_by VARCHAR
+            );
+            -- The CONFIRMED state per check, materialized for fast reads. The
+            -- raw `check_results` table keeps every observation; this table
+            -- holds what the coordinator decided they mean — a check with
+            -- `failures_before_down` = 3 stays 'up' here through its first two
+            -- failed probes. Read by the status page, seeded into the in-memory
+            -- tracker on startup so a restart resumes a confirmation in flight.
+            CREATE TABLE IF NOT EXISTS current_state (
+                check_id   VARCHAR PRIMARY KEY,
+                status     VARCHAR NOT NULL,
+                last_check BIGINT  NOT NULL,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0
             );
             -- Check definitions, editable at runtime from the admin UI. Seeded
             -- from the config file on first boot; the table is authoritative
@@ -378,6 +406,24 @@ impl Storage {
         }
         if !section_columns.iter().any(|c| c == "collapsed") {
             conn.execute_batch("ALTER TABLE sections ADD COLUMN collapsed BOOLEAN DEFAULT FALSE")?;
+        }
+        // Acknowledgment was added after the first release; old databases get
+        // the columns with NULL meaning "not acknowledged".
+        let incident_columns: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT column_name FROM information_schema.columns
+                 WHERE table_name = 'incidents'",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        if !incident_columns.iter().any(|c| c == "acknowledged_at") {
+            // Nullable BIGINT is fine here (DuckDB only rejects NOT NULL on
+            // ADD COLUMN); NULL reads as "not acknowledged".
+            conn.execute_batch("ALTER TABLE incidents ADD COLUMN acknowledged_at BIGINT")?;
+        }
+        if !incident_columns.iter().any(|c| c == "acknowledged_by") {
+            conn.execute_batch("ALTER TABLE incidents ADD COLUMN acknowledged_by VARCHAR")?;
         }
         // The added columns are nullable (DuckDB won't take NOT NULL here), so
         // give pre-existing rows the intended value rather than letting a NULL
@@ -869,7 +915,8 @@ impl Storage {
     /// while it stays DOWN the same row remains open.
     pub fn open_incident_for(&self, check_id: &str) -> Result<Option<IncidentRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, check_id, status, started_at, resolved_at, details
+            "SELECT id, check_id, status, started_at, resolved_at, details,
+                    acknowledged_at, acknowledged_by
              FROM incidents
              WHERE check_id = ? AND status = 'open'
              ORDER BY started_at DESC
@@ -907,7 +954,9 @@ impl Storage {
             status: IncidentStatus::Open,
             started_at,
             resolved_at: None,
-            details: details.map(str::to_string),
+            details: details.map(str::to_owned),
+            acknowledged_at: None,
+            acknowledged_by: None,
         })
     }
 
@@ -928,11 +977,41 @@ impl Storage {
         }))
     }
 
+    /// Mark an open incident acknowledged — an operator has seen it. Returns the
+    /// updated row, or `None` when the id matches no open incident (already
+    /// resolved, or never existed).
+    pub fn acknowledge_incident(
+        &self,
+        id: &str,
+        acknowledged_by: &str,
+        now_millis: i64,
+    ) -> Result<Option<IncidentRow>> {
+        let changed = self.conn.execute(
+            "UPDATE incidents
+             SET acknowledged_at = ?, acknowledged_by = ?
+             WHERE id = ? AND status = 'open'",
+            duckdb::params![now_millis, acknowledged_by, id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT id, check_id, status, started_at, resolved_at, details,
+                    acknowledged_at, acknowledged_by
+             FROM incidents WHERE id = ?",
+        )?;
+        let mut rows = stmt
+            .query_map(duckdb::params![id], Self::incident_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows.pop())
+    }
+
     /// Recent incidents, newest first. `status` filters to 'open' or 'resolved'
     /// when given.
     pub fn list_incidents(&self, limit: usize, status: Option<IncidentStatus>) -> Result<Vec<IncidentRow>> {
         let mut sql = String::from(
-            "SELECT id, check_id, status, started_at, resolved_at, details
+            "SELECT id, check_id, status, started_at, resolved_at, details,
+                    acknowledged_at, acknowledged_by
              FROM incidents WHERE TRUE",
         );
         let mut params: Vec<duckdb::types::Value> = Vec::new();
@@ -956,7 +1035,8 @@ impl Storage {
     /// A check's incidents, newest first.
     pub fn incidents_for_check(&self, check_id: &str, limit: usize) -> Result<Vec<IncidentRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, check_id, status, started_at, resolved_at, details
+            "SELECT id, check_id, status, started_at, resolved_at, details,
+                    acknowledged_at, acknowledged_by
              FROM incidents
              WHERE check_id = ?
              ORDER BY started_at DESC
@@ -976,6 +1056,8 @@ impl Storage {
             started_at: row.get::<_, i64>(3)?,
             resolved_at: row.get::<_, Option<i64>>(4)?,
             details: row.get::<_, Option<String>>(5)?,
+            acknowledged_at: row.get::<_, Option<i64>>(6)?,
+            acknowledged_by: row.get::<_, Option<String>>(7)?,
         })
     }
 
@@ -987,10 +1069,16 @@ impl Storage {
         // Every "latest" field is read from a single row, picked by row_number.
         // Per-column `arg_max` is wrong here: it skips NULLs, so a recovered
         // check would keep reporting the stale error of its last failure.
+        //
+        // The displayed status is the coordinator's CONFIRMED state
+        // (`current_state`), not the raw last observation: with
+        // `failures_before_down` > 1 a check stays UP through its first failed
+        // probes, and that decision must survive a restart. Checks with no
+        // row yet (pre-upgrade data) fall back to the raw latest status.
         let mut stmt = self.conn.prepare(
             "SELECT
                  latest.check_id,
-                 latest.status,
+                 COALESCE(cs.status, latest.status) AS status,
                  latest.latency_ms,
                  latest.ts_millis,
                  win.uptime,
@@ -1009,6 +1097,7 @@ impl Storage {
                  FROM check_results
                  GROUP BY check_id
              ) AS win ON win.check_id = latest.check_id
+             LEFT JOIN current_state cs ON cs.check_id = latest.check_id
              WHERE latest.rn = 1",
         )?;
         let rows = stmt
@@ -1031,6 +1120,71 @@ impl Storage {
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Persist what the coordinator decided a check reads as now: the confirmed
+    /// status, the in-flight DOWN count toward its threshold, and when it was
+    /// last observed. Written on every observation; read back at startup so the
+    /// in-memory tracker resumes confirmations exactly where it left off.
+    pub fn update_current_state(
+        &self,
+        check_id: &str,
+        status: Status,
+        consecutive_failures: u32,
+        last_check: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO current_state (check_id, status, last_check, consecutive_failures)
+             VALUES (?, ?, ?, ?)",
+            duckdb::params![check_id, status.as_str(), last_check, consecutive_failures as i32],
+        )?;
+        Ok(())
+    }
+
+    /// All persisted confirmed states, for seeding the tracker on startup.
+    pub fn list_current_state(&self) -> Result<Vec<CurrentStateRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT check_id, status, consecutive_failures FROM current_state",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(CurrentStateRow {
+                    check_id: row.get::<_, String>(0)?,
+                    status: Status::from_db(&row.get::<_, String>(1)?),
+                    consecutive_failures: row.get::<_, i32>(2)? as u32,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Delete rows older than the retention window. `results_days` covers raw
+    /// probe results; `alerts_days` covers state-transition alerts and CLOSED
+    /// incidents. An open incident is current reality, never pruned. Returns
+    /// the number of rows removed.
+    pub fn prune(&self, results_days: u64, alerts_days: u64, now_millis: i64) -> Result<u64> {
+        let results_before = now_millis - (results_days as i64) * 86_400_000;
+        let alerts_before = now_millis - (alerts_days as i64) * 86_400_000;
+        let mut removed = 0u64;
+        removed += self
+            .conn
+            .execute(
+                "DELETE FROM check_results WHERE ts_millis < ?",
+                duckdb::params![results_before],
+            )? as u64;
+        removed += self
+            .conn
+            .execute(
+                "DELETE FROM alerts WHERE ts_millis < ?",
+                duckdb::params![alerts_before],
+            )? as u64;
+        removed += self
+            .conn
+            .execute(
+                "DELETE FROM incidents WHERE status = 'resolved' AND resolved_at < ?",
+                duckdb::params![alerts_before],
+            )? as u64;
+        Ok(removed)
     }
 
     /// Every agent that has ever reported, newest-seen first. Agents are not
@@ -2168,6 +2322,49 @@ mod tests {
         // And the filter is a filter, not a truncation: successes still queryable.
         let good = s.history("web", 500, None, None, Some(Status::Up)).unwrap();
         assert_eq!(good.len(), 300);
+    }
+
+    #[test]
+    fn prune_removes_rows_older_than_the_retention_window() {
+        let s = Storage::open(":memory:").unwrap();
+        let now = 1_000_000_000_000i64;
+        let day = 86_400_000i64;
+
+        // One recent result and one far outside the 30-day results window.
+        s.insert_results(&[
+            (result("a", now - 1000, 1), Status::Up),
+            (result("a", now - 40 * day, 2), Status::Up),
+        ])
+        .unwrap();
+        // One recent alert and one older than the 90-day alerts window.
+        s.insert_alert("a", Status::Up, Status::Down, now - 1000)
+            .unwrap();
+        s.insert_alert("a", Status::Down, Status::Up, now - 100 * day)
+            .unwrap();
+        // An open incident (any age survives) and a resolved one older than
+        // the alerts window (pruned).
+        s.create_incident("open", now - 10 * day, Some("still down"))
+            .unwrap();
+        s.create_incident("old", now - 200 * day, Some("ancient"))
+            .unwrap();
+        s.resolve_incident("old", now - 100 * day).unwrap();
+
+        let removed = s.prune(30, 90, now).unwrap();
+        assert_eq!(
+            removed, 3,
+            "old result + old alert + old resolved incident"
+        );
+
+        // The recent result and alert survive.
+        let status = s.list_status(now).unwrap();
+        assert_eq!(status.len(), 1, "only the recent result's check remains");
+        assert_eq!(status[0].check_id, "a");
+        assert_eq!(s.recent_alerts(10).unwrap().len(), 1);
+        // The open incident survives; the resolved one is gone.
+        let incidents = s.list_incidents(10, None).unwrap();
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].check_id, "open");
+        assert_eq!(incidents[0].status, IncidentStatus::Open);
     }
 }
 

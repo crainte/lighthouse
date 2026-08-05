@@ -51,6 +51,8 @@ pub struct IncidentDto {
     pub started_at: i64,
     pub resolved_at: Option<i64>,
     pub details: Option<String>,
+    pub acknowledged_at: Option<i64>,
+    pub acknowledged_by: Option<String>,
 }
 
 impl From<storage::IncidentRow> for IncidentDto {
@@ -62,6 +64,8 @@ impl From<storage::IncidentRow> for IncidentDto {
             started_at: i.started_at,
             resolved_at: i.resolved_at,
             details: i.details,
+            acknowledged_at: i.acknowledged_at,
+            acknowledged_by: i.acknowledged_by,
         }
     }
 }
@@ -91,6 +95,10 @@ struct CheckMeta {
     position: i32,
     /// What the check reads as before its first result lands.
     default_status: Status,
+    /// How many consecutive DOWN observations confirm an outage. Fewer than
+    /// this leaves the check reading as it did before, so a single dropped
+    /// probe does not page anyone.
+    failures_before_down: u32,
     /// Probing at all. A disabled check has no agent expectation to violate.
     enabled: bool,
     /// Agents named explicitly. Empty means every agent.
@@ -151,6 +159,7 @@ fn meta_by_name(checks: &[CheckConfig]) -> std::collections::HashMap<String, Che
                     visible: c.visible,
                     eval: c.eval.clone(),
                     position: c.position,
+                    failures_before_down: c.failures_before_down,
                     enabled: c.enabled,
                     agents: c.agents.clone(),
                     default_status: match c.default_status {
@@ -167,6 +176,9 @@ fn meta_by_name(checks: &[CheckConfig]) -> std::collections::HashMap<String, Che
 struct Inner {
     storage: Mutex<Storage>,
     tracker: Mutex<StateTracker>,
+    /// How long history is kept. Copied here so the retention job does not
+    /// need to re-read config.
+    retention: crate::config::RetentionConfig,
     /// Alerts leave through here, never inline. `None` when no channel is
     /// configured, so nothing is queued for a dispatcher that does not exist.
     notify_tx: Option<tokio::sync::mpsc::Sender<alert::Transition>>,
@@ -253,11 +265,26 @@ impl Coordinator {
                  coordinator can post results and read check targets"
             );
         }
+        // Resume confirmations in flight. The confirmed status and the failure
+        // count persist in `current_state`, so a check two failures into a
+        // three-failure confirmation picks up where it left off after a restart
+        // instead of starting over — or alerting on the first result.
+        let mut tracker = StateTracker::new();
+        if let Ok(state) = storage.list_current_state() {
+            let n = state.len();
+            for row in state {
+                tracker.seed(&row.check_id, row.status, row.consecutive_failures);
+            }
+            if n > 0 {
+                info!(checks = n, "seeded state tracker from current_state");
+            }
+        }
         let (events, _) = broadcast::channel(256);
         Ok(Self {
             inner: Arc::new(Inner {
                 storage: Mutex::new(storage),
-                tracker: Mutex::new(StateTracker::new()),
+                tracker: Mutex::new(tracker),
+                retention: cfg.retention.clone(),
                 notify_tx,
                 events,
                 checks: parking_lot::RwLock::new(meta_by_name(&stored)),
@@ -289,31 +316,79 @@ impl Coordinator {
         Ok(stored)
     }
 
+    /// Start the retention job: prune once at startup, then once a day. Runs
+    /// beside ingest on its own task; a failed prune is logged and the
+    /// schedule continues rather than taking the server down.
+    pub fn spawn_retention(&self) {
+        let retention = self.inner.retention.clone();
+        let coord = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
+            loop {
+                tick.tick().await;
+                let now = chrono::Utc::now().timestamp_millis();
+                match coord
+                    .inner
+                    .storage
+                    .lock()
+                    .prune(retention.results_days, retention.alerts_days, now)
+                {
+                    Ok(0) => {}
+                    Ok(removed) => {
+                        tracing::info!(removed, "retention prune removed old rows");
+                    }
+                    Err(e) => tracing::error!(error = %e, "retention prune failed"),
+                }
+            }
+        });
+    }
+
     /// Core ingest path: eval each result, detect transitions, persist, alert,
     /// and broadcast alert-worthy transitions to live WebSocket clients.
     pub async fn ingest(&self, results: Vec<CheckResult>) {
         let mut rows = Vec::with_capacity(results.len());
         let mut transitions = Vec::new();
+        // Confirmed status per check after this batch, so incident opens are
+        // gated on the threshold: a DOWN still inside its confirmation window
+        // is not an outage yet.
+        let mut confirmed: std::collections::HashMap<String, Status> = std::collections::HashMap::new();
+        // (check_id, confirmed status, failure count, last check ts). Built
+        // under the tracker lock and applied to storage afterwards, because the
+        // two guards must never nest.
+        let mut state_updates = Vec::with_capacity(results.len());
 
         {
             let mut tracker = self.inner.tracker.lock();
             for mut r in results {
-                let (expect, script) = {
+                let (expect, script, threshold, default_status) = {
                     let by_name = self.inner.checks.read();
                     let meta = by_name.get(&r.check_id);
                     (
                         meta.and_then(|m| m.expect_status),
                         meta.and_then(|m| m.eval.clone()),
+                        meta.map(|m| m.failures_before_down).unwrap_or(1),
+                        meta.map(|m| m.default_status).unwrap_or(Status::Unknown),
                     )
                 };
                 let status = match script.as_deref() {
                     Some(src) => script_verdict(src, &mut r),
                     None => eval(&r, expect),
                 };
-                if let Some(t) = tracker.observe(&r.check_id, status) {
+                if let Some(t) = tracker.observe(&r.check_id, status, threshold) {
                     let ts = r.timestamp.timestamp_millis();
                     transitions.push((t, ts));
                 }
+                // A check still inside its confirmation window has not flipped;
+                // it reads as it did before its first failed probe.
+                let confirmed_status = tracker.current(&r.check_id).unwrap_or(default_status);
+                confirmed.insert(r.check_id.clone(), confirmed_status);
+                let ts = r.timestamp.timestamp_millis();
+                state_updates.push((
+                    r.check_id.clone(),
+                    confirmed_status,
+                    tracker.failures(&r.check_id),
+                    ts,
+                ));
                 // The body is only here to feed the script. Dropping it before
                 // persistence keeps 64KB per result out of the database.
                 r.body = None;
@@ -334,6 +409,11 @@ impl Coordinator {
             if let Err(e) = store.insert_results(&rows) {
                 tracing::error!(error = %e, "failed to persist results");
             }
+            for (check_id, cs_status, failures, ts) in &state_updates {
+                if let Err(e) = store.update_current_state(check_id, *cs_status, *failures, *ts) {
+                    tracing::error!(error = %e, check = %check_id, "failed to persist current state");
+                }
+            }
             for (t, ts) in transitions.iter().filter(|(t, _)| alert::should_alert(t)) {
                 if let Err(e) = store.insert_alert(&t.check_id, t.from, t.to, *ts) {
                     tracing::error!(error = %e, "failed to persist alert");
@@ -346,18 +426,26 @@ impl Coordinator {
                     // opened it; a DOWN that lands while one is already open
                     // rides on the existing incident.
                     Status::Down => {
-                        match store.open_incident_for(&r.check_id) {
-                            Ok(None) => match store.create_incident(&r.check_id, ts, incident_details(r).as_deref()) {
-                                Ok(i) => Some(WsEvent::IncidentOpened { incident: i.into() }),
+                        // A DOWN that has not yet confirmed (fewer than
+                        // `failures_before_down` consecutive probes) is not an
+                        // outage: no incident, and a later recovery cannot be
+                        // misread as a fix for something that never opened.
+                        if confirmed.get(&r.check_id) != Some(&Status::Down) {
+                            None
+                        } else {
+                            match store.open_incident_for(&r.check_id) {
+                                Ok(None) => match store.create_incident(&r.check_id, ts, incident_details(r).as_deref()) {
+                                    Ok(i) => Some(WsEvent::IncidentOpened { incident: i.into() }),
+                                    Err(e) => {
+                                        tracing::error!(error = %e, check = %r.check_id, "failed to open incident");
+                                        None
+                                    }
+                                },
+                                Ok(Some(_)) => None,
                                 Err(e) => {
-                                    tracing::error!(error = %e, check = %r.check_id, "failed to open incident");
+                                    tracing::error!(error = %e, check = %r.check_id, "failed to look up incident");
                                     None
                                 }
-                            },
-                            Ok(Some(_)) => None,
-                            Err(e) => {
-                                tracing::error!(error = %e, check = %r.check_id, "failed to look up incident");
-                                None
                             }
                         }
                     }
@@ -474,6 +562,7 @@ impl Coordinator {
             )
             .route("/api/v1/alerts", get(alerts_handler))
             .route("/api/v1/incidents", get(incidents_handler))
+            .route("/api/v1/incidents/:id/acknowledge", post(acknowledge_incident_handler))
             .route("/api/v1/checks/:id/incidents", get(check_incidents_handler))
             .route("/api/v1/agents", get(agents_handler))
             .route("/api/v1/admin/agents/:id", delete(purge_agent_handler))
@@ -1035,6 +1124,31 @@ async fn incidents_handler(
             let incidents = rows.into_iter().map(IncidentDto::from).collect();
             Json(IncidentsResponse { incidents }).into_response()
         }
+        Err(e) => internal_error(e),
+    }
+}
+
+/// Acknowledge an open incident. Admin-only: acknowledging is an operator
+/// action, so the route requires a session like the check editor does.
+async fn acknowledge_incident_handler(
+    State(coord): State<Coordinator>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(rejection) = require_admin(&coord, &headers) {
+        return rejection;
+    }
+    // Logins are password-only: there is no per-user identity to record, so the
+    // byline is the role. The column exists for the day multi-user sessions do.
+    let now = chrono::Utc::now().timestamp_millis();
+    match coord
+        .inner
+        .storage
+        .lock()
+        .acknowledge_incident(&id, "admin", now)
+    {
+        Ok(Some(row)) => Json(serde_json::json!({ "incident": IncidentDto::from(row) })).into_response(),
+        Ok(None) => error_response(StatusCode::NOT_FOUND, "no open incident with that id"),
         Err(e) => internal_error(e),
     }
 }

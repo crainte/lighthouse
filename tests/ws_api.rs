@@ -60,6 +60,7 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
             listen: "127.0.0.1:0".into(),
             db_path: ":memory:".into(),
             alert_webhook: None,
+            retention: warden::config::RetentionConfig::default(),
         },
         &[warden::config::CheckConfig {
             name: "test-check".into(),

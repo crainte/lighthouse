@@ -75,6 +75,8 @@ async fn run_coordinator(cfg: Config) -> Result<()> {
 async fn serve(coord: Coordinator, listen: &str) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(%listen, "coordinator listening");
+    // History pruning runs beside the server: once at startup, then daily.
+    coord.spawn_retention();
     // Peer address is needed to rate-limit login attempts per client.
     axum::serve(
         listener,

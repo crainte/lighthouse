@@ -83,6 +83,39 @@ pub struct CoordinatorConfig {
     /// anyone who can reach the coordinator, so it is logged loudly at boot.
     #[serde(default)]
     pub agent_token: Option<String>,
+    /// How long result, alert and incident history is kept. A nightly prune
+    /// deletes rows older than this; raising the values keeps more history.
+    #[serde(default)]
+    pub retention: RetentionConfig,
+}
+
+/// History retention: rows older than the window are pruned periodically.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetentionConfig {
+    /// Keep raw probe results this many days.
+    #[serde(default = "default_results_days")]
+    pub results_days: u64,
+    /// Keep state-transition alerts and closed incidents this many days. Open
+    /// incidents are never pruned — an active outage is not old history.
+    #[serde(default = "default_alerts_days")]
+    pub alerts_days: u64,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            results_days: default_results_days(),
+            alerts_days: default_alerts_days(),
+        }
+    }
+}
+
+fn default_results_days() -> u64 {
+    30
+}
+
+fn default_alerts_days() -> u64 {
+    90
 }
 
 impl CoordinatorConfig {
@@ -304,6 +337,12 @@ pub struct CheckConfig {
     /// Heartbeat only: how long without a ping before the check is DOWN.
     #[serde(default = "default_grace_secs")]
     pub grace_secs: u64,
+    /// How many consecutive failed probes confirm a DOWN. One failed probe does
+    /// not flip the state: the check reads DOWN (and alerts, and opens an
+    /// incident) only after this many failures in a row, so a single dropped
+    /// probe or a flaky hop does not page anyone. 1 is the classic behaviour.
+    #[serde(default = "default_failures_before_down")]
+    pub failures_before_down: u32,
 }
 
 /// What a check reads as before its first result.
@@ -324,6 +363,9 @@ fn default_cert_warning_days() -> u32 {
 }
 fn default_grace_secs() -> u64 {
     300
+}
+fn default_failures_before_down() -> u32 {
+    1
 }
 
 /// Defaults match the serde defaults, so a check built in code behaves like one
@@ -357,6 +399,7 @@ impl Default for CheckConfig {
             ping: PingOptions::default(),
             cert_warning_days: default_cert_warning_days(),
             grace_secs: default_grace_secs(),
+            failures_before_down: default_failures_before_down(),
         }
     }
 }
@@ -481,6 +524,13 @@ impl CheckConfig {
         if self.kind == CheckKind::Heartbeat && self.grace_secs < 10 {
             return Err("heartbeat grace must be at least 10 seconds".into());
         }
+        // 0 failures "before" down would mean down already: the confirmation
+        // threshold exists to swallow a dropped probe, not to distrust every
+        // result. Treat 0 as 1 so a hand-typed config cannot create a check
+        // that never flips.
+        if self.failures_before_down == 0 {
+            return Err("failures_before_down must be at least 1".into());
+        }
         // A script that doesn't compile would mark the service down every
         // interval forever, so it must never reach storage.
         if let Some(src) = self
@@ -567,6 +617,7 @@ impl Default for CoordinatorConfig {
             alert_webhook: None,
             admin_password: None,
             agent_token: None,
+            retention: RetentionConfig::default(),
         }
     }
 }
