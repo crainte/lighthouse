@@ -1,0 +1,13 @@
+[webfetch]
+allow = [
+    "https://meta.hyperping.app/",
+]
+
+[bash]
+allow = [
+    "cd *",
+    "tail *",
+    "docker *",
+    "npx *",
+    "npm *",
+]

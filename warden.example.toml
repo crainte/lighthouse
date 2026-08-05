@@ -1,5 +1,10 @@
 # Warden standalone config example.
 # Run: warden standalone --config warden.example.toml
+#
+# The [[checks]] below seed the store on first boot. After that the store is
+# authoritative: checks are created and edited in the admin UI, and editing this
+# file will not change a check that already exists. With no checks anywhere the
+# coordinator seeds demo data so the dashboard has something to show.
 
 [agent]
 agent_id = "local-01"
@@ -10,6 +15,20 @@ listen = "0.0.0.0:8080"
 db_path = "warden.duckdb"
 # alert_webhook = "https://hooks.slack.com/services/..."
 
+# Secrets are better supplied by the environment than written here — this file
+# tends to end up in version control. Both fall back to an env var:
+#
+#   WARDEN_ADMIN_PASSWORD  unlocks the check editor. With neither this nor the
+#                          env var set, the editor is disabled rather than open.
+#   WARDEN_AGENT_TOKEN     required for agents to post results and to read the
+#                          check list (which contains probe targets). Leaving it
+#                          unset keeps those endpoints public.
+#
+# admin_password = "change-me"
+# agent_token = "shared-with-every-agent"
+
+# --- HTTP -------------------------------------------------------------------
+# Default eval: any 2xx-3xx is UP.
 [[checks]]
 name = "example-http"
 type = "http"
@@ -17,9 +36,71 @@ target = "https://example.com"
 interval_secs = 30
 timeout_secs = 10
 
+# Assert an exact status code and a body substring. Useful when "200 OK" isn't
+# enough — a page that returns 200 while printing "database error" is DOWN.
 [[checks]]
-name = "github"
+name = "api-health"
 type = "http"
-target = "https://github.com"
+target = "https://api.example.com/health"
+interval_secs = 30
+timeout_secs = 10
+[checks.expect]
+status = 200
+body_contains = "ok"
+
+# An endpoint that is *supposed* to reject you: expect 401, so a 200 is DOWN.
+[[checks]]
+name = "api-auth-required"
+type = "http"
+target = "https://api.example.com/private"
 interval_secs = 60
 timeout_secs = 10
+[checks.expect]
+status = 401
+
+# --- TCP --------------------------------------------------------------------
+# Connection success + latency. Target is "host:port".
+[[checks]]
+name = "database"
+type = "tcp"
+target = "db.internal:5432"
+interval_secs = 60
+timeout_secs = 5
+
+# --- DNS --------------------------------------------------------------------
+# Resolution success. The name is queried as a FQDN, so a resolver `search`
+# domain can never silently answer for a different name.
+#
+# Robustness: caching is disabled (a probe must never report a stale success),
+# a dropped UDP packet is retried (2 retries, 3 sends total) instead of counting
+# as an outage, and UDP falls back to TCP on error. NXDOMAIN is a real answer and
+# is deliberately not retried — it reports DOWN.
+[[checks]]
+name = "dns-example"
+type = "dns"
+target = "example.com"
+interval_secs = 60
+timeout_secs = 10
+
+# Assert the record still points where you expect.
+[[checks]]
+name = "dns-record-pinned"
+type = "dns"
+target = "one.one.one.one"
+interval_secs = 60
+timeout_secs = 10
+[checks.expect]
+body_contains = "1.1.1.1"
+
+# --- ICMP -------------------------------------------------------------------
+# Ping success + RTT. Requires CAP_NET_RAW, or a permissive
+# net.ipv4.ping_group_range sysctl. Without it the check reports a permission
+# error rather than silently passing.
+#
+# Docker: docker run --cap-add=NET_RAW ...
+[[checks]]
+name = "gateway"
+type = "icmp"
+target = "1.1.1.1"
+interval_secs = 60
+timeout_secs = 5

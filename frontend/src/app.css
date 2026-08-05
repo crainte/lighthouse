@@ -9,6 +9,7 @@
   --up: #3fb950;
   --down: #f85149;
   --unknown: #8b949e;
+  --amber: #d29922;
   font-size: 16px;
 }
 
@@ -20,186 +21,514 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
   line-height: 1.5;
 }
 
 .app {
-  max-width: 1100px;
+  max-width: 880px;
   margin: 0 auto;
-  padding: 1.5rem;
+  padding: 2rem 1.25rem 4rem;
+}
+/* The admin area is a workbench, not prose: a seven-column table and a
+   three-column editor grid both need room the status page's reading column
+   cannot give them. Capped rather than uncapped so a 34" monitor doesn't
+   stretch a row of six words across a metre, and the page gutter stays. */
+.app.wide {
+  max-width: 1600px;
 }
 
+/* Header */
 header.bar {
   display: flex;
-  align-items: center;
-  gap: 1rem;
-  padding-bottom: 1rem;
-  border-bottom: 1px solid var(--border);
+  align-items: flex-start;
+  justify-content: space-between;
   margin-bottom: 1.5rem;
 }
 
-header.bar h1 {
-  font-size: 1.4rem;
+.brand h1 {
   margin: 0;
-  letter-spacing: 0.02em;
+  font-size: 1.6rem;
+  letter-spacing: -0.01em;
 }
 
-nav.tabs {
-  display: flex;
-  gap: 0.25rem;
-  margin-left: 1rem;
-}
-
-nav.tabs button {
-  background: transparent;
-  border: none;
+.brand .subtitle {
+  margin: 0.15rem 0 0;
   color: var(--text-dim);
-  padding: 0.4rem 0.9rem;
-  border-radius: 6px;
-  cursor: pointer;
-  font-size: 1rem;
+  font-size: 0.95rem;
 }
 
-nav.tabs button:hover {
-  background: var(--bg-hover);
-  color: var(--text);
-}
-
-nav.tabs button.active {
-  background: var(--bg-elev);
-  color: var(--text);
+/* Live-status dot and the admin control share the header's right edge. */
+.bar-right {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
 }
 
 .ws-dot {
-  margin-left: auto;
   display: inline-flex;
   align-items: center;
   gap: 0.4rem;
-  font-size: 0.85rem;
+  font-size: 0.8rem;
   color: var(--text-dim);
+  text-transform: capitalize;
 }
 
 .ws-dot .dot {
-  width: 9px;
-  height: 9px;
+  width: 8px;
+  height: 8px;
   border-radius: 50%;
   background: var(--unknown);
 }
-.ws-dot.open .dot { background: var(--up); }
-.ws-dot.connecting .dot { background: #d29922; }
-.ws-dot.closed .dot { background: var(--down); }
+.ws-dot.open .dot {
+  background: var(--up);
+}
+.ws-dot.connecting .dot {
+  background: var(--amber);
+}
+.ws-dot.closed .dot {
+  background: var(--down);
+}
 
-.badge {
-  display: inline-block;
-  padding: 0.1rem 0.55rem;
-  border-radius: 999px;
-  font-size: 0.8rem;
+/* Overall status banner */
+.banner {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 1.1rem 1.25rem;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  font-size: 1.25rem;
   font-weight: 600;
-  color: #0d1117;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
+  margin-bottom: 2rem;
+}
+.banner.operational {
+  background: rgba(63, 185, 80, 0.12);
+  border-color: rgba(63, 185, 80, 0.4);
+}
+.banner.partial {
+  background: rgba(210, 153, 34, 0.12);
+  border-color: rgba(210, 153, 34, 0.4);
+}
+.banner.major {
+  background: rgba(248, 81, 73, 0.12);
+  border-color: rgba(248, 81, 73, 0.4);
+}
+.banner-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  color: #fff;
+  font-size: 0.95rem;
+  flex-shrink: 0;
+}
+.banner.operational .banner-icon {
+  background: var(--up);
+}
+.banner.partial .banner-icon {
+  background: var(--amber);
+}
+.banner.major .banner-icon {
+  background: var(--down);
 }
 
-table.grid {
-  width: 100%;
-  border-collapse: collapse;
+/* Sections */
+.section {
+  margin-bottom: 2.5rem;
 }
-
-table.grid th,
-table.grid td {
-  text-align: left;
-  padding: 0.7rem 0.9rem;
-  border-bottom: 1px solid var(--border);
-}
-
-table.grid th {
+.section-title {
+  font-size: 1.05rem;
+  font-weight: 600;
   color: var(--text-dim);
+  margin: 0 0 0.9rem;
+}
+
+/* Component rows */
+.components {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+.component {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem 1.15rem;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+  transition: border-color 0.15s;
+}
+.component:hover {
+  border-color: #444c56;
+}
+.component-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.7rem;
+}
+.component-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
   font-weight: 600;
-  font-size: 0.85rem;
-  user-select: none;
 }
-
-table.grid th.sortable {
-  cursor: pointer;
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
 }
-table.grid th.sortable:hover {
-  color: var(--text);
+.component-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  line-height: 1.25;
 }
-
-table.grid tbody tr {
-  cursor: pointer;
+.component-uptime {
+  font-size: 0.95rem;
+  font-weight: 700;
 }
-table.grid tbody tr:hover {
-  background: var(--bg-hover);
+.component-latency {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
 }
-
-td.mono,
-.mono {
+/* Failure reason, shown under a down check's header. */
+.component-reason {
+  margin-top: -0.35rem;
+  margin-bottom: 0.6rem;
+  font-size: 0.75rem;
+  color: var(--down);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.server-detail {
+  font-size: 0.72rem;
+  color: var(--text-dim);
   font-variant-numeric: tabular-nums;
 }
 
-.dim {
+/* Collapsible group card (a named bundle of monitors or probe servers) */
+.group {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 0.9rem 1.15rem;
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.group-head:hover {
+  background: #1c2128;
+}
+.group-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  font-weight: 600;
+}
+.group-count {
+  font-size: 0.72rem;
+  font-weight: 400;
   color: var(--text-dim);
 }
-
-.card {
-  background: var(--bg-elev);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 1.2rem;
+.group-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.group-status {
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+.group-status.down {
+  color: var(--down);
+}
+.group .chevron {
+  color: var(--text-dim);
+  transition: transform 0.15s ease;
+}
+.group.open .chevron {
+  transform: rotate(90deg);
+}
+/* Children run flush inside the group card — no nested boxes, just dividers. */
+.group-body {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+}
+/* Strip the standalone-card chrome from monitors nested in a group.
+   The colour is set explicitly: a bare `border: 0` leaves border-color at
+   `currentColor` (near-white), and `.component` transitions border-color, so
+   hovering flashed a white line along the row divider. */
+.group-body .component {
+  background: none;
+  border: 0 solid var(--border);
+  border-radius: 0;
+}
+.group-body .component:hover {
+  background: #1c2128;
+}
+/* Hairline between rows. Deliberately NOT `x + x`: each row renders its hover
+   tooltip as a following sibling, so an adjacency selector silently stopped
+   matching whenever a tooltip was showing and the divider blinked out.
+   Specific enough to beat the border reset above. */
+.group-body > .component:not(:first-child),
+.group-body > .server-row:not(:first-child) {
+  border-top: 1px solid var(--border);
 }
 
-.notice {
-  padding: 1rem 1.2rem;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: var(--bg-elev);
+/* Plain monitoring-server row: name + status, no charts. */
+.server-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.7rem 1.15rem;
 }
-.notice.error {
-  border-color: var(--down);
+.server-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  font-size: 0.9rem;
+}
+.server-status {
+  font-size: 0.78rem;
+  color: var(--text-dim);
+}
+.server-status.down {
   color: var(--down);
 }
 
-button.link {
-  background: none;
-  border: none;
-  color: var(--accent);
-  cursor: pointer;
-  font-size: 1rem;
-  padding: 0;
+/* Hyperping-style latency graph: cursor-following readout over gradient bars */
+.latency-graph {
+  margin-top: 0.5rem;
 }
-button.link:hover {
-  text-decoration: underline;
+.latency-plot {
+  position: relative;
+  /* Right gutter for the scale label. */
+  padding-right: 3rem;
+}
+.lat-inner {
+  position: relative;
+  /* Reserved band above the bars for the floating readout. */
+  padding-top: 2rem;
+}
+.latency-bars {
+  display: block;
+  width: 100%;
+  height: 60px;
+  cursor: default;
+}
+.latency-bars rect {
+  transition: fill 0.08s linear;
+}
+/* Roomier plot for the day-detail view, which has vertical space to spare. */
+.latency-graph.tall .latency-bars {
+  height: 150px;
+}
+/* Full-height cursor line; the readout straddles it. */
+.lat-cursor {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--text, #e6edf3);
+  opacity: 0.55;
+  pointer-events: none;
+}
+/* Readout anchored at the cursor x: value to the left, time to the right. */
+.lat-readout {
+  position: absolute;
+  top: 0;
+  height: 1.5rem;
+  pointer-events: none;
+}
+.lat-value {
+  position: absolute;
+  right: 100%;
+  bottom: 0;
+  padding-right: 0.4rem;
+  font-size: 1.4rem;
+  font-weight: 700;
+  color: var(--text, #e6edf3);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+.lat-unit {
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-left: 0.1rem;
+}
+/* Hovering a segment with no attempts says so, rather than reading "0ms". */
+.lat-nodata {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-dim, #8b949e);
+}
+.lat-time {
+  position: absolute;
+  left: 100%;
+  bottom: 0.1rem;
+  padding-left: 0.4rem;
+  font-size: 0.78rem;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+/* Max-latency scale marker in the right gutter, aligned to the baseline. */
+.lat-scale {
+  position: absolute;
+  right: 0;
+  bottom: 0.9rem;
+  width: 3rem;
+  padding-left: 0.4rem;
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+/* Hourly time axis below the bars. */
+.lat-axis {
+  position: relative;
+  height: 0.9rem;
+  margin-top: 0.2rem;
+}
+.lat-tick {
+  position: absolute;
+  transform: translateX(-50%);
+  font-size: 0.62rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.lat-tick:first-child {
+  transform: none;
+}
+.lat-tick:last-child {
+  transform: translateX(-100%);
 }
 
-/* Latency bars */
-.bars {
+/* 90-day uptime bar strip */
+.ubars {
   display: flex;
-  align-items: flex-end;
   gap: 2px;
-  height: 140px;
-  padding: 0.5rem 0;
-  border-bottom: 1px solid var(--border);
+  align-items: stretch;
+  height: 34px;
 }
-.bars .bar {
+.ubar {
   flex: 1 1 0;
-  min-width: 2px;
-  border-radius: 2px 2px 0 0;
+  min-width: 0;
+  border-radius: 2px;
+  background: var(--border);
+}
+.ubar.up {
   background: var(--up);
 }
+.ubar.down {
+  background: var(--down);
+}
+/* A day that lost a few checks out of thousands is not a full outage. */
+.ubar.degraded {
+  background: var(--amber);
+}
+.ubar.nodata {
+  background: #21262d;
+}
+/* Highlight is driven by the container's pointer tracking, not :hover, so it
+   doesn't drop out over the 2px gaps between bars. */
+.ubar.hovered {
+  filter: brightness(1.35);
+}
 
+.strip-labels {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 0.45rem;
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  text-transform: uppercase;
+}
+.strip-uptime {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 0.78rem;
+  color: var(--text);
+}
+
+/* Incidents / alerts */
+.badge {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: #0d1117;
+}
+ul.alerts {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+ul.alerts li {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.7rem 1rem;
+}
+ul.alerts .transition {
+  font-weight: 600;
+}
+ul.alerts .arrow {
+  color: var(--text-dim);
+  margin: 0 0.25rem;
+}
+
+/* Detail view */
 .detail-head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 1rem;
   margin-bottom: 1rem;
 }
 .detail-head h2 {
   margin: 0;
-  font-size: 1.25rem;
+  font-size: 1.3rem;
 }
-
+.card {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1.25rem;
+}
 .stat {
   display: inline-flex;
   flex-direction: column;
@@ -210,34 +539,617 @@ button.link:hover {
   color: var(--text-dim);
 }
 .stat .value {
-  font-size: 1.4rem;
-  font-variant-numeric: tabular-nums;
+  font-size: 1.3rem;
+  font-weight: 600;
 }
 
-ul.alerts {
-  list-style: none;
-  padding: 0;
-  margin: 0;
+/* Latency bars (detail) */
+.bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 120px;
+  margin-top: 0.5rem;
+  padding: 0.5rem;
+  background: var(--bg);
+  border-radius: 8px;
 }
-ul.alerts li {
+.bars .bar {
+  flex: 1 1 0;
+  min-width: 0;
+  border-radius: 2px 2px 0 0;
+  min-height: 2px;
+}
+.history-row {
   display: flex;
   align-items: center;
   gap: 0.75rem;
-  padding: 0.7rem 0.2rem;
-  border-bottom: 1px solid var(--border);
-}
-ul.alerts .transition {
-  font-weight: 600;
-}
-ul.alerts .arrow {
-  color: var(--text-dim);
-  margin: 0 0.3rem;
+  padding: 0.4rem 0;
+  border-top: 1px solid var(--border);
 }
 
-.history-row {
-  display: flex;
-  gap: 0.75rem;
-  padding: 0.4rem 0.2rem;
-  border-bottom: 1px solid var(--border);
+/* Utilities */
+.mono {
+  font-variant-numeric: tabular-nums;
+}
+.dim {
+  color: var(--text-dim);
+}
+.notice {
+  padding: 2rem;
+  text-align: center;
+  color: var(--text-dim);
+}
+.notice.error {
+  color: var(--down);
+}
+button.link {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+}
+button.link:hover {
+  text-decoration: underline;
+}
+
+/* Uptime bar hover tooltip */
+.bar-tooltip {
+  position: fixed;
+  transform: translate(-50%, calc(-100% - 12px));
+  z-index: 50;
+  pointer-events: none;
+  background: #0b0f14;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.5rem 0.7rem;
+  min-width: 150px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+}
+.bar-tooltip .tt-date {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-dim);
+  margin-bottom: 0.2rem;
+}
+.bar-tooltip .tt-status {
   font-size: 0.9rem;
+  font-weight: 700;
+}
+.bar-tooltip .tt-status.up {
+  color: var(--up);
+}
+.bar-tooltip .tt-status.down {
+  color: var(--down);
+}
+.bar-tooltip .tt-status.degraded {
+  color: var(--amber);
+}
+.bar-tooltip .tt-status.nodata {
+  color: var(--text-dim);
+}
+.bar-tooltip .tt-detail {
+  font-size: 0.78rem;
+  color: var(--text-dim);
+  margin-top: 0.15rem;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Check detail: per-agent breakdown and attempt rows */
+.agent-table {
+  margin-bottom: 1rem;
+  font-size: 0.82rem;
+}
+.agent-head,
+.agent-line {
+  display: grid;
+  grid-template-columns: 2fr 1.4fr 1fr 1fr 1fr;
+  gap: 0.5rem;
+  padding: 0.35rem 0;
+}
+.agent-head {
+  color: var(--text-dim);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid var(--border);
+}
+.agent-line + .agent-line {
+  border-top: 1px solid var(--border);
+}
+.agent-tag {
+  font-size: 0.72rem;
+}
+.row-reason {
+  font-size: 0.72rem;
+  color: var(--down);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 45%;
+}
+
+/* Section header with the uptime-bar window switcher */
+.section-bar {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 0.9rem;
+}
+.section-bar .section-title {
+  margin: 0;
+}
+.range-switch {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.range-btn {
+  background: none;
+  border: 0;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 0.75rem;
+  padding: 0.25rem 0.6rem;
+  cursor: pointer;
+}
+.range-btn + .range-btn {
+  border-left: 1px solid var(--border);
+}
+.range-btn:hover {
+  background: #1c2128;
+}
+.range-btn.active {
+  background: #1f6feb22;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.sample-note {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  margin-bottom: 0.4rem;
+}
+.fail-block {
+  margin-bottom: 1rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--down);
+  border-radius: 8px;
+  background: rgba(248, 81, 73, 0.06);
+}
+.fail-title {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--down);
+  margin-bottom: 0.4rem;
+}
+.fail-row {
+  display: flex;
+  gap: 0.6rem;
+  align-items: baseline;
+  padding: 0.15rem 0;
+  font-size: 0.78rem;
+}
+.fail-why {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--down);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- Shared detail vocabulary ----
+   Used by both the day-detail modal and the check page so one check reads the
+   same way wherever you meet it. */
+
+.title-line {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  flex-wrap: wrap;
+}
+
+/* Probe type as a pill: the name hints at it ("cloudflare-dns") but only the
+   config actually knows. */
+.kind-pill {
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0.1rem 0.45rem;
+  border: 1px solid var(--border, #30363d);
+  border-radius: 999px;
+  color: var(--text-dim, #8b949e);
+}
+
+/* Agent name as a pill so it reads as an identity, not another number. */
+.agent-pill {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.72rem;
+  padding: 0.05rem 0.4rem;
+  /* Grid items stretch by default, which would draw the border across the whole
+     column instead of hugging the name. */
+  justify-self: start;
+  border: 1px solid var(--border, #30363d);
+  border-radius: 999px;
+  color: var(--text-dim, #8b949e);
+  white-space: nowrap;
+}
+
+/* Headline numbers side by side: each figure gets its own label instead of
+   three values sharing one. */
+.figures {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2.5rem;
+}
+.figure {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.fig-value {
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: var(--text, #e6edf3);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+}
+.fig-value.bad {
+  color: var(--down, #f85149);
+}
+.fig-unit {
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--text-dim, #8b949e);
+  margin-left: 0.15rem;
+}
+/* Dim, spaced separator so "7 / 19 / 109" reads as three numbers and not a
+   date. */
+.fig-sep {
+  color: var(--border, #30363d);
+  margin: 0 0.3rem;
+  font-weight: 400;
+}
+.band .fig-sep {
+  margin: 0 0.22rem;
+}
+.band-v {
+  color: var(--text, #e6edf3);
+}
+.fig-label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim, #8b949e);
+}
+
+/* ---- Admin vocabulary ----
+   Shared by the admin panels so a form control, button or state pill reads the
+   same in every sidebar area. Form-element rules are scoped under .admin-panel
+   to keep them off the public status page. */
+
+.admin-head {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+}
+.admin-head h2 {
+  margin: 0;
+  font-size: 1.3rem;
+}
+
+/* Sidebar + content. minmax(0, 1fr) is load-bearing: a grid track defaults to
+   min-content, and one long target in the checks table would then push the
+   whole page sideways instead of ellipsing. */
+.admin-shell {
+  display: grid;
+  grid-template-columns: 180px minmax(0, 1fr);
+  gap: 1.25rem;
+  align-items: start;
+}
+.admin-nav {
+  display: flex;
+  flex-direction: column;
+  position: sticky;
+  top: 1rem;
+}
+.admin-nav-items {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+/* Leaving the admin area is not one of the areas, so it sits above the rule
+   rather than reading as a fifth nav item. */
+.admin-exit {
+  background: none;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 0.82rem;
+  text-align: left;
+  padding: 0.35rem 0.55rem 0.6rem;
+  margin-bottom: 0.6rem;
+  cursor: pointer;
+}
+.admin-exit:hover {
+  color: var(--accent);
+}
+.admin-nav-item {
+  background: none;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 0.85rem;
+  text-align: left;
+  padding: 0.4rem 0.55rem;
+  cursor: pointer;
+}
+.admin-nav-item:hover {
+  background: #1c2128;
+  color: var(--text);
+}
+.admin-nav-item.active {
+  background: #1f6feb22;
+  color: var(--accent);
+  font-weight: 600;
+}
+.admin-content {
+  min-width: 0;
+}
+
+@media (max-width: 900px) {
+  .admin-shell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .admin-nav {
+    position: static;
+  }
+  .admin-nav-items {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+}
+.admin-signin {
+  margin-top: 0.7rem;
+}
+
+.admin-panel {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem 1.2rem;
+  margin-bottom: 1rem;
+  min-width: 0;
+}
+.panel-title {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  margin-bottom: 0.7rem;
+}
+
+.admin-panel input,
+.admin-panel select,
+.admin-panel textarea {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.82rem;
+  padding: 0.35rem 0.5rem;
+  width: 100%;
+  min-width: 0;
+}
+.admin-panel input:focus,
+.admin-panel select:focus,
+.admin-panel textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.admin-panel input[readonly] {
+  color: var(--text-dim);
+  background: #10151c;
+}
+.admin-panel input[type='checkbox'] {
+  width: auto;
+  accent-color: var(--accent);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+}
+.field-label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+}
+.field-note {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+}
+
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.82rem;
+  color: var(--text);
+}
+.toggle em {
+  font-style: normal;
+  color: var(--text-dim);
+}
+
+.btn {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 0.75rem;
+  padding: 0.25rem 0.6rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn:hover:not(:disabled) {
+  background: #1c2128;
+  color: var(--text);
+}
+.btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.btn.primary {
+  background: #1f6feb22;
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+.btn.primary:hover:not(:disabled) {
+  background: #1f6feb33;
+  color: var(--accent);
+}
+.btn.danger {
+  color: var(--down);
+}
+.btn.danger:hover:not(:disabled) {
+  background: rgba(248, 81, 73, 0.12);
+  color: var(--down);
+}
+
+.admin-error {
+  color: var(--down);
+  font-size: 0.82rem;
+  margin: 0 0 0.2rem;
+}
+.admin-muted {
+  color: var(--text-dim);
+  font-size: 0.82rem;
+  margin: 0;
+}
+
+/* enabled / visible / latency_graph are three independent switches that are
+   easy to conflate, so each gets its own lit-or-dark pill rather than sharing
+   one "enabled" column. */
+.flags {
+  display: inline-flex;
+  gap: 0.25rem;
+}
+.flag {
+  font-size: 0.6rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0.05rem 0.34rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: #4d555e;
+}
+.flag.on {
+  border-color: rgba(63, 185, 80, 0.5);
+  background: rgba(63, 185, 80, 0.12);
+  color: var(--up);
+}
+
+/* Trackless scrollbar: no groove, just a pill thumb. The -webkit- rules are the
+   Safari fallback for the standard properties above them. */
+.admin-rows {
+  max-height: 60vh;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #3d4650 transparent;
+}
+.admin-rows::-webkit-scrollbar {
+  width: 10px;
+}
+.admin-rows::-webkit-scrollbar-track {
+  background: transparent;
+}
+.admin-rows::-webkit-scrollbar-thumb {
+  background: #3d4650;
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+/* ---- Collapsible editor sections ----
+   Native <details>/<summary>, so the disclosure is keyboard-operable, findable
+   by the browser's own in-page search and works with no script at all. They are
+   still .admin-panel so every form control inside picks up the admin styling
+   above; the padding moves to the summary and body instead, which keeps the
+   header flush with the border when a section is shut. */
+.admin-panel.editor-section {
+  padding: 0;
+  overflow: hidden;
+}
+.editor-summary {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.7rem 1.2rem;
+  cursor: pointer;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  user-select: none;
+  /* Both are needed: the standard property, and the Safari pseudo-element
+     below, which still draws its own triangle otherwise. */
+  list-style: none;
+}
+.editor-summary::-webkit-details-marker {
+  display: none;
+}
+.editor-summary:hover {
+  background: #1c2128;
+  color: var(--text);
+}
+.editor-summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.editor-summary .chev {
+  transition: transform 0.12s ease;
+}
+.editor-section[open] > .editor-summary {
+  border-bottom: 1px solid var(--border);
+}
+.editor-section[open] > .editor-summary .chev {
+  transform: rotate(90deg);
+}
+/* Right-aligned aside in a summary — a row count, a "none yet". */
+.editor-summary .sum-note {
+  margin-left: auto;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 0.72rem;
+}
+.editor-body {
+  padding: 0.9rem 1.2rem 1.1rem;
+}
+
+/* The two actions in here are the only ones in the admin UI that destroy data,
+   so the panel is coloured rather than merely labelled. */
+.editor-section.danger {
+  border-color: rgba(248, 81, 73, 0.45);
+}
+.editor-section.danger > .editor-summary {
+  color: var(--down);
+}
+.editor-section.danger[open] > .editor-summary {
+  border-bottom-color: rgba(248, 81, 73, 0.45);
 }

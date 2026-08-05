@@ -1,7 +1,8 @@
 // Live WebSocket client for /api/v1/ws with exponential reconnect backoff.
-import type { StateChange, Status } from './api';
+import type { IncidentEvent, IncidentStatus, StateChange, Status } from './api';
 
 const STATUSES: Status[] = ['up', 'down', 'unknown'];
+const INCIDENT_STATUSES: IncidentStatus[] = ['open', 'resolved'];
 
 function isStatus(v: unknown): v is Status {
   return typeof v === 'string' && (STATUSES as string[]).includes(v);
@@ -23,10 +24,37 @@ function parseStateChange(data: unknown): StateChange | null {
   };
 }
 
+function parseIncident(data: unknown): IncidentEvent | null {
+  if (typeof data !== 'object' || data === null) return null;
+  const m = data as Record<string, unknown>;
+  if (m.type !== 'incident_opened' && m.type !== 'incident_resolved') return null;
+  const i = m.incident as Record<string, unknown> | undefined;
+  if (typeof i !== 'object' || i === null) return null;
+  if (typeof i.id !== 'string' || typeof i.check_id !== 'string') return null;
+  if (typeof i.status !== 'string' || !(INCIDENT_STATUSES as string[]).includes(i.status)) {
+    return null;
+  }
+  if (typeof i.started_at !== 'number') return null;
+  if (i.resolved_at !== null && typeof i.resolved_at !== 'number') return null;
+  if (i.details !== null && typeof i.details !== 'string') return null;
+  return {
+    type: m.type,
+    incident: {
+      id: i.id,
+      check_id: i.check_id,
+      status: i.status as IncidentStatus,
+      started_at: i.started_at,
+      resolved_at: i.resolved_at as number | null,
+      details: i.details as string | null,
+    },
+  };
+}
+
 export type WsStatus = 'connecting' | 'open' | 'closed';
 
 export interface WsHandlers {
   onStateChange: (msg: StateChange) => void;
+  onIncident?: (msg: IncidentEvent) => void;
   onStatus?: (status: WsStatus) => void;
 }
 
@@ -62,6 +90,8 @@ export function connectWs(handlers: WsHandlers): WsConnection {
       }
       const msg = parseStateChange(data);
       if (msg) handlers.onStateChange(msg);
+      const inc = parseIncident(data);
+      if (inc) handlers.onIncident?.(inc);
     };
 
     ws.onclose = () => {

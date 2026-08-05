@@ -49,14 +49,24 @@ fn result_body(check_id: &str, ts: &str, status_code: u16) -> Value {
 
 #[tokio::test]
 async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
-    // Real server, in-memory store. `Coordinator::new` seeds mock data on an
-    // empty store; we assert only on a fresh check_id ("test-check") so seed
-    // data (api-gateway/redis-cache/...) never interferes.
-    let coord = Coordinator::new(&CoordinatorConfig {
-        listen: "127.0.0.1:0".into(),
-        db_path: ":memory:".into(),
-        alert_webhook: None,
-    })
+    // Real server, in-memory store. "test-check" is configured rather than
+    // conjured by ingest alone: the status page only publishes checks that
+    // currently exist, and this test is about transitions surfacing, not about
+    // how orphaned history is treated.
+    let coord = Coordinator::new(
+        &CoordinatorConfig {
+            admin_password: None,
+            agent_token: None,
+            listen: "127.0.0.1:0".into(),
+            db_path: ":memory:".into(),
+            alert_webhook: None,
+        },
+        &[warden::config::CheckConfig {
+            name: "test-check".into(),
+            target: "https://test-check.invalid".into(),
+            ..Default::default()
+        }],
+    )
     .unwrap();
     let addr = spawn_server(coord);
 
@@ -130,24 +140,32 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
     assert_eq!(event["from"], "up", "transition starts at up");
     assert_eq!(event["to"], "down", "transition lands on down");
 
-    // No second broadcast: proves the baseline was silent and the transition
-    // fired exactly once. A text frame arriving here fails the test.
-    let extra = tokio::time::timeout(Duration::from_millis(400), async {
+    // The same ingest that fired the transition also opened an incident, and
+    // that lifecycle event is broadcast next. Reading it also proves the
+    // baseline was silent — had the baseline wrongly emitted, it would have
+    // arrived before the state_change above.
+    let opened: Value = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            match ws.next().await {
-                Some(Ok(m)) if m.is_text() => break Some(m.into_text().unwrap()),
-                Some(Ok(_)) => continue, // ignore ping/pong
-                _ => break None,         // stream closed
+            let msg = ws
+                .next()
+                .await
+                .expect("ws stream closed before incident_opened")
+                .expect("ws read error");
+            if msg.is_text() {
+                let txt = msg.into_text().unwrap();
+                break serde_json::from_str::<Value>(&txt).expect("incident event is valid JSON");
             }
         }
     })
-    .await;
-    assert!(
-        extra.is_err(),
-        "expected no further ws message (baseline must be silent, transition fires once); got {extra:?}"
-    );
+    .await
+    .expect("timed out waiting for incident_opened");
+    assert_eq!(opened["type"], "incident_opened", "event type");
+    assert_eq!(opened["incident"]["check_id"], "test-check", "incident check");
+    assert_eq!(opened["incident"]["status"], "open", "incident opens");
+    assert_eq!(opened["incident"]["resolved_at"], Value::Null, "not yet resolved");
+    let started_at = opened["incident"]["started_at"].as_i64().expect("started_at is a timestamp");
 
-    // --- 5. GET /api/v1/alerts: exactly one alert for test-check, up->down. ---
+    // --- 5. Read APIs: one alert (up->down) and one open incident. ---
     let alerts: Value = http
         .get(format!("http://{addr}/api/v1/alerts?limit=50"))
         .send()
@@ -170,6 +188,24 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
     assert_eq!(mine[0]["from"], "up", "alert from state");
     assert_eq!(mine[0]["to"], "down", "alert to state");
 
+    let incidents: Value = http
+        .get(format!("http://{addr}/api/v1/incidents?limit=50"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mine_inc: Vec<&Value> = incidents["incidents"]
+        .as_array()
+        .expect("incidents is an array")
+        .iter()
+        .filter(|i| i["check_id"] == "test-check")
+        .collect();
+    assert_eq!(mine_inc.len(), 1, "exactly one incident for test-check");
+    assert_eq!(mine_inc[0]["status"], "open", "incident is open");
+    assert_eq!(mine_inc[0]["started_at"], started_at, "started_at matches the WS event");
+
     // --- 6. GET /api/v1/status: test-check reflects the transition (down). ---
     let status: Value = http
         .get(format!("http://{addr}/api/v1/status"))
@@ -186,4 +222,127 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
         .find(|c| c["check_id"] == "test-check")
         .expect("test-check present in status");
     assert_eq!(entry["status"], "down", "latest status is down");
+
+    // --- 7. Recovery: 200 -> up closes the incident. Broadcast order for the
+    // same ingest is state_change first, then the lifecycle event. ---
+    let r = http
+        .post(format!("http://{addr}/api/v1/results"))
+        .json(&result_body("test-check", "2026-07-11T00:00:02Z", 200))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "recovery ingest should succeed");
+
+    let recovered: Value = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let msg = ws
+                .next()
+                .await
+                .expect("ws stream closed before state_change")
+                .expect("ws read error");
+            if msg.is_text() {
+                let txt = msg.into_text().unwrap();
+                break serde_json::from_str::<Value>(&txt).expect("state_change is valid JSON");
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for recovery state_change");
+    assert_eq!(recovered["type"], "state_change", "event type");
+    assert_eq!(recovered["from"], "down", "transition starts at down");
+    assert_eq!(recovered["to"], "up", "transition lands on up");
+
+    let resolved: Value = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let msg = ws
+                .next()
+                .await
+                .expect("ws stream closed before incident_resolved")
+                .expect("ws read error");
+            if msg.is_text() {
+                let txt = msg.into_text().unwrap();
+                break serde_json::from_str::<Value>(&txt).expect("incident event is valid JSON");
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for incident_resolved");
+    assert_eq!(resolved["type"], "incident_resolved", "event type");
+    assert_eq!(resolved["incident"]["check_id"], "test-check", "incident check");
+    assert_eq!(resolved["incident"]["status"], "resolved", "incident closes");
+    assert_eq!(
+        resolved["incident"]["resolved_at"].as_i64(),
+        Some(1_783_728_002_000),
+        "resolved_at is the recovery observation time"
+    );
+
+    // --- 8. Read APIs after recovery: same incident, now resolved. ---
+    let incidents: Value = http
+        .get(format!("http://{addr}/api/v1/incidents?limit=50&status=resolved"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mine_inc: Vec<&Value> = incidents["incidents"]
+        .as_array()
+        .expect("incidents is an array")
+        .iter()
+        .filter(|i| i["check_id"] == "test-check")
+        .collect();
+    assert_eq!(mine_inc.len(), 1, "the resolved incident is listed");
+    assert_eq!(mine_inc[0]["started_at"], started_at, "same incident, not a new one");
+    assert!(mine_inc[0]["resolved_at"].as_i64().unwrap() > started_at, "closed after it opened");
+
+    // Open-only filter excludes it.
+    let open_only: Value = http
+        .get(format!("http://{addr}/api/v1/incidents?limit=50&status=open"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let still_open: Vec<&Value> = open_only["incidents"]
+        .as_array()
+        .expect("incidents is an array")
+        .iter()
+        .filter(|i| i["check_id"] == "test-check")
+        .collect();
+    assert!(still_open.is_empty(), "no open incident after recovery");
+
+    let alerts: Value = http
+        .get(format!("http://{addr}/api/v1/alerts?limit=50"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mine: Vec<&Value> = alerts["alerts"]
+        .as_array()
+        .expect("alerts is an array")
+        .iter()
+        .filter(|a| a["check_id"] == "test-check")
+        .collect();
+    assert_eq!(mine.len(), 2, "recovery is a second alert, down->up");
+    assert_eq!(mine[0]["from"], "down", "newest alert from state");
+    assert_eq!(mine[0]["to"], "up", "newest alert to state");
+
+    let status: Value = http
+        .get(format!("http://{addr}/api/v1/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entry = status["checks"]
+        .as_array()
+        .expect("checks is an array")
+        .iter()
+        .find(|c| c["check_id"] == "test-check")
+        .expect("test-check present in status");
+    assert_eq!(entry["status"], "up", "latest status is up");
 }

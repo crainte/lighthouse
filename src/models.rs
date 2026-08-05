@@ -1,6 +1,67 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// What kind of probe a check performs. Deserialized from the config `type` key;
+/// an unrecognized value fails config load rather than silently probing HTTP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckKind {
+    #[default]
+    Http,
+    Tcp,
+    Dns,
+    Icmp,
+    /// TLS certificate validity and expiry for a host.
+    Ssl,
+    /// Inverted check: nothing is probed. Something external pings a generated
+    /// URL, and the check goes DOWN when that stops happening.
+    Heartbeat,
+    // ponytail: no Database kind yet. Postgres/MySQL/SQLite would be a `sqlx`
+    // feature away, but Oracle and SQL Server need proprietary client libraries
+    // that cannot be vendored into the distroless image — so adding "database"
+    // as one kind would either ship a broken subset or abandon the 80MB
+    // single-binary deployment. Revisit as sqlx-backed pg/mysql/sqlite first,
+    // with the other two behind an opt-in image variant.
+}
+
+impl CheckKind {
+    pub fn as_db(&self) -> &'static str {
+        match self {
+            CheckKind::Http => "http",
+            CheckKind::Tcp => "tcp",
+            CheckKind::Dns => "dns",
+            CheckKind::Icmp => "icmp",
+            CheckKind::Ssl => "ssl",
+            CheckKind::Heartbeat => "heartbeat",
+        }
+    }
+
+    /// Unknown values fall back to HTTP only because the column is written
+    /// exclusively by `as_db` — a stored value outside this set means the row
+    /// was hand-edited.
+    pub fn from_db(s: &str) -> CheckKind {
+        match s {
+            "tcp" => CheckKind::Tcp,
+            "dns" => CheckKind::Dns,
+            "icmp" => CheckKind::Icmp,
+            "ssl" => CheckKind::Ssl,
+            "heartbeat" => CheckKind::Heartbeat,
+            _ => CheckKind::Http,
+        }
+    }
+
+    /// Whether an agent probes this kind at all. A heartbeat is driven by an
+    /// inbound ping, so handing it to agents would have them probe nothing.
+    pub fn is_agent_probed(&self) -> bool {
+        !matches!(self, CheckKind::Heartbeat)
+    }
+}
+
+/// Reserved `agent_id` for heartbeat pings. They arrive over HTTP from whatever
+/// job is checking in, so there is no agent behind them and none should be
+/// listed.
+pub const HEARTBEAT_AGENT: &str = "heartbeat";
+
 /// Raw check result sent from agent to coordinator.
 /// The agent is a dumb probe: it reports what it observed, not a verdict.
 /// The coordinator runs eval logic to derive UP/DOWN.
@@ -8,12 +69,42 @@ use serde::{Deserialize, Serialize};
 pub struct CheckResult {
     pub check_id: String,
     pub agent_id: String,
+    /// Where the probe ran. Stamped by the agent because only it knows, and
+    /// carried on every result because "the API was slow" and "the API was slow
+    /// from Frankfurt" are different findings. Absent on results from agents
+    /// predating this field, which read as "unknown" rather than being guessed.
+    #[serde(default)]
+    pub zone: String,
+    #[serde(default)]
+    pub region: String,
+    /// Which probe produced this, so the coordinator can evaluate it correctly:
+    /// only HTTP carries status-code semantics.
+    #[serde(default, rename = "type")]
+    pub kind: CheckKind,
     pub timestamp: DateTime<Utc>,
     pub latency_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_code: Option<u16>,
+    /// Whether the configured body/answer substring was found. `None` when the
+    /// check has no content expectation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_matched: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Why it failed, classified by the probe that saw it. Present whenever
+    /// `error` is; the pair is detail plus category.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<FailureKind>,
+    /// Response body, sent ONLY when the check has a Lua script that might read
+    /// it, and truncated. Used transiently for evaluation and never stored:
+    /// keeping a body per result per agent per interval would dwarf everything
+    /// else in the database.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// Response headers, same conditions as `body`. Keys are lowercased so a
+    /// script can index them predictably.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Evaluated status, derived by the coordinator from a CheckResult.
@@ -44,16 +135,41 @@ impl Status {
     }
 }
 
-/// Default eval: no error and 2xx-3xx status code = UP.
-/// Coordinator applies this when a check has no custom eval script.
-pub fn default_eval(result: &CheckResult) -> Status {
+/// Derive UP/DOWN from an observation plus the check's optional status
+/// expectation. A probe error, or a failed content match, is always DOWN.
+///
+/// HTTP: `expect_status` must match exactly when set, otherwise any 2xx-3xx is UP.
+/// TCP/DNS/ICMP carry no status code — connecting/resolving/replying at all is UP,
+/// since any failure is reported as an `error`.
+pub fn eval(result: &CheckResult, expect_status: Option<u16>) -> Status {
     if result.error.is_some() {
         return Status::Down;
     }
-    match result.status_code {
-        Some(code) if (200..400).contains(&code) => Status::Up,
-        Some(_) => Status::Down,
-        None => Status::Unknown,
+    if result.body_matched == Some(false) {
+        return Status::Down;
+    }
+    match result.kind {
+        CheckKind::Http => match (expect_status, result.status_code) {
+            (Some(want), Some(got)) => {
+                if got == want {
+                    Status::Up
+                } else {
+                    Status::Down
+                }
+            }
+            (None, Some(code)) if (200..400).contains(&code) => Status::Up,
+            (None, Some(_)) => Status::Down,
+            // Responded without a code: nothing to judge.
+            (_, None) => Status::Unknown,
+        },
+        // These report failure through `error`, handled above, so reaching here
+        // means the probe did what it was asked. A heartbeat never comes from an
+        // agent at all — the coordinator synthesises its result.
+        CheckKind::Tcp
+        | CheckKind::Dns
+        | CheckKind::Icmp
+        | CheckKind::Ssl
+        | CheckKind::Heartbeat => Status::Up,
     }
 }
 
@@ -70,11 +186,18 @@ mod tests {
 
     fn cr(status_code: Option<u16>, error: Option<String>) -> CheckResult {
         CheckResult {
+            zone: "test-zone".into(),
+            region: "test-region".into(),
+            body: None,
+            headers: None,
             check_id: "check".into(),
             agent_id: "agent".into(),
+            kind: CheckKind::Http,
             timestamp: Utc::now(),
             latency_ms: 0,
             status_code,
+            body_matched: None,
+            failure: error.is_some().then_some(FailureKind::Other),
             error,
         }
     }
@@ -82,17 +205,143 @@ mod tests {
     #[test]
     fn eval_maps_result_to_status() {
         let cases: [(&str, Option<u16>, Option<String>, Status); 8] = [
-            ("error wins over 2xx", Some(200), Some("boom".into()), Status::Down),
-            ("error with no code is down", None, Some("boom".into()), Status::Down),
+            (
+                "error wins over 2xx",
+                Some(200),
+                Some("boom".into()),
+                Status::Down,
+            ),
+            (
+                "error with no code is down",
+                None,
+                Some("boom".into()),
+                Status::Down,
+            ),
             ("200 is up (lower edge)", Some(200), None, Status::Up),
             ("399 is up (upper edge)", Some(399), None, Status::Up),
-            ("400 is down (just past range)", Some(400), None, Status::Down),
-            ("199 is down (just below range)", Some(199), None, Status::Down),
+            (
+                "400 is down (just past range)",
+                Some(400),
+                None,
+                Status::Down,
+            ),
+            (
+                "199 is down (just below range)",
+                Some(199),
+                None,
+                Status::Down,
+            ),
             ("500 is down", Some(500), None, Status::Down),
             ("no code, no error is unknown", None, None, Status::Unknown),
         ];
         for (name, code, err, want) in cases {
-            assert_eq!(default_eval(&cr(code, err)), want, "case: {name}");
+            assert_eq!(eval(&cr(code, err), None), want, "case: {name}");
+        }
+    }
+
+    #[test]
+    fn expect_status_requires_an_exact_match() {
+        // A 401 that the check explicitly expects is UP, even though the default
+        // 2xx-3xx rule would call it DOWN.
+        assert_eq!(eval(&cr(Some(401), None), Some(401)), Status::Up);
+        // ...and a 200 is DOWN when 401 was expected.
+        assert_eq!(eval(&cr(Some(200), None), Some(401)), Status::Down);
+    }
+
+    #[test]
+    fn failed_body_match_is_down_even_on_2xx() {
+        let mut r = cr(Some(200), None);
+        r.body_matched = Some(false);
+        assert_eq!(
+            eval(&r, None),
+            Status::Down,
+            "200 with wrong body must be DOWN"
+        );
+        r.body_matched = Some(true);
+        assert_eq!(eval(&r, None), Status::Up);
+    }
+
+    #[test]
+    fn non_http_probes_are_up_when_they_report_no_error() {
+        // TCP/DNS/ICMP carry no status code; reaching the target at all is UP,
+        // and any failure arrives as an `error` instead.
+        for kind in [CheckKind::Tcp, CheckKind::Dns, CheckKind::Icmp] {
+            let mut r = cr(None, None);
+            r.kind = kind;
+            assert_eq!(eval(&r, None), Status::Up, "{kind:?} success");
+
+            let mut failed = cr(None, Some("refused".into()));
+            failed.kind = kind;
+            assert_eq!(eval(&failed, None), Status::Down, "{kind:?} failure");
         }
     }
 }
+
+/// Why a probe failed, as a value rather than prose.
+///
+/// The probe knows the cause at the moment it fails, so it says so. Recovering
+/// it later by matching on our own error text would be guesswork that silently
+/// mis-classifies the day someone rewords a message.
+///
+/// `summary` is what the *public* status page may show. Raw failure text quotes
+/// whatever the probe saw — resolved addresses, expected DNS values, request
+/// URLs, pool member hostnames — and a public page must not republish the
+/// infrastructure it is watching. One mistyped DNS expectation was enough to
+/// broadcast a home IP address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    Timeout,
+    ConnectionFailed,
+    NameResolution,
+    UnexpectedDnsAnswer,
+    UnexpectedContent,
+    UnexpectedStatus,
+    /// Days elapsed since expiry. A certificate's validity window is published
+    /// in the certificate itself, so the count reveals nothing the visitor
+    /// could not read from the handshake — unlike the names it is issued for.
+    CertificateExpired {
+        days: i64,
+    },
+    /// Days remaining. Same reasoning, and the number is the whole point.
+    CertificateExpiring {
+        days: i64,
+    },
+    TlsError,
+    ScriptFailed,
+    Other,
+}
+
+impl FailureKind {
+    /// Safe to publish. Says what went wrong, never what was observed.
+    pub fn summary(&self) -> String {
+        match self {
+            FailureKind::Timeout => "Timed out".into(),
+            FailureKind::ConnectionFailed => "Connection failed".into(),
+            FailureKind::NameResolution => "Name resolution failed".into(),
+            FailureKind::UnexpectedDnsAnswer => "Unexpected DNS answer".into(),
+            FailureKind::UnexpectedContent => "Unexpected response content".into(),
+            FailureKind::UnexpectedStatus => "Unexpected status code".into(),
+            FailureKind::CertificateExpired { days } => match days {
+                0 => "Certificate expired today".into(),
+                1 => "Certificate expired 1 day ago".into(),
+                d => format!("Certificate expired {d} days ago"),
+            },
+            FailureKind::CertificateExpiring { days } => match days {
+                0 => "Certificate expires today".into(),
+                1 => "Certificate expires in 1 day".into(),
+                d => format!("Certificate expires in {d} days"),
+            },
+            FailureKind::TlsError => "TLS error".into(),
+            FailureKind::ScriptFailed => "Check script failed".into(),
+            FailureKind::Other => "Check failed".into(),
+        }
+    }
+}
+
+/// What to publish for a failure recorded before probes classified themselves.
+///
+/// Existing rows carry text only. Rather than guess at their meaning by matching
+/// on our own wording, they all read as a plain failure: a summary that says too
+/// little is recoverable, one that leaks is not.
+pub const LEGACY_FAILURE_SUMMARY: &str = "Check failed";

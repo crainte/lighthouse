@@ -1,0 +1,59 @@
+# Coordinator: serves the dashboard and ingests agent results. Runs NO checks.
+#
+# The [[checks]] below are a *seed*. They populate the store on first boot
+# against an empty volume; after that the store is authoritative, checks are
+# created and edited in the admin UI, and agents pull the list from here rather
+# than carrying their own copy. Editing this file does not change a check that
+# already exists.
+#
+# Credentials come from the environment, never from this file:
+#   WARDEN_ADMIN_PASSWORD  unlocks the check editor (unset = editor disabled)
+#   WARDEN_AGENT_TOKEN     required for agents to post results and read targets
+
+[coordinator]
+listen = "0.0.0.0:8080"
+db_path = "/data/warden.duckdb"
+# alert_webhook = "https://hooks.slack.com/services/..."
+
+[[checks]]
+name = "example-http"
+type = "http"
+target = "https://example.com"
+latency_graph = true
+interval_secs = 30
+timeout_secs = 10
+[checks.expect]
+status = 200
+
+[[checks]]
+name = "cloudflare-dns"
+type = "dns"
+target = "one.one.one.one"
+interval_secs = 30
+timeout_secs = 10
+[checks.expect]
+body_contains = "1.1.1.1"
+
+[[checks]]
+name = "cloudflare-ping"
+type = "icmp"
+target = "1.1.1.1"
+latency_graph = true
+interval_secs = 30
+timeout_secs = 5
+
+[[checks]]
+name = "coordinator-self"
+type = "http"
+target = "http://coordinator:8080/api/v1/status"
+group = "Warden Internals"
+interval_secs = 30
+timeout_secs = 5
+
+[[checks]]
+name = "coordinator-port"
+type = "tcp"
+target = "coordinator:8080"
+group = "Warden Internals"
+interval_secs = 30
+timeout_secs = 5

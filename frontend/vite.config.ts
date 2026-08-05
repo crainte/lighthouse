@@ -2,7 +2,7 @@
 import { defineConfig } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 
-const BACKEND = 'http://127.0.0.1:8080';
+const BACKEND = process.env.WARDEN_BACKEND ?? 'http://127.0.0.1:8080';
 
 export default defineConfig({
   plugins: [svelte()],

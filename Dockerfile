@@ -25,5 +25,10 @@ WORKDIR /data
 COPY --from=builder /app/target/release/warden /usr/local/bin/warden
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/warden"]
-# Default: coordinator serving the dashboard on 0.0.0.0:8080 with seeded data.
+# Default: coordinator serving the dashboard on 0.0.0.0:8080.
+# With no [[checks]] configured the coordinator seeds demo data for the dashboard.
+#
+# ICMP checks need raw sockets, which distroless does not grant by default:
+#   docker run --cap-add=NET_RAW ...
+# Without it, icmp checks report a permission error instead of silently passing.
 CMD ["coordinator"]

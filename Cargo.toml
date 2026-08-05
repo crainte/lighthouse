@@ -17,8 +17,26 @@ tracing = "0.1"
 parking_lot = "0.12"
 tracing-subscriber = "0.3"
 anyhow = "1"
-rust-embed = "8"
+rust-embed = { version = "8", features = ["debug-embed"] }
 mime_guess = "2"
+# Explicit retry/timeout/cache control for DNS probes — see probe_dns in agent.rs.
+hickory-resolver = { version = "0.26", default-features = false, features = ["system-config", "tokio"] }
+surge-ping = "0.9"
+# Session tokens must be unguessable, and the admin password must be compared
+# without leaking its length/prefix through timing.
+rand = "0.8"
+subtle = "2"
+# Custom UP/DOWN eval. Vendored so the build needs no system Lua; the runtime is
+# sandboxed in script.rs — this executes user-supplied code.
+mlua = { version = "0.9", features = ["lua54", "vendored"] }
+# Cron schedules for checks. Six-field (seconds-first) expressions keep
+# sub-minute intervals expressible, which a five-field cron cannot do.
+cron = "0.12"
+# SSL certificate checks: connect, capture the presented chain, read its expiry.
+# reqwest already pulls rustls in, so this adds the handshake plumbing only.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+x509-parser = "0.16"
 
 [dev-dependencies]
 tokio-tungstenite = "0.24"

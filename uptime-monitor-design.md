@@ -801,25 +801,35 @@ Acceptable trade-off for query simplicity.
 ## Implementation Roadmap
 
 ### Phase 1: MVP (Uptime Kuma Replacement)
-- [ ] Agent: HTTP check execution
-- [ ] Agent: Result batching and posting
-- [ ] Coordinator: HTTP endpoint for results
-- [ ] Coordinator: DuckDB persistence
-- [ ] Coordinator: Basic state tracking
-- [ ] CLI: `--standalone` mode
-- [ ] Basic alerting (webhook)
+- [x] Agent: HTTP check execution
+- [x] Agent: Result batching and posting
+- [x] Coordinator: HTTP endpoint for results
+- [x] Coordinator: DuckDB persistence
+- [x] Coordinator: Basic state tracking
+- [x] CLI: `--standalone` mode
+- [x] Basic alerting (webhook)
 
 ### Phase 2: UI
-- [ ] Status dashboard
+- [x] Status dashboard
 - [ ] Monitor configuration
 - [ ] Alert management
-- [ ] Real-time updates (WebSocket)
+- [x] Real-time updates (WebSocket)
+- [x] Incidents: auto-open on DOWN, auto-resolve on UP, REST + WebSocket events + admin panel
 
 ### Phase 3: Check Types & Eval
-- [ ] TCP checks
-- [ ] DNS checks
-- [ ] ICMP ping
+- [x] TCP checks
+- [x] DNS checks — FQDN-forced, caching disabled, UDP retry + TCP fallback
+- [x] ICMP ping — requires `CAP_NET_RAW`
+- [x] Declarative `expect` (status code, body/answer substring)
 - [ ] Lua eval for custom check logic
+
+Deferred from Phase 3, tracked here so it isn't lost:
+- [ ] Confirmation threshold before DOWN (`failures_before_down`) — one dropped
+      probe currently flips state on the next observation
+- [ ] A check whose first-ever observation is DOWN does not alert
+      (`StateTracker` treats the first observation as a baseline)
+- [ ] Agent drops a result batch when the coordinator POST fails — no retry buffer
+- [ ] `zone` / `region` on `CheckResult` (needed by the Phase 5/6 region tree)
 
 ### Phase 4: Notifications & Status Page
 - [ ] Slack, Email, PagerDuty integrations

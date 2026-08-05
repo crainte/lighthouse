@@ -44,9 +44,9 @@ async fn main() -> Result<()> {
 /// Standalone: agent produces results into an in-process channel that
 /// the coordinator drains directly — no HTTP hop.
 async fn run_standalone(cfg: Config) -> Result<()> {
-    let coord = Coordinator::new(&cfg.coordinator)?;
+    let coord = Coordinator::new(&cfg.coordinator, &cfg.checks)?;
     let (tx, mut rx) = mpsc::channel(1024);
-    agent::spawn_check_loops(&cfg.agent, cfg.checks, tx);
+    agent::spawn_check_loops(&cfg.agent, cfg.checks, tx)?;
 
     let ingest = coord.clone();
     tokio::spawn(async move {
@@ -60,19 +60,28 @@ async fn run_standalone(cfg: Config) -> Result<()> {
 
 async fn run_agent(cfg: Config) -> Result<()> {
     let (tx, rx) = mpsc::channel(1024);
-    agent::spawn_check_loops(&cfg.agent, cfg.checks, tx);
+    // The config file's checks are only a starting point: the coordinator owns
+    // the list, so the agent keeps itself in step with edits made in the UI.
+    tokio::spawn(agent::sync_loop(cfg.agent.clone(), tx, cfg.checks));
     agent::poster_loop(cfg.agent, rx).await;
     Ok(())
 }
 
 async fn run_coordinator(cfg: Config) -> Result<()> {
-    let coord = Coordinator::new(&cfg.coordinator)?;
+    let coord = Coordinator::new(&cfg.coordinator, &cfg.checks)?;
     serve(coord, &cfg.coordinator.listen).await
 }
 
 async fn serve(coord: Coordinator, listen: &str) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(%listen, "coordinator listening");
-    axum::serve(listener, coord.router()).await?;
+    // Peer address is needed to rate-limit login attempts per client.
+    axum::serve(
+        listener,
+        coord
+            .router()
+            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

@@ -1,0 +1,67 @@
+# Split deployment: one coordinator + N agents, each in its own container.
+#
+#   docker compose up -d --build
+#   open http://localhost:8082
+#
+# Scale the probe fleet (each replica needs its own agent_id, so add a service
+# rather than using `--scale`; agent_id comes from the config file):
+#   docker compose up -d --build agent-a agent-b
+#
+# The coordinator owns storage, evaluation and the dashboard. Agents only probe.
+#
+# Credentials come from the environment so they stay out of the config files
+# (which are committed). Set them in a local .env, which docker compose reads
+# automatically and .gitignore already covers:
+#
+#   WARDEN_ADMIN_PASSWORD=...   unlocks the check editor; unset disables it
+#   WARDEN_AGENT_TOKEN=...      lets agents post results and read check targets
+
+services:
+  coordinator:
+    build: .
+    image: warden:latest
+    command: ["coordinator", "--config", "/etc/warden/coordinator.toml"]
+    ports:
+      # 8080 is often taken on the host (AdGuard here), so publish on 8082.
+      - "8082:8080"
+    environment:
+      # Unset means the check editor stays locked rather than open.
+      WARDEN_ADMIN_PASSWORD: ${WARDEN_ADMIN_PASSWORD:-}
+      WARDEN_AGENT_TOKEN: ${WARDEN_AGENT_TOKEN:-}
+    volumes:
+      - ./deploy/coordinator.toml:/etc/warden/coordinator.toml:ro
+      - coordinator-data:/data
+    restart: unless-stopped
+
+  agent-a:
+    build: .
+    image: warden:latest
+    command: ["agent", "--config", "/etc/warden/agent.toml"]
+    volumes:
+      - ./deploy/agent-a.toml:/etc/warden/agent.toml:ro
+    environment:
+      WARDEN_AGENT_TOKEN: ${WARDEN_AGENT_TOKEN:-}
+    # ICMP checks need raw sockets; without this the icmp probe reports a
+    # permission error instead of silently passing.
+    cap_add:
+      - NET_RAW
+    depends_on:
+      - coordinator
+    restart: unless-stopped
+
+  agent-b:
+    build: .
+    image: warden:latest
+    command: ["agent", "--config", "/etc/warden/agent.toml"]
+    volumes:
+      - ./deploy/agent-b.toml:/etc/warden/agent.toml:ro
+    environment:
+      WARDEN_AGENT_TOKEN: ${WARDEN_AGENT_TOKEN:-}
+    cap_add:
+      - NET_RAW
+    depends_on:
+      - coordinator
+    restart: unless-stopped
+
+volumes:
+  coordinator-data:

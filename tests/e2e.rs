@@ -18,10 +18,10 @@ use axum::{extract::State, Json, Router};
 use parking_lot::Mutex;
 use serde_json::Value;
 
-use warden::agent::execute_check;
+use warden::agent::{execute_check, Probes};
 use warden::config::{CheckConfig, CoordinatorConfig};
 use warden::coordinator::Coordinator;
-use warden::models::Status;
+use warden::models::{CheckKind, Status};
 
 /// Bind an ephemeral 127.0.0.1 port and serve `app`. Returns the bound addr.
 /// The listener is bound before we hand it to `serve`, so the OS accepts
@@ -36,7 +36,10 @@ async fn serve(app: Router) -> std::net::SocketAddr {
 }
 
 /// Webhook capture handler: record each posted JSON body.
-async fn capture(State(sink): State<Arc<Mutex<Vec<Value>>>>, Json(body): Json<Value>) -> StatusCode {
+async fn capture(
+    State(sink): State<Arc<Mutex<Vec<Value>>>>,
+    Json(body): Json<Value>,
+) -> StatusCode {
     sink.lock().push(body);
     StatusCode::OK
 }
@@ -62,10 +65,20 @@ fn check(target: String) -> CheckConfig {
     // Same `name` for both routes => same check_id => transition is detectable.
     CheckConfig {
         name: "web".into(),
-        r#type: "http".into(),
+        kind: CheckKind::Http,
         target,
-        interval_secs: 60,
+        cron: "0 * * * * *".into(),
         timeout_secs: 5,
+        ..Default::default()
+    }
+}
+
+/// A single-agent test fleet: identity plus the location every result carries.
+fn origin() -> warden::agent::Origin<'static> {
+    warden::agent::Origin {
+        agent_id: "agent-01",
+        zone: "test-zone",
+        region: "test-region",
     }
 }
 
@@ -88,18 +101,32 @@ async fn agent_check_through_coordinator_fires_alert_on_up_to_down() {
     )
     .await;
 
-    let coord = Coordinator::new(&CoordinatorConfig {
-        listen: "127.0.0.1:0".into(),
-        db_path: ":memory:".into(),
-        alert_webhook: Some(format!("http://{webhook_addr}/")),
-    })
+    let coord = Coordinator::new(
+        &CoordinatorConfig {
+            admin_password: None,
+            agent_token: None,
+            listen: "127.0.0.1:0".into(),
+            db_path: ":memory:".into(),
+            alert_webhook: Some(format!("http://{webhook_addr}/")),
+        },
+        &[],
+    )
     .unwrap();
 
-    let client = reqwest::Client::new();
+    let probes = Probes::new().unwrap();
 
     // --- Contract 1: 200 route maps to status_code=Some(200), error=None ---
-    let up = execute_check(&client, "agent-test", &check(format!("http://{target_addr}/ok"))).await;
-    assert_eq!(up.status_code, Some(200), "healthy route must report HTTP 200");
+    let up = execute_check(
+        &probes,
+        &origin(),
+        &check(format!("http://{target_addr}/ok")),
+    )
+    .await;
+    assert_eq!(
+        up.status_code,
+        Some(200),
+        "healthy route must report HTTP 200"
+    );
     assert_eq!(up.error, None, "healthy route must not surface an error");
 
     // Baseline ingest: evals to Up, first observation => no transition => silent.
@@ -111,23 +138,42 @@ async fn agent_check_through_coordinator_fires_alert_on_up_to_down() {
     tokio::time::sleep(Duration::from_millis(2)).await;
 
     // --- Contract 2: 500 route maps to status_code=Some(500) ---
-    let down =
-        execute_check(&client, "agent-test", &check(format!("http://{target_addr}/err"))).await;
-    assert_eq!(down.status_code, Some(500), "failing route must report HTTP 500");
+    let down = execute_check(
+        &probes,
+        &origin(),
+        &check(format!("http://{target_addr}/err")),
+    )
+    .await;
+    assert_eq!(
+        down.status_code,
+        Some(500),
+        "failing route must report HTTP 500"
+    );
 
     // Transition ingest: evals to Down, Up->Down edge => alert must fire.
     coord.ingest(vec![down]).await;
 
     // --- Contract 3: both results persisted, newest-first [Down, Up] ---
-    let hist = coord.history("web", 10).unwrap();
+    let hist = coord.history("web", 10, None, None, None).unwrap();
     assert_eq!(hist.len(), 2, "both ingested results must be persisted");
-    assert_eq!(hist[0].status, Status::Down, "newest row is the 500 => Down");
+    assert_eq!(
+        hist[0].status,
+        Status::Down,
+        "newest row is the 500 => Down"
+    );
     assert_eq!(hist[1].status, Status::Up, "older row is the 200 => Up");
 
     // --- Contract 4: exactly one alert for the Up->Down edge, carrying check_id ---
     let got = wait_for_alerts(&alerts).await;
-    assert_eq!(got.len(), 1, "baseline is silent; only the Up->Down edge alerts");
-    assert_eq!(got[0]["check_id"], "web", "alert payload references the check_id");
+    assert_eq!(
+        got.len(),
+        1,
+        "baseline is silent; only the Up->Down edge alerts"
+    );
+    assert_eq!(
+        got[0]["check_id"], "web",
+        "alert payload references the check_id"
+    );
     assert_eq!(got[0]["from"], "up", "transition edge starts at up");
     assert_eq!(got[0]["to"], "down", "transition edge lands on down");
 }
