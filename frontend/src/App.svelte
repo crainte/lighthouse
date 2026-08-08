@@ -36,6 +36,7 @@
   import CheckEditor from './components/CheckEditor.svelte';
   import SectionsAdmin from './components/SectionsAdmin.svelte';
   import AgentsAdmin from './components/AgentsAdmin.svelte';
+  import AgentCredentials from './components/AgentCredentials.svelte';
   import AdminPlaceholder from './components/AdminPlaceholder.svelte';
   import { fetchSession, logout } from './lib/admin';
 
@@ -45,6 +46,7 @@
     { id: 'checks', label: 'Checks' },
     { id: 'status', label: 'Status page' },
     { id: 'agents', label: 'Agents' },
+    { id: 'credentials', label: 'Credentials' },
     { id: 'alerts', label: 'Alerts' },
     { id: 'incidents', label: 'Incidents' },
     { id: 'maintenance', label: 'Maintenance' },
@@ -406,6 +408,8 @@
           <SectionsAdmin onchanged={load} onexpired={onExpired} />
         {:else if panel === 'agents'}
           <AgentsAdmin onopen={openCheckEditor} onexpired={onExpired} />
+        {:else if panel === 'credentials'}
+          <AgentCredentials onexpired={onExpired} />
         {:else if panel === 'alerts'}
           <div class="panel-title">Alerts</div>
           <AlertsList {alerts} />

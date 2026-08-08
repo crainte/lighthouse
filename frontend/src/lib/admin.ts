@@ -262,3 +262,37 @@ export async function reorderChecks(order: string[]): Promise<AdminCheck[]> {
 export function testEval(sample: EvalSample): Promise<EvalResult> {
   return send<EvalResult>('POST', '/api/v1/admin/eval-test', sample);
 }
+
+/** A per-zone agent credential. The secret itself is never stored here — only
+ *  its hash server-side — so the list is safe to render. Revoked ones stay in
+ *  the list for audit rather than vanishing. */
+export interface AgentCredential {
+  id: string;
+  zone: string;
+  region: string;
+  created_at: number;
+  revoked: boolean;
+}
+
+export async function fetchAgentCredentials(): Promise<AgentCredential[]> {
+  const r = await request<{ credentials: AgentCredential[] }>('/api/v1/admin/agent-credentials');
+  return r.credentials;
+}
+
+/** The only moment `token` exists in cleartext anywhere: the server hashes it
+ *  and cannot hand it back, so the caller must show it before dropping it. */
+export async function createAgentCredential(
+  zone: string,
+  region: string,
+): Promise<{ credential: AgentCredential; token: string }> {
+  return send<{ credential: AgentCredential; token: string }>(
+    'POST',
+    '/api/v1/admin/agent-credentials',
+    { zone, region },
+  );
+}
+
+/** Permanent and immediate — the credential stays listed as revoked. */
+export async function revokeAgentCredential(id: string): Promise<void> {
+  await send('DELETE', `/api/v1/admin/agent-credentials/${encodeURIComponent(id)}`);
+}

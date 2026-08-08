@@ -16,6 +16,9 @@ use serde_json::{json, Value};
 use tokio_tungstenite::connect_async;
 
 use warden::config::CoordinatorConfig;
+
+/// Ingest is authenticated; this is the fleet secret for this test.
+const AGENT_TOKEN: &str = "ws-test-agent-secret";
 use warden::coordinator::Coordinator;
 
 /// Bind an ephemeral 127.0.0.1 port, read the port BEFORE serving, then serve
@@ -53,17 +56,15 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
     // conjured by ingest alone: the status page only publishes checks that
     // currently exist, and this test is about transitions surfacing, not about
     // how orphaned history is treated.
-    // `agent_token: None` does not mean "no token": `Coordinator::new` resolves
-    // it from `WARDEN_AGENT_TOKEN`, so on any machine that exports it — which the
-    // docker-compose workflow encourages via `.env` — an unauthenticated ingest
-    // is rejected and this test fails for a reason unrelated to what it checks.
-    // Remove it for this process so the config's `None` is honoured. This test
-    // binary holds a single test, so there is no other thread to race with.
-    std::env::remove_var("WARDEN_AGENT_TOKEN");
+    // Set the token inline rather than clearing `WARDEN_AGENT_TOKEN`: the config
+    // value wins over the environment, so this is independent of whatever the
+    // machine exports, and ingest now refuses unauthenticated callers outright
+    // rather than falling open when no token is configured.
     let coord = Coordinator::new(
         &CoordinatorConfig {
             listen: "127.0.0.1:0".into(),
             db_path: ":memory:".into(),
+            agent_token: Some(AGENT_TOKEN.into()),
             ..Default::default()
         },
         &[warden::config::CheckConfig {
@@ -105,6 +106,7 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
     // must NOT broadcast and must NOT create an alert. ---
     let r = http
         .post(format!("http://{addr}/api/v1/results"))
+        .bearer_auth(AGENT_TOKEN)
         .json(&result_body("test-check", "2026-07-11T00:00:00Z", 200))
         .send()
         .await
@@ -114,6 +116,7 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
     // --- 3. Transition: 500 -> down. Up->Down edge => broadcast + alert. ---
     let r = http
         .post(format!("http://{addr}/api/v1/results"))
+        .bearer_auth(AGENT_TOKEN)
         .json(&result_body("test-check", "2026-07-11T00:00:01Z", 500))
         .send()
         .await
@@ -244,6 +247,7 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
     // same ingest is state_change first, then the lifecycle event. ---
     let r = http
         .post(format!("http://{addr}/api/v1/results"))
+        .bearer_auth(AGENT_TOKEN)
         .json(&result_body("test-check", "2026-07-11T00:00:02Z", 200))
         .send()
         .await

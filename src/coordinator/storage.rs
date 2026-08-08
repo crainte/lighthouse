@@ -1,4 +1,5 @@
 use crate::config::{CheckConfig, Expect};
+use crate::credential::AgentCredential;
 use crate::models::{CheckKind, CheckResult, Status};
 use anyhow::Result;
 use duckdb::Connection;
@@ -339,6 +340,21 @@ impl Storage {
                 name     VARCHAR PRIMARY KEY,
                 position INTEGER NOT NULL,
                 collapsed BOOLEAN DEFAULT FALSE
+            );
+            -- Per-zone agent credentials. Only the hash is kept: the plaintext
+            -- is returned once at mint and is not reconstructible from this.
+            -- `zone`/`region` live here rather than being asserted by the agent,
+            -- because placement trusts an agent's claimed location.
+            CREATE TABLE IF NOT EXISTS agent_credentials (
+                id          VARCHAR PRIMARY KEY,
+                zone        VARCHAR NOT NULL,
+                region      VARCHAR NOT NULL,
+                secret_hash VARCHAR NOT NULL,
+                salt        VARCHAR NOT NULL,
+                created_at  BIGINT  NOT NULL,
+                -- Kept after revocation so an operator can still see that the
+                -- credential existed and when it stopped working.
+                revoked_at  BIGINT
             );",
         )?;
         // Columns added after the first release. DuckDB has no
@@ -1164,6 +1180,53 @@ impl Storage {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    // ---- Agent credentials ----
+
+    /// Every minted credential, revoked ones included. The caller caches these
+    /// and matches against them per request, so this is read at boot and after
+    /// each mint or revoke rather than on the ingest path.
+    pub fn list_agent_credentials(&self) -> Result<Vec<AgentCredential>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, zone, region, secret_hash, salt, created_at, revoked_at
+             FROM agent_credentials ORDER BY region, zone, created_at",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(AgentCredential {
+                    id: row.get::<_, String>(0)?,
+                    zone: row.get::<_, String>(1)?,
+                    region: row.get::<_, String>(2)?,
+                    secret_hash: row.get::<_, String>(3)?,
+                    salt: row.get::<_, String>(4)?,
+                    created_at: row.get::<_, i64>(5)?,
+                    revoked_at: row.get::<_, Option<i64>>(6)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn insert_agent_credential(&self, c: &AgentCredential) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO agent_credentials
+                 (id, zone, region, secret_hash, salt, created_at, revoked_at)
+             VALUES (?, ?, ?, ?, ?, ?, NULL)",
+            duckdb::params![c.id, c.zone, c.region, c.secret_hash, c.salt, c.created_at],
+        )?;
+        Ok(())
+    }
+
+    /// Returns whether a live credential was actually revoked, so the handler
+    /// can 404 rather than report success for an id that never existed — or
+    /// report success twice for one already revoked.
+    pub fn revoke_agent_credential(&self, id: &str, now: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE agent_credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+            duckdb::params![now, id],
+        )?;
+        Ok(n > 0)
     }
 
     /// Delete rows older than the retention window. `results_days` covers raw

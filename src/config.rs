@@ -95,6 +95,11 @@ pub struct CoordinatorConfig {
     /// secret. Replication is one-hop and best-effort; see `coordinator::gossip`.
     #[serde(default)]
     pub peers: Vec<String>,
+    /// Shared secret peers present to each other on `/internal/gossip`. Falls
+    /// back to `agent_token`. With neither set, gossip is refused rather than
+    /// accepted: the endpoint rewrites published state.
+    #[serde(default)]
+    pub peer_token: Option<String>,
 }
 
 /// History retention: rows older than the window are pruned periodically.
@@ -143,6 +148,16 @@ impl CoordinatorConfig {
 
     pub fn resolved_agent_token(&self) -> Option<String> {
         Self::secret(&self.agent_token, "WARDEN_AGENT_TOKEN")
+    }
+
+    /// Credential peers present to each other on `/internal/gossip`.
+    ///
+    /// Falls back to `agent_token` so existing clusters keep replicating, but
+    /// it is worth setting separately: once agents move to minted per-zone
+    /// credentials the shared agent token stops being handed out, and a peer
+    /// secret should not be one an agent ever held.
+    pub fn resolved_peer_token(&self) -> Option<String> {
+        Self::secret(&self.peer_token, "WARDEN_PEER_TOKEN").or_else(|| self.resolved_agent_token())
     }
 }
 
@@ -627,6 +642,7 @@ impl Default for CoordinatorConfig {
             agent_token: None,
             retention: RetentionConfig::default(),
             peers: Vec::new(),
+            peer_token: None,
         }
     }
 }

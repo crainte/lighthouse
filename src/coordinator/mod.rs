@@ -4,6 +4,7 @@ pub mod state;
 pub mod storage;
 
 use crate::config::{CheckConfig, CoordinatorConfig};
+use crate::credential::AgentCredential;
 use crate::models::{eval, CheckResult, ResultBatch, Status};
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -201,6 +202,12 @@ struct Inner {
     /// restart does not briefly forget the whole fleet.
     seen: parking_lot::RwLock<std::collections::HashMap<String, SeenAgent>>,
     auth: crate::auth::Auth,
+    /// Minted agent credentials by id. Cached because every ingest matches
+    /// against them; rebuilt on mint and revoke so a revocation bites at once.
+    credentials: parking_lot::RwLock<std::collections::HashMap<String, AgentCredential>>,
+    /// Secret peers present on `/internal/gossip`. `None` means gossip is
+    /// refused outright rather than accepted unauthenticated.
+    peer_token: Option<String>,
     /// Peer coordinators to replicate transitions to. `None` when none are
     /// configured, mirroring `notify_tx`: nothing is handed to a fan-out that
     /// does not exist.
@@ -265,10 +272,16 @@ impl Coordinator {
         if !auth.admin_enabled() {
             warn!("no admin password set (WARDEN_ADMIN_PASSWORD); the check editor is disabled");
         }
-        if !auth.agent_auth_enabled() {
+        let credentials = storage.list_agent_credentials().unwrap_or_default();
+        if credentials.iter().any(|c| !c.revoked()) {
+            info!(
+                count = credentials.iter().filter(|c| !c.revoked()).count(),
+                "agent credentials in use; the shared agent token is not accepted for agents"
+            );
+        } else if !auth.agent_auth_enabled() {
             warn!(
-                "no agent token set (WARDEN_AGENT_TOKEN); anyone who can reach this \
-                 coordinator can post results and read check targets"
+                "no agent credentials minted and no agent token set (WARDEN_AGENT_TOKEN); \
+                 agent endpoints will REFUSE every request until one exists"
             );
         }
         // Resume confirmations in flight. The confirmed status and the failure
@@ -310,10 +323,22 @@ impl Coordinator {
                         .collect(),
                 ),
                 auth,
-                gossip: gossip::Peers::new(&cfg.peers, cfg.resolved_agent_token().as_deref())
+                credentials: parking_lot::RwLock::new(
+                    credentials.into_iter().map(|c| (c.id.clone(), c)).collect(),
+                ),
+                peer_token: cfg.resolved_peer_token(),
+                gossip: gossip::Peers::new(&cfg.peers, cfg.resolved_peer_token().as_deref())
                     .map(Arc::new),
             }),
         })
+    }
+
+    /// Re-read credentials after a mint or revoke, so a revocation takes effect
+    /// on the next request instead of at the next restart.
+    fn reload_credentials(&self) -> Result<()> {
+        let rows = self.inner.storage.lock().list_agent_credentials()?;
+        *self.inner.credentials.write() = rows.into_iter().map(|c| (c.id.clone(), c)).collect();
+        Ok(())
     }
 
     /// Re-read check definitions after an admin edit so ingest and the status
@@ -655,6 +680,16 @@ impl Coordinator {
             // What agents probe. Carries targets, so it sits behind the agent
             // token rather than being public like /status.
             .route("/api/v1/agent/checks", get(agent_checks_handler))
+            // Per-zone agent credentials. Minting returns the only copy of the
+            // secret, so these are admin-gated like the check editor.
+            .route(
+                "/api/v1/admin/agent-credentials",
+                get(list_agent_credentials_handler).post(mint_agent_credential_handler),
+            )
+            .route(
+                "/api/v1/admin/agent-credentials/:id",
+                delete(revoke_agent_credential_handler),
+            )
             // Peer replication. Agent-gated rather than public: it mutates
             // published state, so an anonymous POST could mark every check down.
             .route("/internal/gossip", post(gossip_handler))
@@ -877,10 +912,21 @@ struct HoursQuery {
 async fn ingest_handler(
     State(coord): State<Coordinator>,
     headers: HeaderMap,
-    Json(batch): Json<ResultBatch>,
+    Json(mut batch): Json<ResultBatch>,
 ) -> Response {
-    if let Some(denied) = require_agent(&coord, &headers) {
-        return denied;
+    let caller = match authenticate_agent(&coord, &headers) {
+        Ok(c) => c,
+        Err(denied) => return *denied,
+    };
+    // A credentialed agent does not get to say where it is. Zone and region
+    // decide placement and are shown as the location an outage was seen from,
+    // so a caller able to name its own would be able to answer for a zone it
+    // is not in.
+    if let AgentCaller::Bound { zone, region } = &caller {
+        for r in &mut batch.results {
+            r.zone.clone_from(zone);
+            r.region.clone_from(region);
+        }
     }
     let n = batch.results.len();
     coord.ingest(batch.results).await;
@@ -904,7 +950,7 @@ async fn gossip_handler(
     headers: HeaderMap,
     Json(msg): Json<gossip::Message>,
 ) -> Response {
-    if let Some(denied) = require_agent(&coord, &headers) {
+    if let Some(denied) = require_peer(&coord, &headers) {
         return denied;
     }
     let t = msg.transition();
@@ -1574,14 +1620,82 @@ fn require_admin(coord: &Coordinator, headers: &HeaderMap) -> Option<Response> {
         .then(|| error_response(StatusCode::UNAUTHORIZED, "authentication required"))
 }
 
-/// Gate for endpoints that agents call. Open when no agent token is configured.
-fn require_agent(coord: &Coordinator, headers: &HeaderMap) -> Option<Response> {
-    let presented = headers
+/// The bearer credential on a request, if it carries one.
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    (!coord.inner.auth.agent_ok(presented))
-        .then(|| error_response(StatusCode::UNAUTHORIZED, "agent authentication required"))
+        .and_then(|v| v.strip_prefix("Bearer "))
+}
+
+/// Who is calling an agent endpoint, once authenticated.
+enum AgentCaller {
+    /// Matched a minted credential. Location comes from the credential, never
+    /// from what the caller says about itself.
+    Bound { zone: String, region: String },
+    /// The legacy fleet-wide token. Location stays self-asserted, which is
+    /// exactly the weakness minted credentials exist to remove.
+    Shared,
+}
+
+/// Gate for endpoints that agents call.
+///
+/// Minted credentials win outright once any exist. Accepting the shared token
+/// alongside them would leave the weaker path open forever, so issuing the
+/// first credential is what retires the old one.
+///
+/// With neither configured this refuses. It used to accept: an ingest endpoint
+/// open to the world lets anyone post results for checks they do not run, and
+/// a monitor that can be told what it saw is worse than no monitor.
+// Boxed error: this is the ingest hot path, and an unboxed `Response` makes
+// every returned `Result` 128+ bytes to move on the success path too.
+fn authenticate_agent(
+    coord: &Coordinator,
+    headers: &HeaderMap,
+) -> Result<AgentCaller, Box<Response>> {
+    let presented = bearer(headers);
+    {
+        let creds = coord.inner.credentials.read();
+        if creds.values().any(|c| !c.revoked()) {
+            let matched = presented
+                .and_then(crate::credential::split)
+                .and_then(|(id, secret)| {
+                    creds
+                        .get(id)
+                        .filter(|c| crate::credential::verify(c, secret))
+                });
+            return match matched {
+                Some(c) => Ok(AgentCaller::Bound {
+                    zone: c.zone.clone(),
+                    region: c.region.clone(),
+                }),
+                None => Err(Box::new(error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "a valid agent credential is required",
+                ))),
+            };
+        }
+    }
+    if coord.inner.auth.agent_auth_enabled() && coord.inner.auth.agent_ok(presented) {
+        return Ok(AgentCaller::Shared);
+    }
+    Err(Box::new(error_response(
+        StatusCode::UNAUTHORIZED,
+        "agent authentication required",
+    )))
+}
+
+/// Gate for `/internal/gossip`. Peers are infrastructure rather than agents, so
+/// they carry their own secret: once agents hold minted credentials the shared
+/// agent token is no longer handed out. Refuses when none is configured — the
+/// endpoint rewrites published state.
+fn require_peer(coord: &Coordinator, headers: &HeaderMap) -> Option<Response> {
+    use subtle::ConstantTimeEq;
+    let ok = match (coord.inner.peer_token.as_deref(), bearer(headers)) {
+        (Some(expected), Some(got)) => bool::from(got.as_bytes().ct_eq(expected.as_bytes())),
+        _ => false,
+    };
+    (!ok).then(|| error_response(StatusCode::UNAUTHORIZED, "peer authentication required"))
 }
 
 async fn login_handler(
@@ -1752,9 +1866,10 @@ async fn agent_checks_handler(
     Query(q): Query<AgentIdentity>,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(denied) = require_agent(&coord, &headers) {
-        return denied;
-    }
+    let authenticated = match authenticate_agent(&coord, &headers) {
+        Ok(c) => c,
+        Err(denied) => return *denied,
+    };
     let Some(caller) = q.agent_id.as_deref() else {
         // An agent that will not say who it is cannot be placed. Older agents
         // predate identity, so they still get everything rather than silently
@@ -1777,18 +1892,26 @@ async fn agent_checks_handler(
     // agent can give. Record it before deciding, so the caller is part of the
     // fleet it is about to be placed within.
     {
+        // Placement is decided from this map, so a self-declared location is a
+        // way to be handed checks for a zone you are not in and then never
+        // probe them. A credential's location overrides what was asked for.
+        let (zone, region) = match &authenticated {
+            AgentCaller::Bound { zone, region } => (zone.clone(), region.clone()),
+            AgentCaller::Shared => (
+                q.zone
+                    .clone()
+                    .unwrap_or_else(crate::config::default_location),
+                q.region
+                    .clone()
+                    .unwrap_or_else(crate::config::default_location),
+            ),
+        };
         let mut seen = coord.inner.seen.write();
         seen.insert(
             caller.to_string(),
             SeenAgent {
-                zone: q
-                    .zone
-                    .clone()
-                    .unwrap_or_else(crate::config::default_location),
-                region: q
-                    .region
-                    .clone()
-                    .unwrap_or_else(crate::config::default_location),
+                zone,
+                region,
                 at: now,
             },
         );
@@ -2201,4 +2324,133 @@ async fn purge_check_data_handler(
 #[derive(Serialize)]
 struct PurgedResponse {
     purged: u64,
+}
+
+// ---- Agent credentials ----
+
+/// A credential as the admin UI reads it. The secret is absent by construction:
+/// there is nothing stored that could populate it.
+#[derive(Serialize)]
+struct AgentCredentialDto {
+    id: String,
+    zone: String,
+    region: String,
+    created_at: i64,
+    revoked: bool,
+}
+
+impl From<&AgentCredential> for AgentCredentialDto {
+    fn from(c: &AgentCredential) -> Self {
+        Self {
+            id: c.id.clone(),
+            zone: c.zone.clone(),
+            region: c.region.clone(),
+            created_at: c.created_at,
+            revoked: c.revoked(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct AgentCredentialsResponse {
+    credentials: Vec<AgentCredentialDto>,
+}
+
+#[derive(Deserialize)]
+struct MintCredentialRequest {
+    zone: String,
+    region: String,
+}
+
+#[derive(Serialize)]
+struct MintedCredentialResponse {
+    credential: AgentCredentialDto,
+    /// The only time this value exists outside the agent that will use it.
+    token: String,
+}
+
+async fn list_agent_credentials_handler(
+    State(coord): State<Coordinator>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(denied) = require_admin(&coord, &headers) {
+        return denied;
+    }
+    match coord.inner.storage.lock().list_agent_credentials() {
+        Ok(rows) => Json(AgentCredentialsResponse {
+            credentials: rows.iter().map(AgentCredentialDto::from).collect(),
+        })
+        .into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// Mint a credential for one zone.
+///
+/// The token comes back exactly once. Storing it so it could be shown again
+/// would defeat hashing it, so the UI has to make the operator copy it now.
+async fn mint_agent_credential_handler(
+    State(coord): State<Coordinator>,
+    headers: HeaderMap,
+    Json(body): Json<MintCredentialRequest>,
+) -> Response {
+    if let Some(denied) = require_admin(&coord, &headers) {
+        return denied;
+    }
+    let zone = body.zone.trim();
+    let region = body.region.trim();
+    // A blank location would bind the credential to nothing and place its
+    // agents in the "no location declared" bucket, which is the state minting
+    // is supposed to replace.
+    if zone.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "zone must not be empty");
+    }
+    if region.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "region must not be empty");
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let (record, token) = crate::credential::mint(zone, region, now);
+    if let Err(e) = coord.inner.storage.lock().insert_agent_credential(&record) {
+        return internal_error(e);
+    }
+    if let Err(e) = coord.reload_credentials() {
+        return internal_error(e);
+    }
+    info!(id = %record.id, zone, region, "minted agent credential");
+    (
+        StatusCode::CREATED,
+        Json(MintedCredentialResponse {
+            credential: AgentCredentialDto::from(&record),
+            token,
+        }),
+    )
+        .into_response()
+}
+
+async fn revoke_agent_credential_handler(
+    State(coord): State<Coordinator>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(denied) = require_admin(&coord, &headers) {
+        return denied;
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let revoked = coord.inner.storage.lock().revoke_agent_credential(&id, now);
+    match revoked {
+        Ok(true) => {
+            if let Err(e) = coord.reload_credentials() {
+                return internal_error(e);
+            }
+            warn!(id = %id, "revoked agent credential");
+            Json(RevokedResponse { revoked: id }).into_response()
+        }
+        Ok(false) => error_response(StatusCode::NOT_FOUND, "no such credential"),
+        Err(e) => internal_error(e),
+    }
+}
+
+#[derive(Serialize)]
+struct RevokedResponse {
+    revoked: String,
 }
