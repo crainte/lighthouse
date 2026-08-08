@@ -375,3 +375,61 @@ async fn gossip_does_not_accept_an_agent_credential() {
         "the peer token is what opens gossip"
     );
 }
+
+/// The grain is the **zone**, not the agent: every agent in a zone presents the
+/// same credential. Worth pinning, because the natural misreading ("one token
+/// per agent") changes how an operator provisions a fleet.
+#[tokio::test]
+async fn one_credential_is_shared_by_every_agent_in_its_zone() {
+    let addr = serve(coordinator(Some(SHARED_TOKEN), None)).await;
+    let base = format!("http://{addr}");
+    let session = login(&base).await;
+    let zone_token = mint(&base, &session, "eu-west-1a", "eu-west").await;
+
+    // Three distinct agents, one shared credential.
+    for agent in ["prober-a", "prober-b", "prober-c"] {
+        assert_eq!(
+            post_result(&base, &zone_token, agent, "somewhere", "else").await,
+            202,
+            "{agent} shares its zone's credential"
+        );
+        assert_eq!(
+            located(&base, &session, agent).await,
+            ("eu-west-1a".to_string(), "eu-west".to_string()),
+            "and is placed in the zone the credential was minted for"
+        );
+    }
+}
+
+/// ...but nothing forces that grain. Minting several credentials for one zone
+/// is allowed, and is how you get per-agent revocation if you want it.
+#[tokio::test]
+async fn a_zone_may_hold_several_credentials() {
+    let addr = serve(coordinator(Some(SHARED_TOKEN), None)).await;
+    let base = format!("http://{addr}");
+    let session = login(&base).await;
+
+    let a = mint(&base, &session, "eu-west-1a", "eu-west").await;
+    let b = mint(&base, &session, "eu-west-1a", "eu-west").await;
+    assert_ne!(a, b);
+
+    assert_eq!(post_result(&base, &a, "prober-a", "x", "y").await, 202);
+    assert_eq!(post_result(&base, &b, "prober-b", "x", "y").await, 202);
+
+    // Revoking one leaves the other working, so a fleet provisioned one
+    // credential per agent can retire a single machine.
+    let id_a = a.split('.').next().unwrap();
+    reqwest::Client::new()
+        .delete(format!("{base}/api/v1/admin/agent-credentials/{id_a}"))
+        .header(reqwest::header::COOKIE, &session)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(post_result(&base, &a, "prober-a", "x", "y").await, 401);
+    assert_eq!(
+        post_result(&base, &b, "prober-b", "x", "y").await,
+        202,
+        "revoking one credential must not take down the rest of the zone"
+    );
+}

@@ -121,10 +121,11 @@
   <div class="admin-panel">
     <div class="panel-title">Agent credentials</div>
     <p class="admin-muted lead">
-      One credential per zone. An agent authenticates by putting its token in <code class="mono"
-        >[agent] token</code
-      > in its config. Revoking is immediate and permanent: that zone's agents stop being able to report
-      the moment it lands.
+      One credential per zone, shared by every agent in that zone: each of them carries the same
+      value in <code class="mono">[agent] token</code>. The credential decides the zone and region
+      its agents report from, so an agent cannot place itself somewhere it was not issued for.
+      Revoking is immediate and permanent, and takes down every agent in the zone at once — mint
+      the replacement and roll it out first.
     </p>
 
     <form class="create" onsubmit={(e) => (e.preventDefault(), create())}>
@@ -168,9 +169,10 @@
     {:else if ordered.length === 0}
       <p class="admin-muted">
         No agent credentials. Until one exists the coordinator falls back to the legacy shared
-        <code class="mono">agent_token</code>, which every agent uses in common. Generating the
-        first per-zone credential is how you move off it — each agent then carries its own token in
-        <code class="mono">[agent] token</code>.
+        <code class="mono">agent_token</code>, which every agent uses in common and which lets any
+        holder claim any location. Generating the first credential switches the whole fleet over:
+        agents in a zone share that zone's token, and the shared
+        <code class="mono">agent_token</code> stops being accepted.
       </p>
     {:else}
       <div class="admin-rows">

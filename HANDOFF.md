@@ -26,6 +26,14 @@ a node that measured nothing rather than being fabricated.
 `Authorization: Bearer <id>.<secret>`; only a salted SHA-256 of the secret is
 stored, and the plaintext exists once, in the mint response.
 
+**The grain is the zone, not the agent.** One credential is minted per zone and
+every agent in that zone carries the same value in `[agent] token`. Nothing
+forces that grain — several credentials may exist for one zone, which is how you
+get per-agent revocation if you want it — but the default provisioning story is
+one token per zone. Consequences: revoking takes down the whole zone at once, and
+an agent can still impersonate a *sibling in its own zone* (`agent_id` remains
+self-asserted). What it cannot do is claim a different zone.
+
 **The credential carries the agent's location, and that is the point.** Zone and
 region used to be self-asserted and placement believes them, so anyone holding
 the fleet-wide token could register agents into a zone, have real checks placed
