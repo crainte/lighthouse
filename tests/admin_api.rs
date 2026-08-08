@@ -1141,6 +1141,7 @@ async fn heartbeat_pings_do_not_invent_a_monitoring_agent() {
 
     let agents: Value = reqwest::Client::new()
         .get(format!("{base}/api/v1/agents"))
+        .header(reqwest::header::COOKIE, &session)
         .send()
         .await
         .unwrap()
@@ -1190,6 +1191,7 @@ async fn a_check_pinned_to_a_dead_agent_is_reported_not_silent() {
 
     let agents: Value = reqwest::Client::new()
         .get(format!("{base}/api/v1/agents"))
+        .header(reqwest::header::COOKIE, &session)
         .send()
         .await
         .unwrap()
@@ -1252,6 +1254,7 @@ async fn a_check_pinned_to_a_dead_agent_is_reported_not_silent() {
 
     let agents: Value = reqwest::Client::new()
         .get(format!("{base}/api/v1/agents"))
+        .header(reqwest::header::COOKIE, &session)
         .send()
         .await
         .unwrap()
@@ -1740,5 +1743,43 @@ async fn incidents_open_on_down_and_resolve_on_up() {
         incidents[0].status,
         warden::coordinator::storage::IncidentStatus::Open,
         "the newest is the open one"
+    );
+}
+
+/// The fleet listing is admin-only. Agent ids, zones, regions and reporting
+/// cadence together map where monitoring runs from; an anonymous visitor to the
+/// status page must not be able to read it.
+///
+/// This also keeps the admin UI honest: the Agents panel is the only screen
+/// backed by this endpoint, so if it answered anonymously an expired session
+/// would keep rendering it with live data.
+#[tokio::test]
+async fn the_fleet_listing_is_not_public() {
+    let coord = coordinator();
+    let addr = spawn_server(coord);
+    let base = format!("http://{addr}");
+
+    let anon = reqwest::Client::new()
+        .get(format!("{base}/api/v1/agents"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        anon.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "the fleet must not be readable without a session"
+    );
+
+    let session = login(&base).await;
+    let ok = reqwest::Client::new()
+        .get(format!("{base}/api/v1/agents"))
+        .header(reqwest::header::COOKIE, &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        ok.status(),
+        200,
+        "an admin session must still be able to read it"
     );
 }

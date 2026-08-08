@@ -273,6 +273,22 @@
     }
   }
 
+  // The session can die while the tab sits open. Panels that read public
+  // endpoints (agents, alerts, incidents) or render static copy never get a
+  // 401 to learn from, so `authenticated` would stay true from page load and
+  // keep serving admin screens to an expired session. Re-verify on entering
+  // admin and on every panel switch rather than inferring it from failures.
+  $effect(() => {
+    if (view.name !== 'admin') return;
+    void view.panel;
+    fetchSession()
+      .then((ok) => {
+        authenticated = ok;
+        if (!ok) adminView = 'login';
+      })
+      .finally(() => (sessionChecked = true));
+  });
+
   onMount(() => {
     load();
     // Cookie-only: the server is the sole authority on whether we're signed in.

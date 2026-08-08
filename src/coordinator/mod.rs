@@ -1301,7 +1301,14 @@ const AGENT_UNREACHABLE_AFTER_MS: i64 = 90 * 1000;
 /// keeps deployment to "run another one", but it means an agent can only ever
 /// *stop* existing by falling silent — so retirement is derived from
 /// `last_seen` rather than being a state anyone has to maintain.
-async fn agents_handler(State(coord): State<Coordinator>) -> Response {
+///
+/// Admin-only. The fleet is infrastructure detail — agent ids, zones, regions
+/// and reporting cadence together map where monitoring runs from, which is not
+/// something an anonymous visitor to the status page should be able to read.
+async fn agents_handler(State(coord): State<Coordinator>, headers: HeaderMap) -> Response {
+    if let Some(denied) = require_admin(&coord, &headers) {
+        return denied;
+    }
     let now = chrono::Utc::now().timestamp_millis();
     let rows = match coord.inner.storage.lock().list_agents(now) {
         Ok(rows) => rows,
