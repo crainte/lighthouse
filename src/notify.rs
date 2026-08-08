@@ -83,15 +83,6 @@ async fn send_ntfy(client: &Client, base_url: &str, topic: &str, t: &Transition)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::Status;
-
-    fn transition(from: Status, to: Status) -> Transition {
-        Transition {
-            check_id: "test-check".into(),
-            from,
-            to,
-        }
-    }
 
     #[test]
     fn webhook_serializes() {

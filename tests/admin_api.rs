@@ -38,10 +38,9 @@ fn coordinator() -> Coordinator {
         &CoordinatorConfig {
             listen: "127.0.0.1:0".into(),
             db_path: ":memory:".into(),
-            notifiers: Vec::new(),
-            retention: warden::config::RetentionConfig::default(),
             admin_password: Some(PASSWORD.into()),
             agent_token: Some(AGENT_TOKEN.into()),
+            ..Default::default()
         },
         &[],
     )
@@ -1601,9 +1600,9 @@ async fn a_hanging_notification_endpoint_cannot_stall_ingest() {
             notifiers: vec![Notifier::Webhook {
                 url: format!("http://{sink_addr}/"),
             }],
-            retention: warden::config::RetentionConfig::default(),
             admin_password: Some(PASSWORD.into()),
             agent_token: Some(AGENT_TOKEN.into()),
+            ..Default::default()
         },
         &[],
     )

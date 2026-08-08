@@ -70,6 +70,7 @@ pub struct CoordinatorConfig {
     /// List of notification backends for alerts (webhook, ntfy, etc.).
     #[serde(default)]
     pub notifiers: Vec<Notifier>,
+    /// Password for the admin UI. Read from `WARDEN_ADMIN_PASSWORD` when unset
     /// here, which is how it should normally be supplied — a password in a
     /// config file tends to end up in version control.
     ///
@@ -87,6 +88,13 @@ pub struct CoordinatorConfig {
     /// deletes rows older than this; raising the values keeps more history.
     #[serde(default)]
     pub retention: RetentionConfig,
+    /// Peer coordinators to replicate state transitions to, as base URLs
+    /// (`http://coordinator-b:8080`). Empty means standalone.
+    ///
+    /// Peers authenticate with `agent_token`, so clustering adds no second
+    /// secret. Replication is one-hop and best-effort; see `coordinator::gossip`.
+    #[serde(default)]
+    pub peers: Vec<String>,
 }
 
 /// History retention: rows older than the window are pruned periodically.
@@ -618,6 +626,7 @@ impl Default for CoordinatorConfig {
             admin_password: None,
             agent_token: None,
             retention: RetentionConfig::default(),
+            peers: Vec::new(),
         }
     }
 }

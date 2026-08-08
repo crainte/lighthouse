@@ -1,4 +1,5 @@
 pub mod alert;
+pub mod gossip;
 pub mod state;
 pub mod storage;
 
@@ -200,6 +201,10 @@ struct Inner {
     /// restart does not briefly forget the whole fleet.
     seen: parking_lot::RwLock<std::collections::HashMap<String, SeenAgent>>,
     auth: crate::auth::Auth,
+    /// Peer coordinators to replicate transitions to. `None` when none are
+    /// configured, mirroring `notify_tx`: nothing is handed to a fan-out that
+    /// does not exist.
+    gossip: Option<Arc<gossip::Peers>>,
 }
 
 /// An agent observed making contact: where it said it was, and when.
@@ -305,6 +310,8 @@ impl Coordinator {
                         .collect(),
                 ),
                 auth,
+                gossip: gossip::Peers::new(&cfg.peers, cfg.resolved_agent_token().as_deref())
+                    .map(Arc::new),
             }),
         })
     }
@@ -470,6 +477,29 @@ impl Coordinator {
             }
         } // drop storage guard before any await
 
+        // Replicate before the loop below consumes `transitions`, and replicate
+        // every confirmed flip rather than only the alert-worthy ones: a peer
+        // whose status page disagrees with ours is the divergence this exists
+        // to prevent.
+        //
+        // Spawned, never awaited, for the same reason the notifier is handed
+        // off: ingest is the fleet's write path, so a wedged peer must cost
+        // replication lag rather than throughput.
+        if let Some(peers) = &self.inner.gossip {
+            if !transitions.is_empty() {
+                let peers = Arc::clone(peers);
+                let msgs: Vec<_> = transitions
+                    .iter()
+                    .map(|(t, ts)| gossip::Message::new(t, *ts))
+                    .collect();
+                tokio::spawn(async move {
+                    for m in &msgs {
+                        peers.broadcast(m).await;
+                    }
+                });
+            }
+        }
+
         for (t, ts) in transitions
             .into_iter()
             .filter(|(t, _)| alert::should_alert(t))
@@ -625,6 +655,9 @@ impl Coordinator {
             // What agents probe. Carries targets, so it sits behind the agent
             // token rather than being public like /status.
             .route("/api/v1/agent/checks", get(agent_checks_handler))
+            // Peer replication. Agent-gated rather than public: it mutates
+            // published state, so an anonymous POST could mark every check down.
+            .route("/internal/gossip", post(gossip_handler))
             .with_state(self)
             .fallback(static_handler)
     }
@@ -855,12 +888,67 @@ async fn ingest_handler(
     StatusCode::ACCEPTED.into_response()
 }
 
+/// Apply a transition a peer coordinator observed.
+///
+/// Deliberately does three of the things local ingest does — mirror the
+/// confirmed state, record the alert row, tell live dashboards — and two it
+/// must not:
+///
+/// * **It does not notify.** The coordinator that observed the flip already
+///   paged; paging again per peer is how a three-node cluster wakes someone
+///   three times for one outage.
+/// * **It does not re-gossip.** That is what keeps the fan-out acyclic without
+///   a message id or a TTL — see the module docs.
+async fn gossip_handler(
+    State(coord): State<Coordinator>,
+    headers: HeaderMap,
+    Json(msg): Json<gossip::Message>,
+) -> Response {
+    if let Some(denied) = require_agent(&coord, &headers) {
+        return denied;
+    }
+    let t = msg.transition();
+    // The peer sends only confirmed flips, so the failure count resets: this
+    // node is not mid-confirmation for a check somebody else already decided.
+    coord.inner.tracker.lock().seed(&t.check_id, t.to, 0);
+    {
+        let store = coord.inner.storage.lock();
+        if let Err(e) = store.update_current_state(&t.check_id, t.to, 0, msg.timestamp) {
+            tracing::warn!(error = %e, check = %t.check_id, "gossip: failed to persist state");
+        }
+        // Same filter the local path applies, so the two alert feeds agree.
+        if alert::should_alert(&t) {
+            if let Err(e) = store.insert_alert(&t.check_id, t.from, t.to, msg.timestamp) {
+                tracing::warn!(error = %e, check = %t.check_id, "gossip: failed to persist alert");
+            }
+        }
+    } // drop storage guard before the broadcast
+    let _ = coord.inner.events.send(WsEvent::StateChange {
+        check_id: t.check_id,
+        from: t.from,
+        to: t.to,
+        timestamp: msg.timestamp,
+    });
+    StatusCode::NO_CONTENT.into_response()
+}
+
 async fn status_handler(State(coord): State<Coordinator>, headers: HeaderMap) -> Response {
     let now = chrono::Utc::now().timestamp_millis();
     // The status page is public; raw probe errors name resolved addresses and
     // expected values, so only an admin sees them verbatim.
     let detailed = is_admin(&coord, &headers);
-    let rows = coord.inner.storage.lock().list_status(now);
+    let (rows, confirmed) = {
+        let store = coord.inner.storage.lock();
+        // Confirmed states are read under the same guard. A node that learned a
+        // check's state by gossip has no measurements of its own, so it has no
+        // `list_status` row to carry that state on.
+        (store.list_status(now), store.list_current_state())
+    };
+    let confirmed: std::collections::HashMap<String, Status> = confirmed
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.check_id, r.status))
+        .collect();
     match rows {
         Ok(rows) => {
             let by_name = coord.inner.checks.read();
@@ -901,9 +989,13 @@ async fn status_handler(State(coord): State<Coordinator>, headers: HeaderMap) ->
                 .filter(|(name, m)| m.visible && !reported.contains(name.as_str()))
                 .map(|(name, m)| CheckStatusDto {
                     check_id: name.clone(),
-                    // `default_status` is what the check reads as before its
-                    // first result; unknown unless the admin said otherwise.
-                    status: m.default_status,
+                    // A check with no measurements here still has a confirmed
+                    // state if a peer gossiped one to us. Prefer it over the
+                    // configured default: a cluster that knows a service is
+                    // DOWN must not read "unknown" on the node that heard it
+                    // second-hand. Falls back to `default_status`, which is what
+                    // a check reads as before its first result.
+                    status: confirmed.get(name).copied().unwrap_or(m.default_status),
                     latency_ms: 0,
                     last_check: 0,
                     uptime_24h: 0.0,

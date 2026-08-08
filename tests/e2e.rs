@@ -104,14 +104,12 @@ async fn agent_check_through_coordinator_fires_alert_on_up_to_down() {
 
     let coord = Coordinator::new(
         &CoordinatorConfig {
-            admin_password: None,
-            agent_token: None,
             listen: "127.0.0.1:0".into(),
             db_path: ":memory:".into(),
             notifiers: vec![Notifier::Webhook {
                 url: format!("http://{webhook_addr}/"),
             }],
-            retention: warden::config::RetentionConfig::default(),
+            ..Default::default()
         },
         &[],
     )
