@@ -17,6 +17,7 @@ use tokio_tungstenite::connect_async;
 
 use warden::config::CoordinatorConfig;
 use warden::coordinator::Coordinator;
+use warden::notify::Notifier;
 
 /// Bind an ephemeral 127.0.0.1 port, read the port BEFORE serving, then serve
 /// the router in a spawned task. The listener is bound before `serve`, so the
@@ -66,7 +67,7 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
             agent_token: None,
             listen: "127.0.0.1:0".into(),
             db_path: ":memory:".into(),
-            alert_webhook: None,
+            notifiers: Vec::new(),
             retention: warden::config::RetentionConfig::default(),
         },
         &[warden::config::CheckConfig {

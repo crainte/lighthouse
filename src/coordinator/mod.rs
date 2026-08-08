@@ -227,16 +227,21 @@ impl Coordinator {
         // The notifier runs beside ingest, not inside it. Bounded so a wedged
         // endpoint cannot grow an unbounded backlog in memory; overflow drops
         // the notification rather than the results behind it.
-        let notify_tx = cfg.alert_webhook.clone().map(|url| {
+        let notify_tx = if cfg.notifiers.is_empty() {
+            None
+        } else {
+            let notifiers = cfg.notifiers.clone();
             let (tx, mut rx) = tokio::sync::mpsc::channel::<alert::Transition>(1024);
             let client = reqwest::Client::new();
             tokio::spawn(async move {
                 while let Some(t) = rx.recv().await {
-                    alert::send_webhook(&client, &url, &t).await;
+                    for notifier in &notifiers {
+                        crate::notify::send(&client, notifier, &t).await;
+                    }
                 }
             });
-            tx
-        });
+            Some(tx)
+        };
         if storage.seed_checks_if_empty(checks, now)? {
             info!(count = checks.len(), "seeded checks from config file");
         }

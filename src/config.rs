@@ -1,4 +1,5 @@
 use crate::models::CheckKind;
+use crate::notify::Notifier;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -66,10 +67,9 @@ pub struct CoordinatorConfig {
     pub listen: String,
     #[serde(default = "default_db_path")]
     pub db_path: String,
-    /// Webhook URL for alerts (Phase 1: webhook only).
+    /// List of notification backends for alerts (webhook, ntfy, etc.).
     #[serde(default)]
-    pub alert_webhook: Option<String>,
-    /// Password for the admin UI. Read from `WARDEN_ADMIN_PASSWORD` when unset
+    pub notifiers: Vec<Notifier>,
     /// here, which is how it should normally be supplied — a password in a
     /// config file tends to end up in version control.
     ///
@@ -614,7 +614,7 @@ impl Default for CoordinatorConfig {
         Self {
             listen: default_listen(),
             db_path: default_db_path(),
-            alert_webhook: None,
+            notifiers: Vec::new(),
             admin_password: None,
             agent_token: None,
             retention: RetentionConfig::default(),

@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 
 use warden::config::CoordinatorConfig;
 use warden::coordinator::Coordinator;
+use warden::notify::Notifier;
 
 const PASSWORD: &str = "correct horse battery staple";
 const AGENT_TOKEN: &str = "agent-shared-secret";
@@ -37,7 +38,7 @@ fn coordinator() -> Coordinator {
         &CoordinatorConfig {
             listen: "127.0.0.1:0".into(),
             db_path: ":memory:".into(),
-            alert_webhook: None,
+            notifiers: Vec::new(),
             retention: warden::config::RetentionConfig::default(),
             admin_password: Some(PASSWORD.into()),
             agent_token: Some(AGENT_TOKEN.into()),
@@ -1597,7 +1598,9 @@ async fn a_hanging_notification_endpoint_cannot_stall_ingest() {
         &CoordinatorConfig {
             listen: "127.0.0.1:0".into(),
             db_path: ":memory:".into(),
-            alert_webhook: Some(format!("http://{sink_addr}/")),
+            notifiers: vec![Notifier::Webhook {
+                url: format!("http://{sink_addr}/"),
+            }],
             retention: warden::config::RetentionConfig::default(),
             admin_password: Some(PASSWORD.into()),
             agent_token: Some(AGENT_TOKEN.into()),
