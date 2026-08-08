@@ -1657,8 +1657,8 @@ async fn incidents_open_on_down_and_resolve_on_up() {
 
     // `status_code: None` makes the default eval read the probe as Unknown;
     // `Some(code)` drives Up (2xx-3xx) or Down otherwise.
-    let result = |ts: i64, status_code: Option<u16>, error: Option<String>| {
-        warden::models::CheckResult {
+    let result =
+        |ts: i64, status_code: Option<u16>, error: Option<String>| warden::models::CheckResult {
             check_id: "api".into(),
             agent_id: "agent-a".into(),
             zone: "us-east-a".into(),
@@ -1672,13 +1672,16 @@ async fn incidents_open_on_down_and_resolve_on_up() {
             failure: None,
             body: None,
             headers: None,
-        }
-    };
+        };
 
     // First-ever observation is DOWN. No alert (baseline is silent), but the
     // outage is real: an incident must open.
     coord
-        .ingest(vec![result(now, Some(500), Some("connection refused".into()))])
+        .ingest(vec![result(
+            now,
+            Some(500),
+            Some("connection refused".into()),
+        )])
         .await;
     let incidents = coord.incidents_for_test(100);
     assert_eq!(incidents.len(), 1, "first-ever DOWN opens an incident");
@@ -1698,7 +1701,9 @@ async fn incidents_open_on_down_and_resolve_on_up() {
     );
 
     // Further DOWN observations while it is open ride on the same incident.
-    coord.ingest(vec![result(now + 5_000, Some(500), None)]).await;
+    coord
+        .ingest(vec![result(now + 5_000, Some(500), None)])
+        .await;
     let incidents = coord.incidents_for_test(100);
     assert_eq!(incidents.len(), 1, "no second incident while one is open");
 
@@ -1712,7 +1717,9 @@ async fn incidents_open_on_down_and_resolve_on_up() {
     );
 
     // Recovery: the first UP observation resolves it.
-    coord.ingest(vec![result(now + 20_000, Some(200), None)]).await;
+    coord
+        .ingest(vec![result(now + 20_000, Some(200), None)])
+        .await;
     let incidents = coord.incidents_for_test(100);
     assert_eq!(incidents.len(), 1, "same incident, now resolved");
     assert_eq!(
@@ -1722,7 +1729,9 @@ async fn incidents_open_on_down_and_resolve_on_up() {
     assert_eq!(incidents[0].resolved_at, Some(now + 20_000));
 
     // And the next outage is a fresh incident.
-    coord.ingest(vec![result(now + 30_000, Some(500), None)]).await;
+    coord
+        .ingest(vec![result(now + 30_000, Some(500), None)])
+        .await;
     let incidents = coord.incidents_for_test(100);
     assert_eq!(incidents.len(), 2, "a new outage opens a second incident");
     assert_eq!(

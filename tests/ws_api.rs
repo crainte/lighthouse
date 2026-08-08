@@ -53,6 +53,13 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
     // conjured by ingest alone: the status page only publishes checks that
     // currently exist, and this test is about transitions surfacing, not about
     // how orphaned history is treated.
+    // `agent_token: None` does not mean "no token": `Coordinator::new` resolves
+    // it from `WARDEN_AGENT_TOKEN`, so on any machine that exports it — which the
+    // docker-compose workflow encourages via `.env` — an unauthenticated ingest
+    // is rejected and this test fails for a reason unrelated to what it checks.
+    // Remove it for this process so the config's `None` is honoured. This test
+    // binary holds a single test, so there is no other thread to race with.
+    std::env::remove_var("WARDEN_AGENT_TOKEN");
     let coord = Coordinator::new(
         &CoordinatorConfig {
             admin_password: None,
@@ -161,10 +168,19 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
     .await
     .expect("timed out waiting for incident_opened");
     assert_eq!(opened["type"], "incident_opened", "event type");
-    assert_eq!(opened["incident"]["check_id"], "test-check", "incident check");
+    assert_eq!(
+        opened["incident"]["check_id"], "test-check",
+        "incident check"
+    );
     assert_eq!(opened["incident"]["status"], "open", "incident opens");
-    assert_eq!(opened["incident"]["resolved_at"], Value::Null, "not yet resolved");
-    let started_at = opened["incident"]["started_at"].as_i64().expect("started_at is a timestamp");
+    assert_eq!(
+        opened["incident"]["resolved_at"],
+        Value::Null,
+        "not yet resolved"
+    );
+    let started_at = opened["incident"]["started_at"]
+        .as_i64()
+        .expect("started_at is a timestamp");
 
     // --- 5. Read APIs: one alert (up->down) and one open incident. ---
     let alerts: Value = http
@@ -205,7 +221,10 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
         .collect();
     assert_eq!(mine_inc.len(), 1, "exactly one incident for test-check");
     assert_eq!(mine_inc[0]["status"], "open", "incident is open");
-    assert_eq!(mine_inc[0]["started_at"], started_at, "started_at matches the WS event");
+    assert_eq!(
+        mine_inc[0]["started_at"], started_at,
+        "started_at matches the WS event"
+    );
 
     // --- 6. GET /api/v1/status: test-check reflects the transition (down). ---
     let status: Value = http
@@ -269,8 +288,14 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
     .await
     .expect("timed out waiting for incident_resolved");
     assert_eq!(resolved["type"], "incident_resolved", "event type");
-    assert_eq!(resolved["incident"]["check_id"], "test-check", "incident check");
-    assert_eq!(resolved["incident"]["status"], "resolved", "incident closes");
+    assert_eq!(
+        resolved["incident"]["check_id"], "test-check",
+        "incident check"
+    );
+    assert_eq!(
+        resolved["incident"]["status"], "resolved",
+        "incident closes"
+    );
     assert_eq!(
         resolved["incident"]["resolved_at"].as_i64(),
         Some(1_783_728_002_000),
@@ -279,7 +304,9 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
 
     // --- 8. Read APIs after recovery: same incident, now resolved. ---
     let incidents: Value = http
-        .get(format!("http://{addr}/api/v1/incidents?limit=50&status=resolved"))
+        .get(format!(
+            "http://{addr}/api/v1/incidents?limit=50&status=resolved"
+        ))
         .send()
         .await
         .unwrap()
@@ -293,12 +320,20 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
         .filter(|i| i["check_id"] == "test-check")
         .collect();
     assert_eq!(mine_inc.len(), 1, "the resolved incident is listed");
-    assert_eq!(mine_inc[0]["started_at"], started_at, "same incident, not a new one");
-    assert!(mine_inc[0]["resolved_at"].as_i64().unwrap() > started_at, "closed after it opened");
+    assert_eq!(
+        mine_inc[0]["started_at"], started_at,
+        "same incident, not a new one"
+    );
+    assert!(
+        mine_inc[0]["resolved_at"].as_i64().unwrap() > started_at,
+        "closed after it opened"
+    );
 
     // Open-only filter excludes it.
     let open_only: Value = http
-        .get(format!("http://{addr}/api/v1/incidents?limit=50&status=open"))
+        .get(format!(
+            "http://{addr}/api/v1/incidents?limit=50&status=open"
+        ))
         .send()
         .await
         .unwrap()

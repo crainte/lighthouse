@@ -37,6 +37,9 @@ function parseIncident(data: unknown): IncidentEvent | null {
   if (typeof i.started_at !== 'number') return null;
   if (i.resolved_at !== null && typeof i.resolved_at !== 'number') return null;
   if (i.details !== null && typeof i.details !== 'string') return null;
+  // Tolerate omission: older coordinators predate acknowledgement.
+  if (i.acknowledged_at != null && typeof i.acknowledged_at !== 'number') return null;
+  if (i.acknowledged_by != null && typeof i.acknowledged_by !== 'string') return null;
   return {
     type: m.type,
     incident: {
@@ -46,6 +49,8 @@ function parseIncident(data: unknown): IncidentEvent | null {
       started_at: i.started_at,
       resolved_at: i.resolved_at as number | null,
       details: i.details as string | null,
+      acknowledged_at: (i.acknowledged_at ?? null) as number | null,
+      acknowledged_by: (i.acknowledged_by ?? null) as string | null,
     },
   };
 }

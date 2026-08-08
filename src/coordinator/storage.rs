@@ -962,7 +962,11 @@ impl Storage {
 
     /// Close the open incident for a check, recording when. Returns it (now
     /// resolved), or `None` when nothing was open.
-    pub fn resolve_incident(&self, check_id: &str, resolved_at: i64) -> Result<Option<IncidentRow>> {
+    pub fn resolve_incident(
+        &self,
+        check_id: &str,
+        resolved_at: i64,
+    ) -> Result<Option<IncidentRow>> {
         let Some(open) = self.open_incident_for(check_id)? else {
             return Ok(None);
         };
@@ -1008,7 +1012,11 @@ impl Storage {
 
     /// Recent incidents, newest first. `status` filters to 'open' or 'resolved'
     /// when given.
-    pub fn list_incidents(&self, limit: usize, status: Option<IncidentStatus>) -> Result<Vec<IncidentRow>> {
+    pub fn list_incidents(
+        &self,
+        limit: usize,
+        status: Option<IncidentStatus>,
+    ) -> Result<Vec<IncidentRow>> {
         let mut sql = String::from(
             "SELECT id, check_id, status, started_at, resolved_at, details,
                     acknowledged_at, acknowledged_by
@@ -1143,9 +1151,9 @@ impl Storage {
 
     /// All persisted confirmed states, for seeding the tracker on startup.
     pub fn list_current_state(&self) -> Result<Vec<CurrentStateRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT check_id, status, consecutive_failures FROM current_state",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT check_id, status, consecutive_failures FROM current_state")?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(CurrentStateRow {
@@ -1166,24 +1174,18 @@ impl Storage {
         let results_before = now_millis - (results_days as i64) * 86_400_000;
         let alerts_before = now_millis - (alerts_days as i64) * 86_400_000;
         let mut removed = 0u64;
-        removed += self
-            .conn
-            .execute(
-                "DELETE FROM check_results WHERE ts_millis < ?",
-                duckdb::params![results_before],
-            )? as u64;
-        removed += self
-            .conn
-            .execute(
-                "DELETE FROM alerts WHERE ts_millis < ?",
-                duckdb::params![alerts_before],
-            )? as u64;
-        removed += self
-            .conn
-            .execute(
-                "DELETE FROM incidents WHERE status = 'resolved' AND resolved_at < ?",
-                duckdb::params![alerts_before],
-            )? as u64;
+        removed += self.conn.execute(
+            "DELETE FROM check_results WHERE ts_millis < ?",
+            duckdb::params![results_before],
+        )? as u64;
+        removed += self.conn.execute(
+            "DELETE FROM alerts WHERE ts_millis < ?",
+            duckdb::params![alerts_before],
+        )? as u64;
+        removed += self.conn.execute(
+            "DELETE FROM incidents WHERE status = 'resolved' AND resolved_at < ?",
+            duckdb::params![alerts_before],
+        )? as u64;
         Ok(removed)
     }
 
@@ -2350,10 +2352,7 @@ mod tests {
         s.resolve_incident("old", now - 100 * day).unwrap();
 
         let removed = s.prune(30, 90, now).unwrap();
-        assert_eq!(
-            removed, 3,
-            "old result + old alert + old resolved incident"
-        );
+        assert_eq!(removed, 3, "old result + old alert + old resolved incident");
 
         // The recent result and alert survive.
         let status = s.list_status(now).unwrap();
@@ -2561,7 +2560,9 @@ mod migration_tests {
             "only b is still open"
         );
 
-        let resolved = s.list_incidents(100, Some(IncidentStatus::Resolved)).unwrap();
+        let resolved = s
+            .list_incidents(100, Some(IncidentStatus::Resolved))
+            .unwrap();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].id, "a-1000");
 
@@ -2570,6 +2571,10 @@ mod migration_tests {
             for_a.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
             vec!["a-1000"]
         );
-        assert_eq!(s.incidents_for_check("a", 1).unwrap().len(), 1, "limit applies");
+        assert_eq!(
+            s.incidents_for_check("a", 1).unwrap().len(),
+            1,
+            "limit applies"
+        );
     }
 }

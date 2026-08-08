@@ -786,7 +786,8 @@ pub async fn poster_loop(cfg: AgentConfig, mut rx: mpsc::Receiver<CheckResult>) 
     // coordinator cannot grow an unbounded backlog in memory; when the cap is
     // hit the OLDEST results are dropped, because the freshest observation is
     // what the status page and the confirmation threshold act on.
-    let mut pending: std::collections::VecDeque<Vec<CheckResult>> = std::collections::VecDeque::new();
+    let mut pending: std::collections::VecDeque<Vec<CheckResult>> =
+        std::collections::VecDeque::new();
     const MAX_PENDING_BATCHES: usize = 32;
     let mut flush = tokio::time::interval(std::time::Duration::from_secs(cfg.flush_secs));
 

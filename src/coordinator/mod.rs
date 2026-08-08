@@ -33,13 +33,9 @@ pub enum WsEvent {
         timestamp: i64,
     },
     /// A check went DOWN and a new incident opened.
-    IncidentOpened {
-        incident: IncidentDto,
-    },
+    IncidentOpened { incident: IncidentDto },
     /// A check came back UP, closing its incident.
-    IncidentResolved {
-        incident: IncidentDto,
-    },
+    IncidentResolved { incident: IncidentDto },
 }
 
 /// The shape of an incident as the UI reads it. Also carried inside WS events.
@@ -327,12 +323,11 @@ impl Coordinator {
             loop {
                 tick.tick().await;
                 let now = chrono::Utc::now().timestamp_millis();
-                match coord
-                    .inner
-                    .storage
-                    .lock()
-                    .prune(retention.results_days, retention.alerts_days, now)
-                {
+                match coord.inner.storage.lock().prune(
+                    retention.results_days,
+                    retention.alerts_days,
+                    now,
+                ) {
                     Ok(0) => {}
                     Ok(removed) => {
                         tracing::info!(removed, "retention prune removed old rows");
@@ -351,7 +346,8 @@ impl Coordinator {
         // Confirmed status per check after this batch, so incident opens are
         // gated on the threshold: a DOWN still inside its confirmation window
         // is not an outage yet.
-        let mut confirmed: std::collections::HashMap<String, Status> = std::collections::HashMap::new();
+        let mut confirmed: std::collections::HashMap<String, Status> =
+            std::collections::HashMap::new();
         // (check_id, confirmed status, failure count, last check ts). Built
         // under the tracker lock and applied to storage afterwards, because the
         // two guards must never nest.
@@ -434,7 +430,11 @@ impl Coordinator {
                             None
                         } else {
                             match store.open_incident_for(&r.check_id) {
-                                Ok(None) => match store.create_incident(&r.check_id, ts, incident_details(r).as_deref()) {
+                                Ok(None) => match store.create_incident(
+                                    &r.check_id,
+                                    ts,
+                                    incident_details(r).as_deref(),
+                                ) {
                                     Ok(i) => Some(WsEvent::IncidentOpened { incident: i.into() }),
                                     Err(e) => {
                                         tracing::error!(error = %e, check = %r.check_id, "failed to open incident");
@@ -562,7 +562,10 @@ impl Coordinator {
             )
             .route("/api/v1/alerts", get(alerts_handler))
             .route("/api/v1/incidents", get(incidents_handler))
-            .route("/api/v1/incidents/:id/acknowledge", post(acknowledge_incident_handler))
+            .route(
+                "/api/v1/incidents/:id/acknowledge",
+                post(acknowledge_incident_handler),
+            )
             .route("/api/v1/checks/:id/incidents", get(check_incidents_handler))
             .route("/api/v1/agents", get(agents_handler))
             .route("/api/v1/admin/agents/:id", delete(purge_agent_handler))
@@ -1103,7 +1106,9 @@ async fn alerts_handler(State(coord): State<Coordinator>, Query(q): Query<LimitQ
 
 /// Parse the `status` query into an incident lifecycle filter. Anything that is
 /// not exactly `open` or `resolved` means "both".
-fn incident_status_filter(raw: Option<&str>) -> Option<crate::coordinator::storage::IncidentStatus> {
+fn incident_status_filter(
+    raw: Option<&str>,
+) -> Option<crate::coordinator::storage::IncidentStatus> {
     match raw {
         Some("open") => Some(crate::coordinator::storage::IncidentStatus::Open),
         Some("resolved") => Some(crate::coordinator::storage::IncidentStatus::Resolved),
@@ -1147,7 +1152,9 @@ async fn acknowledge_incident_handler(
         .lock()
         .acknowledge_incident(&id, "admin", now)
     {
-        Ok(Some(row)) => Json(serde_json::json!({ "incident": IncidentDto::from(row) })).into_response(),
+        Ok(Some(row)) => {
+            Json(serde_json::json!({ "incident": IncidentDto::from(row) })).into_response()
+        }
         Ok(None) => error_response(StatusCode::NOT_FOUND, "no open incident with that id"),
         Err(e) => internal_error(e),
     }

@@ -39,7 +39,12 @@ impl StateTracker {
     /// when the CONFIRMED status changed — a DOWN below the threshold emits
     /// nothing. The first observation establishes a baseline and never emits a
     /// transition (nothing to alert on yet).
-    pub fn observe(&mut self, check_id: &str, status: Status, threshold: u32) -> Option<Transition> {
+    pub fn observe(
+        &mut self,
+        check_id: &str,
+        status: Status,
+        threshold: u32,
+    ) -> Option<Transition> {
         let threshold = threshold.max(1);
         match status {
             Status::Up => {
@@ -91,7 +96,8 @@ impl StateTracker {
     /// left off instead of starting over (or alerting on the first result).
     pub fn seed(&mut self, check_id: &str, status: Status, consecutive_failures: u32) {
         self.last.insert(check_id.to_string(), status);
-        self.failures.insert(check_id.to_string(), consecutive_failures);
+        self.failures
+            .insert(check_id.to_string(), consecutive_failures);
     }
 }
 
