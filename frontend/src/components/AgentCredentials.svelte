@@ -168,11 +168,11 @@
       </div>
     {:else if ordered.length === 0}
       <p class="admin-muted">
-        No agent credentials. Until one exists the coordinator falls back to the legacy shared
-        <code class="mono">agent_token</code>, which every agent uses in common and which lets any
-        holder claim any location. Generating the first credential switches the whole fleet over:
-        agents in a zone share that zone's token, and the shared
-        <code class="mono">agent_token</code> stops being accepted.
+        No agent credentials, so no agent can report yet. There is no shared token and no open
+        mode: until one exists the coordinator refuses every agent request, which is the intended
+        first-run state. Generate one per zone, then start the agents with the token in
+        <code class="mono">[agent] token</code> — the value is shown once, here, and cannot be
+        recovered afterwards.
       </p>
     {:else}
       <div class="admin-rows">
