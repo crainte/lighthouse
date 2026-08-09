@@ -29,6 +29,10 @@ pub struct AgentConfig {
     /// A zone is the failure domain a probe shares (one AZ, one office link); a
     /// region groups zones for rollups. Both default to "unknown" so a
     /// single-site install needs no configuration at all.
+    ///
+    /// Authoritative in `standalone` mode only. In `agent` mode the coordinator
+    /// takes location from the agent's credential and overwrites these, because
+    /// placement acts on it and the party being placed must not choose it.
     #[serde(default = "default_location")]
     pub zone: String,
     #[serde(default = "default_location")]
@@ -78,12 +82,6 @@ pub struct CoordinatorConfig {
     /// that silently accepts anonymous edits is worse than one you can't edit.
     #[serde(default)]
     pub admin_password: Option<String>,
-    /// Shared secret agents present to post results and fetch their check list.
-    /// Falls back to `WARDEN_AGENT_TOKEN`. Unset means those endpoints stay open,
-    /// preserving existing deployments — but check targets are then readable by
-    /// anyone who can reach the coordinator, so it is logged loudly at boot.
-    #[serde(default)]
-    pub agent_token: Option<String>,
     /// How long result, alert and incident history is kept. A nightly prune
     /// deletes rows older than this; raising the values keeps more history.
     #[serde(default)]
@@ -91,13 +89,13 @@ pub struct CoordinatorConfig {
     /// Peer coordinators to replicate state transitions to, as base URLs
     /// (`http://coordinator-b:8080`). Empty means standalone.
     ///
-    /// Peers authenticate with `agent_token`, so clustering adds no second
-    /// secret. Replication is one-hop and best-effort; see `coordinator::gossip`.
+    /// Peers authenticate with `peer_token`. Replication is one-hop and
+    /// best-effort; see `coordinator::gossip`.
     #[serde(default)]
     pub peers: Vec<String>,
-    /// Shared secret peers present to each other on `/internal/gossip`. Falls
-    /// back to `agent_token`. With neither set, gossip is refused rather than
-    /// accepted: the endpoint rewrites published state.
+    /// Shared secret peers present to each other on `/internal/gossip`. Unset
+    /// means gossip is refused rather than accepted: the endpoint rewrites
+    /// published state.
     #[serde(default)]
     pub peer_token: Option<String>,
 }
@@ -146,18 +144,11 @@ impl CoordinatorConfig {
         Self::secret(&self.admin_password, "WARDEN_ADMIN_PASSWORD")
     }
 
-    pub fn resolved_agent_token(&self) -> Option<String> {
-        Self::secret(&self.agent_token, "WARDEN_AGENT_TOKEN")
-    }
-
-    /// Credential peers present to each other on `/internal/gossip`.
-    ///
-    /// Falls back to `agent_token` so existing clusters keep replicating, but
-    /// it is worth setting separately: once agents move to minted per-zone
-    /// credentials the shared agent token stops being handed out, and a peer
-    /// secret should not be one an agent ever held.
+    /// Secret peers present to each other on `/internal/gossip`. Its own value,
+    /// not shared with agents: an agent credential must never open an endpoint
+    /// that rewrites published state.
     pub fn resolved_peer_token(&self) -> Option<String> {
-        Self::secret(&self.peer_token, "WARDEN_PEER_TOKEN").or_else(|| self.resolved_agent_token())
+        Self::secret(&self.peer_token, "WARDEN_PEER_TOKEN")
     }
 }
 
@@ -639,7 +630,6 @@ impl Default for CoordinatorConfig {
             db_path: default_db_path(),
             notifiers: Vec::new(),
             admin_password: None,
-            agent_token: None,
             retention: RetentionConfig::default(),
             peers: Vec::new(),
             peer_token: None,

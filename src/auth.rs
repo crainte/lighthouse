@@ -29,16 +29,14 @@ pub enum LoginError {
 
 pub struct Auth {
     admin_password: Option<String>,
-    agent_token: Option<String>,
     sessions: Mutex<HashMap<String, i64>>,
     attempts: Mutex<HashMap<IpAddr, (u32, i64)>>,
 }
 
 impl Auth {
-    pub fn new(admin_password: Option<String>, agent_token: Option<String>) -> Self {
+    pub fn new(admin_password: Option<String>) -> Self {
         Self {
             admin_password,
-            agent_token,
             sessions: Mutex::new(HashMap::new()),
             attempts: Mutex::new(HashMap::new()),
         }
@@ -49,12 +47,6 @@ impl Auth {
     /// is worse than one nobody can edit.
     pub fn admin_enabled(&self) -> bool {
         self.admin_password.is_some()
-    }
-
-    /// Whether agents must present a token. When false the agent endpoints stay
-    /// open, which keeps existing deployments working.
-    pub fn agent_auth_enabled(&self) -> bool {
-        self.agent_token.is_some()
     }
 
     /// Exchange a password for a session token.
@@ -97,15 +89,6 @@ impl Auth {
 
     pub fn logout(&self, token: &str) {
         self.sessions.lock().remove(token);
-    }
-
-    /// Whether a presented agent credential is acceptable. Open when no token is
-    /// configured.
-    pub fn agent_ok(&self, presented: Option<&str>) -> bool {
-        let Some(expected) = self.agent_token.as_deref() else {
-            return true;
-        };
-        presented.is_some_and(|p| bool::from(p.as_bytes().ct_eq(expected.as_bytes())))
     }
 
     fn is_rate_limited(&self, from: IpAddr, now_millis: i64) -> bool {
@@ -159,7 +142,7 @@ mod tests {
     const IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 
     fn auth() -> Auth {
-        Auth::new(Some("hunter2".into()), Some("agent-secret".into()))
+        Auth::new(Some("hunter2".into()))
     }
 
     #[test]
@@ -225,21 +208,10 @@ mod tests {
 
     #[test]
     fn without_a_password_the_admin_api_is_closed_not_open() {
-        let a = Auth::new(None, None);
+        let a = Auth::new(None);
         assert!(!a.admin_enabled());
         assert_eq!(a.login("", IP, 0), Err(LoginError::Disabled));
         assert_eq!(a.login("anything", IP, 0), Err(LoginError::Disabled));
-    }
-
-    #[test]
-    fn agent_token_is_required_only_when_configured() {
-        let a = auth();
-        assert!(a.agent_ok(Some("agent-secret")));
-        assert!(!a.agent_ok(Some("nope")));
-        assert!(!a.agent_ok(None), "a configured token must be presented");
-
-        let open = Auth::new(Some("x".into()), None);
-        assert!(open.agent_ok(None), "unset token keeps agents working");
     }
 
     #[test]

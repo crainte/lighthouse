@@ -17,8 +17,8 @@ use tokio_tungstenite::connect_async;
 
 use warden::config::CoordinatorConfig;
 
-/// Ingest is authenticated; this is the fleet secret for this test.
-const AGENT_TOKEN: &str = "ws-test-agent-secret";
+/// Ingest accepts only minted agent credentials, so the test provisions one.
+const AGENT_TOKEN: &str = "wac_ws.ws-test-agent-secret";
 use warden::coordinator::Coordinator;
 
 /// Bind an ephemeral 127.0.0.1 port, read the port BEFORE serving, then serve
@@ -56,15 +56,13 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
     // conjured by ingest alone: the status page only publishes checks that
     // currently exist, and this test is about transitions surfacing, not about
     // how orphaned history is treated.
-    // Set the token inline rather than clearing `WARDEN_AGENT_TOKEN`: the config
-    // value wins over the environment, so this is independent of whatever the
-    // machine exports, and ingest now refuses unauthenticated callers outright
-    // rather than falling open when no token is configured.
+    // Ingest refuses anything but a minted credential, so provision one rather
+    // than relying on an ambient `WARDEN_AGENT_TOKEN`. This test is therefore
+    // independent of whatever the machine exports.
     let coord = Coordinator::new(
         &CoordinatorConfig {
             listen: "127.0.0.1:0".into(),
             db_path: ":memory:".into(),
-            agent_token: Some(AGENT_TOKEN.into()),
             ..Default::default()
         },
         &[warden::config::CheckConfig {
@@ -74,6 +72,9 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
         }],
     )
     .unwrap();
+    coord
+        .provision_agent_credential(AGENT_TOKEN, "ws-zone", "ws-region")
+        .unwrap();
     let addr = spawn_server(coord);
 
     let http = reqwest::Client::new();

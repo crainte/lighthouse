@@ -16,17 +16,15 @@ use warden::coordinator::Coordinator;
 use warden::models::CheckKind;
 
 const PASSWORD: &str = "correct horse battery staple";
-const SHARED_TOKEN: &str = "legacy-fleet-secret";
 const PEER_TOKEN: &str = "peer-only-secret";
 const CHECK: &str = "payments-api";
 
-fn coordinator(agent_token: Option<&str>, peer_token: Option<&str>) -> Coordinator {
+fn coordinator(peer_token: Option<&str>) -> Coordinator {
     Coordinator::new(
         &CoordinatorConfig {
             listen: "127.0.0.1:0".into(),
             db_path: ":memory:".into(),
             admin_password: Some(PASSWORD.into()),
-            agent_token: agent_token.map(str::to_owned),
             peer_token: peer_token.map(str::to_owned),
             ..Default::default()
         },
@@ -137,7 +135,7 @@ async fn located(base: &str, session: &str, agent_id: &str) -> (String, String) 
 
 #[tokio::test]
 async fn a_credential_pins_location_over_whatever_the_agent_claims() {
-    let addr = serve(coordinator(Some(SHARED_TOKEN), None)).await;
+    let addr = serve(coordinator(None)).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
     let token = mint(&base, &session, "eu-west-1a", "eu-west").await;
@@ -157,7 +155,7 @@ async fn a_credential_pins_location_over_whatever_the_agent_claims() {
 /// checks a caller is handed, and it reads the same self-declared location.
 #[tokio::test]
 async fn a_credential_pins_location_on_the_placement_path_too() {
-    let addr = serve(coordinator(Some(SHARED_TOKEN), None)).await;
+    let addr = serve(coordinator(None)).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
     let token = mint(&base, &session, "eu-west-1a", "eu-west").await;
@@ -182,36 +180,55 @@ async fn a_credential_pins_location_on_the_placement_path_too() {
     );
 }
 
+/// A coordinator with no credentials accepts nothing from agents. There is no
+/// fleet-wide token to fall back to and no open mode, so this is the first-run
+/// state until an operator mints one.
 #[tokio::test]
-async fn minting_a_credential_retires_the_shared_token() {
-    let addr = serve(coordinator(Some(SHARED_TOKEN), None)).await;
+async fn nothing_is_accepted_until_a_credential_exists() {
+    let addr = serve(coordinator(None)).await;
     let base = format!("http://{addr}");
-    let session = login(&base).await;
 
     assert_eq!(
-        post_result(&base, SHARED_TOKEN, "agent-3", "z", "r").await,
-        202,
-        "the shared token works while it is the only credential"
-    );
-
-    let token = mint(&base, &session, "eu-west-1a", "eu-west").await;
-
-    assert_eq!(
-        post_result(&base, SHARED_TOKEN, "agent-3", "z", "r").await,
+        post_result(&base, "anything-at-all", "agent-3", "z", "r").await,
         401,
-        "once credentials exist the fleet-wide token must stop working, or the \
-         weaker path stays open forever"
+        "ingest must refuse before any credential is minted"
     );
+    let res = reqwest::get(format!("{base}/api/v1/agent/checks?agent_id=agent-3"))
+        .await
+        .unwrap();
     assert_eq!(
-        post_result(&base, &token, "agent-3", "z", "r").await,
-        202,
-        "the minted credential still works"
+        res.status(),
+        401,
+        "check targets must not be readable either"
     );
+
+    // The forged DOWN must not have landed.
+    let v: Value = reqwest::get(format!("{base}/api/v1/status"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let c = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["check_id"] == CHECK)
+        .expect("the configured check is still listed");
+    assert_eq!(
+        c["status"], "unknown",
+        "a refused result must not be stored"
+    );
+
+    // ...and it starts working the moment one exists.
+    let session = login(&base).await;
+    let token = mint(&base, &session, "eu-west-1a", "eu-west").await;
+    assert_eq!(post_result(&base, &token, "agent-3", "z", "r").await, 202);
 }
 
 #[tokio::test]
 async fn revoking_a_credential_takes_effect_without_a_restart() {
-    let addr = serve(coordinator(Some(SHARED_TOKEN), None)).await;
+    let addr = serve(coordinator(None)).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
     let token = mint(&base, &session, "eu-west-1a", "eu-west").await;
@@ -255,7 +272,7 @@ async fn revoking_a_credential_takes_effect_without_a_restart() {
 /// Minting must never hand back something that lets the caller read it again.
 #[tokio::test]
 async fn the_secret_is_returned_once_and_never_listed() {
-    let addr = serve(coordinator(Some(SHARED_TOKEN), None)).await;
+    let addr = serve(coordinator(None)).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
     let token = mint(&base, &session, "eu-west-1a", "eu-west").await;
@@ -278,7 +295,7 @@ async fn the_secret_is_returned_once_and_never_listed() {
 
 #[tokio::test]
 async fn credentials_are_admin_only() {
-    let addr = serve(coordinator(Some(SHARED_TOKEN), None)).await;
+    let addr = serve(coordinator(None)).await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
 
@@ -304,18 +321,24 @@ async fn credentials_are_admin_only() {
     }
 
     // An agent credential is not an admin session either.
+    let session = login(&base).await;
+    let agent = mint(&base, &session, "eu-west-1a", "eu-west").await;
     let res = client
         .get(format!("{base}/api/v1/admin/agent-credentials"))
-        .bearer_auth(SHARED_TOKEN)
+        .bearer_auth(agent)
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 401);
+    assert_eq!(
+        res.status(),
+        401,
+        "an agent must not be able to mint itself more credentials"
+    );
 }
 
 #[tokio::test]
 async fn a_blank_location_is_refused() {
-    let addr = serve(coordinator(Some(SHARED_TOKEN), None)).await;
+    let addr = serve(coordinator(None)).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
 
@@ -342,7 +365,7 @@ async fn a_blank_location_is_refused() {
 /// is no longer handed out, so gossip must not depend on it.
 #[tokio::test]
 async fn gossip_does_not_accept_an_agent_credential() {
-    let addr = serve(coordinator(Some(SHARED_TOKEN), Some(PEER_TOKEN))).await;
+    let addr = serve(coordinator(Some(PEER_TOKEN))).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
     let agent_token = mint(&base, &session, "eu-west-1a", "eu-west").await;
@@ -369,7 +392,6 @@ async fn gossip_does_not_accept_an_agent_credential() {
         401,
         "an agent credential must not let a caller rewrite published state"
     );
-    assert_eq!(post(SHARED_TOKEN.to_string()).await, 401);
     assert!(
         (200..300).contains(&post(PEER_TOKEN.to_string()).await),
         "the peer token is what opens gossip"
@@ -381,7 +403,7 @@ async fn gossip_does_not_accept_an_agent_credential() {
 /// per agent") changes how an operator provisions a fleet.
 #[tokio::test]
 async fn one_credential_is_shared_by_every_agent_in_its_zone() {
-    let addr = serve(coordinator(Some(SHARED_TOKEN), None)).await;
+    let addr = serve(coordinator(None)).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
     let zone_token = mint(&base, &session, "eu-west-1a", "eu-west").await;
@@ -405,7 +427,7 @@ async fn one_credential_is_shared_by_every_agent_in_its_zone() {
 /// is allowed, and is how you get per-agent revocation if you want it.
 #[tokio::test]
 async fn a_zone_may_hold_several_credentials() {
-    let addr = serve(coordinator(Some(SHARED_TOKEN), None)).await;
+    let addr = serve(coordinator(None)).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
 

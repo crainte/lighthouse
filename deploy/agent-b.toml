@@ -1,17 +1,15 @@
 # Agent B: runs checks, POSTs results to the coordinator. Serves no UI.
 #
-# `zone` and `region` say where this probe observes from. Nothing infers them —
-# only the operator knows which rack, datacentre or AZ a process sits in — and
-# results are meaningless without them once there is more than one vantage
-# point: "the API is slow" and "the API is slow from Frankfurt" are different
-# findings. They also drive placement, so a check scoped to a region is handed
-# only to agents that declared it.
+# Location is NOT declared here. It comes from the credential in `token`, which
+# the coordinator minted for one zone, because placement acts on location and an
+# agent able to name its own zone could be handed checks it never runs. Set
+# `token` from WARDEN_AGENT_TOKEN in the environment; the value is shown once,
+# when the credential is generated in Admin > Credentials.
 
 [agent]
 coordinator_url = "http://coordinator:8080"
 agent_id = "agent-b"
-zone = "eu-west-1a"
-region = "eu-west"
+# Reported location comes from the credential: eu-west-1a / eu-west.
 flush_secs = 5
 
 # No [[checks]] here on purpose. The coordinator owns the check list and this

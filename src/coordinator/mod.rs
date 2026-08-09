@@ -267,22 +267,19 @@ impl Coordinator {
                 info!("no checks configured, seeded demo data");
             }
         }
-        let auth =
-            crate::auth::Auth::new(cfg.resolved_admin_password(), cfg.resolved_agent_token());
+        let auth = crate::auth::Auth::new(cfg.resolved_admin_password());
         if !auth.admin_enabled() {
             warn!("no admin password set (WARDEN_ADMIN_PASSWORD); the check editor is disabled");
         }
         let credentials = storage.list_agent_credentials().unwrap_or_default();
-        if credentials.iter().any(|c| !c.revoked()) {
-            info!(
-                count = credentials.iter().filter(|c| !c.revoked()).count(),
-                "agent credentials in use; the shared agent token is not accepted for agents"
-            );
-        } else if !auth.agent_auth_enabled() {
+        let live = credentials.iter().filter(|c| !c.revoked()).count();
+        if live == 0 {
             warn!(
-                "no agent credentials minted and no agent token set (WARDEN_AGENT_TOKEN); \
-                 agent endpoints will REFUSE every request until one exists"
+                "no agent credentials exist; agent endpoints will refuse every \
+                 request until one is minted from Admin > Credentials"
             );
+        } else {
+            info!(count = live, "agent credentials loaded");
         }
         // Resume confirmations in flight. The confirmed status and the failure
         // count persist in `current_state`, so a check two failures into a
@@ -331,6 +328,21 @@ impl Coordinator {
                     .map(Arc::new),
             }),
         })
+    }
+
+    /// Persist a credential and make it live immediately.
+    fn store_credential(&self, record: &AgentCredential) -> Result<()> {
+        self.inner.storage.lock().insert_agent_credential(record)?;
+        self.reload_credentials()
+    }
+
+    /// Provision a credential whose token is already known — for a zone whose
+    /// agents have to be configured before this coordinator first runs.
+    pub fn provision_agent_credential(&self, token: &str, zone: &str, region: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let record = crate::credential::provision(token, zone, region, now)
+            .ok_or_else(|| anyhow::anyhow!("malformed agent credential token"))?;
+        self.store_credential(&record)
     }
 
     /// Re-read credentials after a mint or revoke, so a revocation takes effect
@@ -918,15 +930,12 @@ async fn ingest_handler(
         Ok(c) => c,
         Err(denied) => return *denied,
     };
-    // A credentialed agent does not get to say where it is. Zone and region
-    // decide placement and are shown as the location an outage was seen from,
-    // so a caller able to name its own would be able to answer for a zone it
-    // is not in.
-    if let AgentCaller::Bound { zone, region } = &caller {
-        for r in &mut batch.results {
-            r.zone.clone_from(zone);
-            r.region.clone_from(region);
-        }
+    // An agent does not get to say where it is. Zone and region decide placement
+    // and are shown as the location an outage was seen from, so a caller able to
+    // name its own could answer for a zone it is not in.
+    for r in &mut batch.results {
+        r.zone.clone_from(&caller.zone);
+        r.region.clone_from(&caller.region);
     }
     let n = batch.results.len();
     coord.ingest(batch.results).await;
@@ -1628,61 +1637,46 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .and_then(|v| v.strip_prefix("Bearer "))
 }
 
-/// Who is calling an agent endpoint, once authenticated.
-enum AgentCaller {
-    /// Matched a minted credential. Location comes from the credential, never
-    /// from what the caller says about itself.
-    Bound { zone: String, region: String },
-    /// The legacy fleet-wide token. Location stays self-asserted, which is
-    /// exactly the weakness minted credentials exist to remove.
-    Shared,
+/// Where an authenticated agent reports from. Read off its credential, never
+/// off the request, because placement acts on it.
+struct AgentLocation {
+    zone: String,
+    region: String,
 }
 
 /// Gate for endpoints that agents call.
 ///
-/// Minted credentials win outright once any exist. Accepting the shared token
-/// alongside them would leave the weaker path open forever, so issuing the
-/// first credential is what retires the old one.
+/// A minted credential is the only way in. There is no fleet-wide fallback and
+/// no open mode: an ingest endpoint that accepts anonymous results lets anyone
+/// post for checks they do not run, and a monitor that can be told what it saw
+/// is worse than no monitor, because it is believed.
 ///
-/// With neither configured this refuses. It used to accept: an ingest endpoint
-/// open to the world lets anyone post results for checks they do not run, and
-/// a monitor that can be told what it saw is worse than no monitor.
+/// A coordinator with no credentials accepts nothing from agents until an
+/// operator mints one. That is the intended first-run state, not a failure.
 // Boxed error: this is the ingest hot path, and an unboxed `Response` makes
 // every returned `Result` 128+ bytes to move on the success path too.
 fn authenticate_agent(
     coord: &Coordinator,
     headers: &HeaderMap,
-) -> Result<AgentCaller, Box<Response>> {
-    let presented = bearer(headers);
-    {
-        let creds = coord.inner.credentials.read();
-        if creds.values().any(|c| !c.revoked()) {
-            let matched = presented
-                .and_then(crate::credential::split)
-                .and_then(|(id, secret)| {
-                    creds
-                        .get(id)
-                        .filter(|c| crate::credential::verify(c, secret))
-                });
-            return match matched {
-                Some(c) => Ok(AgentCaller::Bound {
+) -> Result<AgentLocation, Box<Response>> {
+    bearer(headers)
+        .and_then(crate::credential::split)
+        .and_then(|(id, secret)| {
+            let creds = coord.inner.credentials.read();
+            creds
+                .get(id)
+                .filter(|c| crate::credential::verify(c, secret))
+                .map(|c| AgentLocation {
                     zone: c.zone.clone(),
                     region: c.region.clone(),
-                }),
-                None => Err(Box::new(error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "a valid agent credential is required",
-                ))),
-            };
-        }
-    }
-    if coord.inner.auth.agent_auth_enabled() && coord.inner.auth.agent_ok(presented) {
-        return Ok(AgentCaller::Shared);
-    }
-    Err(Box::new(error_response(
-        StatusCode::UNAUTHORIZED,
-        "agent authentication required",
-    )))
+                })
+        })
+        .ok_or_else(|| {
+            Box::new(error_response(
+                StatusCode::UNAUTHORIZED,
+                "a valid agent credential is required",
+            ))
+        })
 }
 
 /// Gate for `/internal/gossip`. Peers are infrastructure rather than agents, so
@@ -1892,20 +1886,10 @@ async fn agent_checks_handler(
     // agent can give. Record it before deciding, so the caller is part of the
     // fleet it is about to be placed within.
     {
-        // Placement is decided from this map, so a self-declared location is a
-        // way to be handed checks for a zone you are not in and then never
-        // probe them. A credential's location overrides what was asked for.
-        let (zone, region) = match &authenticated {
-            AgentCaller::Bound { zone, region } => (zone.clone(), region.clone()),
-            AgentCaller::Shared => (
-                q.zone
-                    .clone()
-                    .unwrap_or_else(crate::config::default_location),
-                q.region
-                    .clone()
-                    .unwrap_or_else(crate::config::default_location),
-            ),
-        };
+        // Placement is decided from this map, so a self-declared location would
+        // be a way to be handed checks for a zone you are not in and then never
+        // probe them. The credential decides; `?zone=`/`?region=` are ignored.
+        let (zone, region) = (authenticated.zone.clone(), authenticated.region.clone());
         let mut seen = coord.inner.seen.write();
         seen.insert(
             caller.to_string(),
@@ -1959,16 +1943,14 @@ async fn agent_checks_handler(
     Json(AgentChecksResponse { checks: mine }).into_response()
 }
 
-/// Who is asking for a check list, and from where.
+/// Who is asking for a check list.
 ///
-/// Location is sent on the request rather than looked up, because a first-boot
-/// agent has no stored history to look it up from — and that is exactly the
-/// moment it needs placing.
+/// Only the id: location is read off the caller's credential. It used to be
+/// sent on the request, which meant the value placement trusts was chosen by
+/// the party being placed.
 #[derive(Deserialize)]
 struct AgentIdentity {
     agent_id: Option<String>,
-    zone: Option<String>,
-    region: Option<String>,
 }
 
 // ---- Status-page sections ----
@@ -2410,10 +2392,7 @@ async fn mint_agent_credential_handler(
     }
     let now = chrono::Utc::now().timestamp_millis();
     let (record, token) = crate::credential::mint(zone, region, now);
-    if let Err(e) = coord.inner.storage.lock().insert_agent_credential(&record) {
-        return internal_error(e);
-    }
-    if let Err(e) = coord.reload_credentials() {
+    if let Err(e) = coord.store_credential(&record) {
         return internal_error(e);
     }
     info!(id = %record.id, zone, region, "minted agent credential");

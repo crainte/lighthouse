@@ -6,14 +6,25 @@
 # than carrying their own copy. Editing this file does not change a check that
 # already exists.
 #
-# Credentials come from the environment, never from this file:
+# Secrets come from the environment, never from this file:
 #   WARDEN_ADMIN_PASSWORD  unlocks the check editor (unset = editor disabled)
-#   WARDEN_AGENT_TOKEN     required for agents to post results and read targets
+#   WARDEN_PEER_TOKEN      coordinator-to-coordinator gossip; only needed in HA
+#
+# Agents are NOT authenticated by anything here. Each zone gets a credential
+# minted in Admin > Credentials, and a coordinator with none refuses every agent
+# request until one exists.
 
 [coordinator]
 listen = "0.0.0.0:8080"
 db_path = "/data/warden.duckdb"
-# alert_webhook = "https://hooks.slack.com/services/..."
+# Notification backends. Every notifier receives every alert.
+# [[coordinator.notifiers]]
+# type = "webhook"
+# url = "https://hooks.slack.com/services/..."
+#
+# [[coordinator.notifiers]]
+# type = "ntfy"
+# topic = "warden-alerts"
 
 [[checks]]
 name = "example-http"

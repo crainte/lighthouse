@@ -15,7 +15,10 @@ use warden::coordinator::Coordinator;
 use warden::notify::Notifier;
 
 const PASSWORD: &str = "correct horse battery staple";
-const AGENT_TOKEN: &str = "agent-shared-secret";
+/// A provisioned agent credential. Agents authenticate only with these now —
+/// there is no fleet-wide token — so the fixture mints one up front and every
+/// agent-facing call below presents it.
+const AGENT_TOKEN: &str = "wac_test.agent-shared-secret";
 
 fn spawn_server(coord: Coordinator) -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -33,18 +36,42 @@ fn spawn_server(coord: Coordinator) -> SocketAddr {
     addr
 }
 
+/// Provision one credential per zone and hand back the token for each.
+///
+/// This is the real provisioning model — location is bound to the credential —
+/// so a test that wants a multi-zone fleet has to hold a token per zone rather
+/// than declaring `?zone=` on the request.
+fn zone_tokens(
+    coord: &Coordinator,
+    zones: &[(&str, &str)],
+) -> std::collections::HashMap<String, String> {
+    zones
+        .iter()
+        .map(|(zone, region)| {
+            let token = format!("wac_{}.secret", zone.replace('-', "_"));
+            coord
+                .provision_agent_credential(&token, zone, region)
+                .unwrap();
+            ((*zone).to_string(), token)
+        })
+        .collect()
+}
+
 fn coordinator() -> Coordinator {
-    Coordinator::new(
+    let coord = Coordinator::new(
         &CoordinatorConfig {
             listen: "127.0.0.1:0".into(),
             db_path: ":memory:".into(),
             admin_password: Some(PASSWORD.into()),
-            agent_token: Some(AGENT_TOKEN.into()),
             ..Default::default()
         },
         &[],
     )
-    .unwrap()
+    .unwrap();
+    coord
+        .provision_agent_credential(AGENT_TOKEN, "test-zone", "test-region")
+        .unwrap();
+    coord
 }
 
 fn check_body(name: &str, target: &str) -> Value {
@@ -1430,25 +1457,27 @@ async fn a_twenty_agent_fleet_probes_each_check_once_per_zone() {
     // also exercises the cold-start path where liveness cannot come from
     // history.
     let mut fleet = Vec::new();
+    let mut zones = Vec::new();
     for region in ["us-east", "eu-west", "ap-south"] {
         for z in ["a", "b"] {
+            zones.push((format!("{region}-{z}"), region));
             for n in 0..3 {
                 fleet.push((format!("{region}-{z}-{n}"), format!("{region}-{z}"), region));
             }
         }
     }
     assert_eq!(fleet.len(), 18);
+    let zone_refs: Vec<(&str, &str)> = zones.iter().map(|(z, r)| (z.as_str(), *r)).collect();
+    let tokens = zone_tokens(&coord, &zone_refs);
 
     // The fleet is discovered by contact, so the first agent to poll is briefly
     // the only one the coordinator knows about and takes everything. That is
     // self-correcting rather than wrong — but it means steady state is what the
     // guarantee applies to, so the fleet introduces itself first.
-    for (agent_id, zone, region) in &fleet {
+    for (agent_id, zone, _region) in &fleet {
         client
-            .get(format!(
-                "{base}/api/v1/agent/checks?agent_id={agent_id}&zone={zone}&region={region}"
-            ))
-            .header("Authorization", format!("Bearer {AGENT_TOKEN}"))
+            .get(format!("{base}/api/v1/agent/checks?agent_id={agent_id}"))
+            .bearer_auth(&tokens[zone])
             .send()
             .await
             .unwrap()
@@ -1457,12 +1486,10 @@ async fn a_twenty_agent_fleet_probes_each_check_once_per_zone() {
     }
 
     let mut assigned: std::collections::BTreeMap<String, Vec<String>> = Default::default();
-    for (agent_id, zone, region) in &fleet {
+    for (agent_id, zone, _region) in &fleet {
         let body: Value = client
-            .get(format!(
-                "{base}/api/v1/agent/checks?agent_id={agent_id}&zone={zone}&region={region}"
-            ))
-            .header("Authorization", format!("Bearer {AGENT_TOKEN}"))
+            .get(format!("{base}/api/v1/agent/checks?agent_id={agent_id}"))
+            .bearer_auth(&tokens[zone])
             .send()
             .await
             .unwrap()
@@ -1518,15 +1545,18 @@ async fn scoping_a_check_to_a_region_keeps_it_out_of_the_others() {
         .error_for_status()
         .expect("check created");
 
-    let ask = |agent: &'static str, zone: &'static str, region: &'static str| {
+    let tokens = zone_tokens(
+        &coord,
+        &[("eu-west-a", "eu-west"), ("ap-south-a", "ap-south")],
+    );
+    let ask = |agent: &'static str, zone: &'static str, _region: &'static str| {
         let client = client.clone();
         let base = base.clone();
+        let token = tokens[zone].clone();
         async move {
             let v: Value = client
-                .get(format!(
-                    "{base}/api/v1/agent/checks?agent_id={agent}&zone={zone}&region={region}"
-                ))
-                .header("Authorization", format!("Bearer {AGENT_TOKEN}"))
+                .get(format!("{base}/api/v1/agent/checks?agent_id={agent}"))
+                .bearer_auth(token)
                 .send()
                 .await
                 .unwrap()
@@ -1604,7 +1634,6 @@ async fn a_hanging_notification_endpoint_cannot_stall_ingest() {
                 url: format!("http://{sink_addr}/"),
             }],
             admin_password: Some(PASSWORD.into()),
-            agent_token: Some(AGENT_TOKEN.into()),
             ..Default::default()
         },
         &[],

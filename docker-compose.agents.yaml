@@ -1,0 +1,62 @@
+# Probe fleet. Start this *after* the coordinator, and after minting a
+# credential for each zone:
+#
+#   docker compose -f docker-compose.agents.yaml up -d --build
+#
+# Agents authenticate with a per-zone credential minted in the coordinator's
+# admin UI (Admin -> Credentials). There is no shared fleet token. The
+# credential also decides the zone and region an agent reports from — whatever
+# `[agent]` claims locally is ignored — because placement acts on that location,
+# and an agent able to name its own zone could be handed checks it never runs.
+#
+# Put the minted values in .env:
+#
+#   WARDEN_AGENT_TOKEN_A=wac_....   credential for us-east-1a (agent-a)
+#   WARDEN_AGENT_TOKEN_B=wac_....   credential for eu-west-1a (agent-b)
+#
+# Agents in the same zone share that zone's credential, so scaling a zone means
+# adding a service with a fresh `agent_id` and the same token. Each replica
+# needs its own agent_id, which comes from the config file, so add a service
+# rather than using `--scale`.
+#
+# Separate from the core file because agents are the part that moves: in a real
+# deployment they run on other hosts entirely, and they have a different restart
+# and credential lifecycle from the thing that owns the database.
+
+services:
+  agent-a:
+    build: .
+    image: warden:latest
+    command: ["agent", "--config", "/etc/warden/agent.toml"]
+    volumes:
+      - ./deploy/agent-a.toml:/etc/warden/agent.toml:ro
+    environment:
+      WARDEN_AGENT_TOKEN: ${WARDEN_AGENT_TOKEN_A:-}
+    # ICMP checks need raw sockets; without this the icmp probe reports a
+    # permission error instead of silently passing.
+    cap_add:
+      - NET_RAW
+    restart: unless-stopped
+    networks:
+      - warden
+
+  agent-b:
+    build: .
+    image: warden:latest
+    command: ["agent", "--config", "/etc/warden/agent.toml"]
+    volumes:
+      - ./deploy/agent-b.toml:/etc/warden/agent.toml:ro
+    environment:
+      WARDEN_AGENT_TOKEN: ${WARDEN_AGENT_TOKEN_B:-}
+    cap_add:
+      - NET_RAW
+    restart: unless-stopped
+    networks:
+      - warden
+
+# Created by the core compose file; agents attach to it so `coordinator:8080`
+# resolves.
+networks:
+  warden:
+    name: warden
+    external: true

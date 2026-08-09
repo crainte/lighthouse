@@ -669,15 +669,14 @@ pub async fn sync_loop(cfg: AgentConfig, tx: mpsc::Sender<CheckResult>, initial:
     let client = reqwest::Client::new();
     // Identify ourselves so the coordinator can hand back only the checks this
     // agent is assigned, rather than every check it knows about.
-    // Location travels with the request: a first-boot agent has no stored
-    // history for the coordinator to look it up from, and that is precisely
-    // when it needs placing.
+    //
+    // Location is deliberately not sent. The coordinator reads it off this
+    // agent's credential, because placement acts on it and the party being
+    // placed should not get to choose.
     let url = format!(
-        "{}/api/v1/agent/checks?agent_id={}&zone={}&region={}",
-        cfg.coordinator_url,
-        urlencode(&cfg.agent_id),
-        urlencode(&cfg.zone),
-        urlencode(&cfg.region),
+        "{}/api/v1/agent/checks?agent_id={}",
+        cfg.coordinator_url.trim_end_matches('/'),
+        urlencode(&cfg.agent_id)
     );
     let token = cfg.resolved_token();
 

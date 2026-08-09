@@ -40,15 +40,17 @@ the fleet-wide token could register agents into a zone, have real checks placed
 on them, and never probe. Nothing alerts on that: "no results" reads exactly
 like "not scheduled yet", so monitoring goes quiet without a signal.
 
-Auth ladder on `/api/v1/results` and `/api/v1/agent/checks`:
-1. Any live credential exists → a credential is required, location comes from it.
-2. Otherwise `agent_token` (legacy, fleet-wide, self-asserted location).
-3. Neither → **401**. This used to accept.
+**A credential is the only way in.** No fleet-wide token, no open mode: a
+coordinator with no credentials refuses every agent request until an operator
+mints one. That is the intended first-run state, and it is why the compose files
+are split — the coordinator starts, you mint per zone, then agents start.
 
-Minting the first credential retires the shared token, so the weaker path cannot
-linger. `/internal/gossip` now takes `peer_token` (falls back to `agent_token`),
-because once agents hold minted credentials the shared token is no longer handed
-out.
+`/internal/gossip` takes its own `peer_token`. An agent credential must never
+open an endpoint that rewrites published state.
+
+Agent `[agent] zone`/`region` are authoritative in **standalone** mode only. In
+agent mode the coordinator overwrites them from the credential, and the agent no
+longer sends them on the check-list request at all.
 
 ## Ground rules worth keeping
 
@@ -101,7 +103,12 @@ suppression; disabling a check is currently the only way to stop probing.
   before revoking it. Sample it periodically rather than per request.
 - **Per-agent credentials**: current grain is per-zone, so an agent can still
   impersonate a sibling *within its own zone*. Only worth it if agents run on
-  hosts you do not control.
+  hosts you do not control. `Coordinator::provision_agent_credential` already
+  takes a chosen token, so per-agent provisioning needs no new primitive.
+- **Config seeding**: credentials can only be minted through the admin API, so
+  a fully unattended first boot is not possible today — something has to log in
+  once. `provision_agent_credential` is the hook if that ever needs to come from
+  config or an init container.
 
 ### 5. Smaller, known
 - `ponytail:` in `gossip.rs` — no anti-entropy. A peer unreachable when a
@@ -127,7 +134,7 @@ sensitive to it.
 
 | Gate | Expected |
 |---|---|
-| `cargo test` | 88 + 24 + 8 + 1 + 1 + 5 + 1 = 128 passed, 0 failed |
+| `cargo test` | 127 passed, 0 failed |
 | `cargo fmt --check` | clean |
 | `cargo clippy --all-targets` | 0 warnings |
 | `cd frontend && npx svelte-check --threshold error` | 213 files, 0 errors |

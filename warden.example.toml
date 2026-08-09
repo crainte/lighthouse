@@ -13,19 +13,25 @@ flush_secs = 5
 [coordinator]
 listen = "0.0.0.0:8080"
 db_path = "warden.duckdb"
-# alert_webhook = "https://hooks.slack.com/services/..."
+# Notification backends. Every notifier receives every alert.
+# [[coordinator.notifiers]]
+# type = "webhook"
+# url = "https://hooks.slack.com/services/..."
 
 # Secrets are better supplied by the environment than written here — this file
 # tends to end up in version control. Both fall back to an env var:
 #
 #   WARDEN_ADMIN_PASSWORD  unlocks the check editor. With neither this nor the
 #                          env var set, the editor is disabled rather than open.
-#   WARDEN_AGENT_TOKEN     required for agents to post results and to read the
-#                          check list (which contains probe targets). Leaving it
-#                          unset keeps those endpoints public.
+#   WARDEN_PEER_TOKEN      coordinator-to-coordinator gossip. Only needed when
+#                          `peers` is set. Unset means gossip is refused.
+#
+# Agents are not authenticated by anything in this file. Each zone gets a
+# credential minted in Admin > Credentials, and a coordinator with none refuses
+# every agent request until one exists — there is no shared token and no open
+# mode.
 #
 # admin_password = "change-me"
-# agent_token = "shared-with-every-agent"
 
 # --- HTTP -------------------------------------------------------------------
 # Default eval: any 2xx-3xx is UP.

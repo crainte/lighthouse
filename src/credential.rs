@@ -82,6 +82,26 @@ pub fn mint(zone: &str, region: &str, now: i64) -> (AgentCredential, String) {
     (record, token)
 }
 
+/// Build a credential from a token that already exists.
+///
+/// Minting invents the secret, which is right when an operator is standing at
+/// the UI. It is wrong when a zone's agents must be configured before the
+/// coordinator has ever run: then the value has to be one chosen in advance.
+/// `None` if the token is not shaped like one of ours.
+pub fn provision(token: &str, zone: &str, region: &str, now: i64) -> Option<AgentCredential> {
+    let (id, secret) = split(token)?;
+    let salt = random_hex(16);
+    Some(AgentCredential {
+        secret_hash: digest(&salt, secret),
+        salt,
+        id: id.to_owned(),
+        zone: zone.to_owned(),
+        region: region.to_owned(),
+        created_at: now,
+        revoked_at: None,
+    })
+}
+
 /// Split a presented token into its lookup handle and secret. `None` for
 /// anything that is not shaped like one of ours, so a legacy shared token is
 /// never mistaken for a malformed credential.
@@ -157,7 +177,21 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_shared_token_is_not_mistaken_for_a_credential() {
+    fn a_provisioned_token_is_the_one_the_operator_chose() {
+        let rec = provision("wac_seed.chosen-in-advance", "us-east-1a", "us-east", 5)
+            .expect("a well-formed token provisions");
+        assert_eq!(rec.id, "wac_seed");
+        assert_eq!(rec.zone, "us-east-1a");
+        assert!(verify(&rec, "chosen-in-advance"));
+        assert!(!verify(&rec, "something-else"));
+        assert!(
+            provision("not-a-warden-token", "z", "r", 5).is_none(),
+            "a malformed token must be refused, not silently reshaped"
+        );
+    }
+
+    #[test]
+    fn a_malformed_token_is_not_mistaken_for_a_credential() {
         assert!(split("agent-shared-secret").is_none());
         assert!(split("no-prefix.abc").is_none());
         assert!(split("wac_abc").is_none(), "missing separator");

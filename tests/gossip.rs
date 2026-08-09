@@ -28,8 +28,8 @@ use warden::coordinator::Coordinator;
 use warden::models::{CheckKind, CheckResult};
 use warden::notify::Notifier;
 
-/// Both nodes share the agent token, which is what peers authenticate with.
-const AGENT_TOKEN: &str = "cluster-shared-secret";
+/// Peers authenticate with their own secret, never an agent's.
+const PEER_TOKEN: &str = "cluster-peer-secret";
 const CHECK: &str = "web";
 
 type Sink = Arc<Mutex<Vec<Value>>>;
@@ -73,7 +73,7 @@ fn coordinator(alerts_to: SocketAddr, peers: Vec<String>) -> Coordinator {
             notifiers: vec![Notifier::Webhook {
                 url: format!("http://{alerts_to}/"),
             }],
-            agent_token: Some(AGENT_TOKEN.into()),
+            peer_token: Some(PEER_TOKEN.into()),
             peers,
             ..Default::default()
         },
@@ -231,7 +231,7 @@ async fn gossip_is_not_anonymously_writable() {
     // about authentication and not a malformed request.
     let authenticated = reqwest::Client::new()
         .post(format!("http://{addr}/internal/gossip"))
-        .bearer_auth(AGENT_TOKEN)
+        .bearer_auth(PEER_TOKEN)
         .json(&forged)
         .send()
         .await
@@ -285,7 +285,7 @@ async fn recovery_replicates_too() {
 async fn gossip_to(addr: SocketAddr, from: &str, to: &str, ts: i64) {
     let r = reqwest::Client::new()
         .post(format!("http://{addr}/internal/gossip"))
-        .bearer_auth(AGENT_TOKEN)
+        .bearer_auth(PEER_TOKEN)
         .json(&serde_json::json!({
             "check_id": CHECK, "from": from, "to": to, "timestamp": ts,
         }))
