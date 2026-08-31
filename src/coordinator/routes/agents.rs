@@ -76,6 +76,29 @@ struct AgentDto {
     kinds: Option<Vec<String>>,
 }
 
+/// What one agent last said about itself, from either half of the fleet view:
+/// a local poll, or a peer's replicated poll row.
+struct Declared {
+    rtt_ms: Option<i64>,
+    build: Option<String>,
+    /// Wire names as sent, not parsed — a kind this node has never heard of
+    /// must survive being displayed and compared.
+    kinds: Option<Vec<String>>,
+}
+
+/// Split a declared kind list into its wire names.
+///
+/// An empty string yields an empty list, which is meaningful: the agent
+/// answered the question with "nothing". Only an absent parameter means
+/// "never said", and that is the caller's `Option` to hold.
+fn split_kinds(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 pub(in crate::coordinator) async fn ingest_handler(
     State(coord): State<Coordinator>,
     headers: HeaderMap,
@@ -143,14 +166,49 @@ pub(in crate::coordinator) async fn agents_handler(
         .map(|(name, _)| name.clone())
         .collect();
 
-    // What each agent said about itself on its last poll here. Snapshot once
-    // rather than lock per row.
+    // What each agent said about itself on its last poll, wherever it polled.
     //
-    // Capability is local knowledge: it arrives on a poll, and a poll goes to
-    // one coordinator. An agent polling a peer has no declaration here and is
-    // read as capable of anything — the same assumption made of an agent that
-    // predates declaring, so it under-reports rather than inventing a fault.
-    let declared = coord.inner.seen.read().clone();
+    // Replicated poll rows first, local `seen` over the top: a declaration
+    // arrives on a poll and a poll goes to one coordinator, so without the
+    // replicated half an operator would see builds and capabilities only for
+    // the agents that happen to poll the node they opened. Local is preferred
+    // where both exist, being at most one gossip tick fresher.
+    //
+    // Kinds stay as the wire names the agent sent, unparsed. A peer may
+    // legitimately name a kind this node has never heard of, and narrowing to
+    // the kinds this binary knows would make an agent look less capable here
+    // than on the node it actually polls.
+    let mut declared: std::collections::HashMap<String, Declared> = coord
+        .inner
+        .storage
+        .lock()
+        .list_agent_polls()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| {
+            (
+                p.agent_id,
+                Declared {
+                    rtt_ms: p.rtt_ms,
+                    build: p.build,
+                    kinds: p.kinds.map(|k| split_kinds(&k)),
+                },
+            )
+        })
+        .collect();
+    declared.extend(coord.inner.seen.read().iter().map(|(id, s)| {
+        (
+            id.clone(),
+            Declared {
+                rtt_ms: s.rtt_ms,
+                build: s.build.clone(),
+                kinds: s
+                    .kinds
+                    .as_ref()
+                    .map(|ks| ks.iter().map(|k| k.as_db().to_string()).collect()),
+            },
+        )
+    }));
 
     let unrunnable: Vec<String> = coord
         .inner
@@ -171,37 +229,23 @@ pub(in crate::coordinator) async fn agents_handler(
                 && eligible.iter().all(|id| {
                     declared
                         .get(*id)
-                        .and_then(|s| s.kinds.as_ref())
+                        .and_then(|d| d.kinds.as_ref())
                         // Silence is not a refusal: an agent that never
                         // declared must not be counted as declining, or a
                         // fleet that has said nothing would report every
                         // check unrunnable.
-                        .is_some_and(|kinds| !kinds.contains(&m.kind))
+                        .is_some_and(|kinds| !kinds.iter().any(|k| k == m.kind.as_db()))
                 })
         })
         .map(|(name, _)| name.clone())
         .collect();
 
-    // Poll RTT is not on the persisted agent rows, so join it in by id.
-    // The replicated poll rows come first and local `seen` overrides them: an
-    // agent polling a peer would otherwise show a blank RTT here, which reads
-    // as "never answered".
-    let mut rtt_by_id: std::collections::HashMap<String, Option<i64>> = coord
-        .inner
-        .storage
-        .lock()
-        .list_agent_polls()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|p| (p.agent_id, p.rtt_ms))
-        .collect();
-    rtt_by_id.extend(declared.iter().map(|(id, s)| (id.clone(), s.rtt_ms)));
     let agents = rows
         .into_iter()
         .map(|r| {
             let silence = now - r.last_seen;
-            let poll_rtt_ms = rtt_by_id.get(&r.agent_id).copied().flatten();
             let said = declared.get(&r.agent_id);
+            let poll_rtt_ms = said.and_then(|d| d.rtt_ms);
             AgentDto {
                 zone: r.zone.clone(),
                 region: r.region.clone(),
@@ -223,12 +267,8 @@ pub(in crate::coordinator) async fn agents_handler(
                 checks_reporting: r.checks_reporting,
                 results_24h: r.results_24h,
                 poll_rtt_ms,
-                version: said.and_then(|s| s.build.clone()),
-                kinds: said.and_then(|s| {
-                    s.kinds
-                        .as_ref()
-                        .map(|ks| ks.iter().map(|k| k.as_db().to_string()).collect())
-                }),
+                version: said.and_then(|d| d.build.clone()),
+                kinds: said.and_then(|d| d.kinds.clone()),
             }
         })
         .collect();
@@ -477,12 +517,10 @@ pub(in crate::coordinator) struct AgentIdentity {
 /// because an agent *newer* than its coordinator is a legitimate ordering too —
 /// it can simply never be assigned a kind this node has no checks of.
 fn declared_kinds(raw: Option<&str>) -> Option<Vec<crate::models::CheckKind>> {
-    let raw = raw?;
     Some(
-        raw.split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .filter_map(crate::models::CheckKind::parse)
+        split_kinds(raw?)
+            .iter()
+            .filter_map(|k| crate::models::CheckKind::parse(k))
             .collect(),
     )
 }

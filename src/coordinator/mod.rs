@@ -1163,6 +1163,14 @@ impl Coordinator {
                         at: s.at,
                         window_ms: s.window_ms,
                         rtt_ms: s.rtt_ms,
+                        build: s.build.clone(),
+                        // Back to the wire form it arrived as: peers must see
+                        // the kinds the agent named, not the subset this
+                        // binary happens to recognise.
+                        kinds: s
+                            .kinds
+                            .as_ref()
+                            .map(|ks| ks.iter().map(|k| k.as_db()).collect::<Vec<_>>().join(",")),
                     })
                     .collect();
                 if snapshot.is_empty() {
@@ -1171,14 +1179,7 @@ impl Coordinator {
                 {
                     let store = coord.inner.storage.lock();
                     for p in &snapshot {
-                        if let Err(e) = store.record_agent_poll(
-                            &p.agent_id,
-                            &p.zone,
-                            &p.region,
-                            p.at,
-                            p.window_ms,
-                            p.rtt_ms,
-                        ) {
+                        if let Err(e) = store.record_agent_poll(p) {
                             tracing::warn!(error = %e, agent = %p.agent_id, "could not persist agent poll");
                         }
                     }
@@ -1641,14 +1642,7 @@ impl Coordinator {
             // Poll rows are a merge on `polled_at`, so a stale batch cannot
             // un-see a live agent and applying the same batch twice is a no-op.
             for p in &batch.polls {
-                if let Err(e) = store.record_agent_poll(
-                    &p.agent_id,
-                    &p.zone,
-                    &p.region,
-                    p.at,
-                    p.window_ms,
-                    p.rtt_ms,
-                ) {
+                if let Err(e) = store.record_agent_poll(p) {
                     tracing::warn!(error = %e, agent = %p.agent_id, "replicate: failed to persist agent poll");
                 }
             }

@@ -667,6 +667,20 @@ pub struct AgentPollRow {
     pub at: i64,
     pub window_ms: i64,
     pub rtt_ms: Option<i64>,
+    /// What the agent reported it is running, for the same reason the rest of
+    /// this row travels: an operator on any node should see the whole fleet,
+    /// not only the agents that happen to poll the node they opened.
+    #[serde(default)]
+    pub build: Option<String>,
+    /// Check kinds the agent declared, comma-separated as it sent them.
+    ///
+    /// `None` means it never declared — read as "anything", never as
+    /// "nothing". Stored as the wire string rather than parsed: a peer may
+    /// legitimately name a kind this node has never heard of, and reducing that
+    /// to the kinds this binary knows would make an agent look less capable on
+    /// one node than on another for no reason but build order.
+    #[serde(default)]
+    pub kinds: Option<String>,
 }
 
 impl Storage {
@@ -692,7 +706,7 @@ impl Storage {
                 let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
                 rows.collect::<std::result::Result<_, _>>()?
             };
-            if !cols.is_empty() && !cols.iter().any(|c| c == "window_ms") {
+            if !cols.is_empty() && !cols.iter().any(|c| c == "declared_kinds") {
                 conn.execute_batch("DROP TABLE agent_polls")?;
             }
         }
@@ -921,7 +935,14 @@ impl Storage {
                 -- column name differing from the Rust field it backs.
                 polled_at BIGINT  NOT NULL,
                 window_ms BIGINT  NOT NULL,
-                rtt_ms    BIGINT
+                rtt_ms    BIGINT,
+                -- What the agent said it is, on its last poll to whichever node
+                -- it polls. Nullable: an agent predating either declaration
+                -- reports neither, and absent must not read as none-at-all.
+                build     VARCHAR,
+                -- Comma-separated wire names, stored unparsed so a kind this
+                -- node has never heard of survives the round trip.
+                declared_kinds VARCHAR
             );
             -- An incident delete is replicated state for the same reason a
             -- config delete is: an absence alone cannot be told apart from
@@ -3415,18 +3436,10 @@ impl Storage {
     /// and a stale one arriving late must not un-see a live agent. Read then
     /// write is safe without a transaction because DuckDB is single-writer and
     /// the caller already holds the storage mutex.
-    pub fn record_agent_poll(
-        &self,
-        agent_id: &str,
-        zone: &str,
-        region: &str,
-        at: i64,
-        window_ms: i64,
-        rtt_ms: Option<i64>,
-    ) -> Result<()> {
+    pub fn record_agent_poll(&self, row: &AgentPollRow) -> Result<()> {
         let newer_stored: i64 = self.conn.query_row(
             "SELECT count(*) FROM agent_polls WHERE agent_id = ? AND polled_at >= ?",
-            duckdb::params![agent_id, at],
+            duckdb::params![row.agent_id, row.at],
             |r| r.get(0),
         )?;
         if newer_stored > 0 {
@@ -3434,9 +3447,18 @@ impl Storage {
         }
         self.conn.execute(
             "INSERT OR REPLACE INTO agent_polls
-                 (agent_id, zone, region, polled_at, window_ms, rtt_ms)
-             VALUES (?, ?, ?, ?, ?, ?)",
-            duckdb::params![agent_id, zone, region, at, window_ms, rtt_ms],
+                 (agent_id, zone, region, polled_at, window_ms, rtt_ms, build, declared_kinds)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            duckdb::params![
+                row.agent_id,
+                row.zone,
+                row.region,
+                row.at,
+                row.window_ms,
+                row.rtt_ms,
+                row.build,
+                row.kinds,
+            ],
         )?;
         Ok(())
     }
@@ -3456,7 +3478,8 @@ impl Storage {
     /// replicating it to peers.
     pub fn list_agent_polls(&self) -> Result<Vec<AgentPollRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT agent_id, zone, region, polled_at, window_ms, rtt_ms FROM agent_polls",
+            "SELECT agent_id, zone, region, polled_at, window_ms, rtt_ms, build, declared_kinds
+             FROM agent_polls",
         )?;
         let rows = stmt
             .query_map([], |row| {
@@ -3467,6 +3490,8 @@ impl Storage {
                     at: row.get(3)?,
                     window_ms: row.get(4)?,
                     rtt_ms: row.get(5)?,
+                    build: row.get(6)?,
+                    kinds: row.get(7)?,
                 })
             })?
             .collect::<std::result::Result<_, _>>()?;
@@ -5356,14 +5381,33 @@ mod tests {
 
     // ---- Clustering: fleet health ----
 
+    fn poll(agent_id: &str, zone: &str, region: &str, at: i64, window_ms: i64) -> AgentPollRow {
+        AgentPollRow {
+            agent_id: agent_id.into(),
+            zone: zone.into(),
+            region: region.into(),
+            at,
+            window_ms,
+            rtt_ms: None,
+            build: None,
+            kinds: None,
+        }
+    }
+
     #[test]
     fn agent_polls_are_recorded_per_agent_and_replace_on_re_poll() {
         let s = Storage::open(":memory:").unwrap();
-        s.record_agent_poll("agent-a", "z1", "r1", 1000, 90_000, Some(20))
-            .unwrap();
-        s.record_agent_poll("agent-a", "z1", "r1", 2000, 90_000, Some(15))
-            .unwrap();
-        s.record_agent_poll("agent-b", "z2", "r2", 1500, 30_000, None)
+        s.record_agent_poll(&AgentPollRow {
+            rtt_ms: Some(20),
+            ..poll("agent-a", "z1", "r1", 1000, 90_000)
+        })
+        .unwrap();
+        s.record_agent_poll(&AgentPollRow {
+            rtt_ms: Some(15),
+            ..poll("agent-a", "z1", "r1", 2000, 90_000)
+        })
+        .unwrap();
+        s.record_agent_poll(&poll("agent-b", "z2", "r2", 1500, 30_000))
             .unwrap();
 
         let mut polls = s.list_agent_polls().unwrap();
@@ -5381,23 +5425,57 @@ mod tests {
     #[test]
     fn an_older_agent_poll_never_overwrites_a_newer_one() {
         let s = Storage::open(":memory:").unwrap();
-        s.record_agent_poll("agent-a", "z1", "r1", 5000, 90_000, Some(11))
-            .unwrap();
+        s.record_agent_poll(&AgentPollRow {
+            rtt_ms: Some(11),
+            build: Some("0.2.0".into()),
+            ..poll("agent-a", "z1", "r1", 5000, 90_000)
+        })
+        .unwrap();
         // A peer's batch arriving late. Replication is unordered, so this is
         // the normal case rather than an edge one.
-        s.record_agent_poll("agent-a", "z1", "r1", 1000, 90_000, Some(99))
-            .unwrap();
+        s.record_agent_poll(&AgentPollRow {
+            rtt_ms: Some(99),
+            build: Some("0.1.0".into()),
+            ..poll("agent-a", "z1", "r1", 1000, 90_000)
+        })
+        .unwrap();
 
         let polls = s.list_agent_polls().unwrap();
         assert_eq!(polls.len(), 1);
         assert_eq!(polls[0].at, 5000, "the stale row lost");
         assert_eq!(polls[0].rtt_ms, Some(11));
+        assert_eq!(
+            polls[0].build.as_deref(),
+            Some("0.2.0"),
+            "a stale row must not roll the reported build backwards either"
+        );
+    }
+
+    #[test]
+    fn a_declaration_survives_the_round_trip_unparsed() {
+        // Stored as the agent sent it, so a kind this node has never heard of
+        // still reaches the fleet view rather than being narrowed away to the
+        // kinds this particular binary happens to know.
+        let s = Storage::open(":memory:").unwrap();
+        s.record_agent_poll(&AgentPollRow {
+            build: Some("0.3.0 (abc123, built 2026-08-31 00:00:00 UTC)".into()),
+            kinds: Some("http,tcp,warp-drive".into()),
+            ..poll("agent-a", "z1", "r1", 1000, 90_000)
+        })
+        .unwrap();
+
+        let polls = s.list_agent_polls().unwrap();
+        assert_eq!(polls[0].kinds.as_deref(), Some("http,tcp,warp-drive"));
+        assert_eq!(
+            polls[0].build.as_deref(),
+            Some("0.3.0 (abc123, built 2026-08-31 00:00:00 UTC)")
+        );
     }
 
     #[test]
     fn purging_an_agent_drops_its_poll_row() {
         let s = Storage::open(":memory:").unwrap();
-        s.record_agent_poll("agent-a", "z1", "r1", 1000, 90_000, None)
+        s.record_agent_poll(&poll("agent-a", "z1", "r1", 1000, 90_000))
             .unwrap();
         s.purge_agent("agent-a").unwrap();
         assert!(

@@ -408,6 +408,10 @@ mod fleet_tests {
             at: NOW - ago_ms,
             window_ms: unreachable_after_ms(3, Some(poll_secs)),
             rtt_ms: Some(7),
+            // Liveness roll-up is what these tests are about; what an agent can
+            // probe never enters it.
+            build: None,
+            kinds: None,
         }
     }
 
