@@ -53,6 +53,16 @@ export interface Agent {
   /** Round-trip of the agent's last poll, ms, as it measured it. `null` for an
    *  agent seen only via reported results, never a live poll. */
   poll_rtt_ms: number | null;
+  /** The build it reported on its last poll here. `null` for an agent that
+   *  predates build reporting, or one polling a peer coordinator rather than
+   *  this one — capability and build arrive on a poll, and a poll goes to a
+   *  single node. */
+  version: string | null;
+  /** Check kinds it says it can probe. `null` means it never said, which is
+   *  read as "anything" rather than "nothing": every agent predating capability
+   *  negotiation reports nothing, and treating that as incapable would empty
+   *  the fleet on upgrade. */
+  kinds: string[] | null;
 }
 
 export interface AgentsResponse {
@@ -60,6 +70,10 @@ export interface AgentsResponse {
   /** Enabled checks pinned only to agents that have gone silent. Nothing runs
    *  them and nothing else reports it, so this is the one place it surfaces. */
   checks_with_no_live_agent: string[];
+  /** Enabled checks whose every eligible agent is present and reporting but has
+   *  said it cannot probe that kind. Distinct from the list above because the
+   *  remedy differs: those agents are not missing, they are out of date. */
+  checks_no_agent_can_run: string[];
 }
 
 /** Agent liveness on the public page. Three states, unlike a check's `Status`:

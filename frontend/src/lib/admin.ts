@@ -588,6 +588,14 @@ export interface ClusterMember {
    *  `ClusterResponse.now`, not the browser's clock, to read it as an age. */
   last_seen: number;
   state: ClusterState;
+  /** What that node reported it is running. Absent for a peer on a build that
+   *  predates reporting one, or for an entry restored from disk that no ping
+   *  has refreshed yet — builds are deliberately not persisted, since a stored
+   *  one describes a process that may since have been replaced. */
+  build?: string | null;
+  /** The peer wire protocol that node speaks. Absent from a peer predating the
+   *  field. Nothing is gated on it; a mismatch is a diagnosis, not a refusal. */
+  protocol?: number | null;
 }
 
 /** A standalone coordinator answers with `members: []` rather than failing the

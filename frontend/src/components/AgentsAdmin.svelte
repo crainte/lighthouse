@@ -19,6 +19,9 @@
 
   let agents = $state<Agent[]>([]);
   let orphaned = $state<string[]>([]);
+  // Separate from `orphaned` because the remedy is different: those agents are
+  // not missing, they are too old to run the kind they were given.
+  let unrunnable = $state<string[]>([]);
   let loading = $state(true);
   let loadError = $state<string | null>(null);
   let expired = $state(false);
@@ -326,6 +329,7 @@
       const r = await fetchAgents();
       agents = r.agents;
       orphaned = r.checks_with_no_live_agent;
+      unrunnable = r.checks_no_agent_can_run;
     } catch (e) {
       loadError = fail(e);
     } finally {
@@ -401,6 +405,26 @@
       <div class="orphan-list">
         <!-- Check names are map keys server-side, so they cannot repeat. -->
         {#each orphaned as n (n)}
+          <button class="orphan-link" onclick={() => onopen(n)}>{n}</button>
+        {/each}
+      </div>
+    </div>
+  {/if}
+
+  {#if unrunnable.length > 0}
+    <div class="admin-panel orphans">
+      <div class="orphan-title">
+        {unrunnable.length}
+        {unrunnable.length === 1 ? 'check needs' : 'checks need'} a newer agent
+      </div>
+      <p class="orphan-note">
+        Every agent eligible for these is reporting normally but has said it cannot probe that check
+        type — it was built before the type existed. The check is assigned and silent, which looks
+        exactly like a check nobody has got to yet. Upgrade those agents, or assign these to agents
+        that can run them.
+      </p>
+      <div class="orphan-list">
+        {#each unrunnable as n (n)}
           <button class="orphan-link" onclick={() => onopen(n)}>{n}</button>
         {/each}
       </div>
@@ -624,8 +648,14 @@
                 </tr>
               {:else}
                 <tr class="agent-row" class:retired={row.agent.retired}>
-                  <td title={row.agent.agent_id}>
+                  <td title={row.agent.version ?? row.agent.agent_id}>
                     <span class="agent-pill">{row.agent.agent_id}</span>
+                    <!-- The build goes under the id rather than in a column of
+                         its own: it is read when one agent behaves unlike its
+                         neighbours, not scanned down the table. -->
+                    {#if row.agent.version}
+                      <span class="agent-build">{row.agent.version}</span>
+                    {/if}
                   </td>
                   <td class="dim" class:amber={row.agent.region === UNKNOWN_LOCATION}>
                     {placeName(row.agent.region)}
@@ -977,6 +1007,15 @@
     overflow: hidden;
     text-overflow: ellipsis;
     vertical-align: bottom;
+  }
+  .agent-build {
+    display: block;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.7rem;
+    color: var(--text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .state {
     color: var(--text-dim);

@@ -27,6 +27,24 @@
     }
   }
 
+  // A cluster mid-upgrade is the normal state during a deploy and a fault only
+  // if it stays that way, so this reports rather than alarms: peers running
+  // something other than this node get marked, and nothing is blocked.
+  let skewed = $derived(
+    cluster
+      ? cluster.members.filter(
+          (m) => m.state !== 'dead' && m.build && m.build !== cluster!.self.build,
+        )
+      : [],
+  );
+
+  // Silence is not disagreement. A peer too old to report a build cannot be
+  // compared, and counting it as skewed would flag every cluster that has not
+  // finished its first upgrade to a build that reports one.
+  let unreported = $derived(
+    cluster ? cluster.members.filter((m) => m.state !== 'dead' && !m.build).length : 0,
+  );
+
   function fail(e: unknown): string {
     const message = e instanceof Error ? e.message : String(e);
     if (e instanceof AdminError && e.unauthorized) {
@@ -88,7 +106,35 @@
         {cluster.members.filter((m) => m.state === 'alive').length} alive
       </div>
     </div>
+    <div class="stat-card">
+      <div class="stat-label">Build</div>
+      <div class="stat-value cluster-id" title={cluster.self.build ?? ''}>
+        {cluster.self.build ?? 'unknown'}
+      </div>
+      <div class="stat-sub">
+        {#if skewed.length > 0}
+          <span class="amber"
+            >{skewed.length}
+            {skewed.length === 1 ? 'peer runs' : 'peers run'} something else</span
+          >
+        {:else if unreported > 0}
+          {unreported}
+          {unreported === 1 ? 'peer does' : 'peers do'} not report one
+        {:else}
+          whole cluster matches
+        {/if}
+      </div>
+    </div>
   </div>
+
+  {#if skewed.length > 0}
+    <p class="admin-muted skew-note">
+      Peers are running a different build from this node. That is expected while a rolling upgrade
+      is in progress and worth investigating if it persists: an agent polling an older coordinator
+      can be handed a different set of checks, and a coordinator older than the one that configured
+      a check may not understand every field on it.
+    </p>
+  {/if}
 
   {#if cluster.members.length === 0}
     <p class="admin-muted">Clustering is not configured — this coordinator is standalone.</p>
@@ -99,6 +145,7 @@
         <span>Node</span>
         <span>URL</span>
         <span>State</span>
+        <span>Build</span>
         <span>Last seen</span>
       </div>
       <div class="ot-row">
@@ -108,6 +155,9 @@
         </span>
         <span class="field-note">{cluster.self.url}</span>
         <span><span class="opill {tone(cluster.self.state)}">{cluster.self.state}</span></span>
+        <span class="field-note build-cell" title={cluster.self.build ?? ''}>
+          {cluster.self.build ?? '—'}
+        </span>
         <span class="field-note" title={formatAbsolute(cluster.self.last_seen)}>
           {formatRelativeTime(cluster.self.last_seen, now)}
         </span>
@@ -117,6 +167,18 @@
           <span class="node-cell"><span class="ot-id">{m.node_id}</span></span>
           <span class="field-note">{m.url}</span>
           <span><span class="opill {tone(m.state)}">{m.state}</span></span>
+          <span
+            class="field-note build-cell"
+            title={m.build ?? 'this peer does not report a build'}
+          >
+            {#if !m.build}
+              —
+            {:else if m.build === cluster.self.build}
+              {m.build}
+            {:else}
+              <span class="amber">{m.build}</span>
+            {/if}
+          </span>
           <span class="field-note" title={formatAbsolute(m.last_seen)}>
             {formatRelativeTime(m.last_seen, now)}
           </span>
@@ -128,8 +190,18 @@
 
 <style>
   .otable {
-    --ot-cols: minmax(8rem, 1.3fr) minmax(10rem, 2fr) 6.5rem 8rem;
+    --ot-cols: minmax(8rem, 1.3fr) minmax(9rem, 1.5fr) 6.5rem minmax(9rem, 1.6fr) 8rem;
     margin-top: 1rem;
+  }
+  .skew-note {
+    margin-top: 0.75rem;
+  }
+  .build-cell {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.78rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .cluster-id {
     font-size: 1.05rem;
