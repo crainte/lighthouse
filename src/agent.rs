@@ -838,7 +838,19 @@ pub async fn sync_loop(cfg: AgentConfig, tx: mpsc::Sender<CheckResult>, initial:
         last_rtt_ms = Some(started.elapsed().as_millis());
         let fetched = match sent {
             Ok(r) if r.status().is_success() => match r.json::<AgentChecksResponse>().await {
-                Ok(body) => body.checks,
+                Ok(body) => {
+                    let (usable, skipped) = usable_checks(body.checks);
+                    if !skipped.is_empty() {
+                        // Loud, because the operator assigned these and they are
+                        // not running: the coordinator is ahead of this agent and
+                        // the fix is to upgrade it.
+                        warn!(
+                            checks = %skipped.join(", "),
+                            "skipping checks this agent is too old to run; upgrade it"
+                        );
+                    }
+                    usable
+                }
                 Err(e) => {
                     warn!(error = %e, "malformed check list from coordinator");
                     continue;
@@ -904,9 +916,45 @@ fn same_checks(a: &[CheckConfig], b: &[CheckConfig]) -> bool {
 }
 
 /// Wire shape of `/api/v1/agent/checks`.
+///
+/// Checks stay raw until each one is known to parse, because a coordinator is
+/// upgraded before its fleet is. A newer coordinator can legitimately describe
+/// a check kind this binary has never heard of, and deserialising the list as
+/// `Vec<CheckConfig>` made that one unknown kind reject the *whole document* —
+/// serde has no per-element recovery. The agent then kept its previous set
+/// forever and silently ignored every later edit, while still probing and
+/// reporting, so the fleet looked healthy the entire time.
+///
+/// Parsing element by element costs exactly the checks this binary cannot
+/// represent, and nothing else.
 #[derive(serde::Deserialize)]
 struct AgentChecksResponse {
-    checks: Vec<CheckConfig>,
+    checks: Vec<serde_json::Value>,
+}
+
+/// The checks this agent can actually run, and a name for each one it had to
+/// drop. A dropped check is not an error: it is this agent being older than the
+/// coordinator, which is the normal state during a rolling upgrade.
+fn usable_checks(raw: Vec<serde_json::Value>) -> (Vec<CheckConfig>, Vec<String>) {
+    let mut usable = Vec::with_capacity(raw.len());
+    let mut skipped = Vec::new();
+    for value in raw {
+        // Named before parsing, so the warning can say which check was dropped
+        // even though the thing that failed to parse is the check itself.
+        let name = value
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("<unnamed>")
+            .to_string();
+        match serde_json::from_value::<CheckConfig>(value) {
+            Ok(c) => usable.push(c),
+            Err(e) => {
+                debug!(check = %name, error = %e, "cannot represent this check");
+                skipped.push(name);
+            }
+        }
+    }
+    (usable, skipped)
 }
 
 /// Batch results and POST them to a remote coordinator (agent mode).
@@ -982,7 +1030,7 @@ pub async fn poster_loop(cfg: AgentConfig, mut rx: mpsc::Receiver<CheckResult>) 
 
 #[cfg(test)]
 mod sync_tests {
-    use super::same_checks;
+    use super::{same_checks, usable_checks};
     use crate::config::CheckConfig;
 
     fn dns_check() -> CheckConfig {
@@ -1088,6 +1136,59 @@ mod sync_tests {
         let mut b = dns_check();
         b.name = "b".into();
         assert!(same_checks(&[a.clone(), b.clone()], &[b, a]));
+    }
+
+    #[test]
+    fn an_unknown_kind_costs_only_its_own_check() {
+        // The reported failure. A coordinator that learned a new probe type
+        // hands it to an agent that predates it. Deserialising the list as a
+        // whole rejected every check over the one it could not name, and the
+        // agent then ran its previous set forever without saying so.
+        let raw = vec![
+            serde_json::json!({ "name": "api", "type": "http", "target": "https://example.com" }),
+            serde_json::json!({ "name": "exporter", "type": "openmetrics", "target": "http://x/metrics" }),
+            serde_json::json!({ "name": "db", "type": "tcp", "target": "db:5432" }),
+        ];
+
+        let (usable, skipped) = usable_checks(raw);
+
+        assert_eq!(
+            usable.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["api", "exporter", "db"],
+            "every kind this binary knows must survive the poll"
+        );
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn a_kind_from_the_future_is_dropped_by_name() {
+        // What a rolling upgrade actually looks like from the old side: the
+        // coordinator is ahead, one check cannot be represented, and the
+        // operator needs it named because they assigned it and it is not
+        // running.
+        let raw = vec![
+            serde_json::json!({ "name": "api", "type": "http", "target": "https://example.com" }),
+            serde_json::json!({ "name": "warehouse", "type": "not-a-kind-yet", "target": "pg:5432" }),
+        ];
+
+        let (usable, skipped) = usable_checks(raw);
+
+        assert_eq!(usable.len(), 1);
+        assert_eq!(usable[0].name, "api");
+        assert_eq!(skipped, ["warehouse"], "the drop must be attributable");
+    }
+
+    #[test]
+    fn a_check_too_broken_to_name_still_reports() {
+        // Not every unparseable element is a future kind; a truncated or
+        // mangled document has no name to blame. Silence would be worse than
+        // an anonymous warning, so it is still counted.
+        let raw = vec![serde_json::json!({ "type": "http" }), serde_json::json!(7)];
+
+        let (usable, skipped) = usable_checks(raw);
+
+        assert!(usable.is_empty());
+        assert_eq!(skipped, ["<unnamed>", "<unnamed>"]);
     }
 }
 
