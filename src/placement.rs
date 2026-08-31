@@ -17,11 +17,20 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 /// An agent as the placement logic sees it: an identity and a location.
+///
+/// Capability is carried but not consulted here. `assign` answers one question
+/// — given these agents, which of them take this check — and the caller decides
+/// which agents were eligible to be offered it in the first place. Folding both
+/// into `assign` would make its distribution tests depend on kind eligibility
+/// they are not about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Agent {
     pub agent_id: String,
     pub zone: String,
     pub region: String,
+    /// Check kinds this agent can probe, or `None` when it has not said —
+    /// an agent predating capability negotiation, which runs anything.
+    pub kinds: Option<Vec<crate::models::CheckKind>>,
 }
 
 /// Where a check should run.
@@ -143,6 +152,9 @@ mod tests {
                 agent_id: (*id).into(),
                 zone: (*zone).into(),
                 region: (*region).into(),
+                // Distribution is what these tests are about; eligibility is
+                // decided before `assign` is ever called.
+                kinds: None,
             })
             .collect()
     }
@@ -158,6 +170,7 @@ mod tests {
                         agent_id: format!("{region}-{zone}-{n}"),
                         zone: format!("{region}-{zone}"),
                         region: region.into(),
+                        kinds: None,
                     });
                 }
             }

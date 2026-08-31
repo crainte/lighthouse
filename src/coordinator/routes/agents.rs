@@ -41,6 +41,11 @@ struct AgentsResponse {
     /// Checks pinned only to agents that are not reporting. They are configured
     /// and enabled but nothing is running them, which is otherwise silent.
     checks_with_no_live_agent: Vec<String>,
+    /// Checks whose every eligible agent is present and reporting but has said
+    /// it cannot probe that kind — a fleet older than the coordinator that
+    /// configured them. Distinct from the list above because the remedy is
+    /// different: those agents are not missing, they are out of date.
+    checks_no_agent_can_run: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -63,6 +68,12 @@ struct AgentDto {
     /// Round-trip of its last poll, ms, as the agent measured it. `None` for an
     /// agent seen only through reported results, never a live poll.
     poll_rtt_ms: Option<i64>,
+    /// The build it reported on its last poll here. `None` for an agent that
+    /// predates build reporting, or one polling a peer rather than this node.
+    version: Option<String>,
+    /// Check kinds it says it can probe. `None` means it never said, which is
+    /// read as "anything" — not as "nothing".
+    kinds: Option<Vec<String>>,
 }
 
 pub(in crate::coordinator) async fn ingest_handler(
@@ -132,10 +143,49 @@ pub(in crate::coordinator) async fn agents_handler(
         .map(|(name, _)| name.clone())
         .collect();
 
+    // What each agent said about itself on its last poll here. Snapshot once
+    // rather than lock per row.
+    //
+    // Capability is local knowledge: it arrives on a poll, and a poll goes to
+    // one coordinator. An agent polling a peer has no declaration here and is
+    // read as capable of anything — the same assumption made of an agent that
+    // predates declaring, so it under-reports rather than inventing a fault.
+    let declared = coord.inner.seen.read().clone();
+
+    let unrunnable: Vec<String> = coord
+        .inner
+        .checks
+        .read()
+        .iter()
+        .filter(|(_, m)| {
+            if !m.enabled || !m.kind.is_agent_probed() {
+                return false;
+            }
+            let eligible: Vec<&String> = live
+                .iter()
+                .filter(|id| m.agents.is_empty() || m.agents.contains(id))
+                .collect();
+            // `all` over an empty set is vacuously true, and "nobody is here"
+            // is the other list's finding, not this one's.
+            !eligible.is_empty()
+                && eligible.iter().all(|id| {
+                    declared
+                        .get(*id)
+                        .and_then(|s| s.kinds.as_ref())
+                        // Silence is not a refusal: an agent that never
+                        // declared must not be counted as declining, or a
+                        // fleet that has said nothing would report every
+                        // check unrunnable.
+                        .is_some_and(|kinds| !kinds.contains(&m.kind))
+                })
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+
     // Poll RTT is not on the persisted agent rows, so join it in by id.
-    // Snapshot once rather than lock per row. The replicated poll rows come
-    // first and local `seen` overrides them: an agent polling a peer would
-    // otherwise show a blank RTT here, which reads as "never answered".
+    // The replicated poll rows come first and local `seen` overrides them: an
+    // agent polling a peer would otherwise show a blank RTT here, which reads
+    // as "never answered".
     let mut rtt_by_id: std::collections::HashMap<String, Option<i64>> = coord
         .inner
         .storage
@@ -145,19 +195,13 @@ pub(in crate::coordinator) async fn agents_handler(
         .into_iter()
         .map(|p| (p.agent_id, p.rtt_ms))
         .collect();
-    rtt_by_id.extend(
-        coord
-            .inner
-            .seen
-            .read()
-            .iter()
-            .map(|(id, s)| (id.clone(), s.rtt_ms)),
-    );
+    rtt_by_id.extend(declared.iter().map(|(id, s)| (id.clone(), s.rtt_ms)));
     let agents = rows
         .into_iter()
         .map(|r| {
             let silence = now - r.last_seen;
             let poll_rtt_ms = rtt_by_id.get(&r.agent_id).copied().flatten();
+            let said = declared.get(&r.agent_id);
             AgentDto {
                 zone: r.zone.clone(),
                 region: r.region.clone(),
@@ -179,12 +223,19 @@ pub(in crate::coordinator) async fn agents_handler(
                 checks_reporting: r.checks_reporting,
                 results_24h: r.results_24h,
                 poll_rtt_ms,
+                version: said.and_then(|s| s.build.clone()),
+                kinds: said.and_then(|s| {
+                    s.kinds
+                        .as_ref()
+                        .map(|ks| ks.iter().map(|k| k.as_db().to_string()).collect())
+                }),
             }
         })
         .collect();
     Json(AgentsResponse {
         agents,
         checks_with_no_live_agent: orphaned,
+        checks_no_agent_can_run: unrunnable,
     })
     .into_response()
 }
@@ -333,6 +384,8 @@ pub(in crate::coordinator) async fn agent_checks_handler(
                 // at an hour by `unreachable_after_ms`.
                 window_ms: unreachable_after_ms(coord.inner.missed_polls, q.poll_secs),
                 rtt_ms: q.rtt_ms.map(|v| v.min(i64::MAX as u64) as i64),
+                kinds: declared_kinds(q.kinds.as_deref()),
+                build: q.version.clone().filter(|v| !v.is_empty()),
             },
         );
         // Forget agents long out of contact. Without this the map is an
@@ -362,6 +415,7 @@ pub(in crate::coordinator) async fn agent_checks_handler(
             agent_id: agent_id.clone(),
             zone: s.zone.clone(),
             region: s.region.clone(),
+            kinds: s.kinds.clone(),
         })
         .collect();
 
@@ -369,7 +423,14 @@ pub(in crate::coordinator) async fn agent_checks_handler(
         .into_iter()
         .filter(|c| c.enabled && c.kind.is_agent_probed())
         .filter(|c| {
-            crate::placement::assign(&c.name, &c.placement, &c.agents, &fleet)
+            // Placement runs against the agents that can actually run *this*
+            // kind, not the whole fleet. An agent too old for a kind would
+            // otherwise be handed the check, drop it on parse, and leave it
+            // covered on paper and unprobed in fact — the same silence this
+            // negotiation exists to end. Excluding it here lets the next
+            // eligible agent take the work instead.
+            let capable = fleet_for(&fleet, c.kind);
+            crate::placement::assign(&c.name, &c.placement, &c.agents, &capable)
                 .iter()
                 .any(|id| id == caller)
         })
@@ -395,6 +456,50 @@ pub(in crate::coordinator) struct AgentIdentity {
     /// the agent. Self-asserted like `poll_secs`: it only feeds display, never
     /// placement or auth, so a lie changes nothing but its own row.
     rtt_ms: Option<u64>,
+    /// Comma-separated check kinds this agent can probe. Absent from agents
+    /// predating capability negotiation, which are taken to run anything.
+    ///
+    /// Understating it is the only lie available and it is self-punishing: the
+    /// work goes to another agent, or to nobody and gets reported as uncovered.
+    kinds: Option<String>,
+    /// The agent's build, for the fleet view. Display only.
+    version: Option<String>,
+}
+
+/// What an agent claims it can probe.
+///
+/// `None` — the parameter absent entirely — means "never said", which is an
+/// agent older than this negotiation and stays eligible for everything.
+/// Present-but-empty is different and is honoured as "nothing": an agent that
+/// answers the question with an empty list has answered it.
+///
+/// Kinds this coordinator does not recognise are dropped rather than rejected,
+/// because an agent *newer* than its coordinator is a legitimate ordering too —
+/// it can simply never be assigned a kind this node has no checks of.
+fn declared_kinds(raw: Option<&str>) -> Option<Vec<crate::models::CheckKind>> {
+    let raw = raw?;
+    Some(
+        raw.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .filter_map(crate::models::CheckKind::parse)
+            .collect(),
+    )
+}
+
+/// The agents eligible to probe one kind.
+///
+/// Separate from `assign` so placement keeps its single question — given these
+/// agents, which take this check — and eligibility stays the caller's.
+fn fleet_for(
+    fleet: &[crate::placement::Agent],
+    kind: crate::models::CheckKind,
+) -> Vec<crate::placement::Agent> {
+    fleet
+        .iter()
+        .filter(|a| a.kinds.as_ref().is_none_or(|ks| ks.contains(&kind)))
+        .cloned()
+        .collect()
 }
 
 // ---- Agent credentials ----
@@ -526,4 +631,79 @@ pub(in crate::coordinator) async fn revoke_agent_credential_handler(
 #[derive(Serialize)]
 struct RevokedResponse {
     revoked: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{declared_kinds, fleet_for};
+    use crate::models::CheckKind;
+    use crate::placement::Agent;
+
+    fn agent(id: &str, kinds: Option<&[CheckKind]>) -> Agent {
+        Agent {
+            agent_id: id.into(),
+            zone: "eu-west-a".into(),
+            region: "eu-west".into(),
+            kinds: kinds.map(|k| k.to_vec()),
+        }
+    }
+
+    #[test]
+    fn an_agent_that_never_declared_stays_eligible_for_everything() {
+        // The upgrade path. Every agent in an existing fleet predates this
+        // parameter, so treating silence as "runs nothing" would make the
+        // coordinator upgrade turn monitoring off.
+        assert_eq!(declared_kinds(None), None);
+
+        let fleet = vec![agent("old", None)];
+        assert_eq!(fleet_for(&fleet, CheckKind::Openmetrics).len(), 1);
+    }
+
+    #[test]
+    fn an_agent_that_declared_nothing_means_nothing() {
+        // Distinct from never declaring: this agent answered the question.
+        // Reading an explicit empty list as "anything" would make the one
+        // declaration a coordinator cannot act on the one it must trust most.
+        assert_eq!(declared_kinds(Some("")), Some(vec![]));
+
+        let fleet = vec![agent("mute", Some(&[]))];
+        assert!(fleet_for(&fleet, CheckKind::Http).is_empty());
+    }
+
+    #[test]
+    fn a_kind_the_coordinator_does_not_know_is_dropped_not_rejected() {
+        // An agent newer than its coordinator is a legitimate ordering. The
+        // kinds it names that this node has never heard of are simply kinds it
+        // will never be assigned, not grounds to discard the whole declaration
+        // and mistake a capable agent for one that can do nothing.
+        assert_eq!(
+            declared_kinds(Some("http, tcp ,quantum-ping,")),
+            Some(vec![CheckKind::Http, CheckKind::Tcp]),
+            "known kinds survive an unknown neighbour"
+        );
+    }
+
+    #[test]
+    fn placement_only_sees_agents_that_can_run_the_kind() {
+        // The reported failure, from the coordinator's side. An old agent was
+        // handed an openmetrics check, dropped it on parse, and the check stayed
+        // covered on paper while never being probed. Narrowing the fleet first
+        // means the assignment lands on an agent that will actually run it.
+        let fleet = vec![
+            agent("old", Some(&[CheckKind::Http, CheckKind::Tcp])),
+            agent("new", Some(&[CheckKind::Http, CheckKind::Openmetrics])),
+        ];
+
+        let capable = fleet_for(&fleet, CheckKind::Openmetrics);
+        assert_eq!(
+            capable
+                .iter()
+                .map(|a| a.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            ["new"]
+        );
+        // And a kind both can run still reaches both, so narrowing costs
+        // nothing when the fleet is uniform.
+        assert_eq!(fleet_for(&fleet, CheckKind::Http).len(), 2);
+    }
 }

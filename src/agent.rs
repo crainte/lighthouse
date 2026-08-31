@@ -802,11 +802,19 @@ pub async fn sync_loop(cfg: AgentConfig, tx: mpsc::Sender<CheckResult>, initial:
     // Reporting last poll's round-trip is what lets the coordinator show agent
     // reachability without a synthetic self-check — the poll is already the
     // heartbeat, this just times it.
+    //
+    // Capabilities are sent so the coordinator can place around this agent
+    // instead of at it. Dropping a check it cannot represent keeps this agent
+    // running, but the check still counts as covered and never gets probed;
+    // saying up front which kinds it can run is what lets the coordinator give
+    // the work to an agent that can, or report that nobody can.
     let base = format!(
-        "{}/api/v1/agent/checks?agent_id={}&poll_secs={}",
+        "{}/api/v1/agent/checks?agent_id={}&poll_secs={}&kinds={}&version={}",
         cfg.coordinator_url.trim_end_matches('/'),
         urlencode(&cfg.agent_id),
         cfg.poll_secs.max(1),
+        urlencode(&probeable_kinds().join(",")),
+        urlencode(&crate::version::current().to_string()),
     );
     let token = cfg.resolved_token();
 
@@ -930,6 +938,21 @@ fn same_checks(a: &[CheckConfig], b: &[CheckConfig]) -> bool {
 #[derive(serde::Deserialize)]
 struct AgentChecksResponse {
     checks: Vec<serde_json::Value>,
+}
+
+/// The check kinds this binary can probe, as wire names.
+///
+/// Derived from `CheckKind::ALL` rather than written out, so a kind added to
+/// the enum is claimed by every agent built afterwards without anyone
+/// remembering to update a second list. Non-probed kinds are excluded: a
+/// heartbeat is driven by an inbound ping, so claiming it would invite work
+/// that no agent performs.
+fn probeable_kinds() -> Vec<&'static str> {
+    CheckKind::ALL
+        .iter()
+        .filter(|k| k.is_agent_probed())
+        .map(|k| k.as_db())
+        .collect()
 }
 
 /// The checks this agent can actually run, and a name for each one it had to

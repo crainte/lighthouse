@@ -288,6 +288,8 @@ mod fleet_tests {
             at: NOW - ago_ms,
             window_ms: unreachable_after_ms(3, Some(poll_secs)),
             rtt_ms: None,
+            kinds: None,
+            build: None,
         }
     }
 

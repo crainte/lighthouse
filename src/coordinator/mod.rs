@@ -9,7 +9,7 @@ pub mod storage;
 
 use crate::config::{CheckConfig, CoordinatorConfig};
 use crate::credential::AgentCredential;
-use crate::models::{eval, CheckResult, Status};
+use crate::models::{eval, CheckKind, CheckResult, Status};
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -328,6 +328,18 @@ struct SeenAgent {
     /// view. `None` until the agent has completed one poll, or for an entry
     /// seeded from stored results at boot.
     rtt_ms: Option<i64>,
+    /// Which check kinds this agent says it can probe.
+    ///
+    /// `None` means it never said — an agent predating capability negotiation,
+    /// or an entry seeded from stored results at boot. Read as "anything",
+    /// because the alternative is that upgrading the coordinator makes every
+    /// existing agent ineligible for everything and the fleet goes dark.
+    kinds: Option<Vec<CheckKind>>,
+    /// The build it reported, verbatim, for the fleet view. Self-asserted and
+    /// display-only: it answers "why is this agent behaving differently?", and
+    /// never decides placement — `kinds` does, and a lie there costs the liar
+    /// only its own assignments.
+    build: Option<String>,
 }
 
 impl Coordinator {
@@ -474,6 +486,12 @@ impl Coordinator {
                                     at: a.last_seen,
                                     window_ms: unreachable_after_ms(cfg.missed_polls, None),
                                     rtt_ms: None,
+                                    // Seeded from stored results, which carry no
+                                    // capabilities. It says what it can run on
+                                    // its next poll; until then it is eligible
+                                    // for everything, exactly as before.
+                                    kinds: None,
+                                    build: None,
                                 },
                             )
                         })

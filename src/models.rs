@@ -30,6 +30,19 @@ pub enum CheckKind {
 }
 
 impl CheckKind {
+    /// Every kind this binary knows. An agent declares its subset of these to
+    /// the coordinator, so exhaustiveness matters: a kind missing here is a
+    /// kind no agent ever claims to run.
+    pub const ALL: [CheckKind; 7] = [
+        CheckKind::Http,
+        CheckKind::Tcp,
+        CheckKind::Dns,
+        CheckKind::Icmp,
+        CheckKind::Ssl,
+        CheckKind::Heartbeat,
+        CheckKind::Openmetrics,
+    ];
+
     pub fn as_db(&self) -> &'static str {
         match self {
             CheckKind::Http => "http",
@@ -42,19 +55,28 @@ impl CheckKind {
         }
     }
 
-    /// Unknown values fall back to HTTP only because the column is written
-    /// exclusively by `as_db` — a stored value outside this set means the row
-    /// was hand-edited.
-    pub fn from_db(s: &str) -> CheckKind {
-        match s {
+    /// Strict inverse of `as_db`. `None` for anything else, which is what a
+    /// newer peer naming a kind this binary predates looks like — the caller
+    /// decides whether that is a fallback or a refusal, because guessing is
+    /// only safe in one of those two places.
+    pub fn parse(s: &str) -> Option<CheckKind> {
+        Some(match s {
+            "http" => CheckKind::Http,
             "tcp" => CheckKind::Tcp,
             "dns" => CheckKind::Dns,
             "icmp" => CheckKind::Icmp,
             "ssl" => CheckKind::Ssl,
             "heartbeat" => CheckKind::Heartbeat,
             "openmetrics" | "prometheus" => CheckKind::Openmetrics,
-            _ => CheckKind::Http,
-        }
+            _ => return None,
+        })
+    }
+
+    /// Unknown values fall back to HTTP only because the column is written
+    /// exclusively by `as_db` — a stored value outside this set means the row
+    /// was hand-edited.
+    pub fn from_db(s: &str) -> CheckKind {
+        CheckKind::parse(s).unwrap_or(CheckKind::Http)
     }
 
     /// Whether an agent probes this kind at all. A heartbeat is driven by an
