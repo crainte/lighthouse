@@ -9,3 +9,4 @@ pub mod notify;
 pub mod openmetrics;
 pub mod placement;
 pub mod script;
+pub mod version;

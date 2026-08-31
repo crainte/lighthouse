@@ -26,7 +26,13 @@
 
 services:
   coordinator:
-    build: .
+    build:
+      context: .
+      # Stamped into the binary so a node can name the commit it runs. Unset is
+      # fine — the build time still tells two images apart:
+      #   GIT_SHA=$(git rev-parse --short=12 HEAD) docker compose build
+      args:
+        GIT_SHA: ${GIT_SHA:-}
     image: warden:latest
     command: ["coordinator", "--config", "/etc/warden/coordinator.toml"]
     ports:

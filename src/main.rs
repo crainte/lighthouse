@@ -5,10 +5,13 @@ use tokio::sync::mpsc;
 use warden::agent;
 use warden::config::Config;
 use warden::coordinator::Coordinator;
+use warden::version;
 
 /// Warden — self-hosted uptime monitor.
 #[derive(Parser)]
-#[command(name = "warden", version)]
+// `--version` carries the sha and build time too, because the version alone
+// cannot distinguish two deployments of an unreleased crate.
+#[command(name = "warden", version, long_version = build_banner())]
 struct Cli {
     /// Run mode.
     #[arg(value_enum)]
@@ -16,6 +19,12 @@ struct Cli {
     /// Path to config file (TOML).
     #[arg(short, long, default_value = "warden.toml")]
     config: PathBuf,
+}
+
+/// `--version` output. Leaked because clap wants a `&'static str` and the
+/// value lives as long as the process anyway.
+fn build_banner() -> &'static str {
+    Box::leak(version::current().to_string().into_boxed_str())
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -28,10 +37,31 @@ enum Mode {
     Coordinator,
 }
 
+impl Mode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Mode::Standalone => "standalone",
+            Mode::Agent => "agent",
+            Mode::Coordinator => "coordinator",
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
+    // First line of every log: the question asked of a misbehaving node is
+    // almost always "which build is that?", and the answer should already be
+    // in the logs the operator is holding.
+    let build = version::current();
+    tracing::info!(
+        version = %build.version,
+        git_sha = %build.git_sha,
+        built_at = %build.built_at.to_rfc3339(),
+        mode = cli.mode.as_str(),
+        "warden starting"
+    );
     let cfg = Config::load(&cli.config)?;
 
     match cli.mode {

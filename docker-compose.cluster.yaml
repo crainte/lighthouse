@@ -141,7 +141,13 @@
 name: warden-cluster
 
 x-coordinator: &coordinator
-  build: .
+  build:
+    context: .
+    # Stamped into the binary so a node can name the commit it runs. Unset is
+    # fine — the build time still tells two images apart:
+    #   GIT_SHA=$(git rev-parse --short=12 HEAD) docker compose build
+    args:
+      GIT_SHA: ${GIT_SHA:-}
   image: warden:latest
   command: ["coordinator", "--config", "/etc/warden/coordinator.toml"]
   environment:
@@ -152,7 +158,13 @@ x-coordinator: &coordinator
     - warden
 
 x-agent: &agent
-  build: .
+  build:
+    context: .
+    # Stamped into the binary so a node can name the commit it runs. Unset is
+    # fine — the build time still tells two images apart:
+    #   GIT_SHA=$(git rev-parse --short=12 HEAD) docker compose build
+    args:
+      GIT_SHA: ${GIT_SHA:-}
   image: warden:latest
   command: ["agent", "--config", "/etc/warden/agent.toml"]
   # ICMP checks need raw sockets; without this the icmp probe reports a

@@ -11,7 +11,14 @@ RUN bun run build
 # --- Stage 2: build the Rust binary (embeds the built dashboard) ---
 FROM rust:1-bookworm AS builder
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
+# .dockerignore excludes .git, so build.rs has no repository to ask for the
+# commit and takes it from here instead:
+#   docker build --build-arg GIT_SHA=$(git rev-parse --short=12 HEAD) .
+# Omitting it stamps "unknown", which builds fine but makes a deployed image
+# untraceable to a commit.
+ARG GIT_SHA=""
+ENV GIT_SHA=$GIT_SHA
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
 # rust-embed reads frontend/dist at compile time
 COPY --from=frontend /app/frontend/dist ./frontend/dist

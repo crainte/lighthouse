@@ -25,7 +25,11 @@
 
 services:
   agent-a:
-    build: .
+    build:
+      context: .
+      # See docker-compose.yaml: unset stamps "unknown", which builds fine.
+      args:
+        GIT_SHA: ${GIT_SHA:-}
     image: warden:latest
     command: ["agent", "--config", "/etc/warden/agent.toml"]
     volumes:
@@ -41,7 +45,11 @@ services:
       - warden
 
   agent-b:
-    build: .
+    build:
+      context: .
+      # See docker-compose.yaml: unset stamps "unknown", which builds fine.
+      args:
+        GIT_SHA: ${GIT_SHA:-}
     image: warden:latest
     command: ["agent", "--config", "/etc/warden/agent.toml"]
     volumes:
