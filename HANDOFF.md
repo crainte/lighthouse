@@ -1,6 +1,25 @@
 # Warden — session handoff
 
-Repo: `~/code/uptime`. Working tree clean apart from `uptime-monitor-design.md`, which is yours.
+Repo: `~/code/uptime`. `uptime-monitor-design.md` is yours; the rest of the
+working tree is this session's agent-health work, uncommitted.
+
+The compose stack was recreated onto the rebuilt image and its credential table
+turned out to be empty — the previous containers' credentials never lived in
+the `coordinator-data` volume. Two were re-minted through Admin > Credentials
+and written to `.env` as `WARDEN_AGENT_TOKEN_A` / `_B`, which is what
+`docker-compose.agents.yaml` actually reads (the bare `WARDEN_AGENT_TOKEN`
+already in `.env` is read by nothing).
+
+**Security-relevant behaviour change, read this before an incident makes you
+find it the hard way:** admin sessions are now stateless HMAC-signed tokens
+instead of an in-memory table (Phase 5 clustering, **§9 Clustering** in the
+design doc), so that any coordinator in a cluster can validate a session a
+different node created. The consequence outside clustering too: **a
+coordinator restart no longer logs everyone out**, which it did before this
+landed. Logging a token out revokes it into a small in-memory set until its
+own TTL expires; that revocation is pushed to peers best-effort, so the worst
+case of a dropped push is a logged-out token staying valid on one other node
+until it would have expired anyway.
 
 ## Landed this session
 
@@ -8,7 +27,187 @@ Repo: `~/code/uptime`. Working tree clean apart from `uptime-monitor-design.md`,
 |---|---|
 | `33a368f` | One-hop gossip replication between coordinator peers |
 | `0763999` | Admin panels no longer honour an expired session |
-| _(this one)_ | Per-zone agent credentials, fail-closed ingest, Agents UI rebuilt for scale, Credentials admin panel |
+| `88c909e` | Per-zone agent credentials, fail-closed ingest, Credentials panel |
+| _(this one)_ | Agent health on the public status page; notifier management with test-send and a per-check opt-out; the homepage no longer 401s |
+| _(also this one)_ | Slack, PagerDuty and email notifier kinds, each with a delivery test; persistent retry queue for failed notifications |
+| _(also this one)_ | Maintenance windows: scheduled spans that suppress paging, optionally announced on the public page |
+
+### Notifications (`Admin > Notifications`, `NotifiersAdmin.svelte`)
+The backends always existed; nothing could reach them. `cfg.notifiers` was read
+once in `Coordinator::new` and moved into a spawned dispatcher, and `notify_tx`
+was `None` when the list was empty — so with no notifier in the config file
+there was no dispatcher at all and the first one added could never fire.
+
+Now: the list is a stored setting (same `settings` table and `load_or_seed` as
+the agent display), the channel is always created, and the dispatcher clones the
+list **per alert** rather than capturing it at boot. A save is live on the next
+transition. `GET`/`PUT /api/v1/admin/notifiers` and
+`POST /api/v1/admin/notifiers/test` are admin-gated — a webhook URL is the whole
+credential for posting into that channel, and an open test-send endpoint is an
+anonymous request generator.
+
+**Delivery is now falsifiable.** `notify::send` returns `Result<(), String>` and
+a non-2xx counts as a failure, so a wrong ntfy topic (404) is reported instead
+of silently succeeding. Test-send returns HTTP 200 with `delivered: false` and
+the reason: the request worked, the third party did not, and the form has to
+tell those apart.
+
+**Five backends** (`NotifierKind`, flat on the wire, tagged by `type`):
+`webhook`, `ntfy`, `slack`, `pagerduty`, `email`. All share the routing, the
+test-send and the per-check `notify` opt-out below; only the payload differs.
+
+- **`slack` is not `webhook` aimed at a Slack URL.** Slack rejects JSON without
+  `text` with 400 `invalid_payload`, so the generic webhook there looks
+  configured and delivers nothing. Not pinned to `hooks.slack.com`: Mattermost
+  and Discord's compat endpoint take the same shape, and `tests/notifiers.rs`
+  points one at a local sink for exactly that reason.
+- **`pagerduty`** is Events API v2 with `dedup_key = check_id`, so the UP
+  `resolve`s the incident the DOWN `trigger`ed instead of opening a second one,
+  and a flapping check reuses one PagerDuty incident. UNKNOWN triggers at
+  `warning`. The payload is built by `pagerduty_event`, unit-tested — the real
+  endpoint is not mockable and is not worth pretending otherwise.
+- **`email`** is the only backend that is not an HTTP POST (adds `lettre`). TLS
+  mode is declared (`starttls` default / `implicit` / `none`), never guessed
+  from the port, and STARTTLS is *required* rather than opportunistic. `port`
+  absent means 587/465/25 for the mode. One recipient — an alias is the mail
+  server's job. A fresh connection per notification, no pool.
+  `an_email_notifier_delivers_over_smtp` drives a real SMTP session against a
+  ~40-line sink in the test file; flipping its `tls` to `starttls` makes it fail
+  (the sink advertises no extensions), which is what proves the mode is
+  load-bearing rather than decorative.
+
+`Notifier::describe()` was deleted rather than extended — nothing called it but
+its own test.
+
+**Failed deliveries are queued, not lost** (`notification_queue`,
+`Coordinator::retry_due` / `spawn_retries`). Dispatch tries once inline; a
+failure writes the transition and the notifier *name* to DuckDB and a 30s job
+retries with doubling backoff — six attempts including the first, ≈32 minutes.
+Success deletes the row; exhausted attempts leave it with `next_attempt` NULL,
+which is what the panel renders as "reached nobody". Given-up rows age out on
+`alerts_days`; waiting rows are never pruned.
+
+- The row holds the **name**, resolved against the live list per attempt, so
+  correcting a URL in the panel fixes what is queued for it and deleting a
+  notifier drops its queue. Same rule as routing.
+- `retry_due(now_millis)` takes the clock as a parameter, exactly like `prune`,
+  so a test reaches the next attempt without sleeping out the backoff. The
+  ticking job is spawned from `serve`, not `Coordinator::new` — tests drive the
+  method directly.
+- No `status` column: pending vs given up is `next_attempt IS NULL`. Same
+  argument as `alert_type` and `IncidentState`.
+- Enqueued on failure only, so the happy path is still one HTTP request and no
+  write. A crash between the failed send and the insert loses the retry —
+  marked `ponytail:` in `storage.rs`; closing it means writing every
+  notification twice.
+- `GET /api/v1/admin/notifiers` now also returns `undelivered` (newest 20:
+  check, state, notifier, attempts, `given_up`, error), rendered under the
+  unrouted-checks warning.
+
+**Routing.** A notifier has a `name` (the routing key, unique) and
+`default: bool`. A check carries `notifiers: Vec<String>`:
+
+| check | goes to |
+|---|---|
+| `notify = false` | nobody |
+| `notifiers = []` | every notifier with `default = true` |
+| `notifiers = ["team-a"]` | exactly `team-a`, default flag irrelevant |
+
+A name nothing answers to reaches **nobody** — deliberately not a silent fall
+back to the defaults, which would page the wrong people. That failure is
+surfaced instead: the notifiers GET returns `unrouted_checks`, and the panel
+renders it, the same way `checks_with_no_live_agent` surfaces unprobed checks.
+Renaming a notifier is a routing change, so that list is how you see what it
+broke.
+
+**Several notifiers may be default at once, on purpose** — an unrouted alert
+fans out to all of them, which is what you want for Slack *and* PagerDuty. It
+was reported as surprising, and fairly: "default" reads as if it were exclusive.
+Kept as a fan-out rather than made a radio, because exclusivity removes a real
+capability and invents an awkward zero-default state; instead the panel now
+states the consequence outright — *"A check that names no notifier goes to all
+of these: oncall, slack"* — and warns when nothing is default. Make it exclusive
+only if someone actually wants one-and-only-one; it is a `type="radio"` and a
+one-line guard.
+
+Targets are resolved in the **dispatcher** against the live list, from the name
+list the check asked for at enqueue: editing a backend never changes the meaning
+of an alert already queued. `notify = false` is still resolved at enqueue
+(`notify_targets` returns `None`), so a queued alert is not re-judged.
+
+Two upgrade defaults are load-bearing: `Notifier::name` defaults to empty and
+`default` defaults to **true**, so a notifier written before routing keeps
+paging instead of going quiet on upgrade. Checks are stored as JSON documents,
+so neither field needed a migration.
+
+### Agent health (`fleet_rows` / `fleet_health` in `coordinator/mod.rs`)
+`/api/v1/status` carries an `agents` array beside `checks`: `{kind, name,
+status, healthy, total}` where `kind` is `agent` or `region` and status is
+`up`/`degraded`/`down`. The homepage renders it and no longer calls
+`/api/v1/agents`, which is what made an anonymous load fail outright — the
+endpoint is admin-gated and the `Promise.all` rejected on the 401.
+
+**Rows are composed, not moded.** `AgentsDisplay.rows` is an ordered list whose
+entries are `{kind: agent|region, name}`, so "this box, then all of us-east" is
+one list. `mode` only decides what happens to agents no row covered: fold into
+region rows, one row each, or nothing. `off` with rows still shows the rows —
+`off` plus no rows is how the section disappears. A region row counts **every**
+agent in it, including one shown individually above, because a row labelled
+`us-east` that quietly omitted a machine would be a lie. The superseded `pinned`
+list still parses and is folded into `rows` by `sanitized`.
+
+**Liveness, not check health.** An agent that answers is healthy even if every
+check it probes is down. Only a *poll* makes it healthy; results can lift a
+silent agent to `degraded` at best, because a five-minute cron says nothing
+about the last four minutes and an agent with no checks would otherwise read
+dead. The fleet is the union of the in-memory `seen` map and the persisted
+result rows, and an agent in both is read at its best — that is what keeps the
+section honest across a restart.
+
+**The window follows the cadence.** `AGENT_UNREACHABLE_AFTER_MS` is gone. The
+agent declares `?poll_secs=` on every poll and the coordinator stores
+`missed_polls × poll_secs` per agent (`missed_polls = 3`, configurable), so
+detection is three missed cycles at any cadence. An agent that declares nothing
+— an older binary, or an entry seeded from stored results at boot — keeps the
+old fixed 90s, deliberately: the derived window is *tighter*, so a coordinator
+upgraded ahead of its fleet would otherwise start evicting agents that had
+changed nothing.
+
+**The display is a setting, not a config-file decision.** `settings` is a new
+table of `(key, JSON document)` — one row, `status_page.agents`. The config
+block seeds it on first boot and the store wins from then on, exactly like
+checks, so a restart cannot revert what an operator chose. Edited in
+**Admin > Status page** (`AgentDisplayAdmin.svelte`) through `GET`/`PUT
+/api/v1/admin/status-page/agents`; the PUT validates (0–100, `down_below ≤
+warn_below`), trims and dedupes `rows`, persists, then swaps the in-memory
+copy, so the public page changes on the next request with no restart. The GET
+returns the fleet alongside the settings because a picker without the fleet is
+not useful; the editor derives the region list from it.
+
+`AgentsDisplay` is both the TOML type and the admin wire type — one shape, so
+the file and the form cannot disagree about what a setting means. Note the word
+collision: "Pinned" in the Agents panel means *checks pinned to an agent*, so
+the row editor says "Rows, in order" and never uses the word.
+
+**The editor is built for a big fleet.** Verified against a throwaway
+coordinator holding 20 regions and 120 agents, not against the two-agent compose
+stack. The picker is a search box over regions and agents that mounts at most 8
+of each and says how many it is hiding (`+112 more — narrow the search`); a
+chip per fleet member was fine at two agents and unusable at 120. Rows reorder
+by native drag (grip, drop-edge shadow) exactly like the sections list above
+them, with ▲▼ as the keyboard path — puppeteer needs
+`page.setDragInterception(true)` and `handle.dragAndDrop()` to exercise that;
+synthetic mouse moves do not fire HTML5 drag events, and a test written with
+them passes vacuously.
+
+At that size the *public* page is 20-odd region rows, which is the point of the
+remainder modes: curating it down means placing the handful of rows that matter
+and setting everything else to "Not shown".
+
+Also fixed: `broadcast_presents_the_agent_token` in `tests/gossip.rs` asserted
+a literal `cluster-shared-secret` that the credentials refactor renamed out of
+existence. It now asserts against the `PEER_TOKEN` const, which is what stops
+it drifting again.
 
 ### Gossip (`src/coordinator/gossip.rs`)
 Cycles are prevented structurally: a node gossips only transitions it observed
@@ -45,12 +244,70 @@ coordinator with no credentials refuses every agent request until an operator
 mints one. That is the intended first-run state, and it is why the compose files
 are split — the coordinator starts, you mint per zone, then agents start.
 
+**`[[coordinator.provision]]` is the unattended path** (`config.rs`,
+`Coordinator::apply_provisioned_credentials`). A block declares zone, region
+and a token chosen in advance (`token`, or `token_env` naming the variable
+holding it), for a fleet that must be configured before the coordinator has
+ever run. Everything downstream is identical to a minted credential — location
+still comes from the credential, never from the agent.
+
+Two properties carry the whole design, both covered in `tests/provision.rs`:
+
+- **An id that already exists is skipped, revoked ones included.** So a second
+  boot writes nothing (a re-provision would invent a fresh salt, restamp the
+  HLC and push a config write to every peer on every restart — invisible on one
+  node), and a restart cannot resurrect a credential someone revoked.
+- **An unresolvable or malformed token fails startup, loudly, naming the zone**
+  rather than being skipped. Skipping silently yields a fleet authenticating
+  against nothing, and "no results" is the failure mode this project treats as
+  the dangerous one.
+
+In a cluster, declare the blocks on one node; the rest receive them over the
+config plane.
+
 `/internal/gossip` takes its own `peer_token`. An agent credential must never
 open an endpoint that rewrites published state.
 
 Agent `[agent] zone`/`region` are authoritative in **standalone** mode only. In
 agent mode the coordinator overwrites them from the credential, and the agent no
 longer sends them on the check-list request at all.
+
+### Running a cluster locally
+
+```bash
+echo 'WARDEN_PEER_TOKEN=anything-identical-on-every-node' >> .env
+echo 'WARDEN_ADMIN_PASSWORD=...' >> .env
+docker compose -f docker-compose.cluster.yaml up -d --build
+```
+
+Three coordinators on `:8090` / `:8091` / `:8092` (renumbered away from the
+single-node stack's `:8082`, so both run side by side) and one agent each, in
+`us-east-1a` / `eu-west-1a` / `ap-south-1a`. No manual minting step: the agent
+credentials are provisioned from coordinator-a's config, with committed
+throwaway defaults (`wac_demoa.demo-secret-a` and friends) that `.env` overrides
+one line at a time. Treat any stack running on the defaults as unauthenticated.
+
+**The demo seed no longer runs on a node with `peers` set.** An empty store
+means "nobody has configured anything yet" standalone and "the config is on its
+way" when joining, and the difference matters because results replicate: one
+joining node used to seed a fake `seed` agent onto every dashboard in the
+cluster, and it could not be removed — a result delete has no tombstone, so
+`purge_agent` is node-local and the next anti-entropy sweep pulls the rows back
+from a peer. Covered by
+`a_joining_node_does_not_seed_demo_data_over_the_whole_cluster`
+(`tests/cluster.rs`), which asserts the standalone half too so it cannot pass
+vacuously.
+
+The file's header is the documentation — it lists what to watch and why each
+thing is shaped the way it is: transitive membership from a seed *chain*, a
+check created on one node appearing on the others, every node's grid filling
+with all three zones though each ingests from one, credentials on `:8091` that
+node was never configured with, and what `stop coordinator-b` then `start`
+proves about anti-entropy. Expect 401s from agent-b/agent-c for a few seconds at
+first boot while the credentials replicate; that is the config plane working.
+
+Drop the volumes (`down -v`) before a rebuild: no migrations, so a stale volume
+fails on missing HLC columns.
 
 ## Ground rules worth keeping
 
@@ -66,34 +323,167 @@ longer sends them on the check-list request at all.
 - Svelte `{#each}` keys must be unique — duplicates silently hang the page.
 - `innerText` reflects CSS `text-transform`. Asserting `'Sign in required'`
   against a panel that renders uppercase gives a false negative.
-- Coordinator sessions are in-memory, so **restarting the server is how you
-  expire one** for testing.
+- Coordinator sessions are now stateless HMAC-signed tokens (§9 Clustering),
+  not an in-memory table, so **a restart no longer expires one** — the
+  opposite of how this used to work. To force one out for testing, use
+  logout (which revokes it) or wait out its TTL.
 - Tests that need an env var genuinely absent get their own test binary;
   `remove_var` races with anything running beside it (`agent_auth_closed.rs`).
 - `cd` is aliased oddly in this shell — use the tool's `cwd` argument.
 
 ## Outstanding work
 
-### 1. Incidents — full status-page model _(agreed scope, not started)_
-Today `incidents` is `(id, check_id, status, started_at, resolved_at, details,
-acknowledged_at, acknowledged_by)` and Acknowledge is the only verb. Wanted:
-- `incident_updates` table (incident_id, author, body, created_at) + endpoints.
-- Lifecycle states: Investigating → Identified → Monitoring → Resolved.
-- Manual incident creation, with no failing check behind it.
-- Severity, and an owner per incident.
-- Updates rendered on the **public** status page, not just in admin.
+### 1. Incidents — full status-page model _(landed)_
+Replaced outright, no migration (pre-release). Model and reasoning live in
+**`uptime-monitor-design.md` §7 Alerts & Incidents**, which is now the record;
+what follows is only what a reader needs to navigate the code.
 
-### 2. Notifier admin UI _(not started)_
-`notifiers` is config-file only and read **once** in `Coordinator::new` into a
-spawned dispatcher. A UI means moving them into DuckDB like checks, and
-restarting the dispatcher on change. Also wanted: a **test-send** button (a
-wrong ntfy topic is currently silent — it warns to the log and nowhere else),
-and per-check/per-section routing, since every notifier currently gets every
-alert.
+`alerts` is the event log, built out to the documented model: `id`, `scope`,
+`node_id`, `previous_state`/`current_state`, and `incident_id` **stamped as the
+row is written**. Membership is a fact the writer knows; a time-window join was
+drafted and thrown out because it cannot separate overlapping causes and would
+absorb unrelated history the moment a check joined an affects list.
+`alert_type` is derived in the DTO — storing a summary of two columns beside
+them is drift waiting to happen.
 
-### 3. Maintenance panel
-Still `AdminPlaceholder`, no backend at all. Needs scheduled windows and alert
-suppression; disabling a check is currently the only way to stop probing.
+`incidents` is the operator-facing record: `title`, `state`, editable
+`started_at`, `global`, `origin_check`, plus `incident_checks` (blast radius,
+with `source` = origin/dependency/manual) and `incident_updates` (the
+narrative). No `status`, no `details`, no `acknowledged_at/by` — all three were
+second copies of something else.
+
+- **`detected` is where automatic incidents start.** `investigating` claims a
+  human is on it, which is a lie for the first minutes of every outage and an
+  expensive one on a public page.
+- **Every state change is an update**, including the two the coordinator writes
+  itself. Acknowledging is just the first authored update, which is why there
+  is no acknowledge endpoint and no ack columns: "has anyone looked?" is
+  `EXISTS(incident_updates WHERE author IS NOT NULL)`, and it stays right when
+  an operator jumps straight to `identified`.
+- **`depends_on` (new per-check field) groups the blast radius.** A dependent
+  confirming DOWN joins its upstream's open incident as `dependency` instead of
+  opening its own. **One hop, not transitive** — cycle-safe with no seen-set,
+  and `web→api→db` all down is deliberately two incidents. Grouping is not
+  suppression: the dependent still alerts and still notifies. Edited in the
+  check editor ("Depends on", beside Confirm DOWN after); checks are stored as
+  JSON documents, so no schema change was needed to carry it.
+- **Auto-resolve reuses `failures_before_down` as the up-side run.** A check
+  needing three failures to be believed down needs three successes to be
+  believed back, so a flapping check stays inside ONE incident instead of
+  opening and closing twenty. At the default of 1 this is the old behaviour.
+  Only incident resolution reads it — `current_state` still flips UP on the
+  first good probe, so uptime maths and the grid are untouched.
+- Auto-resolve fires whether or not a human has acknowledged.
+
+**Two bugs a live smoke test caught that the suite did not** (both now have a
+regression test, `a_manual_incident_is_never_auto_resolved`):
+`open_incident_for` returned manually created incidents, so a passing check
+pulled one into the resolve path; and `try_resolve` iterated the gating checks
+and fell through on an empty set, so an incident whose attachments are all
+`manual` resolved vacuously. The fix is the `origin_check IS NOT NULL` filter —
+mutation-verified. The empty-set guard was deliberately **not** kept: with the
+filter in place it is unreachable, so it could only ever be untested code. The
+invariant is recorded on `try_resolve`'s doc comment instead.
+
+Public: `GET /api/v1/incidents`, `GET /api/v1/incidents/:id` (carries the
+narrative), and `#/incident/<id>` in the SPA. Writes are all under
+`/api/v1/admin/incidents…` and admin-gated, covered by
+`incident_writes_are_admin_only_while_reads_are_public`.
+
+Still deliberately out: severity, owner per incident, transitive dependencies,
+and suppressing a dependent's notification.
+
+**Deploying a no-migration schema change onto the live volume.** "No migrations"
+is fine for the code and a trap for the deployment: `deploy/coordinator.toml`
+sets `db_path = /data/warden.duckdb` on the `uptime_coordinator-data` volume, so
+the old `alerts`/`incidents` tables survive a rebuild and
+`CREATE TABLE IF NOT EXISTS` silently no-ops on them. The new binary then boots
+cleanly and 500s on every incident and alert read:
+
+```
+ERROR retention prune failed error=Binder Error: Referenced column "state" not found
+GET /api/v1/incidents -> 500
+```
+
+Do **not** answer that by deleting the volume. It holds the real checks
+(`homeassistant`, `unifi-certificate`, `ddns-*`, …), ~350k results, the
+status-page settings and **both agent credentials** — losing those means
+re-minting and rewriting `.env` before the fleet reports again. Drop only the
+tables whose shape changed and everything else survives:
+
+1. Prove the incompatibility against a **copy** first
+   (`docker cp uptime-coordinator-1:/data/warden.duckdb /tmp/...`, point a local
+   coordinator at it). Never diagnose on the live file.
+2. `docker compose stop coordinator`, then copy **both** `warden.duckdb` *and*
+   `warden.duckdb.wal` out. **Stopping the container does not checkpoint the
+   WAL** — there were 2.3 MB of committed rows in it, and taking only the main
+   file loses them *and* leaves a mismatched WAL behind. Opening the pair with
+   DuckDB replays and folds the WAL in (results went 342,013 → 350,155, which is
+   how you know it mattered); closing leaves one consolidated file.
+3. `DROP TABLE IF EXISTS incident_updates, incident_checks, incidents, alerts`
+   — anything with no `duckdb` CLI on the host can borrow the crate's bundled
+   engine from a throwaway test in `tests/`.
+4. Copy the single file back, deleting the stale `.wal`, and
+   `docker compose up -d coordinator`.
+
+Keep a backup of the untouched pair until the new stack is verified. The
+`warden-docker-rebuild` skill predates the compose files and says there is no
+compose file — there are two, and the coordinator is `uptime-coordinator-1`
+publishing 8082.
+
+### 2. Routing by section _(per-check routing landed this session)_
+A check names its notifiers and there is a default set, so "payments pages the
+DB team, everything else pages oncall" works today. What is still missing is
+routing a whole **section** at once: with fifty checks in one group, an
+audience change is fifty edits. The shape would be a section-level default that
+a check inherits unless it names its own — the resolution order already exists
+in `notify_targets`, so it is one more lookup rather than a new model.
+
+Also unbuilt: escalation (page B only if A is not acknowledged), and any
+schedule, which overlaps the maintenance panel below.
+
+### 3. Maintenance panel _(landed)_
+`Admin > Maintenance` is a real panel now (`MaintenanceAdmin.svelte`), and
+`AdminPlaceholder.svelte` is deleted — it had no other user. Model and reasoning
+are in **`uptime-monitor-design.md` §8 Maintenance Windows**; what follows is
+what a reader needs to navigate the code.
+
+A window (`src/maintenance.rs`) is `title`, `starts_at`, `ends_at`, `checks`
+(empty = every check) and `announce`. Suppression is **one arm in
+`notify_targets`**, which now takes the transition's timestamp: a window is the
+per-check `notify = false` switch on a timer, so probing, results, alert rows
+and incidents all continue exactly as they do for a muted check. That is the
+whole implementation — there is no second suppression path to keep in step.
+
+- Judged against the transition's own timestamp, not the clock, so a batch
+  posted late is read by when it happened. Known consequence: an outage that
+  starts inside a window and recovers after it ends pages the recovery having
+  never paged the failure. Fixing that means remembering per check what was
+  suppressed, which is state to persist for a cosmetic gain.
+- Stored, not configured: one `settings` document (`maintenance.windows`) via
+  the same `load_or_seed` as the notifiers, with **no** `[[maintenance]]` block
+  to seed it — a window is booked at a moment and nobody redeploys to schedule
+  one. Replaced as a whole by the PUT, so a window has no id.
+- `announce` publishes the operator's title under the overall-status banner
+  while the window runs (`maintenance` on `/api/v1/status`, `.mbanner` in
+  `App.svelte`). It names no checks and is not clickable: a window has no
+  updates and no permalink, which is what separates it from an incident.
+  Advance notice is deliberately out — that is a manually opened incident.
+- Both `/api/v1/admin/maintenance` verbs are admin-gated. A window is a licence
+  to go quiet, so an anonymous PUT could silence the fleet;
+  `maintenance_windows_are_admin_only` asserts the 401 *and* that the refused
+  PUT stored nothing.
+- The editor is a `<select multiple>` of check names from the same GET, and two
+  `datetime-local` inputs. Native controls on purpose: the picker, the calendar
+  and the timezone handling are the browser's, and the panel is ~120 lines.
+
+Mutation-verified, per the rule below: dropping the `starts_at` bound from
+`active_at` fails only `a_transition_outside_the_window_still_pages`, and making
+`covers` always false fails only
+`a_maintenance_window_suppresses_the_page_without_hiding_the_outage`.
+
+Still open beside it: alert suppression by *section*, and escalation — both
+listed under item 2 above.
 
 ### 4. Credential follow-ups
 - **Rotation without downtime**: two live credentials per zone, so a zone can
@@ -105,15 +495,22 @@ suppression; disabling a check is currently the only way to stop probing.
   impersonate a sibling *within its own zone*. Only worth it if agents run on
   hosts you do not control. `Coordinator::provision_agent_credential` already
   takes a chosen token, so per-agent provisioning needs no new primitive.
-- **Config seeding**: credentials can only be minted through the admin API, so
-  a fully unattended first boot is not possible today — something has to log in
-  once. `provision_agent_credential` is the hook if that ever needs to come from
-  config or an init container.
+- **Config seeding** _(landed)_: `[[coordinator.provision]]` gives
+  `provision_agent_credential` a config surface, so an unattended first boot
+  works — see the credentials section above and `docker-compose.cluster.yaml`.
 
 ### 5. Smaller, known
-- `ponytail:` in `gossip.rs` — no anti-entropy. A peer unreachable when a
-  transition fires misses it permanently. Upgrade path is a periodic
-  `/api/v1/status` pull between peers.
+- Closed: anti-entropy now exists. Every `anti_entropy_secs` a node pulls one
+  random alive peer's digest (`GET /internal/digest` — per-check max-ts/count
+  over a bounded window, plus high-water marks for alerts/incidents and
+  config) and backfills exactly the ranges it is behind on
+  (`GET /internal/backfill`, paged so a catch-up cannot starve ingest under
+  the storage mutex). A peer unreachable when a write happens is caught up on
+  the next sweep instead of missing it permanently. The same sweep reconciles
+  the config plane, pulling a kind from `GET /internal/config` when the peer's
+  stamp is ahead *or* the row counts disagree — config rows are updated in
+  place, so a high-water mark alone cannot see a row this node never received.
+  See **§9 Clustering**.
 - The public check-detail page still exposes `agent_id` per latency band. It is
   a deliberate feature, but it is fleet information on an unauthenticated page.
 - `fetchAgents()` in `api.ts` throws a plain `Error`, not `AdminError`, so the
@@ -121,8 +518,34 @@ suppression; disabling a check is currently the only way to stop probing.
   session dies mid-edit. `AgentsAdmin` works around it by matching on `401`.
 - Agents UI filters client-side over the full fleet. Fine into the hundreds;
   past ~1000 the endpoint needs server-side paging.
-- `docker-compose.yaml` runs a single coordinator; there is no multi-coordinator
-  gossip setup to exercise clustering under compose.
+- Closed: fleet health now agrees across the cluster. Agent poll time is
+  persisted as a column instead of living only in the in-memory `seen` map,
+  so two coordinators serving the same status page read the same answer for
+  who is polling rather than disagreeing based on whichever of them happened
+  to receive the last poll.
+- The demo seed reports as an agent (`agent_id = "seed"`), so a coordinator with
+  no real checks shows a `seed` region on the public page. Harmless, and it
+  disappears the moment a real check exists — but it is the demo data leaking
+  into a new surface.
+- The retry queue stays per coordinator, in its own DuckDB — and that is now
+  known to be permanently correct, not just correct today. The clustering
+  invariant (**§9 Clustering**: the observing coordinator owns evaluation and
+  alerting) means a peer never dispatches on a replicated alert, so there is
+  exactly one coordinator ever trying to send any given notification, however
+  large the cluster gets. Nothing here needed to change.
+- Notifiers are replaced as a whole list, so two admins editing the panel at
+  once is last-write-wins. Fine for a list of two; it is the reason there is no
+  per-notifier id.
+- Test-send builds its own `reqwest::Client` per call rather than sharing the
+  dispatcher's. One TLS handshake on a button press, against not threading a
+  client through the handler.
+- Closed: `docker-compose.yaml` still runs a single coordinator, by design —
+  the multi-coordinator setup now lives in `docker-compose.cluster.yaml`,
+  three coordinators seeded in a ring (`a → b → c → a`) to exercise
+  membership, both replication planes and anti-entropy under compose on ports
+  8080/8081/8082. Boot order does not matter — seeds are retried — and each
+  node gets its own volume; an existing single-coordinator volume is not
+  reusable, the schema changed and this project does not migrate.
 - `git stash` holds an earlier AgentsAdmin experiment of yours
   ("superseded by scale rebuild") — `git stash pop` if you want it back,
   `git stash drop` to bin it.
@@ -134,12 +557,37 @@ sensitive to it.
 
 | Gate | Expected |
 |---|---|
-| `cargo test` | 127 passed, 0 failed |
+| `cargo test` | 295 passed, 0 failed |
 | `cargo fmt --check` | clean |
 | `cargo clippy --all-targets` | 0 warnings |
-| `cd frontend && npx svelte-check --threshold error` | 213 files, 0 errors |
-| `cd frontend && npx vitest run` | 22 passed |
+| `npx svelte-check --threshold error` (in `frontend/`) | 220 files, 0 errors, 1 pre-existing warning in `IncidentEditor.svelte` |
+| `npx vitest run` (in `frontend/`) | 28 passed |
 | served bundle vs `frontend/dist` | hashes match |
+
+Incident work is covered by seven tests in `tests/admin_api.rs`
+(`incidents_open_on_down_and_resolve_on_up`,
+`a_dependent_check_joins_its_upstreams_incident`,
+`unrelated_checks_falling_together_stay_separate_incidents`,
+`a_flapping_check_stays_inside_one_incident`,
+`auto_resolve_fires_even_after_a_human_has_acknowledged`,
+`a_manual_incident_is_never_auto_resolved`,
+`incident_writes_are_admin_only_while_reads_are_public`) plus the wire-shape
+assertions in `tests/ws_api.rs`. The two lifecycle bugs above were found by a
+**live** run, not by the suite — a standalone coordinator on `:8077` with a
+`depends_on` chain in its config is worth ten minutes before believing any
+reconciliation change.
+
+Maintenance windows: five unit tests in `src/maintenance.rs` for the predicate,
+and five in `tests/notifiers.rs`
+(`a_maintenance_window_suppresses_the_page_without_hiding_the_outage`,
+`a_transition_outside_the_window_still_pages`,
+`an_announced_window_is_published_while_it_runs`,
+`maintenance_windows_are_admin_only`,
+`a_window_that_ends_before_it_starts_is_refused`). Live-verified too, the same
+way: a standalone coordinator on `:8077` plus `vite --port 5174`, booking a
+window through the panel, then reading it back on the anonymous `/api/v1/status`
+and again after a coordinator restart — which is what proves the settings
+document, not just the in-memory copy.
 
 Wait **≥55 s** after `docker compose up`; `seed_mock` does 18–26 s of DuckDB
 inserts and shorter readiness probes report false failures.

@@ -40,6 +40,7 @@
     | 'zone'
     | 'status'
     | 'seen'
+    | 'rtt'
     | 'reporting'
     | 'results'
     | 'pinned';
@@ -158,6 +159,9 @@
         break;
       case 'seen':
         d = a.last_seen - b.last_seen;
+        break;
+      case 'rtt':
+        d = (a.poll_rtt_ms ?? Infinity) - (b.poll_rtt_ms ?? Infinity);
         break;
       case 'reporting':
         d = a.checks_reporting - b.checks_reporting;
@@ -551,6 +555,7 @@
             <col class="c-num" />
             <col class="c-num" />
             <col class="c-num" />
+            <col class="c-num" />
             <col class="c-act" />
           </colgroup>
           <thead>
@@ -560,6 +565,7 @@
               {@render column('zone', 'Zone')}
               {@render column('status', 'Status')}
               {@render column('seen', 'Last seen')}
+              {@render column('rtt', 'Poll RTT')}
               {@render column('reporting', 'Reporting')}
               {@render column('results', 'Results 24h')}
               {@render column('pinned', 'Pinned')}
@@ -569,7 +575,7 @@
           <tbody>
             {#if rendered.length === 0}
               <tr>
-                <td class="empty" colspan="9">
+                <td class="empty" colspan="10">
                   No agent matches these filters.
                   <button class="btn" onclick={clearFilters}>Clear filters</button>
                 </td>
@@ -580,7 +586,7 @@
             {#each rendered as row (row.key)}
               {#if row.kind === 'region'}
                 <tr class="grp region" class:unplaced={row.region === UNKNOWN_LOCATION}>
-                  <th colspan="9" scope="colgroup">
+                  <th colspan="10" scope="colgroup">
                     <button
                       class="grp-toggle"
                       aria-expanded={!collapsed[row.key]}
@@ -600,7 +606,7 @@
                 </tr>
               {:else if row.kind === 'zone'}
                 <tr class="grp zone" class:dead={row.zone.up === 0}>
-                  <th colspan="9" scope="colgroup">
+                  <th colspan="10" scope="colgroup">
                     <button
                       class="grp-toggle"
                       aria-expanded={!collapsed[row.key]}
@@ -632,6 +638,9 @@
                   </td>
                   <td class="dim" title={new Date(row.agent.last_seen).toLocaleString()}>
                     {formatRelativeTime(row.agent.last_seen)}
+                  </td>
+                  <td class="mono dim">
+                    {row.agent.poll_rtt_ms == null ? '—' : `${row.agent.poll_rtt_ms} ms`}
                   </td>
                   <td class="mono">{row.agent.checks_reporting}</td>
                   <td class="mono">{row.agent.results_24h}</td>
@@ -897,7 +906,7 @@
     width: 7.5rem;
   }
   .c-num {
-    width: 6rem;
+    width: 7rem;
   }
   .c-act {
     width: 5.5rem;

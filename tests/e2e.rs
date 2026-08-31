@@ -22,7 +22,7 @@ use warden::agent::{execute_check, Probes};
 use warden::config::{CheckConfig, CoordinatorConfig};
 use warden::coordinator::Coordinator;
 use warden::models::{CheckKind, Status};
-use warden::notify::Notifier;
+use warden::notify::{Notifier, NotifierKind};
 
 /// Bind an ephemeral 127.0.0.1 port and serve `app`. Returns the bound addr.
 /// The listener is bound before we hand it to `serve`, so the OS accepts
@@ -106,8 +106,12 @@ async fn agent_check_through_coordinator_fires_alert_on_up_to_down() {
         &CoordinatorConfig {
             listen: "127.0.0.1:0".into(),
             db_path: ":memory:".into(),
-            notifiers: vec![Notifier::Webhook {
-                url: format!("http://{webhook_addr}/"),
+            notifiers: vec![Notifier {
+                name: "alerts".into(),
+                default: true,
+                kind: NotifierKind::Webhook {
+                    url: format!("http://{webhook_addr}/"),
+                },
             }],
             ..Default::default()
         },

@@ -15,8 +15,10 @@
     createCheck,
     deleteCheck,
     fetchAdminChecks,
+    fetchNotifiers,
     fetchSections,
     purgeCheckData,
+    purgeCheckEverything,
     testEval,
     updateCheck,
   } from '../lib/admin';
@@ -60,11 +62,14 @@
     cert_warning_days: number | null;
     grace_secs: number | null;
     failures_before_down: number | null;
+    /** Upstream checks. A DOWN here joins the upstream's open incident rather
+     *  than opening a second one for the same root cause. */
+    depends_on: string[];
     // Same reason as every other number here: cleared reads as empty, not zero.
     placement: { zones: string[]; regions: string[]; per_zone: number | null };
   };
 
-  const KINDS: CheckKind[] = ['http', 'tcp', 'dns', 'icmp', 'ssl', 'heartbeat'];
+  const KINDS: CheckKind[] = ['http', 'tcp', 'dns', 'icmp', 'ssl', 'heartbeat', 'openmetrics'];
   const MATCH_MODES: MatchMode[] = ['any', 'all'];
   const DEFAULT_STATUSES: DefaultStatus[] = ['up', 'down', 'unknown'];
   const DNS_RECORDS = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS'];
@@ -86,6 +91,9 @@
       expect_body: '',
       enabled: true,
       visible: true,
+      notify: true,
+      notifiers: [],
+      depends_on: [],
       eval: '',
       agents: [],
       description: '',
@@ -96,6 +104,7 @@
       allow_self_signed: false,
       dns: { nameserver: '', record: 'A', match_type: 'all', expected: [] },
       ping: { ip_type: 'any', count: 1 },
+      metric: { name: '', labels: [] },
       cert_warning_days: 14,
       grace_secs: 300,
       failures_before_down: 1,
@@ -122,6 +131,9 @@
       expect_body: c.expect?.body_contains ?? '',
       enabled: c.enabled ?? true,
       visible: c.visible ?? true,
+      notify: c.notify ?? true,
+      notifiers: [...(c.notifiers ?? [])],
+      depends_on: [...(c.depends_on ?? [])],
       eval: c.eval ?? '',
       agents: [...(c.agents ?? [])],
       description: c.description ?? '',
@@ -137,6 +149,10 @@
         expected: [...(c.dns?.expected ?? [])],
       },
       ping: { ip_type: c.ping?.ip_type ?? d.ping.ip_type, count: c.ping?.count ?? d.ping.count },
+      metric: {
+        name: c.metric?.name ?? '',
+        labels: (c.metric?.labels ?? []).map((l) => ({ name: l.name, value: l.value })),
+      },
       cert_warning_days: c.cert_warning_days ?? d.cert_warning_days,
       grace_secs: c.grace_secs ?? d.grace_secs,
       failures_before_down: c.failures_before_down ?? d.failures_before_down,
@@ -155,6 +171,14 @@
   /** Every agent the coordinator has ever heard from, with its liveness — the
    *  picker needs both the ids and which of them are still reporting. */
   let agentRows = $state<Agent[]>([]);
+  /** Notifier names this check can route to, and which of them are defaults —
+   *  the picker has to say what "none selected" actually means. */
+  let notifierNames = $state<string[]>([]);
+  let defaultNotifiers = $state<string[]>([]);
+  /** Every other check, for the `depends_on` picker. Excludes this one: a
+   *  check depending on itself would look up its own open incident and join
+   *  it, which is a no-op dressed up as configuration. */
+  let allCheckNames = $state<string[]>([]);
   let loading = $state(true);
   let loadError = $state<string | null>(null);
   let saving = $state(false);
@@ -168,15 +192,21 @@
   let evalResult = $state<EvalResult | null>(null);
   let evalError = $state<string | null>(null);
   let testing = $state(false);
-  let sample = $state<{ status: number | null; latency: number | null; body: string }>({
+  let sample = $state<{
+    status: number | null;
+    latency: number | null;
+    body: string;
+    metric: number | null;
+  }>({
     status: 200,
     latency: 42,
     body: 'ok',
+    metric: 1,
   });
 
   // Each destructive action confirms on its own, so arming one never arms the
   // other — they destroy very different things.
-  let pending = $state<'purge' | 'delete' | null>(null);
+  let pending = $state<'purge' | 'delete' | 'erase' | null>(null);
   let dangerBusy = $state(false);
   let dangerError = $state<string | null>(null);
   let dangerNote = $state<string | null>(null);
@@ -206,6 +236,13 @@
   // Set-deduped so the keyed each below can never see a repeated id.
   const agentOptions = $derived([
     ...new Set([...agentRows.map((a) => a.agent_id), ...draft.agents]),
+  ]);
+
+  /** Dependency candidates: every other check, plus anything already named on
+   *  this one so a stale entry stays visible instead of vanishing silently.
+   *  Set-deduped, since the picker below is keyed on these strings. */
+  const otherChecks = $derived([
+    ...new Set([...allCheckNames, ...draft.depends_on].filter((n) => n !== name)),
   ]);
 
   // An id absent here is either silent or has never reported at all. Both mean
@@ -302,14 +339,21 @@
     loadError = null;
     try {
       // The pickers would silently offer the wrong choices on a partial load,
-      // so the three come together or the failure is reported.
-      const [checks, secs, ag] = await Promise.all([
+      // so they come together or the failure is reported.
+      const [checks, secs, ag, notifiers] = await Promise.all([
         fetchAdminChecks(),
         fetchSections(),
         fetchAgents(),
+        fetchNotifiers(),
       ]);
       sections = secs;
       agentRows = ag.agents;
+      allCheckNames = checks.map((c) => c.name);
+      notifierNames = notifiers.notifiers.map((n) => n.name).filter(Boolean);
+      defaultNotifiers = notifiers.notifiers
+        .filter((n) => n.default)
+        .map((n) => n.name)
+        .filter(Boolean);
       if (name !== null) {
         const found = checks.find((c) => c.name === name);
         if (!found) throw new Error(`No check named “${name}”. It may have been deleted.`);
@@ -359,6 +403,9 @@
   function addExpected() {
     draft.dns.expected.push('');
   }
+  function addMetricLabel() {
+    draft.metric.labels.push({ name: '', value: '' });
+  }
 
   /** Adding a location the fleet has never reported is deliberate: a zone is
    *  usually configured before the agent that will live in it boots. */
@@ -387,6 +434,8 @@
       return (saveError = 'Ping count must be a whole number, at least 1.');
     if (k === 'ssl' && !whole(draft.cert_warning_days, 0))
       return (saveError = 'Certificate warning must be a whole number of days, at least 0.');
+    if (k === 'openmetrics' && !draft.metric.name.trim())
+      return (saveError = 'Metric name is required.');
       if (k === 'heartbeat' && !whole(draft.grace_secs, 10))
         return (saveError = 'Grace must be a whole number of seconds, at least 10.');
       if (!whole(draft.failures_before_down, 1))
@@ -413,6 +462,9 @@
       expect: {},
       enabled: draft.enabled,
       visible: draft.visible,
+      notify: draft.notify,
+      notifiers: [...draft.notifiers],
+      depends_on: trimmed(draft.depends_on),
       agents: [...draft.agents],
       default_status: draft.default_status,
       // Config a type cannot act on is config the server has to reject or
@@ -426,6 +478,15 @@
         expected: k === 'dns' ? trimmed(draft.dns.expected) : [],
       },
       ping: { ip_type: draft.ping.ip_type, count: draft.ping.count ?? 1 },
+      metric:
+        k === 'openmetrics'
+          ? {
+              name: draft.metric.name.trim(),
+              labels: draft.metric.labels
+                .filter((l) => l.name.trim())
+                .map((l) => ({ name: l.name.trim(), value: l.value })),
+            }
+          : { name: '', labels: [] },
       cert_warning_days: draft.cert_warning_days ?? 14,
       grace_secs: draft.grace_secs ?? 300,
       failures_before_down: draft.failures_before_down ?? 1,
@@ -487,6 +548,7 @@
         status: sample.status ?? 0,
         latency: sample.latency ?? 0,
         body: sample.body,
+        ...(kind === 'openmetrics' ? { metric: sample.metric ?? 0 } : {}),
       });
     } catch (e) {
       evalError = fail(e);
@@ -520,6 +582,23 @@
     dangerError = null;
     try {
       await deleteCheck(name);
+      onsaved();
+      onclose();
+    } catch (e) {
+      dangerError = fail(e);
+      dangerBusy = false;
+    }
+  }
+
+  // The only one of the three that also takes the recorded history and the
+  // incidents with it — plain delete leaves those orphaned behind the name.
+  async function confirmErase() {
+    if (name === null || dangerBusy) return;
+    dangerBusy = true;
+    dangerError = null;
+    try {
+      const { results, incidents } = await purgeCheckEverything(name);
+      dangerNote = `Erased ${name}: ${results} recorded ${results === 1 ? 'attempt' : 'attempts'} and ${incidents} ${incidents === 1 ? 'incident' : 'incidents'} removed, along with the check itself.`;
       onsaved();
       onclose();
     } catch (e) {
@@ -637,6 +716,32 @@
           </span>
         </label>
 
+        <div class="field wide">
+          <span class="field-label">Depends on</span>
+          {#if otherChecks.length === 0}
+            <span class="field-note">No other checks to depend on yet.</span>
+          {:else}
+            <div class="agent-picks">
+              {#each otherChecks as name (name)}
+                <label class="toggle">
+                  <input type="checkbox" value={name} bind:group={draft.depends_on} />
+                  <span class="agent-pill">{name}</span>
+                </label>
+              {/each}
+            </div>
+          {/if}
+          <span class="field-note">
+            {#if draft.depends_on.length === 0}
+              Nothing upstream. A failure here opens its own incident.
+            {:else}
+              When this check fails while one of these already has an open incident, it
+              joins that incident instead of opening a second one for the same root cause.
+              It still alerts and still notifies — grouping is not silence. One hop only:
+              it does not follow an upstream's own dependencies.
+            {/if}
+          </span>
+        </div>
+
         <div class="field wide switches">
           <span class="field-label">Switches</span>
           <label class="toggle">
@@ -648,10 +753,48 @@
             <span>Hidden <em>— keep it off the public status page. It is still probed.</em></span>
           </label>
           <label class="toggle">
+            <input type="checkbox" bind:checked={draft.notify} />
+            <span
+              >Notify <em
+                >— send this check's state changes to the notifiers. Off still records the
+                incident; it just doesn't page anyone.</em
+              ></span
+            >
+          </label>
+          <label class="toggle">
             <input type="checkbox" bind:checked={draft.latency_graph} />
             <span>Latency graph <em>— draw the sparkline under it.</em></span>
           </label>
         </div>
+
+        {#if draft.notify}
+          <div class="field wide">
+            <span class="field-label">Send alerts to</span>
+            {#if notifierNames.length === 0}
+              <span class="field-note">
+                No notifiers configured. Add one on the Notifications panel; until then every
+                alert is recorded and sent nowhere.
+              </span>
+            {:else}
+              <div class="agent-picker">
+                {#each notifierNames as n (n)}
+                  <label class="toggle">
+                    <input type="checkbox" value={n} bind:group={draft.notifiers} />
+                    <span class="agent-pill">{n}</span>
+                  </label>
+                {/each}
+              </div>
+              <span class="field-note">
+                {#if draft.notifiers.length === 0}
+                  None picked, so this check goes to the defaults:
+                  <strong>{defaultNotifiers.join(', ') || 'nothing is marked default, so nobody'}</strong>.
+                {:else}
+                  Exactly these, whether or not they are defaults.
+                {/if}
+              </span>
+            {/if}
+          </div>
+        {/if}
 
         <div class="field wide">
           <span class="field-label">Pin to agents</span>
@@ -921,6 +1064,54 @@
             <input type="number" min="0" bind:value={draft.cert_warning_days} />
             <span class="field-note">DOWN once the certificate is this close to expiring.</span>
           </label>
+        {:else if kind === 'openmetrics'}
+          <label class="field wide">
+            <span class="field-label">Target URL</span>
+            <input class="mono" bind:value={draft.target} placeholder="https://example.com/metrics" />
+            <span class="field-note">The exporter's scrape endpoint. Only this one target is probed.</span>
+          </label>
+
+          <label class="field">
+            <span class="field-label">Timeout (s)</span>
+            <input type="number" min="1" bind:value={draft.timeout_secs} />
+          </label>
+
+          <label class="field wide">
+            <span class="field-label">Metric name</span>
+            <input class="mono" bind:value={draft.metric.name} placeholder="up" />
+            <span class="field-note">The metric family to read from the scrape, e.g. "up".</span>
+          </label>
+
+          <div class="field wide">
+            <span class="field-label">Metric labels</span>
+            {#if draft.metric.labels.length === 0}
+              <span class="field-note">
+                None. If the family has more than one series, the first one wins — add labels to
+                pick a specific one.
+              </span>
+            {:else}
+              {#each draft.metric.labels as _label, i (i)}
+                <div class="pair-row">
+                  <input
+                    class="mono pair-name"
+                    bind:value={draft.metric.labels[i].name}
+                    placeholder="path"
+                  />
+                  <input class="mono" bind:value={draft.metric.labels[i].value} placeholder="/health" />
+                  <button class="btn danger" onclick={() => draft.metric.labels.splice(i, 1)}>
+                    Remove
+                  </button>
+                </div>
+              {/each}
+            {/if}
+            <div class="add-row">
+              <button class="btn" onclick={addMetricLabel}>+ Add label</button>
+            </div>
+            <span class="field-note">
+              Narrows the metric family down to one series when several share the same name — e.g.
+              <code>path="/health"</code>. All must match.
+            </span>
+          </div>
         {:else}
           <label class="field">
             <span class="field-label">Grace (s)</span>
@@ -1071,21 +1262,32 @@
           (ms), <code>body</code> (string, truncated), <code>headers</code> (table, lowercased
           keys). Return <code>"UP"</code> or <code>"DOWN"</code>, optionally a latency override as a
           second value. Returning nothing — or leaving this empty — uses the built-in 2xx–3xx logic.
+          {#if kind === 'openmetrics'}
+            For OpenMetrics, <code>metric</code> is the selected sample's value (number), and
+            <code>metrics</code> is an array of every sample from the same scrape.
+          {/if}
         </p>
 
         <div class="try-row">
-          <label class="field try-num">
-            <span class="field-label">status</span>
-            <input type="number" bind:value={sample.status} />
-          </label>
-          <label class="field try-num">
-            <span class="field-label">latency (ms)</span>
-            <input type="number" bind:value={sample.latency} />
-          </label>
-          <label class="field try-body">
-            <span class="field-label">body</span>
-            <input class="mono" bind:value={sample.body} />
-          </label>
+          {#if kind === 'openmetrics'}
+            <label class="field try-num">
+              <span class="field-label">metric</span>
+              <input type="number" bind:value={sample.metric} />
+            </label>
+          {:else}
+            <label class="field try-num">
+              <span class="field-label">status</span>
+              <input type="number" bind:value={sample.status} />
+            </label>
+            <label class="field try-num">
+              <span class="field-label">latency (ms)</span>
+              <input type="number" bind:value={sample.latency} />
+            </label>
+            <label class="field try-body">
+              <span class="field-label">body</span>
+              <input class="mono" bind:value={sample.body} />
+            </label>
+          {/if}
           <button class="btn" onclick={runTest} disabled={testing}>
             {testing ? 'Testing…' : 'Test script'}
           </button>
@@ -1175,13 +1377,15 @@
         <div class="danger-act">
           <div class="danger-title">Delete check</div>
           <p class="admin-muted">
-            Removes <span class="mono">{name}</span> entirely: its configuration, its recorded
-            history and its place on the status page. Nothing will probe it again and the name
-            becomes free to reuse. This cannot be undone.
+            Removes <span class="mono">{name}</span>'s configuration and its place on the status
+            page. Nothing will probe it again and the name becomes free to reuse. Its recorded
+            history — results, alerts, incidents — is <em>not</em> touched by this; it survives, orphaned
+            under the old name. Use "erase everything" below if that history should go too. This
+            cannot be undone.
           </p>
           <div class="form-actions">
             {#if pending === 'delete'}
-              <span class="confirm">Delete the check and everything it recorded?</span>
+              <span class="confirm">Delete the check, keeping its recorded history?</span>
               <button class="btn danger" onclick={confirmDelete} disabled={dangerBusy}>
                 {dangerBusy ? 'Deleting…' : 'Yes, delete the check'}
               </button>
@@ -1190,6 +1394,31 @@
               </button>
             {:else}
               <button class="btn danger" onclick={() => (pending = 'delete')}>Delete check</button>
+            {/if}
+          </div>
+        </div>
+
+        <div class="danger-act">
+          <div class="danger-title">Delete check and erase everything</div>
+          <p class="admin-muted">
+            Removes <span class="mono">{name}</span> and every trace it left behind: its
+            configuration, every recorded result and alert, and every incident it ever opened or
+            joined. Nothing is left orphaned. This is the option for a check that should never
+            have existed — not one you might reuse the name for later. This cannot be undone.
+          </p>
+          <div class="form-actions">
+            {#if pending === 'erase'}
+              <span class="confirm">Delete the check and erase everything it ever recorded?</span>
+              <button class="btn danger" onclick={confirmErase} disabled={dangerBusy}>
+                {dangerBusy ? 'Erasing…' : 'Yes, erase everything'}
+              </button>
+              <button class="btn" onclick={() => (pending = null)} disabled={dangerBusy}>
+                Cancel
+              </button>
+            {:else}
+              <button class="btn danger" onclick={() => (pending = 'erase')}>
+                Delete check and erase everything
+              </button>
             {/if}
           </div>
         </div>

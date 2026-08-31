@@ -1,0 +1,364 @@
+# Three coordinators and three agents, one region. The whole of §9 Clustering
+# in uptime-monitor-design.md in one file: membership, both replication planes,
+# anti-entropy — with actual traffic on them, because each coordinator has an
+# agent reporting to it.
+#
+#   docker compose -f docker-compose.cluster.yaml up -d --build
+#   open http://localhost:8090  (coordinator-a, agent-a in us-east-1a)
+#   open http://localhost:8091  (coordinator-b, agent-b in eu-west-1a)
+#   open http://localhost:8092  (coordinator-c, agent-c in ap-south-1a)
+#
+# One command, no manual step in the middle: agent credentials are provisioned
+# from coordinator-a's config (see CREDENTIALS below) rather than minted in the
+# UI.
+#
+# IT RUNS BESIDE THE SINGLE-NODE STACK, and both halves of that are deliberate:
+#
+#   * its own compose project (`name:` below). Without it the project name comes
+#     from the directory, and this file's agent-a/agent-b would *be* the same
+#     containers as docker-compose.agents.yaml's — starting the cluster would
+#     silently repoint the single-node stack's fleet. It also scopes the network
+#     and volumes, so nothing here can share a DNS alias with another stack.
+#   * its own published ports, 8090-8092, away from docker-compose.yaml's 8082.
+#     Each is overridable, because "the port is already taken on this host" is
+#     exactly the failure this renumbering exists to avoid:
+#     WARDEN_CLUSTER_PORT_A / _B / _C.
+#
+# ONE REGION, THREE NODES. This is Phase 5's shape — coordinators are peers of
+# equal standing, not a hierarchy. The agents' zones (us-east-1a, eu-west-1a,
+# ap-south-1a) are where the *probes* run; they say nothing about where the
+# coordinators sit. Cross-region federation with a global coordinator is Phase
+# 6 and is not what this file shows.
+#
+# SEEDING IS A CHAIN, NOT A MESH, ON PURPOSE:
+#
+#   coordinator-a --seeds--> coordinator-b --seeds--> coordinator-c --seeds--> coordinator-a
+#
+# Each node names exactly one peer in `peers`, not the other two. `peers` is a
+# seed list, not the membership (see §9): coordinator-a discovers coordinator-c
+# transitively, the first time it pings coordinator-b and gets coordinator-c
+# back in the returned view, never having dialled coordinator-c itself. A full
+# mesh would start every node already knowing everyone and prove nothing about
+# that path; a chain is the smallest topology that actually exercises it.
+#
+# BOOT ORDER DOES NOT MATTER, which is why there is no `depends_on` anywhere.
+# Every coordinator retries its one seed until it answers, and an agent that
+# starts before its coordinator simply retries the poll.
+#
+# CONFIG SEEDS ONLY coordinator-a's [[checks]] — coordinator-b and
+# coordinator-c start with none. That is deliberate: it is the config plane
+# (§9) doing the work, not three copies of the same seed.
+#
+# CREDENTIALS ARE PROVISIONED, ON coordinator-a ONLY. The three
+# [[coordinator.provision]] blocks below declare credentials whose token is
+# chosen in advance instead of minted in the UI, which is the only way a stack
+# like this can come up in one command: the agents need their token before
+# there is a coordinator to mint it in. coordinator-b and coordinator-c declare
+# none and receive all three over the config plane — mint once for the fleet,
+# not once per coordinator, which this stack is the only place you can see.
+#
+# Expect a short window at first boot where agent-b and agent-c get 401s until
+# the credential replicates from coordinator-a. Seconds; the agents retry. It
+# is not a bug, and it is the config plane visibly working.
+#
+# THE DEFAULT TOKENS BELOW ARE THROWAWAY VALUES FOR A LOCAL DEMO. They are
+# committed to this repository, so treat any stack running with them as
+# unauthenticated. Overriding them is one line each in .env:
+#
+#   WARDEN_AGENT_TOKEN_A=wac_<id>.<secret>
+#
+# A real deployment mints in Admin > Credentials and never puts a token in a
+# committed file at all.
+#
+# WHAT TO WATCH, once all six containers are up:
+#
+#   * GET :8090/api/v1/cluster — and :8091, :8092 — converge to three members,
+#     though no node was ever told about more than one peer.
+#   * Create a check in the UI on :8092. It appears on :8090 and :8091 within
+#     seconds, and the agents start probing it. That is the config plane.
+#   * Every node's grid fills with results from all three agents, even though
+#     each node ingests from exactly one. That is the data plane.
+#   * Admin > Credentials on :8091 lists three credentials it was never
+#     configured with. That is the config plane again, carrying the thing that
+#     makes the fleet work at all.
+#   * `docker compose -f docker-compose.cluster.yaml stop coordinator-b`: the
+#     other two mark it `suspect`, then `dead`. Start it again and anti-entropy
+#     backfills the results and config it missed while it was down.
+#
+# NO DEMO DATA HERE, unlike a fresh single-node install. An empty store means
+# "nobody has configured anything yet" on one node and "the config is on its
+# way" on a joining one, so the demo seed is skipped whenever `peers` is set.
+# It has to be: results replicate, so coordinator-b seeding a fake `seed` agent
+# would put that agent on all three dashboards — and purging it anywhere is
+# undone by the next anti-entropy sweep pulling the rows back from a peer that
+# still has them, because a result delete has no tombstone. Skipping it also
+# saves coordinator-b and coordinator-c 18-26s of inserts at first boot.
+#
+# THREE PROBES PER CHECK, NOT ONE. Default placement is "every agent", and each
+# coordinator places only across the agents polling *it*, so a check is probed
+# once per zone. That is the multi-region picture working as intended, not
+# duplication to be fixed.
+#
+# EACH COORDINATOR EVALUATES ONLY WHAT ITS OWN AGENT OBSERVED — the data
+# plane's governing invariant (§9): results replicate, but the observer owns
+# its own evaluation. An outage all three zones can see is therefore three
+# observers reaching the same conclusion independently, and this stack is the
+# only place cross-node incident and notification behaviour is visible at all.
+# Worth watching. Deliberately not changed here.
+#
+# AGENT LIVENESS IS SHARED ACROSS THE FLEET NOW; PLACEMENT STILL IS NOT.
+# Poll rows persist (`agent_polls`) and ride the fleet-sync broadcast every
+# `gossip_interval_secs`, so :8091 shows agent-a healthy from a replicated
+# poll row, not from replicated results trailing minutes behind on their own
+# five-minute window — every node in this compose file now reports the same
+# fleet. What stayed exactly as it was: which agents a check gets handed to
+# is still decided from this node's own in-memory `seen`, never from the
+# replicated rows, which is why THREE PROBES PER CHECK above still holds
+# rather than being something this fixed away. See §9, "Fleet liveness across
+# nodes" in the design doc.
+#
+# WARDEN_ADMIN_PASSWORD is shared, and so is the session it produces: admin
+# sessions are stateless tokens signed with a key derived from WARDEN_PEER_TOKEN
+# (see §9 Admin sessions), so logging in on :8090 and pasting the same session
+# into a request against :8092 works. That is not a bug particular to this
+# compose file — it is how sessions work in any cluster sharing a peer_token.
+#
+# WARDEN_PEER_TOKEN must be identical on every node or every ping is refused
+# with 401 — it is peer-to-peer authentication, not an agent credential, and
+# the two are never interchangeable.
+#
+# SCHEMA CHANGED. This project has a strict no-migrations convention: an old
+# single-coordinator volume from before clustering landed does not have the
+# HLC columns on checks/sections/settings/agent_credentials, and does not have
+# cluster_members or config_tombstones. Pointing this compose file at one of
+# those volumes fails on the missing columns instead of starting. Do not reuse
+# `uptime_coordinator-data` (from docker-compose.yaml) here — this file
+# defines three fresh, separate volumes and expects to start from empty.
+
+# Its own project, so nothing here shares a container, volume or network name
+# with the single-node stack — see the header. `down -v` scoped to this file
+# therefore cannot take that stack's data with it either.
+name: warden-cluster
+
+x-coordinator: &coordinator
+  build: .
+  image: warden:latest
+  command: ["coordinator", "--config", "/etc/warden/coordinator.toml"]
+  environment:
+    WARDEN_ADMIN_PASSWORD: ${WARDEN_ADMIN_PASSWORD:-}
+    WARDEN_PEER_TOKEN: ${WARDEN_PEER_TOKEN:?WARDEN_PEER_TOKEN must be set and identical on every node}
+  restart: unless-stopped
+  networks:
+    - warden
+
+x-agent: &agent
+  build: .
+  image: warden:latest
+  command: ["agent", "--config", "/etc/warden/agent.toml"]
+  # ICMP checks need raw sockets; without this the icmp probe reports a
+  # permission error instead of silently passing.
+  cap_add:
+    - NET_RAW
+  restart: unless-stopped
+  networks:
+    - warden
+
+services:
+  coordinator-a:
+    <<: *coordinator
+    environment:
+      WARDEN_ADMIN_PASSWORD: ${WARDEN_ADMIN_PASSWORD:-}
+      WARDEN_PEER_TOKEN: ${WARDEN_PEER_TOKEN:?WARDEN_PEER_TOKEN must be set and identical on every node}
+      WARDEN_NODE_ID: coordinator-a
+      WARDEN_ADVERTISE_URL: http://coordinator-a:8080
+      # Read by the [[coordinator.provision]] blocks in its config below. Only
+      # this node needs them; the credentials replicate from here.
+      WARDEN_AGENT_TOKEN_A: ${WARDEN_AGENT_TOKEN_A:-wac_demoa.demo-secret-a}
+      WARDEN_AGENT_TOKEN_B: ${WARDEN_AGENT_TOKEN_B:-wac_demob.demo-secret-b}
+      WARDEN_AGENT_TOKEN_C: ${WARDEN_AGENT_TOKEN_C:-wac_democ.demo-secret-c}
+    ports:
+      - "${WARDEN_CLUSTER_PORT_A:-8090}:8080"
+    configs:
+      - source: coordinator-a-toml
+        target: /etc/warden/coordinator.toml
+    volumes:
+      - coordinator-a-data:/data
+
+  coordinator-b:
+    <<: *coordinator
+    environment:
+      WARDEN_ADMIN_PASSWORD: ${WARDEN_ADMIN_PASSWORD:-}
+      WARDEN_PEER_TOKEN: ${WARDEN_PEER_TOKEN:?WARDEN_PEER_TOKEN must be set and identical on every node}
+      WARDEN_NODE_ID: coordinator-b
+      WARDEN_ADVERTISE_URL: http://coordinator-b:8080
+    ports:
+      - "${WARDEN_CLUSTER_PORT_B:-8091}:8080"
+    configs:
+      - source: coordinator-b-toml
+        target: /etc/warden/coordinator.toml
+    volumes:
+      - coordinator-b-data:/data
+
+  coordinator-c:
+    <<: *coordinator
+    environment:
+      WARDEN_ADMIN_PASSWORD: ${WARDEN_ADMIN_PASSWORD:-}
+      WARDEN_PEER_TOKEN: ${WARDEN_PEER_TOKEN:?WARDEN_PEER_TOKEN must be set and identical on every node}
+      WARDEN_NODE_ID: coordinator-c
+      WARDEN_ADVERTISE_URL: http://coordinator-c:8080
+    ports:
+      - "${WARDEN_CLUSTER_PORT_C:-8092}:8080"
+    configs:
+      - source: coordinator-c-toml
+        target: /etc/warden/coordinator.toml
+    volumes:
+      - coordinator-c-data:/data
+
+  # One agent per coordinator, each in its own zone. Every agent could point at
+  # any node — the fleet is not partitioned — but one apiece is what makes the
+  # data plane visible: a node ingesting from exactly one zone still shows all
+  # three on its grid, and only replication can have put them there.
+  agent-a:
+    <<: *agent
+    environment:
+      WARDEN_AGENT_TOKEN: ${WARDEN_AGENT_TOKEN_A:-wac_demoa.demo-secret-a}
+    configs:
+      - source: agent-a-toml
+        target: /etc/warden/agent.toml
+
+  agent-b:
+    <<: *agent
+    environment:
+      WARDEN_AGENT_TOKEN: ${WARDEN_AGENT_TOKEN_B:-wac_demob.demo-secret-b}
+    configs:
+      - source: agent-b-toml
+        target: /etc/warden/agent.toml
+
+  agent-c:
+    <<: *agent
+    environment:
+      WARDEN_AGENT_TOKEN: ${WARDEN_AGENT_TOKEN_C:-wac_democ.demo-secret-c}
+    configs:
+      - source: agent-c-toml
+        target: /etc/warden/agent.toml
+
+# Inlined rather than reusing deploy/*.toml, so this compose file is the whole
+# picture — and because those files hardcode `coordinator_url =
+# http://coordinator:8080`, a hostname that does not exist in this stack.
+# `peers` has no environment override (unlike node_id, advertise_url and
+# peer_token) because it is a list, which is why it has to live here rather
+# than being folded into the shared `x-coordinator` anchor.
+configs:
+  coordinator-a-toml:
+    content: |
+      [coordinator]
+      db_path = "/data/warden.duckdb"
+      peers = ["http://coordinator-b:8080"]
+      gossip_interval_secs = 5
+      peer_timeout_secs = 15
+      anti_entropy_secs = 60
+
+      # The whole fleet's credentials, declared on one node. Applied once: an
+      # id that already exists is left alone, so restarting neither rewrites
+      # the rows nor un-revokes one somebody retired in the UI. An unresolvable
+      # or malformed token stops this coordinator starting rather than leaving
+      # the fleet unable to authenticate.
+      [[coordinator.provision]]
+      zone = "us-east-1a"
+      region = "us-east"
+      token_env = "WARDEN_AGENT_TOKEN_A"
+
+      [[coordinator.provision]]
+      zone = "eu-west-1a"
+      region = "eu-west"
+      token_env = "WARDEN_AGENT_TOKEN_B"
+
+      [[coordinator.provision]]
+      zone = "ap-south-1a"
+      region = "ap-south"
+      token_env = "WARDEN_AGENT_TOKEN_C"
+
+      [[checks]]
+      name = "example-http"
+      type = "http"
+      target = "https://example.com"
+      latency_graph = true
+      interval_secs = 30
+      timeout_secs = 10
+      [checks.expect]
+      status = 200
+
+      [[checks]]
+      name = "cloudflare-dns"
+      type = "dns"
+      target = "one.one.one.one"
+      interval_secs = 30
+      timeout_secs = 10
+      [checks.expect]
+      body_contains = "1.1.1.1"
+
+  coordinator-b-toml:
+    content: |
+      # No [[checks]] and no [[coordinator.provision]] here on purpose — see
+      # the header. Both arrive from coordinator-a over the config plane (§9).
+      [coordinator]
+      db_path = "/data/warden.duckdb"
+      peers = ["http://coordinator-c:8080"]
+      gossip_interval_secs = 5
+      peer_timeout_secs = 15
+      anti_entropy_secs = 60
+
+  coordinator-c-toml:
+    content: |
+      # Closes the ring back to coordinator-a. See the header comment.
+      [coordinator]
+      db_path = "/data/warden.duckdb"
+      peers = ["http://coordinator-a:8080"]
+      gossip_interval_secs = 5
+      peer_timeout_secs = 15
+      anti_entropy_secs = 60
+
+  # Zone and region are deliberately absent from every agent config: they come
+  # from the credential the token belongs to, because placement acts on
+  # location and an agent able to name its own zone could be handed checks it
+  # never runs. `agent_id` is per service — two agents sharing an id collide in
+  # the fleet view. No [[checks]] either: the coordinator owns the list, and
+  # each agent pulls it from /api/v1/agent/checks.
+  agent-a-toml:
+    content: |
+      [agent]
+      coordinator_url = "http://coordinator-a:8080"
+      agent_id = "agent-a"
+      flush_secs = 5
+
+  agent-b-toml:
+    content: |
+      [agent]
+      coordinator_url = "http://coordinator-b:8080"
+      agent_id = "agent-b"
+      flush_secs = 5
+
+  agent-c-toml:
+    content: |
+      [agent]
+      coordinator_url = "http://coordinator-c:8080"
+      agent_id = "agent-c"
+      flush_secs = 5
+
+volumes:
+  coordinator-a-data:
+  coordinator-b-data:
+  coordinator-c-data:
+
+# Deliberately *unnamed*, so compose scopes it to the project
+# (`warden-cluster_warden`) rather than claiming a fixed global name.
+#
+# A fixed name is a trap here, and one this file fell into: a second set of
+# containers on a network that already has a `coordinator-a` on it gets a
+# second DNS record for that alias, and Docker answers round-robin. Half the
+# agent polls and peer pings then land on the *other* stack's coordinator,
+# which knows neither the credential nor the peer token — an intermittent 401
+# storm that looks exactly like a broken token. Leftovers from an earlier run
+# of this file are the likeliest source.
+networks:
+  warden:

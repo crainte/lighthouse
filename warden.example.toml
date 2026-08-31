@@ -13,18 +13,45 @@ flush_secs = 5
 [coordinator]
 listen = "0.0.0.0:8080"
 db_path = "warden.duckdb"
-# Notification backends. Every notifier receives every alert.
+# Notification backends. Like [[checks]], these only seed the store on first
+# boot — after that they are edited in Admin > Notifications. A check with no
+# `notifiers` of its own goes to every one marked `default = true`.
+#
 # [[coordinator.notifiers]]
-# type = "webhook"
-# url = "https://hooks.slack.com/services/..."
+# name = "oncall"
+# default = true
+# type = "webhook"            # POSTs {check_id, from, to}
+# url = "https://hooks.example.com/..."
+#
+# type = "slack"              # a Slack incoming webhook wants `text`, so it is
+# webhook_url = "https://hooks.slack.com/services/..."   # not the webhook kind
+#
+# type = "ntfy"
+# topic = "warden"
+# base_url = "https://ntfy.sh"  # optional
+#
+# type = "pagerduty"          # Events API v2. The check id is the dedup key, so
+# routing_key = "..."         # a recovery resolves the incident it opened.
+#
+# type = "email"
+# host = "smtp.example.com"
+# port = 587                  # optional: 465 implicit, 587 starttls, 25 none
+# tls = "starttls"            # starttls (default) | implicit | none
+# username = "warden"         # both or neither
+# password = "..."            # better supplied in the admin UI than this file
+# from = "warden@example.com"
+# to = "ops@example.com"      # one address; use an alias for a list
 
 # Secrets are better supplied by the environment than written here — this file
-# tends to end up in version control. Both fall back to an env var:
+# tends to end up in version control. All three fall back to an env var:
 #
 #   WARDEN_ADMIN_PASSWORD  unlocks the check editor. With neither this nor the
 #                          env var set, the editor is disabled rather than open.
-#   WARDEN_PEER_TOKEN      coordinator-to-coordinator gossip. Only needed when
-#                          `peers` is set. Unset means gossip is refused.
+#   WARDEN_PEER_TOKEN      coordinator-to-coordinator authentication for both
+#                          membership and replication. Only needed when
+#                          `peers` is set. Unset means every peer message is
+#                          refused with 401.
+#   WARDEN_ADVERTISE_URL   see below.
 #
 # Agents are not authenticated by anything in this file. Each zone gets a
 # credential minted in Admin > Credentials, and a coordinator with none refuses
@@ -32,6 +59,64 @@ db_path = "warden.duckdb"
 # mode.
 #
 # admin_password = "change-me"
+
+# Regional clustering. Irrelevant to a standalone install — `peers` empty (the
+# default) is what makes it standalone — so everything below is commented out.
+# Setting `peers` turns on membership, replication and anti-entropy against
+# the coordinators named there; see §9 Clustering in uptime-monitor-design.md.
+#
+# peers = ["http://coordinator-b:8080", "http://coordinator-c:8080"]
+#
+# Stable identity of this node in the cluster. Unset means one is generated on
+# first boot and persisted, so a restart rejoins as itself rather than
+# appearing as a new member and leaving a ghost behind. Env: WARDEN_NODE_ID.
+# node_id = "coordinator-a"
+#
+# How peers reach *this* node. Required once `peers` is non-empty — startup
+# refuses to run without it, because a node no peer can dial back replicates
+# outward while receiving nothing. Env: WARDEN_ADVERTISE_URL.
+# advertise_url = "http://coordinator-a:8080"
+#
+# How often every known member is pinged. Also the granularity of failure
+# detection: nothing is noticed faster than this.
+# gossip_interval_secs = 5
+#
+# Silence after which a member is suspected, and twice which it is declared
+# dead. Comfortably above gossip_interval_secs, or one dropped ping suspects a
+# healthy peer.
+# peer_timeout_secs = 15
+#
+# How often to reconcile with a peer by digest exchange. Bounds how long a
+# divergence from a dropped replication push can last; it is a correctness
+# backstop, not the main replication path.
+# anti_entropy_secs = 60
+
+# Agent credentials whose token is chosen in advance instead of minted in the
+# UI. For a fleet that has to be configured before this coordinator has ever
+# run — a compose stack, a Kubernetes manifest, a test fixture — where there is
+# no browser to mint in and nowhere to paste the result. Everything else about
+# them is identical to a minted credential, zone and region included: the
+# coordinator takes an agent's location from here, never from what the agent
+# claims.
+#
+# Use `token_env` outside a fixture and keep the secret out of this file. An
+# unresolvable or malformed token stops startup rather than being skipped: the
+# alternative is a fleet authenticating against nothing, which looks exactly
+# like a fleet that has not been given work yet.
+#
+# Applied once. A credential whose id already exists is left untouched, so this
+# block neither rewrites the row (and pushes a config change to every peer) on
+# each restart, nor resurrects a credential someone revoked. Revoking one and
+# leaving the block here is fine and is the intended way to retire it.
+#
+# In a cluster, declare the blocks on one node only — the others receive the
+# credentials over the config plane, which is the whole point of minting once
+# for the fleet rather than once per coordinator.
+#
+# [[coordinator.provision]]
+# zone = "us-east-1a"
+# region = "us-east"
+# token_env = "WARDEN_AGENT_TOKEN_A"    # or: token = "wac_....." (fixtures)
 
 # --- HTTP -------------------------------------------------------------------
 # Default eval: any 2xx-3xx is UP.

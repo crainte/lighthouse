@@ -2,3 +2,7 @@
 *.duckdb
 *.duckdb.wal
 .env
+
+# Local tooling caches, not project state.
+/.rtk
+/.vite

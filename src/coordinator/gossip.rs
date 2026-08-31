@@ -37,15 +37,23 @@ pub struct Message {
     /// Milliseconds since epoch, taken from the observing coordinator's result
     /// rather than the receiver's clock, so replicated history lines up.
     pub timestamp: i64,
+    /// The incident the observer stamped this transition with, if any.
+    /// `#[serde(default)]` so a sender on an older binary — or a test that
+    /// posts a bare transition, as `tests/gossip.rs` does — still
+    /// deserialises; the receiver falls back to guessing from its own local
+    /// state when this is absent.
+    #[serde(default)]
+    pub incident_id: Option<String>,
 }
 
 impl Message {
-    pub fn new(t: &Transition, timestamp: i64) -> Self {
+    pub fn new(t: &Transition, timestamp: i64, incident_id: Option<String>) -> Self {
         Self {
             check_id: t.check_id.clone(),
             from: t.from,
             to: t.to,
             timestamp,
+            incident_id,
         }
     }
 
@@ -138,7 +146,7 @@ mod tests {
             from: Status::Up,
             to: Status::Down,
         };
-        let msg = Message::new(&t, 1_700_000_000_000);
+        let msg = Message::new(&t, 1_700_000_000_000, None);
 
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""from":"up""#), "{json}");

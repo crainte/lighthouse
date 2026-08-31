@@ -41,6 +41,10 @@ x509-parser = "0.16"
 # working secrets. A single SHA-256 is right here: these are 256-bit random
 # secrets, not human passwords, so there is nothing to slow a guesser down for.
 sha2 = "0.11"
+# Signs admin session tokens so a coordinator cluster can validate a session
+# minted by any node without sharing session state — see auth.rs.
+hmac = "0.13"
+lettre = { version = "0.11.23", default-features = false, features = ["tokio1", "smtp-transport", "builder", "tokio1-rustls-tls"] }
 
 [dev-dependencies]
 tokio-tungstenite = "0.24"

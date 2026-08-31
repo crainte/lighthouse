@@ -1,22 +1,35 @@
 <script lang="ts">
-  import { fetchHistory, fetchUptime, fetchLatencyWindow } from '../lib/api';
+  import { fetchHistory, fetchUptime, fetchLatencyWindow, fetchCheckIncidents } from '../lib/api';
   import type {
     Check,
+    Incident,
     HistoryPoint,
     UptimeResponse,
     LatencySparklineResponse,
   } from '../lib/api';
-  import { statusColor, formatLatency, formatRelativeTime, failureReason, barColor } from '../lib/format';
+  import {
+    statusColor,
+    formatLatency,
+    formatRelativeTime,
+    formatDuration,
+    failureReason,
+    barColor,
+  } from '../lib/format';
+  import { stateTone } from '../lib/incident';
   import LatencyChart from './LatencyChart.svelte';
 
   let {
     checkId,
     check,
+    refreshKey = 0,
     onback,
   }: {
     checkId: string;
     /** Live status row, so this page reports the same figures as the list. */
     check?: Check;
+    /** Bumped by the parent on a live state change for this check or on a
+     *  websocket reconnect, to force a refetch of this page's own data. */
+    refreshKey?: number;
     onback: () => void;
   } = $props();
 
@@ -36,16 +49,32 @@
   let series = $state<LatencySparklineResponse | null>(null);
   /** Every failing attempt in the window, however far back it sits. */
   let failures = $state<HistoryPoint[]>([]);
-  /** Newest attempts, for the raw log at the bottom. */
+  /** Newest attempts, for the probe grid at the bottom. */
   let history = $state<HistoryPoint[]>([]);
+  /** Every incident this check was attached to, however it got there. The
+   *  per-check endpoint rather than the page's list: that one is capped at the
+   *  newest 50 site-wide, which is not this check's history. */
+  let incidents = $state<Incident[]>([]);
   let loading = $state(true);
   let error = $state<string | null>(null);
+  // The check/window the current data belongs to, so a refreshKey bump can tell
+  // a silent refresh (same check, same window) from a genuine (re)load.
+  let loadedId: string | null = null;
+  let loadedWindow = -1;
 
   $effect(() => {
     const id = checkId;
     const window = hours;
+    // Depend on refreshKey so a live state change or reconnect refetches. A bump
+    // is a silent refresh — no full-page spinner — since the page is already up
+    // and only the numbers are moving. A change of check or window is a real
+    // (re)load and does show the spinner.
+    const isRefresh = refreshKey > 0 && id === loadedId && window === loadedWindow;
+    void refreshKey;
+    loadedId = id;
+    loadedWindow = window;
     let cancelled = false;
-    loading = true;
+    if (!isRefresh) loading = true;
     error = null;
     const to = Date.now();
     const from = to - window * HOUR_MS;
@@ -55,14 +84,16 @@
       fetchUptime(id, Math.max(1, Math.round(window / 24)), STRIP_SEGMENTS),
       fetchLatencyWindow(id, from, to, 120),
       fetchHistory(id, 500, from, to, 'down'),
-      fetchHistory(id, 100),
+      fetchHistory(id, PROBES),
+      fetchCheckIncidents(id),
     ])
-      .then(([u, s, bad, recent]) => {
+      .then(([u, s, bad, recent, inc]) => {
         if (cancelled) return;
         uptime = u;
         series = s;
         failures = bad.history;
         history = recent.history;
+        incidents = inc.incidents;
       })
       .catch((e: unknown) => {
         if (cancelled) return;
@@ -90,16 +121,70 @@
     return [String(min), String(Math.round(avg)), String(max)];
   }
 
-  // The raw list is long (every agent × every interval). Show the newest slice
-  // and let the reader ask for more.
-  const PAGE = 20;
-  let shown = $state(PAGE);
-  const visible = $derived(history.slice(0, shown));
+  /** Squares per row. Fixed rather than "however many fit", so a block of
+   *  probes is either whole rows or nothing — a wrapping flex row left a
+   *  12-square tail hanging off the bottom. */
+  const COLS = 60;
+  /** Ceiling per agent, so one chatty agent cannot push the panel metres long. */
+  const MAX_PER_AGENT = COLS * 4;
+  /** Flat history to slice up. The endpoint serves the newest N across every
+   *  agent, so a big fleet gets shorter rows rather than some agents none. */
+  const PROBES = COLS * 12;
+
+  /** One labelled block per agent. A single chronological grid mixed the agents
+   *  together, where ten of them turn one region's outage into scattered noise
+   *  and the reader cannot tell "one probe location is down" from "everything is
+   *  flapping". Each block is that agent's own newest probes, oldest to newest,
+   *  trimmed to whole rows of `COLS` — so rows are flush, and are deliberately
+   *  not a shared time axis across agents, which is why each is labelled. */
+  const probeRows = $derived.by(() => {
+    // The API serves newest-first, so the first N per agent are the newest.
+    const byAgent = new Map<string, HistoryPoint[]>();
+    for (const p of history) {
+      const row = byAgent.get(p.agent_id);
+      if (row === undefined) byAgent.set(p.agent_id, [p]);
+      else if (row.length < MAX_PER_AGENT) row.push(p);
+    }
+    return [...byAgent]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([agent_id, newestFirst]) => {
+        const whole =
+          newestFirst.length >= COLS
+            ? Math.floor(newestFirst.length / COLS) * COLS
+            : newestFirst.length;
+        return { agent_id, probes: newestFirst.slice(0, whole).reverse() };
+      });
+  });
+  const probeCount = $derived(probeRows.reduce((n, r) => n + r.probes.length, 0));
+
+  const stampFmt = new Intl.DateTimeFormat(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+
+  /** Hovered square, positioned from the square's own box rather than the
+   *  pointer: the squares are 11px with gaps, and a pointer-following tooltip
+   *  jitters across them. Cleared on the grid's own mouseleave, so crossing a
+   *  gap doesn't flicker it. */
+  let hovered = $state<{ p: HistoryPoint; x: number; y: number } | null>(null);
+
+  function hoverSquare(e: MouseEvent, p: HistoryPoint) {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    hovered = { p, x: r.left + r.width / 2, y: r.top };
+  }
+
+  /** `.tt-status` has no `unknown` tone — an unrecorded probe reads the same as
+   *  an empty bucket on the strip. */
+  function tone(s: HistoryPoint['status']): string {
+    return s === 'up' || s === 'down' ? s : 'nodata';
+  }
 
   function setHours(next: number) {
     if (next === hours) return;
     hours = next;
-    shown = PAGE;
   }
 </script>
 
@@ -193,6 +278,22 @@
       <LatencyChart points={series.points} label="latency over the selected window" />
     {/if}
 
+    {#if incidents.length}
+      <div class="detail-panel">
+        <div class="panel-title">Incidents</div>
+        <div class="inc-list">
+          {#each incidents as i (i.id)}
+            <a class="inc-row" href={`#/incident/${encodeURIComponent(i.id)}`}>
+              <span class="opill {stateTone(i.state)}">{i.state}</span>
+              <span class="inc-name">{i.title}</span>
+              <span class="mono">{formatDuration(i.duration_ms)}</span>
+              <span class="dim inc-when">{formatRelativeTime(i.started_at)}</span>
+            </a>
+          {/each}
+        </div>
+      </div>
+    {/if}
+
     <div class="detail-panel">
       <div class="panel-title" class:ok={failed === 0}>
         {#if failed === 0}
@@ -252,30 +353,35 @@
     {/if}
 
     <div class="detail-panel">
-      <div class="panel-title">Recent attempts</div>
-      {#if visible.length}
-        {#each visible as h (`${h.timestamp}-${h.agent_id}`)}
-          <div class="history-row">
-            <span class="badge" style="background:{statusColor(h.status)}">{h.status}</span>
-            <span class="mono">{formatLatency(h.latency_ms)}</span>
-            <span class="agent-pill">{h.agent_id}</span>
-            {#if failureReason(h)}
-              <span class="row-reason" title={failureReason(h)}>{failureReason(h)}</span>
-            {/if}
-            <span class="dim" style="margin-left:auto">{formatRelativeTime(h.timestamp)}</span>
-          </div>
-        {/each}
-        {#if shown < history.length}
-          <div style="margin-top:0.75rem">
-            <button class="link" onclick={() => (shown = Math.min(shown + PAGE, history.length))}>
-              Show {Math.min(PAGE, history.length - shown)} more
-            </button>
-          </div>
-        {:else if history.length > PAGE}
-          <div style="margin-top:0.75rem">
-            <button class="link" onclick={() => (shown = PAGE)}>Collapse</button>
-          </div>
-        {/if}
+      <div class="panel-title">Recent probes</div>
+      {#if probeRows.length}
+        <!-- Hover lives on each square but is cleared on the container: a
+             per-square mouseleave fires in the gutters and blinks the tooltip. -->
+        <div class="sq-rows" role="presentation" onmouseleave={() => (hovered = null)}>
+          {#each probeRows as row (row.agent_id)}
+            <div class="sq-block">
+              <span class="agent-pill">{row.agent_id}</span>
+              <div class="sq-grid" style="grid-template-columns: repeat({COLS}, 1fr)">
+                {#each row.probes as h (`${h.timestamp}-${h.agent_id}`)}
+                  <span
+                    class="sq"
+                    class:hovered={hovered?.p === h}
+                    style="background:{statusColor(h.status)}"
+                    role="presentation"
+                    onmouseenter={(e) => hoverSquare(e, h)}
+                  ></span>
+                {/each}
+              </div>
+            </div>
+          {/each}
+        </div>
+        <p class="panel-note">
+          One square per probe, oldest to newest, {COLS} to a row — {probeCount}
+          {probeCount === 1 ? 'probe' : 'probes'} across {probeRows.length}
+          {probeRows.length === 1 ? 'agent' : 'agents'}, not a fixed span of time. Each agent
+          shows its own probes, so a column is not one moment across rows. Hover for the
+          timestamp and latency.
+        </p>
       {:else}
         <p class="dim">No attempts recorded.</p>
       {/if}
@@ -283,11 +389,25 @@
   </div>
 {/if}
 
+{#if hovered}
+  {@const p = hovered.p}
+  <!-- Same tooltip as the uptime strip's, so a square and a bar read alike. -->
+  <div class="bar-tooltip" style="left:{hovered.x}px; top:{hovered.y}px">
+    <div class="tt-date">{stampFmt.format(new Date(p.timestamp))}</div>
+    <div class="tt-status {tone(p.status)}">{p.status}</div>
+    <!-- No agent here: the block this square sits in is already labelled with it. -->
+    <div class="tt-detail">{formatLatency(p.latency_ms)}</div>
+    {#if failureReason(p)}
+      <div class="tt-detail">{failureReason(p)}</div>
+    {/if}
+  </div>
+{/if}
+
 <style>
   .probe-line {
     margin: 0.35rem 0 0;
     font-size: 0.82rem;
-    color: var(--text-dim, #8b949e);
+    color: var(--text-dim, #7d8590);
     word-break: break-all;
   }
   /* The cron expression is code, so it reads as code. */
@@ -316,13 +436,13 @@
   .detail-panel {
     margin-top: 1.4rem;
     padding-top: 1.1rem;
-    border-top: 1px solid var(--border, #30363d);
+    border-top: 1px solid var(--border, #1f262b);
   }
   .panel-title {
     font-size: 0.72rem;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    color: var(--text-dim, #8b949e);
+    color: var(--text-dim, #7d8590);
     margin-bottom: 0.7rem;
   }
   .panel-title.ok {
@@ -331,7 +451,7 @@
   .panel-note {
     margin: 0.6rem 0 0;
     font-size: 0.72rem;
-    color: var(--text-dim, #8b949e);
+    color: var(--text-dim, #7d8590);
   }
   .all-clear {
     margin: 0;
@@ -347,7 +467,7 @@
     max-height: 280px;
     overflow-y: auto;
     scrollbar-width: thin;
-    scrollbar-color: #3d4650 transparent;
+    scrollbar-color: #1f262b transparent;
   }
   .fail-row {
     display: grid;
@@ -385,8 +505,8 @@
     font-size: 0.68rem;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    color: var(--text-dim, #8b949e);
-    border-bottom: 1px solid var(--border, #30363d);
+    color: var(--text-dim, #7d8590);
+    border-bottom: 1px solid var(--border, #1f262b);
   }
   .agent-row {
     border-bottom: 1px solid rgba(48, 54, 61, 0.5);
@@ -397,5 +517,72 @@
   .agent-row .bad {
     color: var(--down, #f85149);
     font-weight: 600;
+  }
+  /* This check's incidents. Each is a link to its public permalink, which is
+     where the update timeline lives — the row only carries enough to pick one. */
+  .inc-list {
+    display: flex;
+    flex-direction: column;
+  }
+  .inc-row {
+    display: grid;
+    grid-template-columns: auto 1fr auto auto;
+    gap: 0.6rem;
+    align-items: center;
+    padding: 0.4rem 0;
+    font-size: 0.8rem;
+    color: inherit;
+    text-decoration: none;
+    border-bottom: 1px solid rgba(48, 54, 61, 0.5);
+  }
+  .inc-row:last-child {
+    border-bottom: none;
+  }
+  .inc-row:hover .inc-name {
+    text-decoration: underline;
+  }
+  .inc-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .inc-when {
+    text-align: right;
+  }
+  /* One labelled block of squares per agent. */
+  .sq-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 0.7rem;
+  }
+  .sq-block {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.3rem;
+  }
+  /* A fixed column count with `1fr` tracks, not wrapping flex: every row is
+     exactly as wide as the block, so the squares narrow on a small viewport
+     rather than reflowing into a short final row. The count comes from `COLS`
+     inline, so there is one source of truth for it. */
+  .sq-grid {
+    display: grid;
+    gap: 3px;
+    width: 100%;
+  }
+  .sq {
+    /* Square whatever the track width works out to — the Kener proportion,
+       held by geometry rather than a hardcoded 11px. */
+    aspect-ratio: 1;
+    min-width: 0;
+    border-radius: 2px;
+    cursor: default;
+  }
+  /* Driven by state, not `:hover`, so the highlight matches whichever square
+     the tooltip is describing. */
+  .sq.hovered {
+    filter: brightness(1.4);
+    outline: 1px solid var(--text, #e6edf3);
+    outline-offset: 1px;
   }
 </style>

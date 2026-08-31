@@ -1,15 +1,35 @@
 :root {
-  --bg: #0d1117;
-  --bg-elev: #161b22;
-  --bg-hover: #1c2230;
-  --border: #30363d;
-  --text: #e6edf3;
-  --text-dim: #8b949e;
-  --accent: #58a6ff;
-  --up: #3fb950;
-  --down: #f85149;
-  --unknown: #8b949e;
-  --amber: #d29922;
+  /* Admin palette is the single source of truth for the whole app's theme.
+     The status page's legacy vocabulary (--bg, --accent, ...) is re-pointed at
+     these tokens below so both surfaces share one colorscheme. */
+  --ad-bg: #0a0c0e;
+  --ad-panel: #101316;
+  --ad-panel-2: #14181c;
+  --ad-line: #1f262b;
+  --ad-line-soft: #181e22;
+  --ad-text: #e6edf3;
+  --ad-dim: #7d8590;
+  --ad-faint: #5a636c;
+  --ad-cyan: #56d4e4;
+  --ad-green: #3fb950;
+  --ad-amber: #d29922;
+  --ad-red: #f85149;
+  --ad-violet: #8b8bf5;
+
+  /* Status page palette, unified onto the admin tokens above. */
+  --bg: var(--ad-bg);
+  --bg-elev: var(--ad-panel);
+  --bg-hover: var(--ad-panel-2);
+  --border: var(--ad-line);
+  --text: var(--ad-text);
+  --text-dim: var(--ad-dim);
+  --accent: var(--ad-cyan);
+  --up: var(--ad-green);
+  --down: var(--ad-red);
+  --unknown: var(--ad-faint);
+  --amber: var(--ad-amber);
+  /* Card/modal surface used by DayDetailModal and LoginModal. */
+  --bg-card: var(--ad-panel);
   font-size: 16px;
 }
 
@@ -136,6 +156,93 @@ header.bar {
   background: var(--down);
 }
 
+/* Open global incidents, stacked under the overall banner. Page-wide is the
+   entire meaning of the flag, so these render beside the overall status rather
+   than against any one monitor — and a maintenance notice with no checks at
+   all has nowhere else it could go. Clickable: the updates are on the
+   permalink, and "we know" is only half the message. */
+.gbanners {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-bottom: 2rem;
+}
+.gbanner {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  width: 100%;
+  text-align: left;
+  padding: 0.75rem 1rem;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--amber);
+  border-radius: 10px;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+  transition: border-color 0.15s;
+}
+.gbanner:hover {
+  border-color: var(--border);
+  border-left-color: var(--amber);
+}
+.gb-title {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gb-meta {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-size: 0.78rem;
+  color: var(--text-dim);
+}
+
+/* Announced maintenance running right now. Above the incident banners on
+   purpose: it explains the red beneath it. Not clickable — a window has no
+   permalink and no updates, which is exactly what separates it from an
+   incident. */
+.mbanners {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-bottom: 1.4rem;
+}
+.mbanner {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.7rem 1rem;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 10px;
+}
+.mpill {
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 0.15rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  flex-shrink: 0;
+}
+.mb-title {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mb-meta {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-size: 0.78rem;
+  color: var(--text-dim);
+}
+
 /* Sections */
 .section {
   margin-bottom: 2.5rem;
@@ -167,7 +274,7 @@ header.bar {
   transition: border-color 0.15s;
 }
 .component:hover {
-  border-color: #444c56;
+  border-color: var(--border);
 }
 .component-head {
   display: flex;
@@ -213,6 +320,22 @@ header.bar {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* The open incident a monitor is caught in — the human story above the raw
+   failure text below it. Not a link: the row is already a button, and a nested
+   one is invalid markup. */
+.component-incident {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: -0.35rem 0 0.6rem;
+  min-width: 0;
+}
+.ci-title {
+  font-size: 0.8rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .server-detail {
   font-size: 0.72rem;
   color: var(--text-dim);
@@ -240,7 +363,7 @@ header.bar {
   text-align: left;
 }
 .group-head:hover {
-  background: #1c2128;
+  background: var(--bg-hover);
 }
 .group-name {
   display: inline-flex;
@@ -288,7 +411,7 @@ header.bar {
   border-radius: 0;
 }
 .group-body .component:hover {
-  background: #1c2128;
+  background: var(--bg-hover);
 }
 /* Hairline between rows. Deliberately NOT `x + x`: each row renders its hover
    tooltip as a following sibling, so an adjacency selector silently stopped
@@ -318,6 +441,9 @@ header.bar {
 }
 .server-status.down {
   color: var(--down);
+}
+.server-status.degraded {
+  color: var(--amber);
 }
 
 /* Hyperping-style latency graph: cursor-following readout over gradient bars */
@@ -384,7 +510,7 @@ header.bar {
 .lat-nodata {
   font-size: 0.8rem;
   font-weight: 600;
-  color: var(--text-dim, #8b949e);
+  color: var(--text-dim, #7d8590);
 }
 .lat-time {
   position: absolute;
@@ -452,7 +578,7 @@ header.bar {
   background: var(--amber);
 }
 .ubar.nodata {
-  background: #21262d;
+  background: var(--ad-line);
 }
 /* Highlight is driven by the container's pointer tracking, not :hover, so it
    doesn't drop out over the 2px gaps between bars. */
@@ -485,7 +611,7 @@ header.bar {
   font-size: 0.7rem;
   font-weight: 700;
   text-transform: uppercase;
-  color: #0d1117;
+  color: var(--ad-bg);
 }
 ul.alerts {
   list-style: none;
@@ -560,13 +686,6 @@ ul.alerts .arrow {
   border-radius: 2px 2px 0 0;
   min-height: 2px;
 }
-.history-row {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  padding: 0.4rem 0;
-  border-top: 1px solid var(--border);
-}
 
 /* Utilities */
 .mono {
@@ -601,7 +720,7 @@ button.link:hover {
   transform: translate(-50%, calc(-100% - 12px));
   z-index: 50;
   pointer-events: none;
-  background: #0b0f14;
+  background: var(--ad-bg);
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 0.5rem 0.7rem;
@@ -662,15 +781,6 @@ button.link:hover {
 .agent-tag {
   font-size: 0.72rem;
 }
-.row-reason {
-  font-size: 0.72rem;
-  color: var(--down);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 45%;
-}
 
 /* Section header with the uptime-bar window switcher */
 .section-bar {
@@ -701,7 +811,7 @@ button.link:hover {
   border-left: 1px solid var(--border);
 }
 .range-btn:hover {
-  background: #1c2128;
+  background: var(--bg-hover);
 }
 .range-btn.active {
   background: #1f6feb22;
@@ -761,9 +871,9 @@ button.link:hover {
   text-transform: uppercase;
   letter-spacing: 0.06em;
   padding: 0.1rem 0.45rem;
-  border: 1px solid var(--border, #30363d);
+  border: 1px solid var(--border, #1f262b);
   border-radius: 999px;
-  color: var(--text-dim, #8b949e);
+  color: var(--text-dim, #7d8590);
 }
 
 /* Agent name as a pill so it reads as an identity, not another number. */
@@ -774,9 +884,9 @@ button.link:hover {
   /* Grid items stretch by default, which would draw the border across the whole
      column instead of hugging the name. */
   justify-self: start;
-  border: 1px solid var(--border, #30363d);
+  border: 1px solid var(--border, #1f262b);
   border-radius: 999px;
-  color: var(--text-dim, #8b949e);
+  color: var(--text-dim, #7d8590);
   white-space: nowrap;
 }
 
@@ -805,13 +915,13 @@ button.link:hover {
 .fig-unit {
   font-size: 0.85rem;
   font-weight: 500;
-  color: var(--text-dim, #8b949e);
+  color: var(--text-dim, #7d8590);
   margin-left: 0.15rem;
 }
 /* Dim, spaced separator so "7 / 19 / 109" reads as three numbers and not a
    date. */
 .fig-sep {
-  color: var(--border, #30363d);
+  color: var(--border, #1f262b);
   margin: 0 0.3rem;
   font-weight: 400;
 }
@@ -825,7 +935,7 @@ button.link:hover {
   font-size: 0.72rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  color: var(--text-dim, #8b949e);
+  color: var(--text-dim, #7d8590);
 }
 
 /* ---- Admin vocabulary ----
@@ -893,7 +1003,7 @@ button.link:hover {
   cursor: pointer;
 }
 .admin-nav-item:hover {
-  background: #1c2128;
+  background: var(--bg-hover);
   color: var(--text);
 }
 .admin-nav-item.active {
@@ -1006,7 +1116,7 @@ button.link:hover {
   white-space: nowrap;
 }
 .btn:hover:not(:disabled) {
-  background: #1c2128;
+  background: var(--bg-hover);
   color: var(--text);
 }
 .btn:disabled {
@@ -1071,7 +1181,7 @@ button.link:hover {
   max-height: 60vh;
   overflow-y: auto;
   scrollbar-width: thin;
-  scrollbar-color: #3d4650 transparent;
+  scrollbar-color: var(--ad-line) transparent;
 }
 .admin-rows::-webkit-scrollbar {
   width: 10px;
@@ -1080,7 +1190,7 @@ button.link:hover {
   background: transparent;
 }
 .admin-rows::-webkit-scrollbar-thumb {
-  background: #3d4650;
+  background: var(--ad-line);
   border-radius: 999px;
   border: 3px solid transparent;
   background-clip: content-box;
@@ -1115,7 +1225,7 @@ button.link:hover {
   display: none;
 }
 .editor-summary:hover {
-  background: #1c2128;
+  background: var(--bg-hover);
   color: var(--text);
 }
 .editor-summary:focus-visible {
@@ -1152,4 +1262,540 @@ button.link:hover {
 }
 .editor-section.danger[open] > .editor-summary {
   border-bottom-color: rgba(248, 81, 73, 0.45);
+}
+
+/* ====================================================================
+   Admin chrome — "Orbit" dark-console language.
+
+   Everything here is scoped under `.admin-app` / `.admin-shell`, which only
+   the admin view sets. The public status page keeps its own quieter styling on
+   purpose: it is read by strangers during an outage, the admin panel is a
+   console stared at for an hour. They are different jobs.
+   ==================================================================== */
+
+/* Admin (--ad-*) tokens are the app's single source of truth for color; they
+   are declared at the top of this file so the status page's legacy vocabulary
+   (--bg, --accent, ...) can be re-pointed at them. `IncidentsList` and friends
+   render on both surfaces and read these shared tokens directly. */
+
+/* Full-bleed console: the sidebar runs the height of the viewport rather than
+   sitting inside the status page's reading column. */
+.app.admin-app {
+  max-width: none;
+  margin: 0;
+  padding: 0;
+}
+
+.admin-shell {
+  display: grid;
+  /* minmax(0, 1fr) is load-bearing: a grid track defaults to min-content, and
+     one long probe target would otherwise push the whole console sideways
+     instead of ellipsing inside its cell. */
+  grid-template-columns: 240px minmax(0, 1fr);
+  gap: 0;
+  align-items: stretch;
+  min-height: 100vh;
+  background: var(--ad-bg);
+}
+
+/* ---- Sidebar ---- */
+
+.admin-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 1rem 0.75rem 1rem;
+  background: var(--ad-bg);
+  border-right: 1px solid var(--ad-line);
+  position: sticky;
+  top: 0;
+  align-self: start;
+  height: 100vh;
+  overflow-y: auto;
+}
+
+.nav-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.25rem 0.5rem 0.9rem;
+}
+.nav-brand .brand-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ad-cyan);
+  box-shadow: 0 0 8px var(--ad-cyan);
+  flex: none;
+}
+.nav-brand .brand-name {
+  font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.nav-brand .brand-tag {
+  margin-left: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.62rem;
+  color: var(--ad-faint);
+  border: 1px solid var(--ad-line);
+  border-radius: 4px;
+  padding: 0.05rem 0.3rem;
+}
+
+/* Tiny uppercase group heading, the thing that makes a long nav scannable. */
+.nav-group {
+  font-size: 0.62rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--ad-faint);
+  padding: 0.85rem 0.6rem 0.3rem;
+}
+.admin-nav-items {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.admin-nav-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  background: none;
+  border: 0;
+  border-radius: 7px;
+  color: var(--ad-dim);
+  font: inherit;
+  font-size: 0.855rem;
+  text-align: left;
+  padding: 0.42rem 0.6rem;
+  cursor: pointer;
+  width: 100%;
+}
+.admin-nav-item .nav-ico {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  opacity: 0.85;
+}
+.admin-nav-item:hover {
+  background: var(--ad-panel-2);
+  color: var(--ad-text);
+}
+/* Active = filled, brighter, and a left accent bar. The bar is what makes the
+   current area findable at a glance in a nine-item list. */
+.admin-nav-item.active {
+  background: #16303a;
+  color: #a9e9f2;
+  font-weight: 500;
+}
+.admin-nav-item.active::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 20%;
+  bottom: 20%;
+  width: 2px;
+  border-radius: 0 2px 2px 0;
+  background: var(--ad-cyan);
+}
+/* Count of things wanting attention, right-aligned in the row. */
+.nav-badge {
+  margin-left: auto;
+  font-size: 0.64rem;
+  font-weight: 600;
+  min-width: 1.05rem;
+  text-align: center;
+  padding: 0.05rem 0.3rem;
+  border-radius: 999px;
+  background: rgba(248, 81, 73, 0.16);
+  color: var(--ad-red);
+}
+.nav-badge.quiet {
+  background: var(--ad-panel-2);
+  color: var(--ad-faint);
+}
+
+/* Pinned to the bottom: live-connection truth and the way out. */
+.nav-foot {
+  margin-top: auto;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--ad-line);
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+.nav-status {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.75rem;
+  color: var(--ad-dim);
+  padding: 0.42rem 0.6rem;
+}
+.nav-status .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ad-faint);
+  flex: none;
+}
+.nav-status.open .dot {
+  background: var(--ad-green);
+  box-shadow: 0 0 7px rgba(63, 185, 80, 0.7);
+}
+.nav-status.connecting .dot {
+  background: var(--ad-amber);
+}
+.nav-status.closed .dot {
+  background: var(--ad-red);
+}
+
+/* ---- Content column ---- */
+
+.admin-content {
+  min-width: 0;
+  padding: 1.6rem 1.9rem 4rem;
+  background: var(--ad-bg);
+}
+
+/* Page title + one line of meta. The meta line is where "how many, as of when"
+   goes, so the title never has to carry a parenthetical. */
+.page-head {
+  margin-bottom: 1.3rem;
+}
+.page-head h2 {
+  margin: 0;
+  font-size: 1.45rem;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+.page-meta {
+  margin: 0.3rem 0 0;
+  font-size: 0.83rem;
+  color: var(--ad-dim);
+}
+.page-head-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+/* ---- Stat cards ---- */
+
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 0.7rem;
+  margin-bottom: 1.4rem;
+}
+.stat-card {
+  background: var(--ad-panel);
+  border: 1px solid var(--ad-line);
+  border-radius: 9px;
+  padding: 0.85rem 1rem 0.9rem;
+  min-width: 0;
+}
+.stat-label {
+  font-size: 0.63rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ad-dim);
+}
+.stat-value {
+  font-size: 1.85rem;
+  font-weight: 600;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  margin-top: 0.35rem;
+}
+.stat-sub {
+  font-size: 0.74rem;
+  color: var(--ad-dim);
+  margin-top: 0.15rem;
+}
+.stat-value.cyan {
+  color: var(--ad-cyan);
+}
+.stat-value.green {
+  color: var(--ad-green);
+}
+.stat-value.amber {
+  color: var(--ad-amber);
+}
+.stat-value.red {
+  color: var(--ad-red);
+}
+
+/* ---- Banner ---- */
+
+.ad-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  background: var(--ad-panel);
+  border: 1px solid var(--ad-line);
+  border-left: 3px solid var(--ad-cyan);
+  border-radius: 8px;
+  padding: 0.7rem 0.9rem;
+  margin-bottom: 1.2rem;
+  font-size: 0.88rem;
+}
+.ad-banner.warn {
+  border-left-color: var(--ad-amber);
+}
+.ad-banner.bad {
+  border-left-color: var(--ad-red);
+}
+.ad-banner .banner-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 0.4rem;
+}
+
+/* ---- Console table ----
+   Header and body rows share one `--ot-cols` template so a column cannot drift
+   away from its heading. Set it per table. */
+
+.otable {
+  background: var(--ad-panel);
+  border: 1px solid var(--ad-line);
+  border-radius: 9px;
+  overflow: hidden;
+}
+.ot-head,
+.ot-row {
+  display: grid;
+  grid-template-columns: var(--ot-cols);
+  gap: 0.9rem;
+  align-items: center;
+  padding: 0.6rem 1rem;
+}
+.ot-head {
+  font-size: 0.62rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ad-faint);
+  border-bottom: 1px solid var(--ad-line);
+}
+.ot-row {
+  position: relative;
+  border-bottom: 1px solid var(--ad-line-soft);
+  font-size: 0.85rem;
+}
+.ot-row:last-child {
+  border-bottom: none;
+}
+.ot-row:hover {
+  background: var(--ad-panel-2);
+}
+/* The row that needs attention: lifted, with an accent bar. */
+.ot-row.flagged {
+  background: #12191d;
+}
+.ot-row.flagged::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--ad-cyan);
+}
+.ot-row.flagged.bad::before {
+  background: var(--ad-red);
+}
+.ot-empty {
+  padding: 1.4rem 1rem;
+  color: var(--ad-dim);
+  font-size: 0.85rem;
+}
+.ot-right {
+  justify-self: end;
+  display: flex;
+  gap: 0.35rem;
+}
+
+/* A pill holding an identifier rather than a label. Check names are handles —
+   uppercasing them misrepresents what they are, and `innerText` then reports
+   the transformed text, which quietly breaks anything asserting on it. */
+.opill.name {
+  text-transform: none;
+  letter-spacing: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.72rem;
+  font-weight: 500;
+}
+
+/* Identifier cell: monospace and tinted, so a check name reads as a handle
+   rather than prose. */
+.ot-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+  color: var(--ad-cyan);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+button.ot-id {
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+}
+button.ot-id:hover {
+  text-decoration: underline;
+}
+
+/* ---- Pills ---- */
+
+.opill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.63rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 0.14rem 0.45rem;
+  border-radius: 5px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.opill .pdot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.opill.red {
+  background: rgba(248, 81, 73, 0.15);
+  border-color: rgba(248, 81, 73, 0.35);
+  color: #ff8078;
+}
+.opill.amber {
+  background: rgba(210, 153, 34, 0.15);
+  border-color: rgba(210, 153, 34, 0.35);
+  color: #e3b341;
+}
+.opill.green {
+  background: rgba(63, 185, 80, 0.14);
+  border-color: rgba(63, 185, 80, 0.32);
+  color: #57d364;
+}
+.opill.cyan {
+  background: rgba(86, 212, 228, 0.13);
+  border-color: rgba(86, 212, 228, 0.32);
+  color: #7ae0ec;
+}
+.opill.violet {
+  background: rgba(139, 139, 245, 0.14);
+  border-color: rgba(139, 139, 245, 0.32);
+  color: #a5a5f7;
+}
+.opill.grey {
+  background: var(--ad-panel-2);
+  border-color: var(--ad-line);
+  color: var(--ad-dim);
+}
+
+/* ---- Buttons ---- */
+
+.admin-app .btn {
+  background: none;
+  border: 1px solid var(--ad-line);
+  border-radius: 6px;
+  color: var(--ad-dim);
+  font: inherit;
+  font-size: 0.78rem;
+  padding: 0.3rem 0.7rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.admin-app .btn:hover:not(:disabled) {
+  background: var(--ad-panel-2);
+  color: var(--ad-text);
+  border-color: #2a343a;
+}
+.admin-app .btn.primary {
+  background: rgba(86, 212, 228, 0.12);
+  border-color: rgba(86, 212, 228, 0.4);
+  color: #8ae4ef;
+  font-weight: 500;
+}
+.admin-app .btn.primary:hover:not(:disabled) {
+  background: rgba(86, 212, 228, 0.2);
+}
+.admin-app .btn.danger {
+  color: #ff8078;
+  border-color: rgba(248, 81, 73, 0.3);
+}
+.admin-app .btn.danger:hover:not(:disabled) {
+  background: rgba(248, 81, 73, 0.14);
+}
+
+/* ---- Panels / cards ---- */
+
+.admin-app .admin-panel {
+  background: var(--ad-panel);
+  border: 1px solid var(--ad-line);
+  border-radius: 9px;
+  padding: 1rem 1.15rem 1.15rem;
+  margin-bottom: 1rem;
+}
+.admin-app .panel-title {
+  font-size: 0.63rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ad-dim);
+  margin-bottom: 0.8rem;
+}
+.admin-app .admin-panel input,
+.admin-app .admin-panel select,
+.admin-app .admin-panel textarea {
+  background: #0c1013;
+  border: 1px solid var(--ad-line);
+  border-radius: 6px;
+  font-size: 0.84rem;
+  padding: 0.4rem 0.55rem;
+}
+.admin-app .admin-panel input:focus,
+.admin-app .admin-panel select:focus,
+.admin-app .admin-panel textarea:focus {
+  border-color: rgba(86, 212, 228, 0.55);
+}
+.admin-app .field-label {
+  font-size: 0.63rem;
+  letter-spacing: 0.08em;
+  color: var(--ad-dim);
+}
+
+@media (max-width: 900px) {
+  .admin-shell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .admin-nav {
+    position: static;
+    height: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--ad-line);
+  }
+  .admin-nav-items {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+  .nav-foot {
+    margin-top: 0.5rem;
+  }
+  .admin-content {
+    padding: 1.1rem 1rem 3rem;
+  }
 }

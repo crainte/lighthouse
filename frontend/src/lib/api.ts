@@ -1,9 +1,10 @@
 // Types + fetch wrappers for the Warden coordinator HTTP API.
 // Same-origin in production; /api is proxied to the backend during `vite dev`.
 
-export type Status = 'up' | 'down' | 'unknown';
+export type Status = "up" | "down" | "unknown";
 
-export type CheckKind = 'http' | 'tcp' | 'dns' | 'icmp' | 'ssl' | 'heartbeat';
+export type CheckKind =
+  "http" | "tcp" | "dns" | "icmp" | "ssl" | "heartbeat" | "openmetrics";
 
 export interface Check {
   check_id: string;
@@ -30,7 +31,7 @@ export interface Check {
 /** What the coordinator reports for an agent that declares no zone or region.
  *  A real value the backend writes, not a frontend placeholder — matching on it
  *  is how the unplaced bucket is found. */
-export const UNKNOWN_LOCATION = 'unknown';
+export const UNKNOWN_LOCATION = "unknown";
 
 export interface Agent {
   agent_id: string;
@@ -49,6 +50,9 @@ export interface Agent {
   /** How many checks name this agent explicitly. Purging one that is still
    *  named would leave those checks with nothing to run them. */
   assigned_checks: number;
+  /** Round-trip of the agent's last poll, ms, as it measured it. `null` for an
+   *  agent seen only via reported results, never a live poll. */
+  poll_rtt_ms: number | null;
 }
 
 export interface AgentsResponse {
@@ -58,8 +62,34 @@ export interface AgentsResponse {
   checks_with_no_live_agent: string[];
 }
 
+/** Agent liveness on the public page. Three states, unlike a check's `Status`:
+ *  an agent answering is healthy even if every check it probes is down. */
+export type Health = "up" | "degraded" | "down";
+
+/** One row of the public agent section: a single agent, or a whole region. */
+export interface FleetRow {
+  /** Also what keeps keys unique: a region and an agent may share a name. */
+  kind: "agent" | "region";
+  name: string;
+  status: Health;
+  healthy: number;
+  total: number;
+}
+
+/** A scheduled window the operator chose to announce, while it runs. Windows
+ *  that were not announced suppress paging silently and never appear here. */
+export interface MaintenanceNotice {
+  title: string;
+  starts_at: number;
+  ends_at: number;
+}
+
 export interface StatusResponse {
   checks: Check[];
+  /** Empty when `[status_page.agents] mode = "off"`. */
+  agents: FleetRow[];
+  /** Announced windows running right now, soonest to end first. */
+  maintenance: MaintenanceNotice[];
 }
 
 export interface HistoryPoint {
@@ -77,11 +107,19 @@ export interface HistoryResponse {
   history: HistoryPoint[];
 }
 
+/** One confirmed state transition. The event log — distinct from `Incident`,
+ *  which is the operator-facing record of an outage. `alert_type` is derived
+ *  by the server from the two state fields, never stored. */
 export interface Alert {
-  check_id: string;
-  from: Status;
-  to: Status;
+  id: string;
+  scope: "check" | "agent" | "zone" | "region";
+  node_id: string;
+  alert_type: "state_change" | "degradation" | "recovery";
+  previous_state: Status | null;
+  current_state: Status;
   timestamp: number;
+  /** The incident this transition belongs to, stamped when it was written. */
+  incident_id: string | null;
 }
 
 export interface AlertsResponse {
@@ -89,18 +127,23 @@ export interface AlertsResponse {
 }
 
 export interface StateChange {
-  type: 'state_change';
+  type: "state_change";
   check_id: string;
   from: Status;
   to: Status;
   timestamp: number;
 }
 
-/** WS lifecycle events for incidents, broadcast alongside state changes. */
-export interface IncidentEvent {
-  type: 'incident_opened' | 'incident_resolved';
-  incident: Incident;
-}
+/** WS lifecycle events for incidents, broadcast alongside state changes.
+ *  `incident_updated` covers everything after the open — a check joining, an
+ *  operator posting, auto-resolve — because the payload is the whole incident
+ *  and the UI just replaces its copy. `incident_deleted` carries only the id —
+ *  the incident is gone, there is nothing left to replace it with — and fires
+ *  both on a local admin delete and on a peer's replicated one, so every node
+ *  drops it the same way. */
+export type IncidentEvent =
+  | { type: "incident_opened" | "incident_updated"; incident: Incident }
+  | { type: "incident_deleted"; id: string };
 
 export interface UptimeBucket {
   /** Exclusive lower bound of the segment. Only a day boundary at the 90d range. */
@@ -157,7 +200,7 @@ async function getJson<T>(url: string): Promise<T> {
 }
 
 export function fetchStatus(): Promise<StatusResponse> {
-  return getJson<StatusResponse>('/api/v1/status');
+  return getJson<StatusResponse>("/api/v1/status");
 }
 
 export function fetchHistory(
@@ -178,21 +221,61 @@ export function fetchAlerts(limit = 50): Promise<AlertsResponse> {
   return getJson<AlertsResponse>(`/api/v1/alerts?limit=${limit}`);
 }
 
-/** Lifecycle of an outage: opened when a check reads DOWN, resolved when it
- *  reads UP again. Distinct from `Alert`, which is one state transition. */
-export type IncidentStatus = 'open' | 'resolved';
+/** Where an incident is in its life. The single lifecycle field: "open" means
+ *  anything other than `resolved`.
+ *
+ *  `detected` is the machine's state and where every automatic incident
+ *  starts — a probe noticing an outage is not a human investigating one.
+ *  Acknowledging is the `detected` -> `investigating` edge. */
+export type IncidentState =
+  "detected" | "investigating" | "identified" | "monitoring" | "resolved";
+
+export const INCIDENT_STATES: IncidentState[] = [
+  "detected",
+  "investigating",
+  "identified",
+  "monitoring",
+  "resolved",
+];
+
+/** How a check came to be attached. `origin` is the check whose DOWN opened
+ *  the incident, `dependency` was attached by `depends_on` reconciliation, and
+ *  only `manual` rows are editable — the other two belong to the coordinator. */
+export type AffectSource = "origin" | "dependency" | "manual";
+
+export interface IncidentCheck {
+  check_id: string;
+  source: AffectSource;
+}
+
+export interface IncidentUpdate {
+  id: string;
+  state: IncidentState;
+  body: string;
+  /** `null` when the coordinator wrote it. A non-null author is what makes an
+   *  update an acknowledgement. */
+  author: string | null;
+  created_at: number;
+}
 
 export interface Incident {
   id: string;
-  check_id: string;
-  status: IncidentStatus;
+  title: string;
+  state: IncidentState;
   started_at: number;
   resolved_at: number | null;
-  /** Why it went down, recorded at open. */
-  details: string | null;
-  /** When an admin acknowledged it. `null` until then. */
-  acknowledged_at: number | null;
-  acknowledged_by: string | null;
+  /** Server-computed: to resolution, or to now while open. */
+  duration_ms: number;
+  /** Rendered page-wide rather than against its checks. */
+  global: boolean;
+  /** The check whose DOWN opened it; null when a human did. */
+  origin_check: string | null;
+  checks: IncidentCheck[];
+  /** Whether any human has posted an update. Derived server-side from the
+   *  narrative, not a stored flag. */
+  acknowledged: boolean;
+  /** Only present on the single-incident read. */
+  updates?: IncidentUpdate[];
 }
 
 export interface IncidentsResponse {
@@ -203,13 +286,86 @@ export function fetchIncidents(limit = 50): Promise<IncidentsResponse> {
   return getJson<IncidentsResponse>(`/api/v1/incidents?limit=${limit}`);
 }
 
-/** Acknowledge an open incident. Requires an admin session (cookie auth). */
-export async function acknowledgeIncident(id: string): Promise<Incident> {
-  const res = await fetch(`/api/v1/incidents/${encodeURIComponent(id)}/acknowledge`, {
-    method: 'POST',
+/** One incident with its full update timeline. Public, like the list. */
+export function fetchIncident(id: string): Promise<{ incident: Incident }> {
+  return getJson<{ incident: Incident }>(
+    `/api/v1/incidents/${encodeURIComponent(id)}`,
+  );
+}
+
+async function incidentWrite(
+  url: string,
+  method: string,
+  body: unknown,
+): Promise<Incident> {
+  const res = await fetch(url, {
+    method,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(detail || `${res.status} ${res.statusText}`);
+  }
   return (await res.json()).incident;
+}
+
+/** Open an incident by hand — a maintenance notice, or anything no probe can
+ *  see. It carries no origin check, so reconciliation never touches it. */
+export function createIncident(body: {
+  title: string;
+  state?: IncidentState;
+  started_at?: number;
+  global?: boolean;
+  checks?: string[];
+  body?: string;
+}): Promise<Incident> {
+  return incidentWrite("/api/v1/admin/incidents", "POST", body);
+}
+
+/** Edit the operator-owned fields. Deliberately cannot move `state` — post an
+ *  update for that, so the timeline always explains the state. */
+export function editIncident(
+  id: string,
+  body: { title: string; started_at: number; global: boolean },
+): Promise<Incident> {
+  return incidentWrite(
+    `/api/v1/admin/incidents/${encodeURIComponent(id)}`,
+    "PATCH",
+    body,
+  );
+}
+
+/** Replace the manually attached checks. Origin and dependency attachments are
+ *  untouched by this. */
+export function setIncidentChecks(
+  id: string,
+  checks: string[],
+): Promise<Incident> {
+  return incidentWrite(
+    `/api/v1/admin/incidents/${encodeURIComponent(id)}/checks`,
+    "PUT",
+    {
+      checks,
+    },
+  );
+}
+
+/** Post an update. The only way an incident changes state, and the only way it
+ *  gets acknowledged. Returns the incident with its refreshed timeline. */
+export function addIncidentUpdate(
+  id: string,
+  state: IncidentState,
+  body: string,
+): Promise<Incident> {
+  return incidentWrite(
+    `/api/v1/admin/incidents/${encodeURIComponent(id)}/updates`,
+    "POST",
+    {
+      state,
+      body,
+    },
+  );
 }
 
 export function fetchCheckIncidents(
@@ -222,7 +378,7 @@ export function fetchCheckIncidents(
 }
 
 export function fetchAgents(): Promise<AgentsResponse> {
-  return getJson<AgentsResponse>('/api/v1/agents');
+  return getJson<AgentsResponse>("/api/v1/agents");
 }
 
 export function fetchUptime(
@@ -267,5 +423,7 @@ export interface PublicSection {
 }
 
 export function fetchPublicSections(): Promise<PublicSection[]> {
-  return getJson<{ sections: PublicSection[] }>('/api/v1/sections').then((r) => r.sections);
+  return getJson<{ sections: PublicSection[] }>("/api/v1/sections").then(
+    (r) => r.sections,
+  );
 }

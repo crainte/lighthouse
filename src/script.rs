@@ -38,6 +38,14 @@ pub struct EvalInput {
     pub latency_ms: u64,
     pub body: Option<String>,
     pub headers: HashMap<String, String>,
+    /// OpenMetrics: the selected sample's value, or `None` when nothing matched
+    /// the configured selection. Exposed to Lua as `metric` (nil when absent),
+    /// so a script can distinguish "no such sample" from a real zero.
+    pub metric: Option<f64>,
+    /// OpenMetrics: every sample from the same scrape, so a script can compare
+    /// series that share this scrape's freshness and source. Exposed to Lua as
+    /// the `metrics` table (see `evaluate`). Empty for non-metric checks.
+    pub metrics: Vec<crate::openmetrics::MetricSample>,
 }
 
 /// A script's verdict. `latency_ms` is the script's optional override.
@@ -80,6 +88,51 @@ pub fn evaluate(source: &str, input: &EvalInput) -> Result<EvalOutcome, String> 
             .map_err(|e| e.to_string())?;
     }
     globals.set("headers", headers).map_err(|e| e.to_string())?;
+
+    // The selected sample. Nil when nothing matched so a script can tell an
+    // absent selection apart from a genuine zero value.
+    match input.metric {
+        Some(v) => globals.set("metric", v).map_err(|e| e.to_string())?,
+        None => globals
+            .set("metric", Value::Nil)
+            .map_err(|e| e.to_string())?,
+    }
+
+    // All same-scrape samples, keyed by family name to an array of records:
+    //   metrics[family] = { { labels = { name = value, ... }, value = n }, ... }
+    // Keying by family (rather than a flat list) makes the common lookup direct
+    // while still exposing every series for arbitrary same-body comparisons. The
+    // per-record `labels` table is name -> value, which is what a script indexes.
+    let metrics = lua.create_table().map_err(|e| e.to_string())?;
+    for sample in &input.metrics {
+        let existing: Value = metrics
+            .get(sample.name.as_str())
+            .map_err(|e| e.to_string())?;
+        let family: mlua::Table = match existing {
+            Value::Table(t) => t,
+            _ => {
+                let t = lua.create_table().map_err(|e| e.to_string())?;
+                metrics
+                    .set(sample.name.as_str(), t.clone())
+                    .map_err(|e| e.to_string())?;
+                t
+            }
+        };
+        let record = lua.create_table().map_err(|e| e.to_string())?;
+        let labels = lua.create_table().map_err(|e| e.to_string())?;
+        for (k, v) in &sample.labels {
+            labels
+                .set(k.as_str(), v.as_str())
+                .map_err(|e| e.to_string())?;
+        }
+        record.set("labels", labels).map_err(|e| e.to_string())?;
+        record
+            .set("value", sample.value)
+            .map_err(|e| e.to_string())?;
+        let next = family.raw_len() + 1;
+        family.set(next, record).map_err(|e| e.to_string())?;
+    }
+    globals.set("metrics", metrics).map_err(|e| e.to_string())?;
 
     let chunk = lua.load(wrap(source));
     let returned: mlua::MultiValue = chunk
@@ -357,5 +410,80 @@ mod tests {
             &input(200),
         );
         assert!(out.unwrap().up, "state leaked between evaluations");
+    }
+
+    use crate::openmetrics::MetricSample;
+
+    fn metric_input(metric: Option<f64>, metrics: Vec<MetricSample>) -> EvalInput {
+        EvalInput {
+            status: 200,
+            latency_ms: 5,
+            metric,
+            metrics,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_selected_metric_is_visible_as_a_number() {
+        let out = evaluate(
+            r#"if metric > 0.9 then return "UP" end return "DOWN""#,
+            &metric_input(Some(1.0), vec![]),
+        )
+        .unwrap();
+        assert!(out.up);
+        let out = evaluate(
+            r#"if metric > 0.9 then return "UP" end return "DOWN""#,
+            &metric_input(Some(0.0), vec![]),
+        )
+        .unwrap();
+        assert!(!out.up);
+    }
+
+    #[test]
+    fn an_absent_selection_reads_as_nil_not_zero() {
+        // A missing sample must be distinguishable from a real zero, or an
+        // exporter that stopped emitting the series would silently read healthy.
+        let out = evaluate(
+            r#"if metric == nil then return "DOWN" end return "UP""#,
+            &metric_input(None, vec![]),
+        )
+        .unwrap();
+        assert!(!out.up);
+    }
+
+    #[test]
+    fn same_scrape_samples_are_addressable_by_family_and_labels() {
+        let metrics = vec![
+            MetricSample::new("q_used", vec![("queue".into(), "a".into())], 8.0),
+            MetricSample::new("q_size", vec![("queue".into(), "a".into())], 10.0),
+        ];
+        // A script can compare two series from the same scrape: used vs size.
+        let out = evaluate(
+            r#"
+              local used = metrics.q_used[1].value
+              local size = metrics.q_size[1].value
+              if used / size < 0.9 then return "UP" end
+              return "DOWN"
+            "#,
+            &metric_input(Some(8.0), metrics),
+        )
+        .unwrap();
+        assert!(out.up);
+    }
+
+    #[test]
+    fn a_records_labels_are_indexable_by_name() {
+        let metrics = vec![MetricSample::new(
+            "up",
+            vec![("job".into(), "web".into())],
+            1.0,
+        )];
+        let out = evaluate(
+            r#"if metrics.up[1].labels.job == "web" then return "UP" end return "DOWN""#,
+            &metric_input(Some(1.0), metrics),
+        )
+        .unwrap();
+        assert!(out.up);
     }
 }

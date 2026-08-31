@@ -61,7 +61,7 @@
   .boundary-hint {
     margin: 0 0 1rem;
     font-size: 0.82rem;
-    color: var(--text-dim, #8b949e);
+    color: var(--text-dim, #7d8590);
   }
   .boundary-actions {
     display: flex;

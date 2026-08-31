@@ -26,7 +26,7 @@ use serde_json::Value;
 use warden::config::{CheckConfig, CoordinatorConfig};
 use warden::coordinator::Coordinator;
 use warden::models::{CheckKind, CheckResult};
-use warden::notify::Notifier;
+use warden::notify::{Notifier, NotifierKind};
 
 /// Peers authenticate with their own secret, never an agent's.
 const PEER_TOKEN: &str = "cluster-peer-secret";
@@ -70,8 +70,12 @@ fn coordinator(alerts_to: SocketAddr, peers: Vec<String>) -> Coordinator {
         &CoordinatorConfig {
             listen: "127.0.0.1:0".into(),
             db_path: ":memory:".into(),
-            notifiers: vec![Notifier::Webhook {
-                url: format!("http://{alerts_to}/"),
+            notifiers: vec![Notifier {
+                name: "alerts".into(),
+                default: true,
+                kind: NotifierKind::Webhook {
+                    url: format!("http://{alerts_to}/"),
+                },
             }],
             peer_token: Some(PEER_TOKEN.into()),
             peers,
@@ -106,6 +110,8 @@ fn result(status_code: u16, ts_millis: i64) -> CheckResult {
         failure: None,
         body: None,
         headers: None,
+        metric: None,
+        metrics: None,
     }
 }
 
@@ -174,10 +180,10 @@ async fn a_transition_reaches_the_peer_without_paging_twice() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|a| a["check_id"] == CHECK)
+        .find(|a| a["node_id"] == CHECK)
         .expect("peer should have recorded the replicated alert");
-    assert_eq!(replicated["from"], "up");
-    assert_eq!(replicated["to"], "down");
+    assert_eq!(replicated["previous_state"], "up");
+    assert_eq!(replicated["current_state"], "down");
     assert_eq!(replicated["timestamp"], 2_000);
 
     // 2. Exactly one page for one outage. A observed it, so A pages; B learned
@@ -276,7 +282,12 @@ async fn recovery_replicates_too() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|a| (a["from"].as_str().unwrap(), a["to"].as_str().unwrap()))
+        .map(|a| {
+            (
+                a["previous_state"].as_str().unwrap(),
+                a["current_state"].as_str().unwrap(),
+            )
+        })
         .collect();
     assert_eq!(legs, vec![("down", "up"), ("up", "down")]);
 }
@@ -368,7 +379,9 @@ async fn broadcast_presents_the_agent_token() {
     })
     .await;
 
-    assert_eq!(got.0.as_deref(), Some("Bearer cluster-shared-secret"));
+    // Against the const, not a copy of it: the literal here was left behind by
+    // the rename to a peer-only token and asserted a secret nothing used.
+    assert_eq!(got.0, Some(format!("Bearer {PEER_TOKEN}")));
     assert_eq!(got.1["check_id"], CHECK);
     assert_eq!(got.1["to"], "down");
 }

@@ -1,16 +1,19 @@
 // Pure display/logic helpers. No DOM, no side effects — unit-tested in format.test.ts.
-import type { Status, Check, UptimeBucket } from './api';
+import type { Status, Health, Check, UptimeBucket } from './api';
 
 export type SortKey = 'name' | 'status' | 'uptime';
 export type SortDir = 'asc' | 'desc';
 
-const STATUS_COLORS: Record<Status, string> = {
+// `degraded` is not a check state — it is an agent-health row that is neither
+// fully healthy nor wholly down. Same amber the partial-outage bars use.
+const STATUS_COLORS: Record<Status | Health, string> = {
   up: '#3fb950',
   down: '#f85149',
   unknown: '#8b949e',
+  degraded: '#d29922',
 };
 
-export function statusColor(status: Status): string {
+export function statusColor(status: Status | Health): string {
   return STATUS_COLORS[status] ?? STATUS_COLORS.unknown;
 }
 

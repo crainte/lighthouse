@@ -7,7 +7,7 @@
     CheckKind,
   } from '../lib/api';
   import { fetchHistory, fetchLatencyWindow } from '../lib/api';
-  import { barColor, dayStatusText, formatLatency, failureReason } from '../lib/format';
+  import { barColor, dayStatusText, formatLatency, failureReason, statusColor } from '../lib/format';
   import LatencyChart from './LatencyChart.svelte';
 
   let {
@@ -40,6 +40,11 @@
 
   const DAY_MS = 86_400_000;
 
+  /** Squares per row — matches CheckDetail so the two grids read alike. */
+  const COLS = 60;
+  /** Ceiling per agent, so one chatty agent cannot push the panel metres long. */
+  const MAX_PER_AGENT = COLS * 4;
+
   const dateFmt = new Intl.DateTimeFormat(undefined, {
     weekday: 'short',
     month: 'short',
@@ -48,6 +53,13 @@
   });
   const timeFmt = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
   const secFmt = new Intl.DateTimeFormat(undefined, {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+  const stampFmt = new Intl.DateTimeFormat(undefined, {
+    month: 'short',
+    day: 'numeric',
     hour: '2-digit',
     minute: '2-digit',
     second: '2-digit',
@@ -85,11 +97,49 @@
       });
   });
 
+  /** One labelled block per agent, oldest→newest, trimmed to whole rows of
+   *  `COLS` — identical shape to CheckDetail's probe grid, but derived from this
+   *  modal's exact-window `log` instead of the check's newest-N history. */
+  const probeRows = $derived.by(() => {
+    // The API serves newest-first, so the first N per agent are the newest.
+    const byAgent = new Map<string, HistoryPoint[]>();
+    for (const p of log) {
+      const row = byAgent.get(p.agent_id);
+      if (row === undefined) byAgent.set(p.agent_id, [p]);
+      else if (row.length < MAX_PER_AGENT) row.push(p);
+    }
+    return [...byAgent]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([agent_id, newestFirst]) => {
+        const whole =
+          newestFirst.length >= COLS
+            ? Math.floor(newestFirst.length / COLS) * COLS
+            : newestFirst.length;
+        return { agent_id, probes: newestFirst.slice(0, whole).reverse() };
+      });
+  });
+  const probeCount = $derived(probeRows.reduce((n, r) => n + r.probes.length, 0));
+
+  /** Hovered square, positioned from the square's own box rather than the
+   *  pointer, cleared on the grid's own mouseleave. Mirrors CheckDetail. */
+  let hovered = $state<{ p: HistoryPoint; x: number; y: number } | null>(null);
+
+  function hoverSquare(e: MouseEvent, p: HistoryPoint) {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    hovered = { p, x: r.left + r.width / 2, y: r.top };
+  }
+
+  /** `.tt-status` has no `unknown` tone — an unrecorded probe reads the same as
+   *  an empty bucket on the strip. */
+  function tone(s: HistoryPoint['status']): string {
+    return s === 'up' || s === 'down' ? s : 'nodata';
+  }
+
   function toggleLog() {
     showLog = !showLog;
     if (!showLog || log.length || logLoading) return;
     logLoading = true;
-    fetchHistory(checkId, 300, bucket.start, bucket.end)
+    fetchHistory(checkId, COLS * 12, bucket.start, bucket.end)
       .then((r: HistoryResponse) => {
         log = r.history;
         logLoading = false;
@@ -252,24 +302,34 @@
           {#if logLoading}
             <p class="muted">Loading…</p>
           {:else if log.length}
-            <div class="log">
-              {#each log as pt (`${pt.timestamp}-${pt.agent_id}`)}
-                <div class="log-row" class:down={pt.status === 'down'}>
-                  <span class="mono dim">{secFmt.format(new Date(pt.timestamp))}</span>
-                  <span class="agent-pill">{pt.agent_id}</span>
-                  <span class="mono lat">{formatLatency(pt.latency_ms)}</span>
-                  <span class="verdict" class:down={pt.status === 'down'}>
-                    {pt.status === 'up' ? 'OK' : pt.status === 'down' ? 'FAIL' : 'UNKN'}
-                  </span>
-                  <span class="fail-why" title={failureReason(pt) ?? ''}>
-                    {failureReason(pt) ?? ''}
-                  </span>
+            <!-- Hover lives on each square but is cleared on the container: a
+                 per-square mouseleave fires in the gutters and blinks the tooltip. -->
+            <div class="sq-rows" role="presentation" onmouseleave={() => (hovered = null)}>
+              {#each probeRows as row (row.agent_id)}
+                <div class="sq-block">
+                  <span class="agent-pill">{row.agent_id}</span>
+                  <div class="sq-grid" style="grid-template-columns: repeat({COLS}, 1fr)">
+                    {#each row.probes as h (`${h.timestamp}-${h.agent_id}`)}
+                      <span
+                        class="sq"
+                        class:hovered={hovered?.p === h}
+                        style="background:{statusColor(h.status)}"
+                        role="presentation"
+                        onmouseenter={(e) => hoverSquare(e, h)}
+                      ></span>
+                    {/each}
+                  </div>
                 </div>
               {/each}
             </div>
-            {#if log.length >= 300}
-              <p class="panel-note">Newest 300 of {bucket.total} attempts.</p>
-            {/if}
+            <p class="panel-note">
+              One square per probe, oldest to newest, {COLS} to a row — {probeCount}
+              {probeCount === 1 ? 'probe' : 'probes'} across {probeRows.length}
+              {probeRows.length === 1 ? 'agent' : 'agents'}, not a fixed span of time. Each agent
+              shows its own probes, so a column is not one moment across rows. Hover for the
+              timestamp and latency.{#if log.length >= COLS * 12}
+                Capped at {COLS * 12} of {bucket.total} attempts.{/if}
+            </p>
           {:else}
             <p class="muted">No attempts recorded.</p>
           {/if}
@@ -278,6 +338,20 @@
     {/if}
   </div>
 </div>
+
+{#if hovered}
+  {@const p = hovered.p}
+  <!-- Same tooltip as the uptime strip's, so a square and a bar read alike. -->
+  <div class="bar-tooltip" style="left:{hovered.x}px; top:{hovered.y}px">
+    <div class="tt-date">{stampFmt.format(new Date(p.timestamp))}</div>
+    <div class="tt-status {tone(p.status)}">{p.status}</div>
+    <!-- No agent here: the block this square sits in is already labelled with it. -->
+    <div class="tt-detail">{formatLatency(p.latency_ms)}</div>
+    {#if failureReason(p)}
+      <div class="tt-detail">{failureReason(p)}</div>
+    {/if}
+  </div>
+{/if}
 
 <style>
   .modal-backdrop {
@@ -295,8 +369,8 @@
   /* Wide: the content is a time series and two tables, all of which read badly
      in a narrow column. */
   .modal {
-    background: var(--bg-card, #161b22);
-    border: 1px solid var(--border, #30363d);
+    background: var(--bg-card, #101316);
+    border: 1px solid var(--border, #1f262b);
     border-radius: 12px;
     width: min(1100px, 100%);
     position: relative;
@@ -309,7 +383,7 @@
     justify-content: space-between;
     gap: 1rem;
     padding: 1.1rem 1.4rem;
-    border-bottom: 1px solid var(--border, #30363d);
+    border-bottom: 1px solid var(--border, #1f262b);
   }
   .modal-header h2 {
     margin: 0;
@@ -321,7 +395,7 @@
   .modal-span {
     margin: 0.25rem 0 0;
     font-size: 0.82rem;
-    color: var(--text-dim, #8b949e);
+    color: var(--text-dim, #7d8590);
   }
   .header-right {
     display: flex;
@@ -332,7 +406,7 @@
   .close-btn {
     background: none;
     border: none;
-    color: var(--text-dim, #8b949e);
+    color: var(--text-dim, #7d8590);
     font-size: 1.5rem;
     cursor: pointer;
     padding: 0;
@@ -363,7 +437,7 @@
   }
   .day-status.nodata {
     background: rgba(139, 148, 158, 0.12);
-    color: var(--text-dim, #8b949e);
+    color: var(--text-dim, #7d8590);
   }
 
   .modal-body {
@@ -374,7 +448,7 @@
      how the strip sits in the dialog. */
   .figures {
     padding: 1.1rem 1.4rem;
-    border-bottom: 1px solid var(--border, #30363d);
+    border-bottom: 1px solid var(--border, #1f262b);
   }
 
   .panel-title.ok {
@@ -392,7 +466,7 @@
 
   .panel {
     padding: 1rem 1.4rem;
-    border-bottom: 1px solid var(--border, #30363d);
+    border-bottom: 1px solid var(--border, #1f262b);
     min-width: 0;
   }
   .panel:last-child {
@@ -402,26 +476,26 @@
     font-size: 0.72rem;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    color: var(--text-dim, #8b949e);
+    color: var(--text-dim, #7d8590);
     margin-bottom: 0.7rem;
   }
   .panel-note {
     margin: 0.6rem 0 0;
     font-size: 0.72rem;
-    color: var(--text-dim, #8b949e);
+    color: var(--text-dim, #7d8590);
   }
 
   /* Failures beside agent attribution: the two questions you ask together. */
   .columns {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    border-bottom: 1px solid var(--border, #30363d);
+    border-bottom: 1px solid var(--border, #1f262b);
   }
   .columns > .panel {
     border-bottom: none;
   }
   .columns > .panel:first-child {
-    border-right: 1px solid var(--border, #30363d);
+    border-right: 1px solid var(--border, #1f262b);
   }
   @media (max-width: 820px) {
     .columns {
@@ -429,57 +503,44 @@
     }
     .columns > .panel:first-child {
       border-right: none;
-      border-bottom: 1px solid var(--border, #30363d);
+      border-bottom: 1px solid var(--border, #1f262b);
     }
   }
 
   /* Trackless scrollbar: no groove, just a pill thumb. Modern browsers use the
      standard properties; the -webkit- rules are the fallback for Safari, which
      ignores them. Chromium honours whichever it supports and skips the rest. */
-  .fail-list,
-  .log {
+  .fail-list {
     max-height: 260px;
     overflow-y: auto;
     scrollbar-width: thin;
-    scrollbar-color: #3d4650 transparent;
+    scrollbar-color: #1f262b transparent;
   }
-  .fail-list::-webkit-scrollbar,
-  .log::-webkit-scrollbar {
+  .fail-list::-webkit-scrollbar {
     width: 10px;
   }
-  .fail-list::-webkit-scrollbar-track,
-  .log::-webkit-scrollbar-track {
+  .fail-list::-webkit-scrollbar-track {
     background: transparent;
   }
-  .fail-list::-webkit-scrollbar-thumb,
-  .log::-webkit-scrollbar-thumb {
-    background: #3d4650;
+  .fail-list::-webkit-scrollbar-thumb {
+    background: #1f262b;
     border-radius: 999px;
     /* Transparent border + content-box clip insets the pill so it floats in the
        gutter instead of filling it edge to edge. */
     border: 3px solid transparent;
     background-clip: content-box;
   }
-  .fail-row,
-  .log-row {
+  .fail-row {
     display: grid;
     grid-template-columns: 5.5rem auto 1fr;
     gap: 0.6rem;
     align-items: baseline;
     padding: 0.28rem 0;
     font-size: 0.8rem;
-  }
-  .log-row {
-    grid-template-columns: 5.5rem auto 3.5rem 2.6rem 1fr;
-  }
-  .fail-row {
     border-left: 2px solid var(--down, #f85149);
     padding-left: 0.5rem;
     background: rgba(248, 81, 73, 0.05);
     margin-bottom: 2px;
-  }
-  .log-row.down {
-    background: rgba(248, 81, 73, 0.06);
   }
   .fail-why {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -488,16 +549,34 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .lat {
-    text-align: right;
+
+  /* One labelled block of squares per agent \u2014 same as CheckDetail. */
+  .sq-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 0.7rem;
   }
-  .verdict {
-    font-weight: 600;
-    font-size: 0.72rem;
-    color: var(--up, #3fb950);
+  .sq-block {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.3rem;
   }
-  .verdict.down {
-    color: var(--down, #f85149);
+  .sq-grid {
+    display: grid;
+    gap: 3px;
+    width: 100%;
+  }
+  .sq {
+    aspect-ratio: 1;
+    min-width: 0;
+    border-radius: 2px;
+    cursor: default;
+  }
+  .sq.hovered {
+    filter: brightness(1.4);
+    outline: 1px solid var(--text, #e6edf3);
+    outline-offset: 1px;
   }
 
   .agent-grid {
@@ -518,8 +597,8 @@
     font-size: 0.68rem;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    color: var(--text-dim, #8b949e);
-    border-bottom: 1px solid var(--border, #30363d);
+    color: var(--text-dim, #7d8590);
+    border-bottom: 1px solid var(--border, #1f262b);
   }
   .agent-row {
     border-bottom: 1px solid rgba(48, 54, 61, 0.5);
@@ -540,7 +619,7 @@
     font-size: 0.72rem;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    color: var(--text-dim, #8b949e);
+    color: var(--text-dim, #7d8590);
     cursor: pointer;
   }
   .log-toggle:hover {
@@ -552,10 +631,10 @@
     font-variant-numeric: tabular-nums;
   }
   .dim {
-    color: var(--text-dim, #8b949e);
+    color: var(--text-dim, #7d8590);
   }
   .muted {
-    color: var(--text-dim, #8b949e);
+    color: var(--text-dim, #7d8590);
     font-size: 0.82rem;
     margin: 0;
   }

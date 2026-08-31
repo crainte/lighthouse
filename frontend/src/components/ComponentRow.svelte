@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Check, UptimeResponse, UptimeBucket, LatencyPoint } from '../lib/api';
+  import type { Check, Incident, UptimeResponse, UptimeBucket, LatencyPoint } from '../lib/api';
   import {
     formatUptime,
     formatLatency,
@@ -8,18 +8,24 @@
     dayStatusText,
     failureReason,
   } from '../lib/format';
+  import { stateTone } from '../lib/incident';
   import LatencyChart from './LatencyChart.svelte';
 
   let {
     check,
     uptime,
     sparkline,
+    incident,
     onselect,
     onbarclick,
   }: {
     check: Check;
     uptime: UptimeResponse | undefined;
     sparkline: LatencyPoint[] | null;
+    /** The open incident this monitor is caught in, if any. Informational: the
+     *  row is already a button to the check's detail page, where the incident
+     *  is a link to its updates. */
+    incident?: Incident | null;
     onselect: (id: string) => void;
     onbarclick?: (id: string, b: UptimeBucket) => void;
   } = $props();
@@ -111,6 +117,13 @@
       <span class="component-latency">{formatLatency(check.latency_ms)} · {statusLabel}</span>
     </span>
   </div>
+
+  {#if incident}
+    <div class="component-incident">
+      <span class="opill {stateTone(incident.state)}">{incident.state}</span>
+      <span class="ci-title">{incident.title}</span>
+    </div>
+  {/if}
 
   {#if reason}
     <div class="component-reason" title={reason}>{reason}</div>

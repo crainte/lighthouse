@@ -151,7 +151,7 @@
             y={bar.y}
             width={bar.w}
             height={bar.h}
-            fill={bar.i === hoverIndex ? 'var(--text, #e6edf3)' : 'var(--accent, #58a6ff)'}
+            fill={bar.i === hoverIndex ? 'var(--text, #e6edf3)' : 'var(--accent, #56d4e4)'}
           />
         {/each}
       </svg>
@@ -171,6 +171,6 @@
   .lat-empty {
     margin: 0.75rem 0 0.25rem;
     font-size: 0.75rem;
-    color: var(--text-dim, #8b949e);
+    color: var(--text-dim, #7d8590);
   }
 </style>

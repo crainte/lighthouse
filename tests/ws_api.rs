@@ -170,10 +170,22 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
     .expect("timed out waiting for incident_opened");
     assert_eq!(opened["type"], "incident_opened", "event type");
     assert_eq!(
-        opened["incident"]["check_id"], "test-check",
-        "incident check"
+        opened["incident"]["origin_check"], "test-check",
+        "the check that fell is the origin"
     );
-    assert_eq!(opened["incident"]["status"], "open", "incident opens");
+    assert_eq!(
+        opened["incident"]["state"], "detected",
+        "an automatic incident starts at detected, not investigating"
+    );
+    assert_eq!(
+        opened["incident"]["acknowledged"], false,
+        "nobody has looked at it yet"
+    );
+    assert_eq!(
+        opened["incident"]["checks"][0]["check_id"], "test-check",
+        "the origin is attached as an affected check"
+    );
+    assert_eq!(opened["incident"]["checks"][0]["source"], "origin");
     assert_eq!(
         opened["incident"]["resolved_at"],
         Value::Null,
@@ -182,6 +194,10 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
     let started_at = opened["incident"]["started_at"]
         .as_i64()
         .expect("started_at is a timestamp");
+    let incident_id = opened["incident"]["id"]
+        .as_str()
+        .expect("incident carries an id")
+        .to_string();
 
     // --- 5. Read APIs: one alert (up->down) and one open incident. ---
     let alerts: Value = http
@@ -196,15 +212,24 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
         .as_array()
         .expect("alerts is an array")
         .iter()
-        .filter(|a| a["check_id"] == "test-check")
+        .filter(|a| a["node_id"] == "test-check")
         .collect();
     assert_eq!(
         mine.len(),
         1,
         "exactly one alert for test-check (baseline must not alert)"
     );
-    assert_eq!(mine[0]["from"], "up", "alert from state");
-    assert_eq!(mine[0]["to"], "down", "alert to state");
+    assert_eq!(mine[0]["previous_state"], "up", "alert from state");
+    assert_eq!(mine[0]["current_state"], "down", "alert to state");
+    assert_eq!(mine[0]["scope"], "check", "scope is stored, not guessed");
+    assert_eq!(
+        mine[0]["alert_type"], "state_change",
+        "alert_type is derived from the state pair"
+    );
+    assert_eq!(
+        mine[0]["incident_id"], incident_id,
+        "the transition is stamped with the incident it opened"
+    );
 
     let incidents: Value = http
         .get(format!("http://{addr}/api/v1/incidents?limit=50"))
@@ -218,13 +243,38 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
         .as_array()
         .expect("incidents is an array")
         .iter()
-        .filter(|i| i["check_id"] == "test-check")
+        .filter(|i| i["origin_check"] == "test-check")
         .collect();
     assert_eq!(mine_inc.len(), 1, "exactly one incident for test-check");
-    assert_eq!(mine_inc[0]["status"], "open", "incident is open");
+    assert_eq!(mine_inc[0]["state"], "detected", "incident is open");
     assert_eq!(
         mine_inc[0]["started_at"], started_at,
         "started_at matches the WS event"
+    );
+    assert!(
+        mine_inc[0]["updates"].is_null(),
+        "the list omits narratives; only the permalink carries them"
+    );
+
+    // The permalink carries the opening entry, which is where the cause lives
+    // now that there is no `details` column.
+    let one: Value = http
+        .get(format!("http://{addr}/api/v1/incidents/{incident_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let updates = one["incident"]["updates"]
+        .as_array()
+        .expect("the permalink carries the narrative");
+    assert_eq!(updates.len(), 1, "opening wrote exactly one update");
+    assert_eq!(updates[0]["state"], "detected");
+    assert_eq!(
+        updates[0]["author"],
+        Value::Null,
+        "the coordinator wrote it, so it is not an acknowledgement"
     );
 
     // --- 6. GET /api/v1/status: test-check reflects the transition (down). ---
@@ -289,19 +339,20 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
     })
     .await
     .expect("timed out waiting for incident_resolved");
-    assert_eq!(resolved["type"], "incident_resolved", "event type");
+    assert_eq!(resolved["type"], "incident_updated", "event type");
     assert_eq!(
-        resolved["incident"]["check_id"], "test-check",
+        resolved["incident"]["origin_check"], "test-check",
         "incident check"
     );
-    assert_eq!(
-        resolved["incident"]["status"], "resolved",
-        "incident closes"
-    );
+    assert_eq!(resolved["incident"]["state"], "resolved", "incident closes");
     assert_eq!(
         resolved["incident"]["resolved_at"].as_i64(),
         Some(1_783_728_002_000),
         "resolved_at is the recovery observation time"
+    );
+    assert!(
+        resolved["incident"]["duration_ms"].as_i64().unwrap() > 0,
+        "duration is served, not left to the client to compute"
     );
 
     // --- 8. Read APIs after recovery: same incident, now resolved. ---
@@ -319,7 +370,7 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
         .as_array()
         .expect("incidents is an array")
         .iter()
-        .filter(|i| i["check_id"] == "test-check")
+        .filter(|i| i["origin_check"] == "test-check")
         .collect();
     assert_eq!(mine_inc.len(), 1, "the resolved incident is listed");
     assert_eq!(
@@ -346,7 +397,7 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
         .as_array()
         .expect("incidents is an array")
         .iter()
-        .filter(|i| i["check_id"] == "test-check")
+        .filter(|i| i["origin_check"] == "test-check")
         .collect();
     assert!(still_open.is_empty(), "no open incident after recovery");
 
@@ -362,11 +413,19 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
         .as_array()
         .expect("alerts is an array")
         .iter()
-        .filter(|a| a["check_id"] == "test-check")
+        .filter(|a| a["node_id"] == "test-check")
         .collect();
     assert_eq!(mine.len(), 2, "recovery is a second alert, down->up");
-    assert_eq!(mine[0]["from"], "down", "newest alert from state");
-    assert_eq!(mine[0]["to"], "up", "newest alert to state");
+    assert_eq!(mine[0]["previous_state"], "down", "newest alert from state");
+    assert_eq!(mine[0]["current_state"], "up", "newest alert to state");
+    assert_eq!(
+        mine[0]["alert_type"], "recovery",
+        "down->up derives as a recovery"
+    );
+    assert_eq!(
+        mine[0]["incident_id"], incident_id,
+        "the recovery names the incident it closed"
+    );
 
     let status: Value = http
         .get(format!("http://{addr}/api/v1/status"))

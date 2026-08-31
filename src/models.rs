@@ -16,6 +16,11 @@ pub enum CheckKind {
     /// Inverted check: nothing is probed. Something external pings a generated
     /// URL, and the check goes DOWN when that stops happening.
     Heartbeat,
+    /// Scrape a Prometheus/OpenMetrics exporter, select one sample by metric
+    /// name and exact labels, and evaluate it (optionally via Lua). The raw
+    /// exporter body is never persisted; only the selected value survives.
+    #[serde(alias = "prometheus")]
+    Openmetrics,
     // ponytail: no Database kind yet. Postgres/MySQL/SQLite would be a `sqlx`
     // feature away, but Oracle and SQL Server need proprietary client libraries
     // that cannot be vendored into the distroless image — so adding "database"
@@ -33,6 +38,7 @@ impl CheckKind {
             CheckKind::Icmp => "icmp",
             CheckKind::Ssl => "ssl",
             CheckKind::Heartbeat => "heartbeat",
+            CheckKind::Openmetrics => "openmetrics",
         }
     }
 
@@ -46,6 +52,7 @@ impl CheckKind {
             "icmp" => CheckKind::Icmp,
             "ssl" => CheckKind::Ssl,
             "heartbeat" => CheckKind::Heartbeat,
+            "openmetrics" | "prometheus" => CheckKind::Openmetrics,
             _ => CheckKind::Http,
         }
     }
@@ -105,6 +112,17 @@ pub struct CheckResult {
     /// script can index them predictably.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers: Option<std::collections::HashMap<String, String>>,
+    /// The value of the configured selected sample from an OpenMetrics scrape.
+    /// `None` when no sample matched the selection (a failed observation) or
+    /// for non-metric checks. Transient: passed into Lua at ingest and never
+    /// written to `check_results`, history, or gossip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric: Option<f64>,
+    /// Every sample from the same scrape, so a script can compare samples that
+    /// share the metric's freshness and source. Transient like `metric` and
+    /// `body`; omitted when absent and never persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<Vec<crate::openmetrics::MetricSample>>,
 }
 
 /// Evaluated status, derived by the coordinator from a CheckResult.
@@ -170,6 +188,16 @@ pub fn eval(result: &CheckResult, expect_status: Option<u16>) -> Status {
         | CheckKind::Icmp
         | CheckKind::Ssl
         | CheckKind::Heartbeat => Status::Up,
+        // A metric check with no custom Lua is UP when a sample was selected.
+        // Transport, parse, and selection failures all surface as `error` and
+        // are caught above as DOWN, so reaching here means a sample was found.
+        // Guard on `metric` all the same: a result carrying neither an error
+        // nor a selected value has nothing to judge and reads as Unknown rather
+        // than a silent UP.
+        CheckKind::Openmetrics => match result.metric {
+            Some(_) => Status::Up,
+            None => Status::Unknown,
+        },
     }
 }
 
@@ -199,6 +227,8 @@ mod tests {
             body_matched: None,
             failure: error.is_some().then_some(FailureKind::Other),
             error,
+            metric: None,
+            metrics: None,
         }
     }
 

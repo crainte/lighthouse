@@ -86,18 +86,125 @@ pub struct CoordinatorConfig {
     /// deletes rows older than this; raising the values keeps more history.
     #[serde(default)]
     pub retention: RetentionConfig,
-    /// Peer coordinators to replicate state transitions to, as base URLs
+    /// Coordinators to *contact first*, as base URLs
     /// (`http://coordinator-b:8080`). Empty means standalone.
     ///
-    /// Peers authenticate with `peer_token`. Replication is one-hop and
-    /// best-effort; see `coordinator::gossip`.
+    /// This is a seed list, not the membership: a node pings a seed, gets that
+    /// node's whole member view back, and learns everyone else transitively.
+    /// One reachable seed is therefore enough to join a cluster of any size,
+    /// and a seed that is down costs nothing once the cluster is formed.
+    ///
+    /// Peers authenticate with `peer_token`. See `coordinator::cluster`.
     #[serde(default)]
     pub peers: Vec<String>,
-    /// Shared secret peers present to each other on `/internal/gossip`. Unset
-    /// means gossip is refused rather than accepted: the endpoint rewrites
-    /// published state.
+    /// Shared secret peers present to each other on `/internal/*`. Unset means
+    /// clustering is refused rather than accepted: those endpoints rewrite
+    /// published state and edit configuration.
     #[serde(default)]
     pub peer_token: Option<String>,
+    /// Stable identity of this coordinator within the cluster.
+    ///
+    /// Unset means one is generated on first boot and persisted in `settings`,
+    /// so a restart rejoins as itself rather than appearing as a new member and
+    /// leaving a ghost behind. It also breaks HLC ties, so it must be unique.
+    #[serde(default)]
+    pub node_id: Option<String>,
+    /// How peers reach *this* node, as a base URL. Required when `peers` is
+    /// non-empty: a node that cannot be dialled back can be discovered by
+    /// nobody, and would replicate outward while receiving nothing.
+    #[serde(default)]
+    pub advertise_url: Option<String>,
+    /// How often to ping every known member. Also the granularity of failure
+    /// detection: nothing is noticed faster than this.
+    #[serde(default = "default_gossip_interval_secs")]
+    pub gossip_interval_secs: u64,
+    /// Silence after which a member becomes `suspect`, and twice which it
+    /// becomes `dead`. Comfortably above `gossip_interval_secs`, or a single
+    /// dropped ping reads as a failure.
+    #[serde(default = "default_peer_timeout_secs")]
+    pub peer_timeout_secs: u64,
+    /// How often to reconcile with a peer by digest exchange. This bounds how
+    /// long a divergence caused by a dropped push can last, so it is a
+    /// correctness backstop rather than the main replication path.
+    #[serde(default = "default_anti_entropy_secs")]
+    pub anti_entropy_secs: u64,
+    /// How many consecutive polls an agent may miss before it stops counting
+    /// toward placement and reads as unhealthy. The silence window is
+    /// `missed_polls × poll_secs`, the agent's own cadence, so detection costs
+    /// the same number of cycles however often it polls.
+    #[serde(default = "default_missed_polls")]
+    pub missed_polls: u32,
+    /// What the public status page shows.
+    #[serde(default)]
+    pub status_page: StatusPageConfig,
+    /// Credentials whose token is chosen in advance rather than minted in the
+    /// UI — for a fleet whose agents must be configured before this coordinator
+    /// has ever run (a compose stack, a Kubernetes manifest, a test fixture).
+    ///
+    /// Applied once, at boot: an id that already exists is left exactly as it
+    /// is, so this neither churns the config plane on every restart nor
+    /// resurrects a credential an operator revoked. In a cluster one node
+    /// declaring the blocks is enough — the rest receive them over the config
+    /// plane.
+    #[serde(default)]
+    pub provision: Vec<ProvisionedCredential>,
+}
+
+/// One `[[coordinator.provision]]` block: a credential the operator already
+/// knows the token of, because the agents that will present it were configured
+/// before this coordinator first ran.
+///
+/// Zone and region are declared here, not by the agent, for the same reason
+/// they are bound to a minted credential (see `credential.rs`): placement acts
+/// on location, and the party being placed must not choose it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProvisionedCredential {
+    pub zone: String,
+    pub region: String,
+    /// The token itself. Present for a fixture; a deployment should use
+    /// `token_env` instead and keep the secret out of a committed file.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Name of the environment variable holding the token.
+    #[serde(default)]
+    pub token_env: Option<String>,
+}
+
+impl ProvisionedCredential {
+    /// Inline value first, environment second, like every other secret here.
+    /// Blank is treated as absent: an unset variable expands to an empty string
+    /// in most of the places these are written (compose, shell), and an empty
+    /// token is not a credential.
+    pub fn resolved_token(&self) -> Option<String> {
+        self.token
+            .clone()
+            .or_else(|| {
+                self.token_env
+                    .as_deref()
+                    .and_then(|key| std::env::var(key).ok())
+            })
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// What to say when there is no token to provision. Names the variable and
+    /// the zone, because the alternative failure is a fleet authenticating
+    /// against nothing, and "no results" is the mode this project treats as
+    /// dangerous precisely because it reads like "not scheduled yet".
+    pub fn missing_token_error(&self) -> String {
+        match self.token_env.as_deref() {
+            Some(key) => format!(
+                "coordinator.provision for zone {zone} has no token: neither an \
+                 inline `token` nor the environment variable {key} is set",
+                zone = self.zone
+            ),
+            None => format!(
+                "coordinator.provision for zone {zone} has no token: set `token` \
+                 for a fixture, or `token_env` naming the variable that holds it",
+                zone = self.zone
+            ),
+        }
+    }
 }
 
 /// History retention: rows older than the window are pruned periodically.
@@ -129,6 +236,171 @@ fn default_alerts_days() -> u64 {
     90
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct StatusPageConfig {
+    #[serde(default)]
+    pub agents: AgentsDisplay,
+}
+
+/// `[status_page.agents]` — how the fleet is summarised for anonymous readers.
+///
+/// The per-agent list stays admin-only; what is public is liveness, aggregated.
+///
+/// Also the admin wire type, so the editor and the config file cannot disagree
+/// about what a setting means. The file seeds this on first boot and the store
+/// is authoritative afterwards, exactly like checks.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct AgentsDisplay {
+    /// Rows the operator placed by hand, in the order they appear. An entry is
+    /// one agent or one whole region, so "this box, then all of us-east" is
+    /// expressible — which a list of agent ids was not.
+    #[serde(default)]
+    pub rows: Vec<FleetEntry>,
+    /// What happens to agents no explicit row already covers.
+    #[serde(default)]
+    pub mode: AgentsMode,
+    /// Superseded by `rows`, which can name a region as well as an agent.
+    /// Still read so a config file or a stored document written before the
+    /// change keeps working; folded into `rows` by `sanitized` and never
+    /// written back.
+    #[serde(default, skip_serializing)]
+    pub pinned: Vec<String>,
+    /// Percent of a region's agents that must be healthy for a green row.
+    /// Default 100: one silent agent is worth an amber row.
+    #[serde(default = "default_warn_below")]
+    pub warn_below: f64,
+    /// Below this percent the region row reads down.
+    #[serde(default = "default_down_below")]
+    pub down_below: f64,
+}
+
+/// One row an operator placed on the public page.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum FleetEntry {
+    /// One named agent, on a row of its own.
+    Agent { name: String },
+    /// Every agent in a region, aggregated — including any also shown
+    /// individually above it. "The whole region" is read literally, because a
+    /// row labelled `us-east` that quietly omitted a machine would be a lie.
+    Region { name: String },
+}
+
+impl FleetEntry {
+    pub fn name(&self) -> &str {
+        match self {
+            FleetEntry::Agent { name } | FleetEntry::Region { name } => name,
+        }
+    }
+
+    fn trimmed(self) -> Self {
+        match self {
+            FleetEntry::Agent { name } => FleetEntry::Agent {
+                name: name.trim().to_string(),
+            },
+            FleetEntry::Region { name } => FleetEntry::Region {
+                name: name.trim().to_string(),
+            },
+        }
+    }
+}
+
+/// What to do with agents the explicit rows do not already cover.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentsMode {
+    /// Fold them into a row per region.
+    #[default]
+    Regions,
+    /// One row each. Publishes the fleet's agent ids, so it is opt-in.
+    Flat,
+    /// Show only the explicit rows. With none, the section disappears.
+    Off,
+}
+
+impl Default for AgentsDisplay {
+    fn default() -> Self {
+        Self {
+            rows: Vec::new(),
+            mode: AgentsMode::default(),
+            pinned: Vec::new(),
+            warn_below: default_warn_below(),
+            down_below: default_down_below(),
+        }
+    }
+}
+
+impl AgentsDisplay {
+    /// Trim the strings a form submits, drop the blanks and the duplicates, and
+    /// absorb the superseded `pinned` list.
+    ///
+    /// Deduping is not cosmetic: the status page keys its rows, so a repeated
+    /// entry would render two rows with the same key — which hangs a Svelte
+    /// `{#each}` rather than looking wrong. An agent and a region may share a
+    /// name, so identity is the pair, not the string.
+    pub fn sanitized(mut self) -> Self {
+        let migrated = std::mem::take(&mut self.pinned)
+            .into_iter()
+            .map(|name| FleetEntry::Agent { name });
+        let mut seen = std::collections::HashSet::new();
+        self.rows = self
+            .rows
+            .into_iter()
+            .chain(migrated)
+            .map(FleetEntry::trimmed)
+            .filter(|e| !e.name().is_empty() && seen.insert(e.clone()))
+            .collect();
+        self
+    }
+
+    /// Rejections are read by whoever is looking at the form, so they say what
+    /// to do rather than which field failed a predicate.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, v) in [
+            ("warn_below", self.warn_below),
+            ("down_below", self.down_below),
+        ] {
+            if !(0.0..=100.0).contains(&v) || v.is_nan() {
+                return Err(format!("{name} is a percentage, so it has to be 0-100"));
+            }
+        }
+        if self.down_below > self.warn_below {
+            return Err(
+                "the down threshold has to be at or below the warning threshold, \
+                 otherwise a region can never read as merely degraded"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn default_missed_polls() -> u32 {
+    3
+}
+
+fn default_gossip_interval_secs() -> u64 {
+    5
+}
+
+/// Three missed pings, matching `missed_polls` for agents: one dropped packet
+/// must not suspect a healthy peer.
+fn default_peer_timeout_secs() -> u64 {
+    15
+}
+
+fn default_anti_entropy_secs() -> u64 {
+    60
+}
+
+fn default_warn_below() -> f64 {
+    100.0
+}
+
+fn default_down_below() -> f64 {
+    50.0
+}
+
 impl CoordinatorConfig {
     /// Config file first, environment second. Returns `None` when neither is
     /// set or the value is blank.
@@ -149,6 +421,52 @@ impl CoordinatorConfig {
     /// that rewrites published state.
     pub fn resolved_peer_token(&self) -> Option<String> {
         Self::secret(&self.peer_token, "WARDEN_PEER_TOKEN")
+    }
+
+    /// Where peers should dial this node, environment second like the secrets.
+    pub fn resolved_advertise_url(&self) -> Option<String> {
+        self.advertise_url
+            .clone()
+            .or_else(|| std::env::var("WARDEN_ADVERTISE_URL").ok())
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn resolved_node_id(&self) -> Option<String> {
+        self.node_id
+            .clone()
+            .or_else(|| std::env::var("WARDEN_NODE_ID").ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Refuse to start a half-configured cluster.
+    ///
+    /// Both of these otherwise fail silently and late: without a `peer_token`
+    /// the node gossips outward and every receiver returns 401, and without an
+    /// `advertise_url` it discovers peers that can never dial it back. Either
+    /// looks exactly like a network problem for as long as it takes someone to
+    /// read the logs on the *other* machine.
+    pub fn validate_cluster(&self) -> Result<()> {
+        if self.peers.is_empty() {
+            return Ok(());
+        }
+        if self.resolved_peer_token().is_none() {
+            anyhow::bail!(
+                "coordinator.peers is set but peer_token is not: peers would refuse \
+                 every message. Set peer_token (or WARDEN_PEER_TOKEN) to the same \
+                 value on every coordinator."
+            );
+        }
+        if self.resolved_advertise_url().is_none() {
+            anyhow::bail!(
+                "coordinator.peers is set but advertise_url is not: peers would have \
+                 no address to reach this node on. Set advertise_url (or \
+                 WARDEN_ADVERTISE_URL) to this node's base URL, e.g. \
+                 http://coordinator-a:8080"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -261,6 +579,39 @@ fn default_ping_count() -> u8 {
     1
 }
 
+/// A single label constraint for OpenMetrics sample selection. Exact match on
+/// both name and value; a sample is selected only when its label set equals the
+/// configured constraints (see `crate::openmetrics::select`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct MetricLabel {
+    pub name: String,
+    pub value: String,
+}
+
+/// OpenMetrics specifics: which sample to pull out of the scrape. The metric
+/// family name is required; labels narrow an ambiguous family to one series.
+/// Missing or ambiguous selection is a failed observation, never a silent zero.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct MetricOptions {
+    /// The metric family name to select, e.g. `up` or `http_requests_total`.
+    #[serde(default)]
+    pub name: String,
+    /// Exact label constraints. Empty selects the family's single unlabeled
+    /// series; a family with multiple series and no labels here is ambiguous.
+    #[serde(default)]
+    pub labels: Vec<MetricLabel>,
+}
+
+impl MetricOptions {
+    /// The labels as the `(name, value)` pairs the selector expects.
+    pub fn label_pairs(&self) -> Vec<(String, String)> {
+        self.labels
+            .iter()
+            .map(|l| (l.name.clone(), l.value.clone()))
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct CheckConfig {
     pub name: String,
@@ -305,6 +656,20 @@ pub struct CheckConfig {
     /// check can be probed and alerted on without being published.
     #[serde(default = "default_enabled")]
     pub visible: bool,
+    /// Whether a state change on this check reaches the notifiers. Distinct
+    /// from `enabled` and `visible`: some checks are just checks — worth
+    /// probing and charting, not worth waking anyone for. The incident and the
+    /// alert row are recorded either way; only the notification is withheld.
+    #[serde(default = "default_enabled")]
+    pub notify: bool,
+    /// Which notifiers this check's alerts go to, by name. Empty means the
+    /// ones marked as defaults, so a check needs no routing at all until two
+    /// audiences exist. Ignored entirely when `notify` is off.
+    ///
+    /// A name no notifier has any more routes nowhere; the notifier admin page
+    /// lists those checks rather than letting them go quietly unrouted.
+    #[serde(default)]
+    pub notifiers: Vec<String>,
     /// Lua deciding UP/DOWN, overriding the built-in rule. See `crate::script`.
     /// Absent means the standard 2xx-3xx logic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -345,6 +710,9 @@ pub struct CheckConfig {
     pub dns: DnsOptions,
     #[serde(default)]
     pub ping: PingOptions,
+    /// OpenMetrics sample selection. Only meaningful for the `openmetrics` kind.
+    #[serde(default)]
+    pub metric: MetricOptions,
     /// Warn this many days before a TLS certificate expires (SSL checks).
     #[serde(default = "default_cert_warning_days")]
     pub cert_warning_days: u32,
@@ -357,6 +725,22 @@ pub struct CheckConfig {
     /// probe or a flaky hop does not page anyone. 1 is the classic behaviour.
     #[serde(default = "default_failures_before_down")]
     pub failures_before_down: u32,
+    /// Checks this one sits behind. When this check confirms DOWN and any
+    /// upstream named here already has an open incident, this check joins that
+    /// incident instead of opening its own — one outage, one entry on the
+    /// status page, rather than a row per symptom.
+    ///
+    /// The lookup is one hop, deliberately: `web -> api -> db` with all three
+    /// down gives two incidents, not one. Transitive grouping needs a cycle
+    /// guard and a tie-break for a check reachable from two roots, and one hop
+    /// covers the case this exists for — a fan-out of checks behind a single
+    /// dependency. It is also cycle-safe by construction, so a mutual
+    /// `depends_on` pair simply gives the incident to whichever fell first.
+    ///
+    /// Grouping does not change who gets paged: the dependent still records its
+    /// own alert and still notifies per its own routing.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
 }
 
 /// What a check reads as before its first result.
@@ -399,6 +783,8 @@ impl Default for CheckConfig {
             expect: Expect::default(),
             enabled: true,
             visible: true,
+            notify: true,
+            notifiers: Vec::new(),
             eval: None,
             position: 0,
             placement: crate::placement::Placement::default(),
@@ -411,9 +797,11 @@ impl Default for CheckConfig {
             allow_self_signed: false,
             dns: DnsOptions::default(),
             ping: PingOptions::default(),
+            metric: MetricOptions::default(),
             cert_warning_days: default_cert_warning_days(),
             grace_secs: default_grace_secs(),
             failures_before_down: default_failures_before_down(),
+            depends_on: Vec::new(),
         }
     }
 }
@@ -521,6 +909,12 @@ impl CheckConfig {
                         return Err("target must be a hostname or IP, not a URL".into());
                     }
                 }
+                // The exporter is scraped over HTTP, so the target is a URL.
+                CheckKind::Openmetrics => {
+                    if !(target.starts_with("http://") || target.starts_with("https://")) {
+                        return Err("OpenMetrics target must start with http:// or https://".into());
+                    }
+                }
                 CheckKind::Heartbeat => {}
             }
         }
@@ -531,6 +925,25 @@ impl CheckConfig {
             )
         {
             return Err("lookup record must be one of A, AAAA, CNAME, MX, TXT, NS".into());
+        }
+        if self.kind == CheckKind::Openmetrics {
+            // One scrape selects one sample; aggregating across several exporters
+            // has no defined meaning here, and silently probing only the last
+            // host would hide the rest. Reject extra hosts rather than guess.
+            if !self.hosts.is_empty() {
+                return Err(
+                    "OpenMetrics checks probe a single target; extra hosts are not supported"
+                        .into(),
+                );
+            }
+            if self.metric.name.trim().is_empty() {
+                return Err("metric name is required for OpenMetrics checks".into());
+            }
+            for label in &self.metric.labels {
+                if label.name.trim().is_empty() {
+                    return Err("a metric label with no name is invalid".into());
+                }
+            }
         }
         if self.kind == CheckKind::Icmp && self.ping.count == 0 {
             return Err("ping count must be at least 1".into());
@@ -633,6 +1046,14 @@ impl Default for CoordinatorConfig {
             retention: RetentionConfig::default(),
             peers: Vec::new(),
             peer_token: None,
+            node_id: None,
+            advertise_url: None,
+            gossip_interval_secs: default_gossip_interval_secs(),
+            peer_timeout_secs: default_peer_timeout_secs(),
+            anti_entropy_secs: default_anti_entropy_secs(),
+            missed_polls: default_missed_polls(),
+            status_page: StatusPageConfig::default(),
+            provision: Vec::new(),
         }
     }
 }
@@ -751,5 +1172,80 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.checks[0].kind, CheckKind::Http);
+    }
+
+    fn openmetrics_check() -> CheckConfig {
+        CheckConfig {
+            name: "exporter".into(),
+            kind: CheckKind::Openmetrics,
+            target: "http://exporter.internal:9100/metrics".into(),
+            metric: MetricOptions {
+                name: "up".into(),
+                labels: vec![MetricLabel {
+                    name: "job".into(),
+                    value: "node".into(),
+                }],
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn valid_openmetrics_check_passes_validation() {
+        openmetrics_check().validate().expect("should validate");
+    }
+
+    #[test]
+    fn openmetrics_requires_metric_name() {
+        let mut c = openmetrics_check();
+        c.metric.name = "  ".into();
+        assert!(c
+            .validate()
+            .unwrap_err()
+            .contains("metric name is required"));
+    }
+
+    #[test]
+    fn openmetrics_rejects_empty_label_name() {
+        let mut c = openmetrics_check();
+        c.metric.labels[0].name = "".into();
+        assert!(c
+            .validate()
+            .unwrap_err()
+            .contains("metric label with no name"));
+    }
+
+    #[test]
+    fn openmetrics_target_must_be_http_url() {
+        let mut c = openmetrics_check();
+        c.target = "exporter.internal:9100".into();
+        assert!(c
+            .validate()
+            .unwrap_err()
+            .contains("OpenMetrics target must start with http"));
+    }
+
+    #[test]
+    fn openmetrics_rejects_extra_hosts() {
+        let mut c = openmetrics_check();
+        c.hosts = vec!["http://other:9100/metrics".into()];
+        assert!(c.validate().unwrap_err().contains("single target"));
+    }
+
+    #[test]
+    fn prometheus_alias_deserializes_to_openmetrics() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[checks]]
+            name = "exp"
+            type = "prometheus"
+            target = "http://exp:9100/metrics"
+            [checks.metric]
+            name = "up"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.checks[0].kind, CheckKind::Openmetrics);
+        assert_eq!(cfg.checks[0].metric.name, "up");
     }
 }

@@ -44,6 +44,7 @@ async fn main() -> Result<()> {
 /// Standalone: agent produces results into an in-process channel that
 /// the coordinator drains directly — no HTTP hop.
 async fn run_standalone(cfg: Config) -> Result<()> {
+    cfg.coordinator.validate_cluster()?;
     let coord = Coordinator::new(&cfg.coordinator, &cfg.checks)?;
     let (tx, mut rx) = mpsc::channel(1024);
     agent::spawn_check_loops(&cfg.agent, cfg.checks, tx)?;
@@ -68,6 +69,7 @@ async fn run_agent(cfg: Config) -> Result<()> {
 }
 
 async fn run_coordinator(cfg: Config) -> Result<()> {
+    cfg.coordinator.validate_cluster()?;
     let coord = Coordinator::new(&cfg.coordinator, &cfg.checks)?;
     serve(coord, &cfg.coordinator.listen).await
 }
@@ -77,6 +79,16 @@ async fn serve(coord: Coordinator, listen: &str) -> Result<()> {
     tracing::info!(%listen, "coordinator listening");
     // History pruning runs beside the server: once at startup, then daily.
     coord.spawn_retention();
+    // Notifications that failed on the first try are retried on their own
+    // schedule; without this the queue would fill and never drain.
+    coord.spawn_retries();
+    // Membership heartbeat and anti-entropy against peer coordinators. A
+    // no-op when clustering is not configured.
+    coord.spawn_cluster();
+    // Persist who is polling this node and share it with the peers, so every
+    // coordinator reports the same fleet. Runs standalone too: it is also what
+    // makes the fleet view survive a restart.
+    coord.spawn_fleet_sync();
     // Peer address is needed to rate-limit login attempts per client.
     axum::serve(
         listener,

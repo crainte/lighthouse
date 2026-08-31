@@ -87,8 +87,8 @@
   /* Narrow: one field. The wide detail dialog shape would read as a form with
      most of its fields missing. */
   .modal {
-    background: var(--bg-card, #161b22);
-    border: 1px solid var(--border, #30363d);
+    background: var(--bg-card, #101316);
+    border: 1px solid var(--border, #1f262b);
     border-radius: 12px;
     width: min(380px, 100%);
     box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6);
@@ -100,7 +100,7 @@
     justify-content: space-between;
     gap: 1rem;
     padding: 0.9rem 1.2rem;
-    border-bottom: 1px solid var(--border, #30363d);
+    border-bottom: 1px solid var(--border, #1f262b);
   }
   .modal-header h2 {
     margin: 0;
@@ -112,7 +112,7 @@
   .close-btn {
     background: none;
     border: none;
-    color: var(--text-dim, #8b949e);
+    color: var(--text-dim, #7d8590);
     font-size: 1.5rem;
     cursor: pointer;
     padding: 0;
@@ -133,12 +133,12 @@
     font-size: 0.72rem;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    color: var(--text-dim, #8b949e);
+    color: var(--text-dim, #7d8590);
   }
 
   input {
-    background: var(--bg, #0d1117);
-    border: 1px solid var(--border, #30363d);
+    background: var(--bg, #0a0c0e);
+    border: 1px solid var(--border, #1f262b);
     border-radius: 6px;
     color: var(--text, #e6edf3);
     font: inherit;
@@ -148,7 +148,7 @@
   }
   input:focus {
     outline: none;
-    border-color: var(--accent, #58a6ff);
+    border-color: var(--accent, #56d4e4);
   }
   input:disabled {
     opacity: 0.6;
@@ -157,9 +157,9 @@
   .submit {
     margin-top: 0.25rem;
     background: #1f6feb22;
-    border: 1px solid var(--accent, #58a6ff);
+    border: 1px solid var(--accent, #56d4e4);
     border-radius: 6px;
-    color: var(--accent, #58a6ff);
+    color: var(--accent, #56d4e4);
     font: inherit;
     font-size: 0.8rem;
     font-weight: 600;
