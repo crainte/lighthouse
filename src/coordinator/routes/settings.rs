@@ -23,9 +23,9 @@
 //! inventing one for no reader that needs it.
 
 use super::super::{
-    alert, error_response, fleet_members, internal_error, require_admin, Coordinator,
-    FleetMemberDto,
+    alert, error_response, fleet_members, internal_error, Coordinator, FleetMemberDto,
 };
+use super::session::require_admin;
 use crate::models::Status;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};

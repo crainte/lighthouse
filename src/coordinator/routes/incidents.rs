@@ -23,8 +23,9 @@
 //! on the node the admin happened to be talking to.
 
 use super::super::{
-    error_response, internal_error, require_admin, storage, Coordinator, DeletedResponse, WsEvent,
+    error_response, internal_error, storage, Coordinator, DeletedResponse, WsEvent,
 };
+use super::session::require_admin;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};

@@ -16,10 +16,9 @@
 //! membership and is gated by `require_admin` instead, because it is a human
 //! in a browser asking, not a peer — see its own doc comment.
 
-use super::super::{
-    alert, bearer, cluster, error_response, gossip, hlc, internal_error, require_admin,
-};
+use super::super::{alert, cluster, error_response, gossip, hlc, internal_error};
 use super::super::{storage, Coordinator, WsEvent};
+use super::session::{bearer, require_admin};
 use crate::models::{CheckResult, Status};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};

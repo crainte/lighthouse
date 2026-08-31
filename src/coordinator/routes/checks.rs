@@ -24,8 +24,9 @@
 //! endpoints with separate names.
 
 use super::super::{
-    error_response, internal_error, require_admin, storage, Coordinator, DeletedResponse, WsEvent,
+    error_response, internal_error, storage, Coordinator, DeletedResponse, WsEvent,
 };
+use super::session::require_admin;
 use crate::config::CheckConfig;
 use crate::models::CheckResult;
 use axum::extract::{Path, State};
