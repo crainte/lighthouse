@@ -2678,6 +2678,11 @@ impl Storage {
                     state: crate::coordinator::cluster::MemberState::from_db(
                         &row.get::<_, String>(4)?,
                     ),
+                    // Not stored: see `Member::build`. A restored row says who
+                    // was out there, not what they are running now; the first
+                    // ping after boot fills this in.
+                    build: None,
+                    protocol: None,
                 })
             })?
             .collect::<std::result::Result<_, _>>()?;

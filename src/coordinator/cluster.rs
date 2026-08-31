@@ -73,6 +73,21 @@ pub struct Member {
     pub generation: i64,
     pub last_seen: i64,
     pub state: MemberState,
+    /// What that node reported it is running. Propagates with membership, so
+    /// every node can show the whole cluster's builds and a half-finished
+    /// rolling upgrade is visible from any one of them.
+    ///
+    /// `None` means not heard from since this process started — either a peer
+    /// on a build that predates reporting, or an entry restored from disk that
+    /// no ping has refreshed yet. Deliberately not persisted: a build read back
+    /// from a table is a claim about a process that may since have been
+    /// replaced, and a stale build is worse than an absent one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
+    /// The wire protocol that node speaks. `None` from a peer predating it,
+    /// which is read as "the protocol before this field existed".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<u32>,
 }
 
 /// Sender identity plus its whole member view. Both directions of
@@ -86,6 +101,21 @@ pub struct PingBody {
     pub generation: i64,
     pub members: Vec<Member>,
 }
+
+/// The peer wire protocol this build speaks.
+///
+/// Not a compatibility gate, and deliberately not one: every peer payload is
+/// additively compatible already — new fields carry `#[serde(default)]`, so an
+/// older node ignores what it does not know instead of rejecting the batch.
+/// Refusing a peer on a number would break rolling upgrades that currently
+/// work.
+///
+/// It exists for the case defaults cannot absorb: a field whose *meaning*
+/// changes, where an old node applies the new value confidently and wrongly.
+/// Increment it then, and only then, so that a mismatch shown in the cluster
+/// view means "these two nodes disagree about what the bytes mean" rather than
+/// "one of them is newer", which the build string already says.
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The cluster as this node sees it: its own identity, everyone it has heard
 /// of, and what it needs to keep asking.
@@ -167,12 +197,21 @@ impl Cluster {
     pub fn merge(&self, incoming: &PingBody, now_millis: i64) {
         let mut guard = self.members.write();
 
+        // The sender's own entry travels in `members` (it pushes `self_member`
+        // there), so its build is taken from that rather than duplicated onto
+        // `PingBody`. Absent only if the sender predates reporting one.
+        let said = incoming
+            .members
+            .iter()
+            .find(|m| m.node_id == incoming.node_id);
         let sender = Member {
             node_id: incoming.node_id.clone(),
             url: incoming.url.clone(),
             generation: incoming.generation,
             last_seen: now_millis,
             state: MemberState::Alive,
+            build: said.and_then(|m| m.build.clone()),
+            protocol: said.and_then(|m| m.protocol),
         };
         Self::merge_one(&mut guard, sender, &self.self_id);
 
@@ -232,6 +271,8 @@ impl Cluster {
             generation: self.generation,
             last_seen: now_millis,
             state: MemberState::Alive,
+            build: Some(crate::version::current().to_string()),
+            protocol: Some(PROTOCOL_VERSION),
         }
     }
 
@@ -387,6 +428,10 @@ mod tests {
             generation,
             last_seen,
             state,
+            // Liveness and merge order are what these tests are about; a build
+            // string never participates in either.
+            build: None,
+            protocol: None,
         }
     }
 
@@ -555,6 +600,68 @@ mod tests {
     }
 
     // -- endpoint joining --
+
+    #[test]
+    fn a_peers_build_travels_with_its_membership() {
+        // A rolling upgrade is only diagnosable if any node can name what the
+        // others are running. The sender's build rides its own member entry,
+        // so it reaches every node the view reaches.
+        let c = cluster("a", "http://a", 1);
+        let mut sender = member("b", "http://b", 5, 5, MemberState::Alive);
+        sender.build = Some("0.2.0 (deadbeef, built 2026-08-31 00:00:00 UTC)".into());
+        sender.protocol = Some(PROTOCOL_VERSION);
+
+        c.merge(
+            &PingBody {
+                node_id: "b".into(),
+                url: "http://b".into(),
+                generation: 5,
+                members: vec![sender],
+            },
+            10,
+        );
+
+        let known = c.snapshot();
+        let b = known.iter().find(|m| m.node_id == "b").expect("merged");
+        assert_eq!(
+            b.build.as_deref(),
+            Some("0.2.0 (deadbeef, built 2026-08-31 00:00:00 UTC)")
+        );
+        assert_eq!(b.protocol, Some(PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn a_peer_that_reports_no_build_is_still_a_member() {
+        // The other half of the upgrade: a node too old to report one must
+        // merge exactly as before rather than being dropped or defaulted into
+        // claiming a build it is not running.
+        let c = cluster("a", "http://a", 1);
+        c.merge(
+            &PingBody {
+                node_id: "b".into(),
+                url: "http://b".into(),
+                generation: 5,
+                members: vec![member("b", "http://b", 5, 5, MemberState::Alive)],
+            },
+            10,
+        );
+
+        let known = c.snapshot();
+        let b = known.iter().find(|m| m.node_id == "b").expect("merged");
+        assert_eq!(b.build, None);
+        assert_eq!(b.protocol, None);
+    }
+
+    #[test]
+    fn a_member_with_no_build_omits_the_field_entirely() {
+        // `skip_serializing_if` keeps the old wire shape byte-identical for a
+        // node that has nothing to say, so a peer parsing strictly on some
+        // other field is not handed a null it never saw before.
+        let json = serde_json::to_string(&member("b", "http://b", 1, 2, MemberState::Alive))
+            .expect("serialises");
+        assert!(!json.contains("build"), "{json}");
+        assert!(!json.contains("protocol"), "{json}");
+    }
 
     #[test]
     fn endpoint_joins_without_a_double_slash() {

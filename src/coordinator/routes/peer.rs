@@ -509,6 +509,10 @@ pub(in crate::coordinator) async fn cluster_view_handler(
                 generation: 0,
                 last_seen: now,
                 state: cluster::MemberState::Alive,
+                // An unclustered node still runs a build, and this view is
+                // where an operator looks for it.
+                build: Some(crate::version::current().to_string()),
+                protocol: Some(cluster::PROTOCOL_VERSION),
             },
             Vec::new(),
         ),
