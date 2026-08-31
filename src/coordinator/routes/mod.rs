@@ -6,4 +6,6 @@
 //! rather than on resource is what keeps a gate like `require_peer` next to
 //! every handler it protects instead of scattered across a file organised
 //! by endpoint shape.
+pub(super) mod incidents;
 pub(super) mod peer;
+pub(super) mod sections;
