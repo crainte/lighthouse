@@ -2,6 +2,23 @@
 // that file is about numbers and clocks; this is about one domain type.
 import type { AffectSource, Incident, IncidentState } from './api';
 
+/// `Incident.checks` carries only the immutable `check_id` — the server never
+/// repeats a check's mutable name onto every incident row it appears on.
+/// Build the id -> name lookup once from whatever check list the caller
+/// already has (the public status list, or the admin check list) and use it
+/// to label a row. A check that no longer exists (deleted since the incident
+/// was recorded) falls back to its raw id, the same way the server's own
+/// `meta.map_or_else(|| id.to_string(), ...)` fallbacks do.
+export function checkNameMap(
+  checks: { check_id: string; name: string }[],
+): Map<string, string> {
+  return new Map(checks.map((c) => [c.check_id, c.name]));
+}
+
+export function checkLabel(names: Map<string, string>, checkId: string): string {
+  return names.get(checkId) ?? checkId;
+}
+
 /// The lifecycle read as colour. `detected` is red because nobody has looked at
 /// it yet, and amber through blue as a human takes it over — the ramp says how
 /// far the response has got, not how bad the outage is.

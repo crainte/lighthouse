@@ -9,7 +9,8 @@ pub mod storage;
 
 use crate::config::{CheckConfig, CoordinatorConfig};
 use crate::credential::AgentCredential;
-use crate::models::{eval, CheckKind, CheckResult, Status};
+use crate::models::{eval, CheckKind, CheckResult, NodeState, Status};
+use crate::rollup::{rollup, RollupPolicy};
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -33,7 +34,7 @@ use routes::checks::{
 use routes::incidents::{
     check_incidents_handler, create_incident_handler, delete_incident_handler,
     edit_incident_handler, incident_checks_handler, incident_handler, incident_update_handler,
-    incidents_handler,
+    incidents_handler, purge_results_handler, purge_short_incidents_handler, results_count_handler,
 };
 pub use routes::incidents::{IncidentCheckDto, IncidentDto, IncidentUpdateDto};
 use routes::peer::{
@@ -42,8 +43,12 @@ use routes::peer::{
     replicate_handler, ConfigBatch,
 };
 pub use routes::peer::{
-    CheckDigestDto, ConfigDigestDto, DigestResponse, ReplicatedAlert, ReplicatedResult,
-    ReplicationBatch,
+    CheckDigestDto, ConfigDigestDto, DigestResponse, ReplicatedAlert, ReplicatedBelief,
+    ReplicatedResult, ReplicationBatch,
+};
+use routes::policies::{
+    delete_rollup_policy_handler, list_rollup_policies_handler, region_tree_handler,
+    upsert_rollup_policy_handler,
 };
 use routes::public::{
     alerts_handler, history_handler, latency_sparkline_handler, results_handler, status_handler,
@@ -73,9 +78,9 @@ use tracing::{info, warn};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsEvent {
     StateChange {
-        check_id: String,
-        from: Status,
-        to: Status,
+        check_id: crate::models::CheckId,
+        from: NodeState,
+        to: NodeState,
         timestamp: i64,
     },
     /// A check confirmed DOWN and a new incident opened.
@@ -105,10 +110,15 @@ pub struct Coordinator {
     inner: Arc<Inner>,
 }
 
-/// Configured metadata for a check, looked up by check_id. The store only knows
-/// check_ids, so anything declared in config (grouping, expectations, probe type)
-/// has to be joined back in here.
+/// Configured metadata for a check, looked up by its immutable id. The store
+/// only knows check ids, so anything declared in config (grouping,
+/// expectations, probe type) has to be joined back in here.
+#[derive(Clone)]
 struct CheckMeta {
+    /// The mutable display name, carried here because everything that needs
+    /// human-facing text (incident titles, notification bodies) only has the
+    /// id to look the check up by.
+    name: String,
     kind: crate::models::CheckKind,
     group: Option<String>,
     latency_graph: bool,
@@ -138,7 +148,15 @@ struct CheckMeta {
     agents: Vec<String>,
     /// Upstream checks. A DOWN here joins an upstream's open incident rather
     /// than opening its own. One hop only — see `CheckConfig::depends_on`.
-    depends_on: Vec<String>,
+    depends_on: Vec<crate::models::CheckId>,
+    rollup: crate::config::RollupOverrides,
+    min_incident_secs: u64,
+    min_recovery_secs: u64,
+    notify_degraded: bool,
+    // Retained as the effective per-check SLA interpretation for consumers that
+    // do not have the original CheckConfig override available.
+    #[allow(dead_code)]
+    degraded_is_downtime: bool,
 }
 
 /// Apply a check's Lua script to one result.
@@ -181,6 +199,45 @@ fn incident_details(r: &CheckResult) -> Option<String> {
     r.failure.map(|f| f.summary()).or_else(|| r.error.clone())
 }
 
+fn incident_title(
+    check_id: &str,
+    state: NodeState,
+    failing_regions: &std::collections::BTreeSet<String>,
+) -> String {
+    if state == NodeState::Degraded {
+        let regions = failing_regions
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if regions.is_empty() {
+            format!("{check_id} partial outage")
+        } else {
+            format!("{check_id} partial outage in {regions}")
+        }
+    } else {
+        format!("{check_id} is {}", state.as_str())
+    }
+}
+
+fn region_change_narrative(
+    previous: &std::collections::BTreeSet<String>,
+    current: &std::collections::BTreeSet<String>,
+) -> String {
+    let list = |regions: &std::collections::BTreeSet<String>| {
+        if regions.is_empty() {
+            "none".to_string()
+        } else {
+            regions.iter().cloned().collect::<Vec<_>>().join(", ")
+        }
+    };
+    format!(
+        "Affected failing regions changed from {} to {}.",
+        list(previous),
+        list(current)
+    )
+}
+
 /// A span of milliseconds as human prose, for the auto-written resolve update.
 /// Coarse on purpose: "4 minutes" is what a status page says, not "4m 12s".
 fn format_duration(ms: i64) -> String {
@@ -195,14 +252,18 @@ fn format_duration(ms: i64) -> String {
     }
 }
 
-/// Index config rows by check name for the lookups ingest and the status page do.
-fn meta_by_name(checks: &[CheckConfig]) -> std::collections::HashMap<String, CheckMeta> {
+/// Index config rows by check id for the lookups ingest and the status page do.
+fn meta_by_id(
+    checks: &[CheckConfig],
+    defaults: crate::config::RollupDefaults,
+) -> std::collections::HashMap<crate::models::CheckId, CheckMeta> {
     checks
         .iter()
         .map(|c| {
             (
-                c.name.clone(),
+                c.id,
                 CheckMeta {
+                    name: c.name.clone(),
                     kind: c.kind,
                     group: c.group.clone(),
                     latency_graph: c.latency_graph,
@@ -222,15 +283,70 @@ fn meta_by_name(checks: &[CheckConfig]) -> std::collections::HashMap<String, Che
                         crate::config::DefaultStatus::Down => Status::Down,
                         crate::config::DefaultStatus::Unknown => Status::Unknown,
                     },
+                    rollup: c.rollup,
+                    min_incident_secs: c.min_incident_secs.unwrap_or(defaults.min_incident_secs),
+                    min_recovery_secs: c.min_recovery_secs.unwrap_or(defaults.min_recovery_secs),
+                    notify_degraded: c.notify_degraded.unwrap_or(defaults.notify_degraded),
+                    degraded_is_downtime: c
+                        .degraded_is_downtime
+                        .unwrap_or(defaults.degraded_is_downtime),
                 },
             )
         })
         .collect()
 }
 
+#[derive(Debug)]
+struct RollupCandidate {
+    root: NodeState,
+    intermediates: Vec<IntermediateState>,
+    failing_regions: std::collections::BTreeSet<String>,
+}
+
+#[derive(Debug)]
+pub(in crate::coordinator) struct RollupTree {
+    root: NodeState,
+    global_policy: RollupPolicy,
+    regions: Vec<RollupRegion>,
+}
+
+#[derive(Debug)]
+pub(in crate::coordinator) struct RollupRegion {
+    name: String,
+    state: NodeState,
+    policy: RollupPolicy,
+    zones: Vec<RollupZone>,
+}
+
+#[derive(Debug)]
+pub(in crate::coordinator) struct RollupZone {
+    name: String,
+    state: NodeState,
+    policy: RollupPolicy,
+    agents: Vec<RollupAgent>,
+}
+
+#[derive(Debug)]
+pub(in crate::coordinator) struct RollupAgent {
+    id: String,
+    state: NodeState,
+    staleness_ms: i64,
+}
+
+#[derive(Debug)]
+struct IntermediateState {
+    scope: storage::AlertScope,
+    node_id: String,
+    state: NodeState,
+}
+
 struct Inner {
     storage: Mutex<Storage>,
     tracker: Mutex<StateTracker>,
+    /// Last observed zone and region rollups. The first observation establishes
+    /// a silent baseline; only subsequent changes become persisted alerts.
+    intermediate_states:
+        Mutex<std::collections::HashMap<(crate::models::CheckId, String), NodeState>>,
     /// How long history is kept. Copied here so the retention job does not
     /// need to re-read config.
     retention: crate::config::RetentionConfig,
@@ -251,7 +367,10 @@ struct Inner {
     /// standard 2xx-3xx rule. Behind a lock because the admin API edits checks
     /// at runtime; ingest reads it per batch, so it stays a cached map rather
     /// than a query.
-    checks: parking_lot::RwLock<std::collections::HashMap<String, CheckMeta>>,
+    checks: parking_lot::RwLock<std::collections::HashMap<crate::models::CheckId, CheckMeta>>,
+    rollup_defaults: crate::config::RollupDefaults,
+    rollup_policies:
+        parking_lot::RwLock<std::collections::HashMap<String, crate::rollup::RollupPolicy>>,
     /// Agents that have made contact recently, whether or not they have
     /// reported anything yet.
     ///
@@ -310,6 +429,26 @@ struct Inner {
     /// How often `spawn_cluster`'s anti-entropy loop reconciles with a random
     /// live peer. Copied from config for the same reason.
     anti_entropy_secs: u64,
+    /// Which region this coordinator belongs to, used to label the state
+    /// summaries it pushes to a global coordinator (Phase 6). Only meaningful
+    /// when `global_push` is set.
+    region: String,
+    /// Where this node advertises itself, so a state push tells the global node
+    /// a live endpoint to route drill-down reads back to. `None` outside a
+    /// cluster; the push still works, the global node just cannot proxy to a
+    /// node it was never told how to reach.
+    advertise_url: Option<String>,
+    /// Global-coordinator push target: `(base_url, token, push_secs)`. `None`
+    /// when no `[coordinator.global]` block is configured — the push loop is a
+    /// no-op, and a Stage A deployment is untouched.
+    global_push: Option<(String, String, u64)>,
+    /// Shared cross-region secret the global coordinator presents as a `Bearer`
+    /// to drive admin operations here (add/edit checks, notifiers, etc.) on
+    /// behalf of an operator signed in at the global dashboard. Same value as
+    /// the global push token: a region that trusts the global node with its
+    /// state also trusts it to relay admin writes. `None` outside Phase 6, so a
+    /// Stage A coordinator accepts admin only via a signed session as before.
+    admin_trust_token: Option<String>,
 }
 
 /// An agent observed making contact: where it said it was, when, and how long
@@ -343,13 +482,24 @@ struct SeenAgent {
 }
 
 impl Coordinator {
-    /// `checks` are the config-file checks. They seed the store the first time
-    /// it runs against an empty `checks` table; afterwards the store is
-    /// authoritative so runtime edits survive a restart.
-    ///
-    /// When no checks exist at all the demo seed runs: a real deployment must
-    /// not have fake monitors in its store.
-    pub fn new(cfg: &CoordinatorConfig, checks: &[CheckConfig]) -> Result<Self> {
+    pub fn mark_embedded_agent_live(&self, agent: &crate::config::AgentConfig) {
+        self.inner.seen.write().insert(
+            agent.agent_id.clone(),
+            SeenAgent {
+                zone: agent.zone.clone(),
+                region: agent.region.clone(),
+                at: chrono::Utc::now().timestamp_millis(),
+                window_ms: unreachable_after_ms(self.inner.missed_polls, Some(agent.poll_secs)),
+                rtt_ms: Some(0),
+                kinds: None,
+                build: None,
+            },
+        );
+    }
+
+    /// Check definitions are persisted and authoritative. Runtime edits survive
+    /// restarts; process configuration never seeds application resources.
+    pub fn new(cfg: &CoordinatorConfig) -> Result<Self> {
         let storage = Storage::open(&cfg.db_path)?;
         let now = chrono::Utc::now().timestamp_millis();
         // Who was reporting before this process started, so a restart does not
@@ -377,27 +527,10 @@ impl Coordinator {
         // Spawned below, once `Self` exists: a failed send is persisted to the
         // retry queue, so the dispatcher needs the store.
         let (notify_tx, rx) = tokio::sync::mpsc::channel::<(alert::Transition, Vec<String>)>(1024);
-        if storage.seed_checks_if_empty(checks, now)? {
-            info!(count = checks.len(), "seeded checks from config file");
-        }
         // A deployment that predates the sections table has group names only on
         // its checks; adopt them so the admin page isn't empty on first open.
         storage.seed_sections_from_checks()?;
         let stored = storage.list_checks()?;
-        // No checks anywhere — seed demo data so the dashboard isn't blank.
-        //
-        // Never in a cluster. A node with `peers` set has an empty store
-        // because its config is *on its way*, not because nobody has
-        // configured anything, so the emptiness that means "new install, show
-        // them something" on a single node means "wait a moment" here. And the
-        // demo rows do not stay local: results replicate, so every node ends up
-        // showing a fake `seed` agent alongside the real fleet, and purging it
-        // anywhere is undone by the next anti-entropy sweep pulling it back
-        // from a peer that still has it — result deletes have no tombstone.
-        // Skipping also saves each joining node 18-26s of inserts at boot.
-        if stored.is_empty() && cfg.peers.is_empty() && storage.seed_mock(now)? {
-            info!("no checks configured, seeded demo data");
-        }
         // Stable across restarts either way: config-resolved when set, else
         // generated once and persisted so a restart rejoins as itself instead
         // of appearing as a new member.
@@ -440,6 +573,13 @@ impl Coordinator {
             _ => None,
         };
         let clock = hlc::Clock::new(node_id.clone());
+        // Resolve the global-push target up front: a present-but-tokenless
+        // block is a hard error, matching how a half-configured cluster
+        // refuses to start rather than pushing into a 401.
+        let global_push = cfg.resolved_global_push()?;
+        if let Some((url, _, secs)) = &global_push {
+            info!(url = %url, push_secs = secs, region = %cfg.region, "global push enabled");
+        }
         let credentials = storage.list_agent_credentials().unwrap_or_default();
         let live = credentials.iter().filter(|c| !c.revoked()).count();
         if live == 0 {
@@ -450,30 +590,56 @@ impl Coordinator {
         } else {
             info!(count = live, "agent credentials loaded");
         }
-        // Resume confirmations in flight. The confirmed status and the failure
-        // count persist in `current_state`, so a check two failures into a
-        // three-failure confirmation picks up where it left off after a restart
-        // instead of starting over — or alerting on the first result.
+        // Resume every per-agent belief and the published root, including a
+        // hold-down timer in flight. Seed a history baseline as well; record_state
+        // is idempotent when a span already exists.
         let mut tracker = StateTracker::new();
-        if let Ok(state) = storage.list_current_state() {
-            let n = state.len();
-            for row in state {
-                tracker.seed(&row.check_id, row.status, row.consecutive_failures);
+        if let Ok(leaves) = storage.list_agent_check_state() {
+            let n = leaves.len();
+            for row in leaves {
+                tracker.seed_agent(
+                    row.check_id,
+                    &row.agent_id,
+                    &row.zone,
+                    &row.region,
+                    row.status,
+                    row.consecutive_failures,
+                    row.last_check,
+                );
             }
             if n > 0 {
-                info!(checks = n, "seeded state tracker from current_state");
+                info!(leaves = n, "seeded agent beliefs");
             }
         }
+        let current = storage.list_current_state().unwrap_or_default();
+        for row in &current {
+            tracker.seed_published(row.check_id, row.state, row.pending);
+            if let Err(e) = storage.record_state(row.check_id, row.state, now) {
+                warn!(error = %e, check = %row.check_id, "could not seed state history baseline");
+            }
+        }
+        if !current.is_empty() {
+            info!(checks = current.len(), "seeded published state");
+        }
+        let rollup_policies = storage
+            .list_rollup_policies()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| (row.node_id, row.policy))
+            .collect();
         let (events, _) = broadcast::channel(256);
         let coord = Self {
             inner: Arc::new(Inner {
                 storage: Mutex::new(storage),
                 tracker: Mutex::new(tracker),
+                intermediate_states: Mutex::new(std::collections::HashMap::new()),
                 retention: cfg.retention.clone(),
                 notify_tx,
                 notifiers,
                 events,
-                checks: parking_lot::RwLock::new(meta_by_name(&stored)),
+                checks: parking_lot::RwLock::new(meta_by_id(&stored, cfg.rollup_defaults)),
+                rollup_defaults: cfg.rollup_defaults,
+                rollup_policies: parking_lot::RwLock::new(rollup_policies),
                 seen: parking_lot::RwLock::new(
                     reported_fleet
                         .into_iter()
@@ -512,6 +678,10 @@ impl Coordinator {
                 cluster,
                 gossip_interval_secs: cfg.gossip_interval_secs,
                 anti_entropy_secs: cfg.anti_entropy_secs,
+                region: cfg.region.clone(),
+                advertise_url: cfg.resolved_advertise_url(),
+                admin_trust_token: global_push.as_ref().map(|(_, token, _)| token.clone()),
+                global_push,
             }),
         };
         coord.spawn_dispatcher(rx);
@@ -611,8 +781,9 @@ impl Coordinator {
                         "alert matched no notifier"
                     );
                 }
+                let name = coord.check_name(t.check_id);
                 for notifier in targets {
-                    if let Err(e) = crate::notify::send(&client, notifier, &t).await {
+                    if let Err(e) = crate::notify::send(&client, notifier, &t, &name).await {
                         warn!(error = %e, check = %t.check_id, notifier = %notifier.name, "notification failed, queued for retry");
                         coord.enqueue_retry(&notifier.name, &t, &e);
                     }
@@ -626,7 +797,7 @@ impl Coordinator {
         let now = chrono::Utc::now().timestamp_millis();
         let row = storage::QueuedRow {
             notifier: notifier.to_string(),
-            check_id: t.check_id.clone(),
+            check_id: t.check_id,
             previous_state: Some(t.from),
             current_state: t.to,
             attempts: 1,
@@ -687,11 +858,12 @@ impl Coordinator {
                 continue;
             };
             let t = alert::Transition {
-                check_id: row.check_id.clone(),
-                from: row.previous_state.unwrap_or(Status::Unknown),
+                check_id: row.check_id,
+                from: row.previous_state.unwrap_or(NodeState::Unknown),
                 to: row.current_state,
             };
-            match crate::notify::send(&client, &notifier, &t).await {
+            let name = self.check_name(t.check_id);
+            match crate::notify::send(&client, &notifier, &t, &name).await {
                 Ok(()) => {
                     info!(
                         check = %row.check_id,
@@ -735,7 +907,7 @@ impl Coordinator {
     fn drop_queued(&self, row: &storage::QueuedRow) {
         if let Err(e) = self.inner.storage.lock().delete_notification(
             &row.notifier,
-            &row.check_id,
+            row.check_id,
             row.queued_at,
         ) {
             tracing::error!(error = %e, "failed to clear a delivered notification");
@@ -804,6 +976,168 @@ impl Coordinator {
         });
     }
 
+    /// Push this coordinator's state summary to the global coordinator on a
+    /// timer. A no-op when no `[coordinator.global]` block is configured, so
+    /// this runs harmlessly in every mode that serves — like `spawn_cluster`.
+    ///
+    /// Best-effort like gossip: a failed push is logged and the next tick tries
+    /// again. The global node keeps last-writer-wins, so a missed push costs at
+    /// most one interval of staleness, never correctness.
+    pub fn spawn_global_push(&self) {
+        let Some((url, token, push_secs)) = self.inner.global_push.clone() else {
+            return;
+        };
+        let coord = self.clone();
+        let client = reqwest::Client::new();
+        let endpoint = format!("{}/internal/global/state", url.trim_end_matches('/'));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(push_secs));
+            loop {
+                tick.tick().await;
+                let push = coord.build_state_push();
+                match client
+                    .post(&endpoint)
+                    .bearer_auth(&token)
+                    .json(&push)
+                    .send()
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => {}
+                    Ok(r) => warn!(status = %r.status(), "global push rejected"),
+                    Err(e) => warn!(error = %e, "global push failed"),
+                }
+            }
+        });
+    }
+
+    /// Build the summary of every configured, visible check for a global push.
+    /// Reuses the same status source the public `/api/v1/status` reads, so the
+    /// global dashboard shows exactly what a regional dashboard would.
+    fn build_state_push(&self) -> crate::global::wire::RegionStatePush {
+        use crate::global::cache::worst;
+        use crate::global::wire::{CheckSummary, RegionStatePush};
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let (rows, confirmed) = {
+            let store = self.inner.storage.lock();
+            (store.list_status(now), store.list_current_state())
+        };
+        let confirmed: std::collections::HashMap<crate::models::CheckId, NodeState> = confirmed
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| (r.check_id, r.state))
+            .collect();
+        let by_id = self.inner.checks.read();
+        let mut summaries: Vec<CheckSummary> = Vec::new();
+        let mut reported: std::collections::HashSet<crate::models::CheckId> =
+            std::collections::HashSet::new();
+        for r in rows.unwrap_or_default() {
+            let Some(meta) = by_id.get(&r.check_id) else {
+                continue;
+            };
+            if !meta.visible {
+                continue;
+            }
+            reported.insert(r.check_id);
+            summaries.push(CheckSummary {
+                check_id: r.check_id,
+                name: meta.name.clone(),
+                state: r.state,
+                latency_ms: r.latency_ms,
+                last_check: r.last_check,
+                uptime_24h: r.uptime_24h,
+                status_code: r.status_code,
+                // The raw error is redacted from the public page; the global
+                // push carries only the safe category the failure implies.
+                error: r.failure.map(|f| f.summary()),
+                kind: Some(meta.kind),
+                group: meta.group.clone(),
+                latency_graph: meta.latency_graph,
+                position: meta.position,
+            });
+        }
+        // Configured-but-unreported checks still belong on the global page,
+        // carrying whatever confirmed state gossip supplied, else their default.
+        for (id, meta) in by_id.iter() {
+            if !meta.visible || reported.contains(id) {
+                continue;
+            }
+            summaries.push(CheckSummary {
+                check_id: *id,
+                name: meta.name.clone(),
+                state: confirmed
+                    .get(id)
+                    .copied()
+                    .unwrap_or_else(|| meta.default_status.into()),
+                latency_ms: 0,
+                last_check: 0,
+                uptime_24h: 0.0,
+                status_code: None,
+                error: None,
+                kind: Some(meta.kind),
+                group: meta.group.clone(),
+                latency_graph: meta.latency_graph,
+                position: meta.position,
+            });
+        }
+        let region_health = summaries
+            .iter()
+            .fold(NodeState::Unknown, |acc, c| worst(acc, c.state));
+        // Truthful agent counts for this region: an agent is healthy when its
+        // last contact is inside its own silence window. The global status page
+        // shows these instead of pretending a region is one agent.
+        //
+        // Local `seen` alone undercounts in a cluster — an agent polling a peer
+        // coordinator is invisible here until fleet gossip lands it in the
+        // persisted `agent_polls` twin. Union both sources (an agent healthy in
+        // either is healthy), matching how `fleet_health` builds the same view,
+        // so every US coordinator reports the whole region's 3 agents, not just
+        // the ones it personally serves.
+        let (agents_healthy, agents_total) = {
+            let region = self.inner.region.as_str();
+            let mut merged: std::collections::HashMap<String, bool> =
+                std::collections::HashMap::new();
+            {
+                let seen = self.inner.seen.read();
+                for (id, a) in seen.iter() {
+                    if a.region != region {
+                        continue;
+                    }
+                    let healthy = now.saturating_sub(a.at) <= a.window_ms;
+                    merged
+                        .entry(id.clone())
+                        .and_modify(|h| *h = *h || healthy)
+                        .or_insert(healthy);
+                }
+            }
+            if let Ok(polls) = self.inner.storage.lock().list_agent_polls() {
+                for p in polls {
+                    if p.region != region {
+                        continue;
+                    }
+                    let healthy = now.saturating_sub(p.at) <= p.window_ms;
+                    merged
+                        .entry(p.agent_id)
+                        .and_modify(|h| *h = *h || healthy)
+                        .or_insert(healthy);
+                }
+            }
+            let total = merged.len() as u32;
+            let healthy = merged.values().filter(|h| **h).count() as u32;
+            (healthy, total)
+        };
+        RegionStatePush {
+            region: self.inner.region.clone(),
+            origin: self.inner.node_id.clone(),
+            advertise_url: self.inner.advertise_url.clone(),
+            pushed_at: now,
+            region_health,
+            agents_healthy,
+            agents_total,
+            checks: summaries,
+        }
+    }
+
     /// Replace the published fleet summary, through the config-replication
     /// path so a peer picks it up too. `write_config` persists before
     /// `apply_config_batch` swaps the live cache, so a failed write cannot
@@ -847,7 +1181,12 @@ impl Coordinator {
     /// window is that same opt-out on a timer — judged against `at`, the
     /// transition's own timestamp, so a batch posted late is read by when it
     /// happened rather than by when it arrived.
-    fn notify_targets(&self, check_id: &str, at: i64) -> Option<Vec<String>> {
+    fn notify_targets(
+        &self,
+        check_id: crate::models::CheckId,
+        state: NodeState,
+        at: i64,
+    ) -> Option<Vec<String>> {
         if self
             .inner
             .maintenance
@@ -857,8 +1196,8 @@ impl Coordinator {
         {
             return None;
         }
-        match self.inner.checks.read().get(check_id) {
-            Some(m) if !m.notify => None,
+        match self.inner.checks.read().get(&check_id) {
+            Some(m) if !m.notify || (state == NodeState::Degraded && !m.notify_degraded) => None,
             Some(m) => Some(m.notifiers.clone()),
             None => Some(Vec::new()),
         }
@@ -891,11 +1230,20 @@ impl Coordinator {
         Ok(())
     }
 
+    fn reload_rollup_policies(&self) -> Result<()> {
+        let rows = self.inner.storage.lock().list_rollup_policies()?;
+        *self.inner.rollup_policies.write() = rows
+            .into_iter()
+            .map(|row| (row.node_id, row.policy))
+            .collect();
+        Ok(())
+    }
+
     /// Re-read check definitions after an admin edit so ingest and the status
     /// page pick them up without a restart.
     fn reload_checks(&self) -> Result<Vec<CheckConfig>> {
         let stored = self.inner.storage.lock().list_checks()?;
-        *self.inner.checks.write() = meta_by_name(&stored);
+        *self.inner.checks.write() = meta_by_id(&stored, self.inner.rollup_defaults);
         Ok(stored)
     }
 
@@ -938,8 +1286,7 @@ impl Coordinator {
         }
     }
 
-    /// Apply a batch of config entries — checks, sections, settings,
-    /// credentials — through the one HLC-arbitrated write path
+    /// Apply a batch of config entries through the one HLC-arbitrated write path
     /// (`Storage::apply_config_entry`), then refresh whichever in-memory
     /// caches that path bypasses. The single point both `config_handler`
     /// (an entry that arrived over the wire) and `Coordinator::write_config`
@@ -963,6 +1310,7 @@ impl Coordinator {
     fn apply_config_batch(&self, entries: &[storage::ConfigEntry]) -> Result<()> {
         let mut touched_checks = false;
         let mut touched_credentials = false;
+        let mut touched_rollup_policies = false;
         let mut touched_settings: Vec<String> = Vec::new();
         {
             let store = self.inner.storage.lock();
@@ -983,6 +1331,7 @@ impl Coordinator {
                         storage::ConfigKind::Check => touched_checks = true,
                         storage::ConfigKind::Credential => touched_credentials = true,
                         storage::ConfigKind::Setting => touched_settings.push(e.id.clone()),
+                        storage::ConfigKind::RollupPolicy => touched_rollup_policies = true,
                         // Sections have no in-memory cache of their own —
                         // every reader queries the table directly.
                         storage::ConfigKind::Section => {}
@@ -1007,6 +1356,9 @@ impl Coordinator {
         }
         if touched_credentials {
             self.reload_credentials()?;
+        }
+        if touched_rollup_policies {
+            self.reload_rollup_policies()?;
         }
         for id in touched_settings {
             self.reload_setting_cache(&id);
@@ -1035,6 +1387,26 @@ impl Coordinator {
         };
         self.apply_config_batch(std::slice::from_ref(&entry))?;
         Ok(entry)
+    }
+
+    pub(in crate::coordinator) fn save_rollup_policy(
+        &self,
+        node_id: &str,
+        node_type: storage::NodeType,
+        policy: RollupPolicy,
+    ) -> Result<()> {
+        policy.validate().map_err(anyhow::Error::msg)?;
+        let document = serde_json::to_string(&storage::RollupPolicyDoc { node_type, policy })?;
+        let entry =
+            self.write_config(storage::ConfigKind::RollupPolicy, node_id, Some(document))?;
+        self.replicate_config(vec![entry]);
+        Ok(())
+    }
+
+    pub(in crate::coordinator) fn delete_rollup_policy(&self, node_id: &str) -> Result<()> {
+        let entry = self.write_config(storage::ConfigKind::RollupPolicy, node_id, None)?;
+        self.replicate_config(vec![entry]);
+        Ok(())
     }
 
     /// Push a batch of just-applied config entries to every live peer,
@@ -1243,40 +1615,95 @@ impl Coordinator {
         &self,
         store: &storage::Storage,
         r: &CheckResult,
+        state: NodeState,
+        failing_regions: &std::collections::BTreeSet<String>,
         ts: i64,
-    ) -> anyhow::Result<(String, bool)> {
-        if let Some(existing) = store.open_incident_for(&r.check_id)? {
-            return Ok((existing.id, false));
+    ) -> anyhow::Result<(String, bool, bool)> {
+        let name = self.check_name(r.check_id);
+        if let Some(existing) = store.open_incident_for(r.check_id)? {
+            let title = incident_title(&name, state, failing_regions);
+            let changed = existing.title != title;
+            if changed {
+                store.edit_incident(&existing.id, &title, existing.started_at, existing.global)?;
+            }
+            return Ok((existing.id, false, changed));
         }
-        let upstreams: Vec<String> = {
-            let by_name = self.inner.checks.read();
-            by_name
+        let upstreams: Vec<crate::models::CheckId> = {
+            let by_id = self.inner.checks.read();
+            by_id
                 .get(&r.check_id)
                 .map(|m| m.depends_on.clone())
                 .unwrap_or_default()
         };
         for up in upstreams {
-            if let Some(inc) = store.open_incident_for(&up)? {
-                store.attach_check(&inc.id, &r.check_id, storage::AffectSource::Dependency)?;
-                return Ok((inc.id, false));
+            if let Some(inc) = store.open_incident_for(up)? {
+                store.attach_check(&inc.id, r.check_id, storage::AffectSource::Dependency)?;
+                return Ok((inc.id, false, false));
             }
         }
         let id = format!("{}-{ts}", r.check_id);
-        let cause = incident_details(r).unwrap_or_else(|| "check is failing".into());
+        let cause = incident_details(r).unwrap_or_else(|| format!("check is {}", state.as_str()));
         store.create_incident(
             &id,
-            &format!("{} is down", r.check_id),
+            &incident_title(&name, state, failing_regions),
             storage::IncidentState::Detected,
             ts,
             false,
-            Some(&r.check_id),
+            Some(r.check_id),
             &[storage::IncidentCheckRow {
-                check_id: r.check_id.clone(),
+                check_id: r.check_id,
                 source: storage::AffectSource::Origin,
             }],
             Some((&cause, None)),
         )?;
-        Ok((id, true))
+        Ok((id, true, false))
+    }
+
+    /// The mutable display name for a check id, or the id itself (rendered)
+    /// when the coordinator has no config metadata for it \u2014 a check deleted
+    /// between the observation and this lookup, or one this node has not
+    /// replicated config for yet. Never fails: this is for human-facing text,
+    /// not identity.
+    fn check_name(&self, check_id: crate::models::CheckId) -> String {
+        self.inner
+            .checks
+            .read()
+            .get(&check_id)
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| check_id.to_string())
+    }
+
+    fn alert_name(&self, scope: storage::AlertScope, node_id: &str) -> String {
+        let check_name = |id| {
+            self.inner
+                .checks
+                .read()
+                .get(&id)
+                .map(|meta| meta.name.clone())
+                .unwrap_or_else(|| "Deleted check".to_string())
+        };
+
+        if scope == storage::AlertScope::Check {
+            return node_id
+                .parse()
+                .map(check_name)
+                .unwrap_or_else(|_| node_id.to_string());
+        }
+
+        let Some(rest) = node_id.strip_prefix("check:") else {
+            return node_id.to_string();
+        };
+        let Some((check_id, location)) = rest.split_once('/') else {
+            return node_id.to_string();
+        };
+        let Ok(check_id) = check_id.parse() else {
+            return node_id.to_string();
+        };
+        format!(
+            "{} / {}",
+            check_name(check_id),
+            location.replace('/', " / ")
+        )
     }
 
     /// Resolve an incident if every gating check has recovered. Returns whether
@@ -1304,15 +1731,13 @@ impl Coordinator {
         inc: &storage::IncidentRow,
         ts: i64,
     ) -> anyhow::Result<bool> {
+        let current: std::collections::HashMap<_, _> = store
+            .list_current_state()?
+            .into_iter()
+            .map(|row| (row.check_id, row.state))
+            .collect();
         for check_id in inc.gating_checks() {
-            let runs = {
-                let by_name = self.inner.checks.read();
-                by_name
-                    .get(check_id)
-                    .map(|m| m.failures_before_down)
-                    .unwrap_or(1)
-            };
-            if !store.recovered_for(check_id, runs)? {
+            if current.get(&check_id) != Some(&NodeState::Up) {
                 return Ok(false);
             }
         }
@@ -1327,153 +1752,516 @@ impl Coordinator {
         Ok(true)
     }
 
-    /// Core ingest path: eval each result, detect transitions, persist, alert,
-    /// and broadcast alert-worthy transitions to live WebSocket clients.
-    pub async fn ingest(&self, results: Vec<CheckResult>) {
+    fn reconcile_open_incidents(
+        &self,
+        store: &storage::Storage,
+        ts: i64,
+    ) -> anyhow::Result<Vec<storage::IncidentRow>> {
+        let mut resolved = Vec::new();
+        for inc in store.list_incidents(1000, Some(true))? {
+            if inc.origin_check.is_some() && self.try_resolve(store, &inc, ts)? {
+                if let Some(row) = store.incident(&inc.id)? {
+                    resolved.push(row);
+                }
+            }
+        }
+        Ok(resolved)
+    }
+
+    pub(in crate::coordinator) fn rollup_tree(
+        &self,
+        meta: Option<&CheckMeta>,
+        leaves: Vec<(String, state::Belief)>,
+        now: i64,
+    ) -> RollupTree {
+        use std::collections::BTreeMap;
+
+        let policies = self.inner.rollup_policies.read();
+        let policy = |override_policy: Option<RollupPolicy>, key: &str, built_in| {
+            override_policy
+                .or_else(|| policies.get(key).copied())
+                .unwrap_or(built_in)
+        };
+
+        // Credentials, not self-declared beliefs, define which locations exist.
+        // Keeping an Unknown leaf for each credential makes newly configured
+        // locations visible before their first agent reports, without affecting
+        // rollup thresholds (Unknown is excluded by `rollup`).
+        let mut topology: BTreeMap<String, BTreeMap<String, BTreeMap<String, RollupAgent>>> =
+            BTreeMap::new();
+        for credential in self.inner.credentials.read().values() {
+            if credential.revoked() {
+                continue;
+            }
+            topology
+                .entry(credential.region.clone())
+                .or_default()
+                .entry(credential.zone.clone())
+                .or_default();
+        }
+
+        let credential_topology = !topology.is_empty();
+        let seen = self.inner.seen.read();
+        for (agent_id, belief) in leaves {
+            if !credential_topology {
+                topology
+                    .entry(belief.region.clone())
+                    .or_default()
+                    .entry(belief.zone.clone())
+                    .or_default();
+            }
+            let Some(agents) = topology
+                .get_mut(&belief.region)
+                .and_then(|zones| zones.get_mut(&belief.zone))
+            else {
+                continue;
+            };
+            let (staleness_ms, live) = seen.get(&agent_id).map_or_else(
+                || {
+                    let age = now.saturating_sub(belief.last_check);
+                    (
+                        age,
+                        age <= unreachable_after_ms(self.inner.missed_polls, None),
+                    )
+                },
+                |agent| {
+                    let age = now.saturating_sub(agent.at.max(belief.last_check));
+                    (age, age <= agent.window_ms)
+                },
+            );
+            agents.insert(
+                agent_id.clone(),
+                RollupAgent {
+                    id: agent_id,
+                    state: if live {
+                        belief.status.into()
+                    } else {
+                        NodeState::Unknown
+                    },
+                    staleness_ms,
+                },
+            );
+        }
+        drop(seen);
+
+        let mut regions = Vec::with_capacity(topology.len());
+        for (region, zone_map) in topology {
+            let mut zones = Vec::with_capacity(zone_map.len());
+            for (zone, agent_map) in zone_map {
+                let agents: Vec<_> = agent_map.into_values().collect();
+                let zone_policy = policy(
+                    meta.and_then(|m| m.rollup.zone),
+                    &format!("zone:{region}/{zone}"),
+                    RollupPolicy::ZONE_DEFAULT,
+                );
+                let state = rollup(
+                    &zone_policy,
+                    &agents.iter().map(|agent| agent.state).collect::<Vec<_>>(),
+                );
+                zones.push(RollupZone {
+                    name: zone,
+                    state,
+                    policy: zone_policy,
+                    agents,
+                });
+            }
+            let region_policy = policy(
+                meta.and_then(|m| m.rollup.region),
+                &format!("region:{region}"),
+                RollupPolicy::REGION_DEFAULT,
+            );
+            let state = rollup(
+                &region_policy,
+                &zones.iter().map(|zone| zone.state).collect::<Vec<_>>(),
+            );
+            regions.push(RollupRegion {
+                name: region,
+                state,
+                policy: region_policy,
+                zones,
+            });
+        }
+        let global_policy = policy(
+            meta.and_then(|m| m.rollup.global),
+            "global",
+            RollupPolicy::CHECK_DEFAULT,
+        );
+        let candidate = rollup(
+            &global_policy,
+            &regions
+                .iter()
+                .map(|region| region.state)
+                .collect::<Vec<_>>(),
+        );
+        RollupTree {
+            root: if candidate == NodeState::Unknown {
+                meta.map(|m| m.default_status.into())
+                    .unwrap_or(NodeState::Unknown)
+            } else {
+                candidate
+            },
+            global_policy,
+            regions,
+        }
+    }
+
+    fn rollup_candidate(
+        &self,
+        check_id: &str,
+        meta: Option<&CheckMeta>,
+        leaves: Vec<(String, state::Belief)>,
+        now: i64,
+    ) -> RollupCandidate {
+        let tree = self.rollup_tree(meta, leaves, now);
+        let mut intermediates = Vec::new();
+        let mut failing_regions = std::collections::BTreeSet::new();
+        for region in &tree.regions {
+            for zone in &region.zones {
+                intermediates.push(IntermediateState {
+                    scope: storage::AlertScope::Zone,
+                    node_id: format!("check:{check_id}/region:{}/zone:{}", region.name, zone.name),
+                    state: zone.state,
+                });
+            }
+            if region.state.is_failing() {
+                failing_regions.insert(region.name.clone());
+            }
+            intermediates.push(IntermediateState {
+                scope: storage::AlertScope::Region,
+                node_id: format!("check:{check_id}/region:{}", region.name),
+                state: region.state,
+            });
+        }
+        RollupCandidate {
+            root: tree.root,
+            intermediates,
+            failing_regions,
+        }
+    }
+
+    /// Evaluate and persist observations, then publish one rolled-up root per
+    /// affected check. Everything downstream is driven solely by root changes.
+    pub async fn ingest(&self, mut results: Vec<CheckResult>) {
+        results.sort_by(|a, b| (&a.agent_id, a.timestamp).cmp(&(&b.agent_id, b.timestamp)));
         let mut rows = Vec::with_capacity(results.len());
-        let mut transitions = Vec::new();
-        // Confirmed status per check after this batch, so incident opens are
-        // gated on the threshold: a DOWN still inside its confirmation window
-        // is not an outage yet.
-        let mut confirmed: std::collections::HashMap<String, Status> =
+        let mut affected: std::collections::HashMap<crate::models::CheckId, (CheckResult, i64)> =
             std::collections::HashMap::new();
-        // (check_id, confirmed status, failure count, last check ts). Built
-        // under the tracker lock and applied to storage afterwards, because the
-        // two guards must never nest.
-        let mut state_updates = Vec::with_capacity(results.len());
+        let mut leaf_updates = Vec::with_capacity(results.len());
 
         {
             let mut tracker = self.inner.tracker.lock();
             for mut r in results {
-                let (expect, script, threshold, default_status) = {
-                    let by_name = self.inner.checks.read();
-                    let meta = by_name.get(&r.check_id);
-                    (
-                        meta.and_then(|m| m.expect_status),
-                        meta.and_then(|m| m.eval.clone()),
-                        meta.map(|m| m.failures_before_down).unwrap_or(1),
-                        meta.map(|m| m.default_status).unwrap_or(Status::Unknown),
-                    )
-                };
-                let status = match script.as_deref() {
+                let meta = self.inner.checks.read().get(&r.check_id).cloned();
+                let status = match meta.as_ref().and_then(|m| m.eval.as_deref()) {
                     Some(src) => script_verdict(src, &mut r),
-                    None => eval(&r, expect),
+                    None => eval(&r, meta.as_ref().and_then(|m| m.expect_status)),
                 };
-                if let Some(t) = tracker.observe(&r.check_id, status, threshold) {
-                    let ts = r.timestamp.timestamp_millis();
-                    transitions.push((t, ts));
-                }
-                // A check still inside its confirmation window has not flipped;
-                // it reads as it did before its first failed probe.
-                let confirmed_status = tracker.current(&r.check_id).unwrap_or(default_status);
-                confirmed.insert(r.check_id.clone(), confirmed_status);
                 let ts = r.timestamp.timestamp_millis();
-                state_updates.push((
-                    r.check_id.clone(),
-                    confirmed_status,
-                    tracker.failures(&r.check_id),
+                let confirmed = tracker.observe(
+                    r.check_id,
+                    &r.agent_id,
+                    &r.zone,
+                    &r.region,
+                    status,
+                    meta.as_ref().map(|m| m.failures_before_down).unwrap_or(1),
+                    ts,
+                );
+                leaf_updates.push((
+                    r.check_id,
+                    r.agent_id.clone(),
+                    r.zone.clone(),
+                    r.region.clone(),
+                    confirmed,
+                    tracker.failures(r.check_id, &r.agent_id),
                     ts,
                 ));
-                // The body is only here to feed the script. Dropping it before
-                // persistence keeps 64KB per result out of the database.
+                let replace = affected
+                    .get(&r.check_id)
+                    .map(|(_, prior)| ts >= *prior)
+                    .unwrap_or(true);
+                if replace {
+                    affected.insert(r.check_id, (r.clone(), ts));
+                }
                 r.body = None;
                 r.headers = None;
                 rows.push((r, status));
             }
-        } // drop tracker guard before any await
-          // Incidents are driven by observations, not transitions, so a restart
-          // (which forgets the tracker's baseline) cannot strand a check in the
-          // wrong incident state. The open incident is the source of truth.
-          //
-          // Order matters here: incidents are reconciled BEFORE alerts are
-          // written, because an alert is stamped with the incident it belongs to
-          // and that is only knowable once this batch's opens and joins have
-          // happened.
+        }
+
+        let mut transitions = Vec::new();
+        let mut intermediate_transitions = Vec::new();
+        let mut region_set_changes = Vec::new();
+        let mut root_regions = std::collections::HashMap::new();
+        let mut published_states = std::collections::HashMap::new();
+        let mut baseline_failures = Vec::new();
+        let mut state_updates = Vec::with_capacity(affected.len());
+        for (check_id, (_, ts)) in &affected {
+            let check_id = *check_id;
+            let meta = self.inner.checks.read().get(&check_id).cloned();
+            let leaves = self.inner.tracker.lock().children(check_id);
+            let candidate =
+                self.rollup_candidate(&check_id.to_string(), meta.as_ref(), leaves, *ts);
+            let (transition, state, pending, was_unpublished) = {
+                let mut tracker = self.inner.tracker.lock();
+                let was_unpublished = tracker.state(check_id).is_none();
+                let transition = tracker.publish(
+                    check_id,
+                    candidate.root,
+                    *ts,
+                    meta.as_ref().map(|m| m.min_incident_secs).unwrap_or(0),
+                    meta.as_ref().map(|m| m.min_recovery_secs).unwrap_or(0),
+                );
+                (
+                    transition,
+                    tracker.state(check_id).unwrap_or(candidate.root),
+                    tracker.pending(check_id),
+                    was_unpublished,
+                )
+            };
+            // Intermediate transitions are downstream evidence just like the root
+            // alert, so do not publish them while the root is held down. Otherwise
+            // a swallowed blip still leaks zone/region alerts to the UI.
+            if was_unpublished || transition.is_some() {
+                let previous_regions = {
+                    let mut cache = self.inner.intermediate_states.lock();
+                    let mut previous = std::collections::BTreeSet::new();
+                    let mut had_baseline = false;
+                    for intermediate in &candidate.intermediates {
+                        let key = (check_id, intermediate.node_id.clone());
+                        if let Some(prior) = cache.insert(key, intermediate.state) {
+                            had_baseline = true;
+                            if intermediate.scope == storage::AlertScope::Region
+                                && prior.is_failing()
+                            {
+                                previous.insert(
+                                    intermediate
+                                        .node_id
+                                        .rsplit("region:")
+                                        .next()
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                );
+                            }
+                            if prior != intermediate.state {
+                                intermediate_transitions.push((
+                                    intermediate.scope,
+                                    intermediate.node_id.clone(),
+                                    prior,
+                                    intermediate.state,
+                                    *ts,
+                                ));
+                            }
+                        }
+                    }
+                    had_baseline.then_some(previous)
+                };
+                if let Some(previous) = previous_regions {
+                    if previous != candidate.failing_regions {
+                        region_set_changes.push((
+                            check_id,
+                            previous,
+                            candidate.failing_regions.clone(),
+                            *ts,
+                        ));
+                    }
+                }
+            }
+            root_regions.insert(check_id, candidate.failing_regions);
+            if let Some(t) = transition {
+                transitions.push((t, *ts));
+            } else if was_unpublished && state.is_failing() {
+                baseline_failures.push((check_id, state, *ts));
+            }
+            // Persist every candidate, including pending hold-down state.
+            published_states.insert(check_id, state);
+            state_updates.push((check_id, state, pending, *ts));
+        }
+
         let mut incident_events = Vec::new();
-        // check_id -> the incident it belonged to during this batch. Captured
-        // even when the incident then resolves, so the recovery alert is
-        // stamped with the outage it ended rather than with nothing.
-        let mut incident_for: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        // Collected alongside the local writes below, for the cluster-based
-        // replication push after the storage guard drops. Empty when
-        // clustering is not configured — nobody reads them in that case.
-        let mut replicated_alerts: Vec<ReplicatedAlert> = Vec::new();
-        let mut replicated_incidents: Vec<storage::ReplicatedIncident> = Vec::new();
+        let mut incident_for = std::collections::HashMap::<crate::models::CheckId, String>::new();
+        let mut replicated_alerts = Vec::<ReplicatedAlert>::new();
+        let mut replicated_incidents = Vec::<storage::ReplicatedIncident>::new();
         {
             let store = self.inner.storage.lock();
             if let Err(e) = store.insert_results(&rows) {
                 tracing::error!(error = %e, "failed to persist results");
             }
-            for (check_id, cs_status, failures, ts) in &state_updates {
-                if let Err(e) = store.update_current_state(check_id, *cs_status, *failures, *ts) {
-                    tracing::error!(error = %e, check = %check_id, "failed to persist current state");
+            for (check_id, agent_id, zone, region, status, failures, ts) in &leaf_updates {
+                if let Err(e) = store.update_agent_check_state(
+                    *check_id, agent_id, zone, region, *status, *failures, *ts,
+                ) {
+                    tracing::error!(error = %e, check = %check_id, agent = %agent_id, "failed to persist agent belief");
                 }
             }
-            for (r, status) in &rows {
-                let ts = r.timestamp.timestamp_millis();
-                match status {
-                    Status::Down => {
-                        // A DOWN that has not yet confirmed (fewer than
-                        // `failures_before_down` consecutive probes) is not an
-                        // outage: no incident, and a later recovery cannot be
-                        // misread as a fix for something that never opened.
-                        if confirmed.get(&r.check_id) != Some(&Status::Down) {
-                            continue;
+            for (check_id, state, pending, ts) in &state_updates {
+                if let Err(e) = store.update_current_state(*check_id, *state, *pending, *ts) {
+                    tracing::error!(error = %e, check = %check_id, "failed to persist current state");
+                }
+                if let Err(e) = store.record_state(*check_id, *state, *ts) {
+                    tracing::error!(error = %e, check = %check_id, "failed to persist state history");
+                }
+            }
+
+            for (check_id, state, ts) in &baseline_failures {
+                let Some((result, _)) = affected.get(check_id) else {
+                    continue;
+                };
+                let regions = root_regions.get(check_id).cloned().unwrap_or_default();
+                match self.attach_or_open(&store, result, *state, &regions, *ts) {
+                    Ok((id, opened, changed)) => {
+                        if opened || changed {
+                            if let Ok(Some(i)) = store.incident(&id) {
+                                let incident = IncidentDto::from_row(i, *ts, false);
+                                incident_events.push(if opened {
+                                    WsEvent::IncidentOpened { incident }
+                                } else {
+                                    WsEvent::IncidentUpdated { incident }
+                                });
+                            }
                         }
-                        match self.attach_or_open(&store, r, ts) {
-                            Ok((id, opened)) => {
-                                if opened {
-                                    if let Ok(Some(i)) = store.incident(&id) {
-                                        incident_events.push(WsEvent::IncidentOpened {
-                                            incident: IncidentDto::from_row(i, ts, false),
-                                        });
-                                    }
+                        incident_for.insert(*check_id, id);
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, check = %check_id, "failed to reconcile baseline incident")
+                    }
+                }
+            }
+            for (t, ts) in &transitions {
+                let Some((result, _)) = affected.get(&t.check_id) else {
+                    continue;
+                };
+                if t.to.is_failing() {
+                    let regions = root_regions.get(&t.check_id).cloned().unwrap_or_default();
+                    match self.attach_or_open(&store, result, t.to, &regions, *ts) {
+                        Ok((id, opened, changed)) => {
+                            if opened || changed {
+                                if let Ok(Some(i)) = store.incident(&id) {
+                                    let incident = IncidentDto::from_row(i, *ts, false);
+                                    incident_events.push(if opened {
+                                        WsEvent::IncidentOpened { incident }
+                                    } else {
+                                        WsEvent::IncidentUpdated { incident }
+                                    });
                                 }
-                                incident_for.insert(r.check_id.clone(), id);
                             }
-                            Err(e) => {
-                                tracing::error!(error = %e, check = %r.check_id, "failed to reconcile incident");
-                            }
+                            incident_for.insert(t.check_id, id);
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, check = %t.check_id, "failed to reconcile incident")
                         }
                     }
-                    // A recovery does not resolve on sight: every gating check
-                    // has to clear its own `failures_before_down` worth of UP
-                    // observations first, so a flapping check stays inside one
-                    // incident instead of opening and closing twenty.
-                    Status::Up => match store.open_incident_for(&r.check_id) {
+                } else if t.to == NodeState::Up {
+                    match store.open_incident_for(t.check_id) {
                         Ok(Some(inc)) => {
-                            incident_for.insert(r.check_id.clone(), inc.id.clone());
-                            match self.try_resolve(&store, &inc, ts) {
+                            incident_for.insert(t.check_id, inc.id.clone());
+                            match self.try_resolve(&store, &inc, *ts) {
                                 Ok(true) => {
                                     if let Ok(Some(i)) = store.incident(&inc.id) {
                                         let ack = store.is_acknowledged(&inc.id).unwrap_or(false);
                                         incident_events.push(WsEvent::IncidentUpdated {
-                                            incident: IncidentDto::from_row(i, ts, ack),
+                                            incident: IncidentDto::from_row(i, *ts, ack),
                                         });
                                     }
                                 }
                                 Ok(false) => {}
                                 Err(e) => {
-                                    tracing::error!(error = %e, incident = %inc.id, "failed to resolve incident");
+                                    tracing::error!(error = %e, incident = %inc.id, "failed to resolve incident")
                                 }
                             }
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            tracing::error!(error = %e, check = %r.check_id, "failed to look up incident");
+                            tracing::error!(error = %e, check = %t.check_id, "failed to look up incident")
                         }
-                    },
-                    // An un-evaluable probe is not a confirmed recovery, so it
-                    // leaves whatever is open exactly as it is.
-                    Status::Unknown => {}
+                    }
                 }
             }
+
+            let reconcile_ts = affected
+                .values()
+                .map(|(_, ts)| *ts)
+                .max()
+                .unwrap_or_default();
+            match self.reconcile_open_incidents(&store, reconcile_ts) {
+                Ok(rows) => {
+                    for row in rows {
+                        let ack = store.is_acknowledged(&row.id).unwrap_or(false);
+                        if let Some(origin) = row.origin_check {
+                            incident_for.insert(origin, row.id.clone());
+                        }
+                        incident_events.push(WsEvent::IncidentUpdated {
+                            incident: IncidentDto::from_row(row, reconcile_ts, ack),
+                        });
+                    }
+                }
+                Err(e) => tracing::error!(error = %e, "failed to reconcile open incidents"),
+            }
+
+            for (check_id, previous, current, ts) in &region_set_changes {
+                if published_states.get(check_id) != Some(&NodeState::Degraded) {
+                    continue;
+                }
+                match store.open_incident_for(*check_id) {
+                    Ok(Some(inc)) => {
+                        if let Err(e) = store.add_update(
+                            &inc.id,
+                            inc.state,
+                            &region_change_narrative(previous, current),
+                            None,
+                            *ts,
+                        ) {
+                            tracing::error!(error = %e, incident = %inc.id, "failed to record region change");
+                            continue;
+                        }
+                        let title = incident_title(
+                            &self.check_name(*check_id),
+                            NodeState::Degraded,
+                            current,
+                        );
+                        if inc.title != title {
+                            if let Err(e) =
+                                store.edit_incident(&inc.id, &title, inc.started_at, inc.global)
+                            {
+                                tracing::error!(error = %e, incident = %inc.id, "failed to update degraded incident title");
+                            }
+                        }
+                        incident_for.insert(*check_id, inc.id.clone());
+                        if let Ok(Some(row)) = store.incident(&inc.id) {
+                            let ack = store.is_acknowledged(&inc.id).unwrap_or(false);
+                            incident_events.push(WsEvent::IncidentUpdated {
+                                incident: IncidentDto::from_row(row, *ts, ack),
+                            });
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, check = %check_id, "failed to find degraded incident")
+                    }
+                }
+            }
+
+            for (scope, node_id, previous, current, ts) in &intermediate_transitions {
+                match store.insert_alert(*scope, node_id, Some(*previous), *current, *ts, None) {
+                    Ok(id) => replicated_alerts.push(ReplicatedAlert {
+                        id,
+                        scope: scope.as_str().to_string(),
+                        node_id: node_id.clone(),
+                        previous_state: Some(*previous),
+                        current_state: *current,
+                        timestamp: *ts,
+                        incident_id: None,
+                    }),
+                    Err(e) => {
+                        tracing::error!(error = %e, node = %node_id, "failed to persist rollup alert")
+                    }
+                }
+            }
+
             for (t, ts) in transitions.iter().filter(|(t, _)| alert::should_alert(t)) {
                 let incident_id = incident_for.get(&t.check_id).cloned();
                 match store.insert_alert(
                     storage::AlertScope::Check,
-                    &t.check_id,
+                    &t.check_id.to_string(),
                     Some(t.from),
                     t.to,
                     *ts,
@@ -1482,7 +2270,7 @@ impl Coordinator {
                     Ok(id) => replicated_alerts.push(ReplicatedAlert {
                         id,
                         scope: storage::AlertScope::Check.as_str().to_string(),
-                        node_id: t.check_id.clone(),
+                        node_id: t.check_id.to_string(),
                         previous_state: Some(t.from),
                         current_state: t.to,
                         timestamp: *ts,
@@ -1491,54 +2279,32 @@ impl Coordinator {
                     Err(e) => tracing::error!(error = %e, "failed to persist alert"),
                 }
             }
-            // Every incident touched this batch, whole, so a peer learns the
-            // real id instead of guessing one on its own — see
-            // `ReplicatedIncident` and the fix for the gossip ponytail.
-            let mut seen_incidents: std::collections::HashSet<&str> =
-                std::collections::HashSet::new();
+            let mut seen_incidents = std::collections::HashSet::new();
             for id in incident_for.values() {
                 if seen_incidents.insert(id.as_str()) {
-                    if let Ok(Some(ri)) = store.replicated_incident(id) {
-                        replicated_incidents.push(ri);
+                    if let Ok(Some(row)) = store.replicated_incident(id) {
+                        replicated_incidents.push(row);
                     }
                 }
             }
-        } // drop storage guard before any await
+        }
 
-        // Replicate before the loop below consumes `transitions`, and replicate
-        // every confirmed flip rather than only the alert-worthy ones: a peer
-        // whose status page disagrees with ours is the divergence this exists
-        // to prevent.
-        //
-        // Spawned, never awaited, for the same reason the notifier is handed
-        // off: ingest is the fleet's write path, so a wedged peer must cost
-        // replication lag rather than throughput.
         if let Some(peers) = &self.inner.gossip {
             if !transitions.is_empty() {
                 let peers = Arc::clone(peers);
-                let msgs: Vec<_> = transitions
+                let messages: Vec<_> = transitions
                     .iter()
                     .map(|(t, ts)| {
                         gossip::Message::new(t, *ts, incident_for.get(&t.check_id).cloned())
                     })
                     .collect();
                 tokio::spawn(async move {
-                    for m in &msgs {
-                        peers.broadcast(m).await;
+                    for message in &messages {
+                        peers.broadcast(message).await;
                     }
                 });
             }
         }
-
-        // Cluster-based replication: the richer successor to the
-        // transition-only push above, carrying raw results, confirmed alerts
-        // and full incident rows so a peer's history, alert feed and
-        // incident detail all agree with the observer's, not only its
-        // flips. `self.inner.gossip` and `self.inner.cluster` are
-        // independent — a deployment may run either, both, or neither.
-        //
-        // Spawned, never awaited, for the same reason: ingest is the fleet's
-        // write path and must not cost throughput for a wedged or slow peer.
         if let Some(cluster) = &self.inner.cluster {
             if !rows.is_empty() || !replicated_alerts.is_empty() || !replicated_incidents.is_empty()
             {
@@ -1549,6 +2315,23 @@ impl Coordinator {
                         results: rows
                             .into_iter()
                             .map(|(result, status)| ReplicatedResult { result, status })
+                            .collect(),
+                        // The same leaves just written to `agent_check_state`,
+                        // so a peer that never saw these probes still folds the
+                        // whole zone rather than the slice that reports to it.
+                        beliefs: leaf_updates
+                            .iter()
+                            .map(|(check_id, agent_id, zone, region, status, failures, ts)| {
+                                ReplicatedBelief {
+                                    check_id: *check_id,
+                                    agent_id: agent_id.clone(),
+                                    zone: zone.clone(),
+                                    region: region.clone(),
+                                    status: *status,
+                                    consecutive_failures: *failures,
+                                    last_check: *ts,
+                                }
+                            })
                             .collect(),
                         alerts: replicated_alerts,
                         incidents: replicated_incidents,
@@ -1566,45 +2349,25 @@ impl Coordinator {
             .into_iter()
             .filter(|(t, _)| alert::should_alert(t))
         {
-            // Broadcast to WS clients (ignore if no subscribers).
             let _ = self.inner.events.send(WsEvent::StateChange {
-                check_id: t.check_id.clone(),
+                check_id: t.check_id,
                 from: t.from,
                 to: t.to,
                 timestamp: ts,
             });
-            // Hand off rather than dispatch. Ingest is the path every agent in
-            // the fleet POSTs into, so it must never wait on a third party:
-            // sending here once blocked forever on an endpoint that accepted
-            // the connection and never replied.
-            //
-            // `try_send`, not `send`. If the notifier has fallen behind, the
-            // alert is dropped with a warning instead of applying backpressure
-            // to results — the transition is already persisted and visible in
-            // the UI, so a lost notification costs less than lost measurements.
-            //
-            // Some checks are just checks, and some outages are scheduled: the
-            // transition is still confirmed, still recorded as an alert and
-            // still opens an incident — it just does not page. Both the
-            // per-check switch and the maintenance window are read here rather
-            // than inside the dispatcher, where a later edit would silently
-            // change the meaning of something already queued.
-            if let Some(routed_to) = self.notify_targets(&t.check_id, ts) {
+            if let Some(routed_to) = self.notify_targets(t.check_id, t.to, ts) {
                 if self
                     .inner
                     .notify_tx
                     .try_send((t.clone(), routed_to))
                     .is_err()
                 {
-                    tracing::warn!(
-                        check = %t.check_id,
-                        "notification queue full, alert not dispatched"
-                    );
+                    tracing::warn!(check = %t.check_id, "notification queue full, alert not dispatched");
                 }
             }
         }
-        for ev in incident_events {
-            let _ = self.inner.events.send(ev);
+        for event in incident_events {
+            let _ = self.inner.events.send(event);
         }
     }
 
@@ -1620,7 +2383,8 @@ impl Coordinator {
         // alerts in the batch — the same "only a confirmed flip moves the
         // published state" rule `gossip_handler` applies, generalized to a
         // whole batch instead of one transition.
-        let mut state_changes: Vec<(String, Option<Status>, Status, i64)> = Vec::new();
+        let mut state_changes: Vec<(crate::models::CheckId, Option<NodeState>, NodeState, i64)> =
+            Vec::new();
         {
             let store = self.inner.storage.lock();
             let now = chrono::Utc::now().timestamp_millis();
@@ -1648,32 +2412,50 @@ impl Coordinator {
             }
             for i in &batch.incidents {
                 let existed = matches!(store.incident(&i.id), Ok(Some(_)));
-                if let Err(e) = store.upsert_incident(i) {
-                    tracing::warn!(error = %e, incident = %i.id, "replicate: failed to persist incident");
-                    continue;
-                }
-                if let Ok(Some(row)) = store.incident(&i.id) {
-                    let ack = store.is_acknowledged(&i.id).unwrap_or(false);
-                    let dto = IncidentDto::from_row(row, now, ack);
-                    incident_events.push(if existed {
-                        WsEvent::IncidentUpdated { incident: dto }
-                    } else {
-                        WsEvent::IncidentOpened { incident: dto }
-                    });
+                let changed = match store.upsert_incident(i) {
+                    Ok(changed) => changed,
+                    Err(e) => {
+                        tracing::warn!(error = %e, incident = %i.id, "replicate: failed to persist incident");
+                        continue;
+                    }
+                };
+                if changed {
+                    if let Ok(Some(row)) = store.incident(&i.id) {
+                        let ack = store.is_acknowledged(&i.id).unwrap_or(false);
+                        let dto = IncidentDto::from_row(row, now, ack);
+                        incident_events.push(if existed {
+                            WsEvent::IncidentUpdated { incident: dto }
+                        } else {
+                            WsEvent::IncidentOpened { incident: dto }
+                        });
+                    }
                 }
             }
             for a in &batch.alerts {
                 let row = a.clone().into_row();
-                if let Err(e) = store.upsert_alert(&row) {
-                    tracing::warn!(error = %e, alert = %a.id, "replicate: failed to persist alert");
-                    continue;
+                let inserted = match store.upsert_alert(&row) {
+                    Ok(inserted) => inserted,
+                    Err(e) => {
+                        tracing::warn!(error = %e, alert = %a.id, "replicate: failed to persist alert");
+                        continue;
+                    }
+                };
+                // Zone and region alerts are topology narratives only. They
+                // replicate for the alert feed, but never masquerade as check
+                // roots in current state or websocket notifications.
+                if inserted && row.scope == storage::AlertScope::Check {
+                    match a.node_id.parse::<crate::models::CheckId>() {
+                        Ok(check_id) => state_changes.push((
+                            check_id,
+                            a.previous_state,
+                            a.current_state,
+                            a.timestamp,
+                        )),
+                        Err(_) => {
+                            tracing::warn!(node_id = %a.node_id, "replicate: check-scoped alert has a non-uuid node_id, skipping")
+                        }
+                    }
                 }
-                state_changes.push((
-                    a.node_id.clone(),
-                    a.previous_state,
-                    a.current_state,
-                    a.timestamp,
-                ));
             }
             if !batch.results.is_empty() {
                 let rows: Vec<(CheckResult, Status)> = batch
@@ -1686,24 +2468,63 @@ impl Coordinator {
                 }
             }
             for (check_id, _, current, ts) in &state_changes {
-                if let Err(e) = store.update_current_state(check_id, *current, 0, *ts) {
+                if let Err(e) = store.update_current_state(*check_id, *current, None, *ts) {
                     tracing::warn!(error = %e, check = %check_id, "replicate: failed to persist state");
+                }
+                if let Err(e) = store.record_state(*check_id, *current, *ts) {
+                    tracing::warn!(error = %e, check = %check_id, "replicate: failed to persist state history");
                 }
             }
         } // drop storage guard before touching the tracker or broadcasting
-        {
+        let merged_beliefs: Vec<ReplicatedBelief> = {
             // The failure count resets, same as `gossip_handler`: this node
             // is not mid-confirmation for something the observer already
             // decided.
             let mut tracker = self.inner.tracker.lock();
             for (check_id, _, current, _) in &state_changes {
-                tracker.seed(check_id, *current, 0);
+                tracker.seed_published(*check_id, *current, None);
+            }
+            // Leaves from a peer's tracker. `merge_agent` keeps the newer
+            // observation, so an out-of-order or replayed batch cannot rewind a
+            // live agent, and only what actually won is persisted below.
+            batch
+                .beliefs
+                .into_iter()
+                .filter(|b| {
+                    tracker.merge_agent(
+                        b.check_id,
+                        &b.agent_id,
+                        &b.zone,
+                        &b.region,
+                        b.status,
+                        b.consecutive_failures,
+                        b.last_check,
+                    )
+                })
+                .collect()
+        };
+        if !merged_beliefs.is_empty() {
+            // Persisted so a restart resumes the whole regional fleet, not just
+            // the agents that happen to report to this node.
+            let store = self.inner.storage.lock();
+            for b in &merged_beliefs {
+                if let Err(e) = store.update_agent_check_state(
+                    b.check_id,
+                    &b.agent_id,
+                    &b.zone,
+                    &b.region,
+                    b.status,
+                    b.consecutive_failures,
+                    b.last_check,
+                ) {
+                    tracing::warn!(error = %e, check = %b.check_id, agent = %b.agent_id, "replicate: failed to persist agent belief");
+                }
             }
         }
         for (check_id, from, to, timestamp) in state_changes {
             let _ = self.inner.events.send(WsEvent::StateChange {
                 check_id,
-                from: from.unwrap_or(Status::Unknown),
+                from: from.unwrap_or(NodeState::Unknown),
                 to,
                 timestamp,
             });
@@ -1939,7 +2760,7 @@ impl Coordinator {
     /// range and optionally restricted to one evaluated status.
     pub fn history(
         &self,
-        check_id: &str,
+        check_id: crate::models::CheckId,
         limit: usize,
         from: Option<i64>,
         to: Option<i64>,
@@ -1949,6 +2770,17 @@ impl Coordinator {
             .storage
             .lock()
             .history(check_id, limit, from, to, status)
+    }
+
+    /// Effective SLA interpretation for a check. This comes from `CheckMeta`,
+    /// where inheritance from coordinator defaults has already been resolved.
+    pub(crate) fn degraded_is_downtime(&self, check_id: crate::models::CheckId) -> bool {
+        self.inner
+            .checks
+            .read()
+            .get(&check_id)
+            .map(|meta| meta.degraded_is_downtime)
+            .unwrap_or(false)
     }
 
     /// Recent raw probe results across all checks and agents (newest first),
@@ -1970,14 +2802,32 @@ impl Coordinator {
             Ok(d) => d,
             Err(e) => return internal_error(e.into()),
         };
-        let entry = match self.write_config(storage::ConfigKind::Check, &check.name, Some(document))
-        {
+        let entry = match self.write_config(
+            storage::ConfigKind::Check,
+            &check.id.to_string(),
+            Some(document),
+        ) {
             Ok(e) => e,
             Err(e) => return internal_error(e),
         };
         self.replicate_config(vec![entry]);
         info!(check = %check.name, "check saved");
         Json(CheckResponse { check }).into_response()
+    }
+
+    /// Persist a check straight through storage, for tests that want one
+    /// configured without spinning up the admin API's session and HTTP
+    /// layers — creating a check is an admin's job, not what most of these
+    /// tests exercise. `Coordinator::new` deliberately never seeds checks
+    /// from process configuration (see its doc), so a test-only coordinator
+    /// that wants an already-configured check has to put it there itself,
+    /// the same way the admin API would once a session existed. Returns the
+    /// id it persisted under, which is always `check.id` — this never mints
+    /// a fresh identity the way the unauthenticated create path does.
+    pub fn create_check_for_test(&self, check: CheckConfig) -> crate::models::CheckId {
+        let id = check.id;
+        self.save_check(check);
+        id
     }
 
     /// Persisted alerts, for tests that assert dispatch did not lose one.
@@ -2043,6 +2893,10 @@ impl Coordinator {
             // `detected` incident is the acknowledgement.
             .route("/api/v1/admin/incidents", post(create_incident_handler))
             .route(
+                "/api/v1/admin/incidents/purge-short",
+                post(purge_short_incidents_handler),
+            )
+            .route(
                 "/api/v1/admin/incidents/:id",
                 axum::routing::patch(edit_incident_handler).delete(delete_incident_handler),
             )
@@ -2059,6 +2913,15 @@ impl Coordinator {
             // it returns un-redacted errors that quote resolved addresses and
             // expected values, unlike the public per-check history endpoint.
             .route("/api/v1/admin/results", get(results_handler))
+            .route("/api/v1/admin/results/count", get(results_count_handler))
+            .route("/api/v1/admin/results/purge", post(purge_results_handler))
+            .route(
+                "/api/v1/admin/rollup-policies",
+                get(list_rollup_policies_handler)
+                    .put(upsert_rollup_policy_handler)
+                    .delete(delete_rollup_policy_handler),
+            )
+            .route("/api/v1/admin/region-tree", get(region_tree_handler))
             .route("/api/v1/admin/agents/:id", delete(purge_agent_handler))
             // Section names and their display flags. Public because the status
             // page needs them to render groups; it carries no targets.
@@ -2074,30 +2937,30 @@ impl Coordinator {
             // DOWN when the pings stop. Unauthenticated by design — the URL is
             // the credential, and it is only ever shown to an admin.
             .route(
-                "/api/v1/heartbeat/:name",
+                "/api/v1/heartbeat/:id",
                 get(heartbeat_handler).post(heartbeat_handler),
             )
             .route(
-                "/api/v1/admin/checks/:name/data",
+                "/api/v1/admin/checks/:id/data",
                 delete(purge_check_data_handler),
             )
             // The whole erase: the check AND everything it ever produced.
-            // Ordered before the `:name` route for the same reason
-            // `checks/order` is — a suffix must never be read as a check name.
+            // Ordered before the `:id` route for the same reason
+            // `checks/order` is — a suffix must never be read as a check id.
             .route(
-                "/api/v1/admin/checks/:name/everything",
+                "/api/v1/admin/checks/:id/everything",
                 delete(purge_check_everything_handler),
             )
-            // Ordering is its own route, ahead of the `:name` route so "order"
-            // is never taken for a check called "order". Reordering is a bulk
-            // operation over names, not an edit to any one check.
+            // Ordering is its own route, ahead of the `:id` route so "order"
+            // is never taken for a check id. Reordering is a bulk operation
+            // over ids, not an edit to any one check.
             .route("/api/v1/admin/checks/order", put(reorder_checks_handler))
             .route(
                 "/api/v1/admin/checks",
                 get(list_checks_handler).post(create_check_handler),
             )
             .route(
-                "/api/v1/admin/checks/:name",
+                "/api/v1/admin/checks/:id",
                 put(update_check_handler).delete(delete_check_handler),
             )
             // Status-page presentation: sections exist independently of checks,
@@ -2405,6 +3268,89 @@ fn error_response(code: StatusCode, message: &str) -> Response {
         }),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{incident_title, region_change_narrative, Coordinator};
+    use crate::{
+        config::CoordinatorConfig,
+        coordinator::storage::{AffectSource, IncidentCheckRow, IncidentState},
+        models::NodeState,
+    };
+    use std::collections::BTreeSet;
+    use uuid::Uuid;
+
+    fn regions(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    #[test]
+    fn degraded_title_names_sorted_failing_regions() {
+        assert_eq!(
+            incident_title(
+                "api",
+                NodeState::Degraded,
+                &regions(&["us-west", "eu-central"]),
+            ),
+            "api partial outage in eu-central, us-west"
+        );
+    }
+
+    #[test]
+    fn down_title_remains_plain_and_sensible() {
+        assert_eq!(
+            incident_title("api", NodeState::Down, &regions(&["eu-central"])),
+            "api is down"
+        );
+    }
+
+    #[test]
+    fn region_change_narrative_records_old_and_new_sets() {
+        assert_eq!(
+            region_change_narrative(&regions(&["eu"]), &regions(&["us", "apac"])),
+            "Affected failing regions changed from eu to apac, us."
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_closes_a_stale_open_incident_for_an_up_check() {
+        let coord = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let check_id = Uuid::new_v4();
+        let store = coord.inner.storage.lock();
+        store
+            .update_current_state(check_id, NodeState::Up, None, 2_000)
+            .unwrap();
+        store
+            .create_incident(
+                "stale",
+                "upstream is down",
+                IncidentState::Detected,
+                1_000,
+                false,
+                Some(check_id),
+                &[IncidentCheckRow {
+                    check_id,
+                    source: AffectSource::Origin,
+                }],
+                Some(("timeout", None)),
+            )
+            .unwrap();
+
+        let resolved = coord.reconcile_open_incidents(&store, 3_000).unwrap();
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].state, IncidentState::Resolved);
+        assert_eq!(resolved[0].resolved_at, Some(3_000));
+        assert!(coord
+            .reconcile_open_incidents(&store, 4_000)
+            .unwrap()
+            .is_empty());
+    }
 }
 
 #[derive(Serialize)]

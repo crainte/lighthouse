@@ -916,6 +916,7 @@ dependencies = [
  "num-integer",
  "rust_decimal",
  "strum",
+ "uuid",
 ]
 
 [[package]]
@@ -2726,6 +2727,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
+
+[[package]]
 name = "sha2"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3382,6 +3389,8 @@ checksum = "bf80a72845275afea99e7f2b434723d3bc7e38470fcd1c7ed39a599c73319a53"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 
@@ -3439,6 +3448,7 @@ dependencies = [
  "mime_guess",
  "mlua",
  "parking_lot",
+ "percent-encoding",
  "rand 0.8.6",
  "reqwest",
  "rust-embed",
@@ -3454,6 +3464,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "x509-parser",
 ]
 

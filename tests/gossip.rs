@@ -23,9 +23,10 @@ use axum::{extract::State, Json, Router};
 use parking_lot::Mutex;
 use serde_json::Value;
 
+use uuid::Uuid;
 use warden::config::{CheckConfig, CoordinatorConfig};
 use warden::coordinator::Coordinator;
-use warden::models::{CheckKind, CheckResult};
+use warden::models::{CheckId, CheckKind, CheckResult};
 use warden::notify::{Notifier, NotifierKind};
 
 /// Peers authenticate with their own secret, never an agent's.
@@ -65,39 +66,43 @@ async fn alert_sink() -> (Sink, SocketAddr) {
     (sink, addr)
 }
 
+fn cid(name: &str) -> CheckId {
+    Uuid::new_v5(&Uuid::NAMESPACE_DNS, name.as_bytes())
+}
+
 fn coordinator(alerts_to: SocketAddr, peers: Vec<String>) -> Coordinator {
-    Coordinator::new(
-        &CoordinatorConfig {
-            listen: "127.0.0.1:0".into(),
-            db_path: ":memory:".into(),
-            notifiers: vec![Notifier {
-                name: "alerts".into(),
-                default: true,
-                kind: NotifierKind::Webhook {
-                    url: format!("http://{alerts_to}/"),
-                },
-            }],
-            peer_token: Some(PEER_TOKEN.into()),
-            peers,
-            ..Default::default()
-        },
-        &[CheckConfig {
-            name: CHECK.into(),
-            kind: CheckKind::Http,
-            target: "https://example.invalid".into(),
-            cron: "0 * * * * *".into(),
-            timeout_secs: 5,
-            ..Default::default()
+    let coord = Coordinator::new(&CoordinatorConfig {
+        listen: "127.0.0.1:0".into(),
+        db_path: ":memory:".into(),
+        notifiers: vec![Notifier {
+            name: "alerts".into(),
+            default: true,
+            kind: NotifierKind::Webhook {
+                url: format!("http://{alerts_to}/"),
+            },
         }],
-    )
-    .unwrap()
+        peer_token: Some(PEER_TOKEN.into()),
+        peers,
+        ..Default::default()
+    })
+    .unwrap();
+    coord.create_check_for_test(CheckConfig {
+        id: cid(CHECK),
+        name: CHECK.into(),
+        kind: CheckKind::Http,
+        target: "https://example.invalid".into(),
+        cron: "0 * * * * *".into(),
+        timeout_secs: 5,
+        ..Default::default()
+    });
+    coord
 }
 
 /// A probe observation. `status_code` drives the default eval: 200 -> UP,
 /// 500 -> DOWN.
 fn result(status_code: u16, ts_millis: i64) -> CheckResult {
     CheckResult {
-        check_id: CHECK.into(),
+        check_id: cid(CHECK),
         agent_id: "agent-test".into(),
         zone: "z".into(),
         region: "r".into(),
@@ -167,7 +172,7 @@ async fn a_transition_reaches_the_peer_without_paging_twice() {
         let c = v["checks"]
             .as_array()?
             .iter()
-            .find(|c| c["check_id"] == CHECK)?
+            .find(|c| c["check_id"] == cid(CHECK).to_string())?
             .clone();
         (c["status"] == "down").then_some(c)
     })
@@ -180,7 +185,7 @@ async fn a_transition_reaches_the_peer_without_paging_twice() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|a| a["node_id"] == CHECK)
+        .find(|a| a["node_id"] == cid(CHECK).to_string())
         .expect("peer should have recorded the replicated alert");
     assert_eq!(replicated["previous_state"], "up");
     assert_eq!(replicated["current_state"], "down");
@@ -208,7 +213,7 @@ async fn gossip_is_not_anonymously_writable() {
     let addr = serve(coord.clone().router()).await;
 
     let forged = serde_json::json!({
-        "check_id": CHECK,
+        "check_id": cid(CHECK),
         "from": "up",
         "to": "down",
         "timestamp": 9_999,
@@ -269,7 +274,7 @@ async fn recovery_replicates_too() {
         let c = v["checks"]
             .as_array()?
             .iter()
-            .find(|c| c["check_id"] == CHECK)?
+            .find(|c| c["check_id"] == cid(CHECK).to_string())?
             .clone();
         (c["status"] == "up").then_some(c)
     })
@@ -298,7 +303,7 @@ async fn gossip_to(addr: SocketAddr, from: &str, to: &str, ts: i64) {
         .post(format!("http://{addr}/internal/gossip"))
         .bearer_auth(PEER_TOKEN)
         .json(&serde_json::json!({
-            "check_id": CHECK, "from": from, "to": to, "timestamp": ts,
+            "check_id": cid(CHECK), "from": from, "to": to, "timestamp": ts,
         }))
         .send()
         .await
@@ -313,7 +318,7 @@ async fn peer_status(addr: SocketAddr) -> String {
         .as_array()
         .unwrap()
         .iter()
-        .find(|c| c["check_id"] == CHECK)
+        .find(|c| c["check_id"] == cid(CHECK).to_string())
         .expect("check should be listed")["status"]
         .as_str()
         .unwrap()
@@ -382,6 +387,6 @@ async fn broadcast_presents_the_agent_token() {
     // Against the const, not a copy of it: the literal here was left behind by
     // the rename to a peer-only token and asserted a secret nothing used.
     assert_eq!(got.0, Some(format!("Bearer {PEER_TOKEN}")));
-    assert_eq!(got.1["check_id"], CHECK);
+    assert_eq!(got.1["check_id"], cid(CHECK).to_string());
     assert_eq!(got.1["to"], "down");
 }

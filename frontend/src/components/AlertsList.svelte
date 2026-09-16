@@ -1,29 +1,40 @@
 <script lang="ts">
   import type { Alert } from '../lib/api';
   import { formatRelativeTime } from '../lib/format';
-  import { formatAbsolute } from '../lib/incident';
+  import { checkLabel, checkNameMap, formatAbsolute } from '../lib/incident';
 
   let {
     alerts,
+    checks,
     onOpenIncident,
   }: {
     alerts: Alert[];
+    checks: { check_id: string; name: string }[];
     /** Follow a transition through to the incident it belongs to. In the admin
      *  console this opens the editor, not the public page: an operator reading
      *  the alert feed wants the thing they can act on. */
     onOpenIncident?: (id: string) => void;
   } = $props();
 
+  const names = $derived(checkNameMap(checks));
+
+  function alertLabel(alert: Alert): string {
+    if (alert.name) return alert.name;
+    return alert.scope === 'check' ? checkLabel(names, alert.node_id) : alert.node_id;
+  }
+
   /** Severity from the transition itself. A recovery is not an alarm, an
-   *  un-evaluable probe is not an outage, and only a confirmed DOWN is both. */
+   *  un-evaluable probe is not an outage, and degraded is an amber warning. */
   function tone(a: Alert): { pill: string; label: string; bar: string } {
     if (a.current_state === 'down') return { pill: 'red', label: 'down', bar: 'bad' };
+    if (a.current_state === 'degraded') return { pill: 'amber', label: 'degraded', bar: 'warn' };
     if (a.current_state === 'unknown') return { pill: 'amber', label: 'unknown', bar: 'warn' };
     return { pill: 'green', label: 'recovered', bar: 'ok' };
   }
 
   const counts = $derived({
     down: alerts.filter((a) => a.current_state === 'down').length,
+    degraded: alerts.filter((a) => a.current_state === 'degraded').length,
     unknown: alerts.filter((a) => a.current_state === 'unknown').length,
     up: alerts.filter((a) => a.current_state === 'up').length,
   });
@@ -35,6 +46,7 @@
     if (from === null) return `First observation read ${a.current_state}.`;
     if (a.current_state === 'up') return `Recovered from ${from}.`;
     if (a.current_state === 'down') return `Confirmed down, previously ${from}.`;
+    if (a.current_state === 'degraded') return `Degraded, previously ${from}.`;
     return `Became un-evaluable, previously ${from}.`;
   }
 </script>
@@ -47,6 +59,11 @@
       <div class="stat-label">Down</div>
       <div class="stat-value {counts.down ? 'red' : 'green'}">{counts.down}</div>
       <div class="stat-sub">of {alerts.length} recorded</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Degraded</div>
+      <div class="stat-value amber">{counts.degraded}</div>
+      <div class="stat-sub">partially available</div>
     </div>
     <div class="stat-card">
       <div class="stat-label">Un-evaluable</div>
@@ -66,7 +83,7 @@
       <li class="alert-card {t.bar}">
         <div class="ac-top">
           <span class="opill {t.pill}">{t.label}</span>
-          <span class="ac-title">{a.node_id}</span>
+          <span class="ac-title">{alertLabel(a)}</span>
           <span class="ac-id">{a.alert_type.replace('_', ' ')}</span>
         </div>
         <p class="ac-desc">{sentence(a)}</p>

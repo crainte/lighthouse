@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { openGlobalIncidents, openIncidentForCheck } from './incident';
+import { checkLabel, checkNameMap, openGlobalIncidents, openIncidentForCheck } from './incident';
 import type { Incident, IncidentState } from './api';
 
 function inc(over: Partial<Incident> & { id: string }): Incident {
@@ -61,5 +61,21 @@ describe('openIncidentForCheck', () => {
     ];
     expect(openIncidentForCheck(rows, 'api')?.id).toBe('newer');
     expect(openIncidentForCheck([...rows].reverse(), 'api')?.id).toBe('newer');
+  });
+});
+
+describe('checkNameMap / checkLabel', () => {
+  it('resolves a mutable name from an immutable id', () => {
+    const names = checkNameMap([
+      { check_id: 'uuid-1', name: 'API' },
+      { check_id: 'uuid-2', name: 'こんにちは' },
+    ]);
+    expect(checkLabel(names, 'uuid-1')).toBe('API');
+    expect(checkLabel(names, 'uuid-2')).toBe('こんにちは');
+  });
+
+  it('falls back to the raw id for a check no longer in the list', () => {
+    const names = checkNameMap([{ check_id: 'uuid-1', name: 'API' }]);
+    expect(checkLabel(names, 'uuid-deleted')).toBe('uuid-deleted');
   });
 });

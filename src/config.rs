@@ -3,23 +3,43 @@ use crate::notify::Notifier;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
     pub coordinator: CoordinatorConfig,
+    /// Global-coordinator settings. Only consulted in `global` mode; a regional
+    /// coordinator ignores it, and a regional deployment need not write it.
     #[serde(default)]
-    pub checks: Vec<CheckConfig>,
+    pub global: GlobalConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentConfig {
-    /// Where to POST results. Ignored in standalone (writes in-process).
-    #[serde(default = "default_coordinator_url")]
-    pub coordinator_url: String,
+    /// Where to POST results and poll for work. Ignored in standalone (writes
+    /// in-process).
+    ///
+    /// Accepts one URL or a list of them, so an existing
+    /// `coordinator_url = "http://coordinator-a:8080"` keeps working unchanged.
+    /// A list is failover, not sharding: the coordinators in a region are
+    /// interchangeable for an agent — config replicates through the config
+    /// plane and per-agent beliefs replicate through the data plane, so it does
+    /// not matter which one is answering. Pinning an agent to a single
+    /// coordinator would make that coordinator a single point of failure for
+    /// everything the agent probes, which is the opposite of why the region has
+    /// three of them.
+    ///
+    /// Order is preference, not priority: whichever entry answered last is the
+    /// one still in use, and there is no failback. Flapping between endpoints
+    /// on every blip would move placement around for no benefit.
+    #[serde(default = "default_coordinator_url", deserialize_with = "one_or_many")]
+    pub coordinator_url: Vec<String>,
     #[serde(default = "default_agent_id")]
     pub agent_id: String,
     /// Where this agent runs. Declared, never inferred: only the operator knows
@@ -53,9 +73,50 @@ pub struct AgentConfig {
     /// `WARDEN_AGENT_TOKEN`. Must match the coordinator's `agent_token`.
     #[serde(default)]
     pub token: Option<String>,
+    /// Which entry of `coordinator_url` is currently believed reachable.
+    ///
+    /// Shared rather than per-loop: `AgentConfig` is cloned into the sync loop
+    /// and the poster loop, and cloning an `Arc` shares it, so both loops fail
+    /// over together. Split cursors would leave the agent polling one
+    /// coordinator for work while posting results to another — legal, since
+    /// both replicate, but an operator reading two sets of logs to answer "who
+    /// is this agent talking to?" is a needless puzzle.
+    #[serde(skip)]
+    cursor: Arc<AtomicUsize>,
 }
 
 impl AgentConfig {
+    /// The coordinator currently in use, without a trailing slash.
+    pub fn coordinator(&self) -> &str {
+        let urls = &self.coordinator_url;
+        let url = urls
+            .get(self.cursor.load(Ordering::Relaxed) % urls.len().max(1))
+            .map_or("", String::as_str);
+        url.trim_end_matches('/')
+    }
+
+    /// Give up on the current coordinator and move to the next.
+    ///
+    /// Called only when a request did not get an answer at all. A coordinator
+    /// that *rejects* a request is up and has an opinion — rotating away from a
+    /// 401 would just spread a bad token across the region and turn one clear
+    /// error into three confusing ones.
+    ///
+    /// Reports the move itself, rather than leaving each caller to. Both agent
+    /// loops share the cursor and race to notice an outage; the first one to
+    /// rotate leaves the other succeeding against the new endpoint with nothing
+    /// to report, so a per-caller log prints only when the *slower* loop
+    /// happens to win. Failing over is exactly the event an operator needs in
+    /// the log, and it was silent in the common case.
+    pub fn rotate_coordinator(&self) {
+        if self.coordinator_url.len() < 2 {
+            return;
+        }
+        let from = self.coordinator().to_string();
+        self.cursor.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(from = %from, to = %self.coordinator(), "failing over to another coordinator");
+    }
+
     pub fn resolved_token(&self) -> Option<String> {
         self.token
             .clone()
@@ -148,6 +209,158 @@ pub struct CoordinatorConfig {
     /// plane.
     #[serde(default)]
     pub provision: Vec<ProvisionedCredential>,
+    /// Fleet-wide fallbacks for the per-check rollup knobs.
+    ///
+    /// A check that sets none of `min_incident_secs`, `min_recovery_secs`,
+    /// `notify_degraded` or `degraded_is_downtime` inherits these. This is the
+    /// lever that turns hold-down on for a whole deployment at once, which is
+    /// how a single-instance install gets protection from phantom incidents
+    /// without editing every check.
+    #[serde(default)]
+    pub rollup_defaults: RollupDefaults,
+    /// Which region this coordinator belongs to, used only to label the state
+    /// summaries it pushes to a global coordinator (Stage B / Phase 6). A
+    /// single-region deployment never reads this; it defaults to `"default"`
+    /// and changes nothing until a `[coordinator.global]` push target is set.
+    #[serde(default = "default_region")]
+    pub region: String,
+    /// Where and how to push this coordinator's state summary to a global
+    /// coordinator. Absent (the common case) means no push happens — every
+    /// completed Stage A deployment behaves exactly as before.
+    #[serde(default)]
+    pub global: Option<GlobalPushConfig>,
+}
+
+/// `[coordinator.global]` — a regional coordinator's link up to the global
+/// coordinator. Presence of this block is what turns the push loop on.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GlobalPushConfig {
+    /// Base URL of the global coordinator, e.g. `http://global:8080`.
+    pub url: String,
+    /// Shared secret the global coordinator requires on `/internal/global/*`.
+    /// The same bearer story as `peer_token`, kept separate so a regional
+    /// peer secret never doubles as the cross-region one.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Environment variable holding the token, when it is not inline.
+    #[serde(default)]
+    pub token_env: Option<String>,
+    /// How often to push, in seconds. The design allows 5-10s; 5 keeps the
+    /// global dashboard within a probe interval of the regions.
+    #[serde(default = "default_push_secs")]
+    pub push_secs: u64,
+}
+
+impl GlobalPushConfig {
+    /// Inline value first, environment second, blank treated as absent —
+    /// exactly like every other secret here.
+    pub fn resolved_token(&self) -> Option<String> {
+        self.token
+            .clone()
+            .or_else(|| {
+                self.token_env
+                    .as_deref()
+                    .and_then(|key| std::env::var(key).ok())
+            })
+            .or_else(|| std::env::var("WARDEN_GLOBAL_TOKEN").ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+}
+
+/// `[global]` — the global coordinator itself (`warden global`). Caches state
+/// summaries pushed by regional coordinators, serves an aggregated dashboard,
+/// and routes drill-down reads back to the owning region. Holds no raw data.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GlobalConfig {
+    #[serde(default = "default_global_listen")]
+    pub listen: String,
+    /// Admin password for the aggregated dashboard, `WARDEN_ADMIN_PASSWORD`
+    /// when unset — same contract as a coordinator.
+    #[serde(default)]
+    pub admin_password: Option<String>,
+    /// Secret regional coordinators must present to push state. Required in
+    /// `global` mode: an unauthenticated push endpoint would let anyone rewrite
+    /// what the global dashboard shows. Falls back to `WARDEN_GLOBAL_TOKEN`.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Seconds without a push after which a region reads as dark (its health
+    /// goes Unknown and, if notifiers are set, a region-down alert fires).
+    #[serde(default = "default_region_staleness_secs")]
+    pub region_staleness_secs: u64,
+    /// Cross-region alert backends. Empty means the global node never pages —
+    /// the regions already alert, and double-paging is the failure mode to
+    /// avoid. Populated, it pages only on conditions a single region cannot
+    /// see: a check down in every reporting region, or a region going dark.
+    #[serde(default)]
+    pub notifiers: Vec<Notifier>,
+    /// Known regions and where to reach a live coordinator in each, seeding the
+    /// query-routing table. Endpoints are also learned from pushes; this is the
+    /// fallback so drill-downs work before the first push and after a restart —
+    /// and, since the seed is the only endpoint a single-node region that
+    /// advertises nothing ever has, it is what admin write fan-out reaches such
+    /// a region by.
+    ///
+    /// `alias = "region"` because the natural TOML spelling of an array-of-
+    /// tables is the singular `[[global.region]]`; without it that block parses
+    /// as an unknown key and is silently dropped, leaving non-advertising
+    /// regions unreachable.
+    #[serde(default, alias = "region")]
+    pub regions: Vec<GlobalRegion>,
+}
+
+/// One `[[global.region]]` block: a region name and the coordinator endpoints
+/// the global node proxies drill-down reads to.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GlobalRegion {
+    pub name: String,
+    /// Base URLs of coordinators in the region. Any one that answers is used;
+    /// the list is failover, not sharding, like an agent's `coordinator_url`.
+    #[serde(default)]
+    pub endpoints: Vec<String>,
+}
+
+impl Default for GlobalConfig {
+    fn default() -> Self {
+        Self {
+            listen: default_global_listen(),
+            admin_password: None,
+            token: None,
+            region_staleness_secs: default_region_staleness_secs(),
+            notifiers: Vec::new(),
+            regions: Vec::new(),
+        }
+    }
+}
+
+impl GlobalConfig {
+    pub fn resolved_admin_password(&self) -> Option<String> {
+        self.admin_password
+            .clone()
+            .or_else(|| std::env::var("WARDEN_ADMIN_PASSWORD").ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn resolved_token(&self) -> Option<String> {
+        self.token
+            .clone()
+            .or_else(|| std::env::var("WARDEN_GLOBAL_TOKEN").ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Refuse to start a global node that would accept anonymous pushes.
+    pub fn validate(&self) -> Result<()> {
+        if self.resolved_token().is_none() {
+            anyhow::bail!(
+                "global mode needs a token: set [global] token (or \
+                 WARDEN_GLOBAL_TOKEN) to the same value the regional \
+                 coordinators present in [coordinator.global] token."
+            );
+        }
+        Ok(())
+    }
 }
 
 /// One `[[coordinator.provision]]` block: a credential the operator already
@@ -393,6 +606,24 @@ fn default_anti_entropy_secs() -> u64 {
     60
 }
 
+fn default_region() -> String {
+    "default".to_string()
+}
+
+fn default_push_secs() -> u64 {
+    5
+}
+
+fn default_global_listen() -> String {
+    "0.0.0.0:8080".to_string()
+}
+
+/// Four push intervals of silence, mirroring the peer/agent "three misses plus
+/// slack" rule: one dropped push must not blank a healthy region.
+fn default_region_staleness_secs() -> u64 {
+    20
+}
+
 fn default_warn_below() -> f64 {
     100.0
 }
@@ -438,6 +669,30 @@ impl CoordinatorConfig {
             .or_else(|| std::env::var("WARDEN_NODE_ID").ok())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
+    }
+
+    /// The global push target and its resolved token, when both are set.
+    /// Returns `None` — push disabled — when no `[coordinator.global]` block
+    /// exists, so a regional-only deployment is untouched. Errors when the
+    /// block is present but its token cannot be resolved, because a push that
+    /// every receiver 401s is the same silent-failure trap as a tokenless
+    /// cluster.
+    pub fn resolved_global_push(&self) -> Result<Option<(String, String, u64)>> {
+        let Some(g) = &self.global else {
+            return Ok(None);
+        };
+        let url = g.url.trim().trim_end_matches('/').to_string();
+        if url.is_empty() {
+            anyhow::bail!("coordinator.global.url is set but empty");
+        }
+        let token = g.resolved_token().ok_or_else(|| {
+            anyhow::anyhow!(
+                "coordinator.global is set but its token is not: set \
+                 [coordinator.global] token (or token_env, or WARDEN_GLOBAL_TOKEN) \
+                 to the value the global node's [global] token expects."
+            )
+        })?;
+        Ok(Some((url, token, g.push_secs.max(1))))
     }
 
     /// Refuse to start a half-configured cluster.
@@ -614,6 +869,19 @@ impl MetricOptions {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct CheckConfig {
+    /// Immutable identity, generated once at creation as a UUIDv7 and never
+    /// reassigned. `name` is the mutable display value; every stored
+    /// relationship (results, current state, agent beliefs, incidents,
+    /// notification queues, dependencies, maintenance) keys on this instead.
+    ///
+    /// The default here is a safety net for a document that predates this
+    /// field (or a struct literal built without setting it) rather than the
+    /// normal path: public admin creation always mints a fresh one and
+    /// ignores whatever a client sent (see `create_check_handler`), and a
+    /// trusted internal caller — regional creation folded into a global
+    /// check, replication, fanout — supplies an existing id explicitly.
+    #[serde(default = "crate::models::new_check_id")]
+    pub id: crate::models::CheckId,
     pub name: String,
     /// Probe type. An unknown value fails config load — a check that silently
     /// probes the wrong protocol is worse than one that refuses to start.
@@ -725,6 +993,15 @@ pub struct CheckConfig {
     /// probe or a flaky hop does not page anyone. 1 is the classic behaviour.
     #[serde(default = "default_failures_before_down")]
     pub failures_before_down: u32,
+    /// Seconds between confirmation attempts after a failure, before DOWN is
+    /// confirmed. When omitted, derived from the normal schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_interval_secs: Option<u64>,
+    /// Seconds between probes while DOWN. A successful probe immediately
+    /// returns the check to its normal cron schedule. When omitted, derived
+    /// from the normal schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub down_interval_secs: Option<u64>,
     /// Checks this one sits behind. When this check confirms DOWN and any
     /// upstream named here already has an open incident, this check joins that
     /// incident instead of opening its own — one outage, one entry on the
@@ -740,7 +1017,120 @@ pub struct CheckConfig {
     /// Grouping does not change who gets paged: the dependent still records its
     /// own alert and still notifies per its own routing.
     #[serde(default)]
-    pub depends_on: Vec<String>,
+    pub depends_on: Vec<crate::models::CheckId>,
+    /// Per-level overrides of the region tree's node policies. `None` at a
+    /// level means that node's own stored policy, or the built-in default for
+    /// the level.
+    ///
+    /// Overrides exist because a policy is a statement about *this check*,
+    /// not only about the fleet: a service that is genuinely served from one
+    /// region should not be called degraded by a rule written for globally
+    /// anycast ones.
+    #[serde(default)]
+    pub rollup: RollupOverrides,
+    /// How long the rollup must continuously argue for a non-Up state before
+    /// the published state moves. `0` — the default — is today's behaviour, so
+    /// upgrading changes nothing until an operator asks for it.
+    ///
+    /// This is the fix that reaches single-instance deployments. With one
+    /// agent there is nobody to corroborate with, so the tree is a pass-through
+    /// and time is the only evidence available that a failure is real.
+    ///
+    /// Mind the interaction with the schedule: on a 60s interval, a 120s
+    /// hold-down announces a genuine outage roughly three minutes after it
+    /// starts. That is the trade being bought, not a bug.
+    ///
+    /// `None` falls back to `[coordinator.rollup_defaults]`, then to 0.
+    /// Optional rather than a bare `u64` so that "unset" and "explicitly zero"
+    /// stay distinguishable — otherwise a fleet-wide hold-down could never be
+    /// switched *off* for one noisy check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_incident_secs: Option<u64>,
+    /// The up-side mirror: how long a recovery must hold before the check is
+    /// published as Up again. Useful for a service that comes back, falls over,
+    /// and comes back again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_recovery_secs: Option<u64>,
+    /// Whether a Degraded transition reaches the notifiers. Down always does,
+    /// subject to `notify`.
+    ///
+    /// On by default: a partial regional outage is real enough to wake someone.
+    /// Off is for checks where one region dropping out is routine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_degraded: Option<bool>,
+    /// Whether Degraded minutes count against the 24h uptime figure.
+    ///
+    /// Off by default, and the asymmetry with `notify_degraded` is deliberate:
+    /// the outage is worth telling someone about, but the service *was*
+    /// reachable, so the SLA number should say so rather than quietly charging
+    /// a full outage for a partial one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_is_downtime: Option<bool>,
+}
+
+/// Fleet-wide fallbacks for the per-check region-tree settings, so an operator
+/// who wants a 120-second hold-down everywhere says it once.
+///
+/// Every field here is a plain value with a built-in default; the *check* is
+/// what carries options. That way the fallback chain has exactly one place it
+/// can bottom out, and reading a check's effective setting is a single
+/// `unwrap_or`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RollupDefaults {
+    #[serde(default)]
+    pub min_incident_secs: u64,
+    #[serde(default)]
+    pub min_recovery_secs: u64,
+    #[serde(default = "default_enabled")]
+    pub notify_degraded: bool,
+    #[serde(default)]
+    pub degraded_is_downtime: bool,
+}
+
+impl Default for RollupDefaults {
+    fn default() -> Self {
+        Self {
+            // Zero, so upgrading to the region tree changes nothing about
+            // when a deployment pages until someone asks it to.
+            min_incident_secs: 0,
+            min_recovery_secs: 0,
+            notify_degraded: true,
+            degraded_is_downtime: false,
+        }
+    }
+}
+
+/// Per-check overrides of the region tree's rollup policies, one per level.
+///
+/// A level left `None` falls through to that node's stored policy, and then to
+/// the built-in default — so a check that cares about only one level says only
+/// that, rather than having to restate the whole tree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RollupOverrides {
+    /// Agents → zone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<crate::rollup::RollupPolicy>,
+    /// Zones → region.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<crate::rollup::RollupPolicy>,
+    /// Regions → the check itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global: Option<crate::rollup::RollupPolicy>,
+}
+
+impl RollupOverrides {
+    fn validate(&self) -> Result<(), String> {
+        for (level, policy) in [
+            ("zone", self.zone),
+            ("region", self.region),
+            ("global", self.global),
+        ] {
+            if let Some(p) = policy {
+                p.validate().map_err(|e| format!("rollup.{level}: {e}"))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What a check reads as before its first result.
@@ -766,11 +1156,14 @@ fn default_failures_before_down() -> u32 {
     1
 }
 
+pub const NEW_CHECK_FAILURES_BEFORE_DOWN: u32 = 2;
+
 /// Defaults match the serde defaults, so a check built in code behaves like one
 /// parsed from an empty TOML table rather than getting a blank schedule.
 impl Default for CheckConfig {
     fn default() -> Self {
         Self {
+            id: crate::models::new_check_id(),
             name: String::new(),
             kind: CheckKind::default(),
             target: String::new(),
@@ -801,7 +1194,14 @@ impl Default for CheckConfig {
             cert_warning_days: default_cert_warning_days(),
             grace_secs: default_grace_secs(),
             failures_before_down: default_failures_before_down(),
+            retry_interval_secs: None,
+            down_interval_secs: None,
             depends_on: Vec::new(),
+            rollup: RollupOverrides::default(),
+            min_incident_secs: None,
+            min_recovery_secs: None,
+            notify_degraded: None,
+            degraded_is_downtime: None,
         }
     }
 }
@@ -838,6 +1238,32 @@ impl CheckConfig {
         Duration::from_secs(self.timeout_secs)
     }
 
+    fn schedule_gap_secs(&self) -> Result<u64, String> {
+        let schedule = self.schedule()?;
+        let mut upcoming = schedule.upcoming(chrono::Utc);
+        let (Some(first), Some(second)) = (upcoming.next(), upcoming.next()) else {
+            return Err("that schedule never runs".into());
+        };
+        u64::try_from((second - first).num_seconds())
+            .map_err(|_| "schedule must move forward".into())
+    }
+
+    pub fn retry_interval(&self) -> Result<Duration, String> {
+        let normal = self.schedule_gap_secs()?;
+        let derived = (normal / 10).clamp(10, 60).max(self.timeout_secs);
+        Ok(Duration::from_secs(
+            self.retry_interval_secs.unwrap_or(derived),
+        ))
+    }
+
+    pub fn down_interval(&self) -> Result<Duration, String> {
+        let normal = self.schedule_gap_secs()?;
+        let derived = (normal / 4).clamp(30, 300).max(self.timeout_secs);
+        Ok(Duration::from_secs(
+            self.down_interval_secs.unwrap_or(derived),
+        ))
+    }
+
     /// Reject a check that could not work, before it reaches storage. The admin
     /// UI can submit anything, so the rules live with the type rather than in
     /// one handler.
@@ -848,13 +1274,8 @@ impl CheckConfig {
         if name.is_empty() {
             return Err("name is required".into());
         }
-        // The name is a URL path segment and the storage key, so keep it to
-        // characters that survive both without escaping surprises.
-        if !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        {
-            return Err("name may only contain letters, digits, dash, underscore and dot".into());
+        if name.contains('/') || name.chars().any(char::is_control) {
+            return Err("name may not contain a slash or control character".into());
         }
         // A heartbeat is pinged rather than probed, so it is the one kind with
         // nothing to point at.
@@ -958,6 +1379,24 @@ impl CheckConfig {
         if self.failures_before_down == 0 {
             return Err("failures_before_down must be at least 1".into());
         }
+        if self.kind != CheckKind::Heartbeat {
+            for (name, interval) in [
+                ("retry interval", self.retry_interval_secs),
+                ("down interval", self.down_interval_secs),
+            ] {
+                if let Some(seconds) = interval {
+                    if seconds < self.timeout_secs {
+                        return Err(format!("{name} must not be shorter than the timeout"));
+                    }
+                }
+            }
+        }
+        // A policy whose `down_when` is easier to satisfy than its
+        // `degraded_when` would let a check jump straight from Up to Down
+        // without passing through Degraded, skipping an edge the alerting code
+        // assumes exists. Rejected here rather than clamped, because either
+        // repair would be a guess at which of the two the operator meant.
+        self.rollup.validate()?;
         // A script that doesn't compile would mark the service down every
         // interval forever, so it must never reach storage.
         if let Some(src) = self
@@ -988,8 +1427,42 @@ impl Config {
     }
 }
 
-fn default_coordinator_url() -> String {
-    "http://127.0.0.1:8080".into()
+fn default_coordinator_url() -> Vec<String> {
+    vec!["http://127.0.0.1:8080".into()]
+}
+
+/// Accept either a bare string or a list of them for the same key.
+///
+/// A single coordinator is the common case and should not have to be written as
+/// a one-element array; a region with three is the deployed case and must not
+/// need a second key that can disagree with the first.
+fn one_or_many<'de, D>(de: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    let urls = match OneOrMany::deserialize(de)? {
+        OneOrMany::One(u) => vec![u],
+        OneOrMany::Many(u) => u,
+    };
+    let urls: Vec<String> = urls
+        .into_iter()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .collect();
+    if urls.is_empty() {
+        // Falling back to the default here would silently point an agent whose
+        // config says `coordinator_url = []` at localhost.
+        return Err(serde::de::Error::custom(
+            "coordinator_url must name at least one coordinator",
+        ));
+    }
+    Ok(urls)
 }
 /// Unplaced rather than misplaced. An agent that never says where it is must
 /// not be silently filed under someone else's zone.
@@ -1032,6 +1505,7 @@ impl Default for AgentConfig {
             flush_secs: default_flush_secs(),
             poll_secs: default_poll_secs(),
             token: None,
+            cursor: Arc::default(),
         }
     }
 }
@@ -1054,6 +1528,9 @@ impl Default for CoordinatorConfig {
             missed_polls: default_missed_polls(),
             status_page: StatusPageConfig::default(),
             provision: Vec::new(),
+            rollup_defaults: RollupDefaults::default(),
+            region: default_region(),
+            global: None,
         }
     }
 }
@@ -1063,115 +1540,127 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_all_check_kinds_and_nested_expect() {
+    fn global_region_seed_parses_from_singular_table_name() {
+        // The natural array-of-tables spelling is `[[global.region]]`; the field
+        // is `regions`. Without the serde alias this block is silently dropped,
+        // leaving a non-advertising region with no endpoint and unreachable to
+        // admin write fan-out.
         let cfg: Config = toml::from_str(
             r#"
-            [[checks]]
-            name = "api"
-            type = "http"
-            target = "https://example.com/health"
-            [checks.expect]
-            status = 200
-            body_contains = "ok"
-
-            [[checks]]
-            name = "db"
-            type = "tcp"
-            target = "db.internal:5432"
-
-            [[checks]]
-            name = "resolve"
-            type = "dns"
-            target = "example.com"
-
-            [[checks]]
-            name = "gateway"
-            type = "icmp"
-            target = "192.0.2.1"
+            [global]
+            token = "t"
+            [[global.region]]
+            name = "tw"
+            endpoints = ["http://coordinator-tw:8080"]
             "#,
         )
-        .expect("config parses");
-
-        let kinds: Vec<_> = cfg.checks.iter().map(|c| c.kind).collect();
+        .expect("singular [[global.region]] must parse");
+        assert_eq!(cfg.global.regions.len(), 1, "region seed was dropped");
+        assert_eq!(cfg.global.regions[0].name, "tw");
         assert_eq!(
-            kinds,
-            vec![
-                CheckKind::Http,
-                CheckKind::Tcp,
-                CheckKind::Dns,
-                CheckKind::Icmp
-            ]
-        );
-
-        let api = &cfg.checks[0];
-        assert_eq!(api.expect.status, Some(200));
-        assert_eq!(api.expect.body_contains.as_deref(), Some("ok"));
-        // Checks without an [expect] table assert nothing.
-        assert_eq!(cfg.checks[1].expect.status, None);
-        assert_eq!(cfg.checks[1].expect.body_contains, None);
-    }
-
-    #[test]
-    fn group_drives_dashboard_sections_and_defaults_to_none() {
-        // `group` is what the status page renders its collapsible sections from,
-        // so the UI always reflects the config rather than a hardcoded list.
-        let cfg: Config = toml::from_str(
-            r#"
-            [[checks]]
-            name = "web"
-            target = "https://example.com"
-            group = "External"
-
-            [[checks]]
-            name = "db"
-            type = "tcp"
-            target = "db.internal:5432"
-            group = "Core Services"
-
-            [[checks]]
-            name = "loose"
-            target = "https://example.org"
-            "#,
-        )
-        .expect("config parses");
-
-        assert_eq!(cfg.checks[0].group.as_deref(), Some("External"));
-        assert_eq!(cfg.checks[1].group.as_deref(), Some("Core Services"));
-        assert_eq!(
-            cfg.checks[2].group, None,
-            "a check with no group is listed loose, never hidden"
+            cfg.global.regions[0].endpoints,
+            vec!["http://coordinator-tw:8080".to_string()]
         );
     }
 
     #[test]
-    fn unknown_check_type_is_rejected() {
-        // A typo must fail loudly rather than silently probing HTTP.
+    fn coordinator_url_accepts_one_url_or_a_list() {
+        let one: Config = toml::from_str(
+            r#"
+            [agent]
+            coordinator_url = "http://coordinator-a:8080/"
+            "#,
+        )
+        .expect("a bare string is still valid");
+        assert_eq!(one.agent.coordinator_url.len(), 1);
+        // The trailing slash is trimmed at use, not at parse: what the operator
+        // wrote is what `--print-config` should show back.
+        assert_eq!(one.agent.coordinator(), "http://coordinator-a:8080");
+
+        let many: Config = toml::from_str(
+            r#"
+            [agent]
+            coordinator_url = ["http://coordinator-a:8080", "http://coordinator-b:8080"]
+            "#,
+        )
+        .expect("a list is valid");
+        assert_eq!(many.agent.coordinator_url.len(), 2);
+        assert_eq!(many.agent.coordinator(), "http://coordinator-a:8080");
+    }
+
+    #[test]
+    fn an_empty_coordinator_list_is_rejected_rather_than_defaulted() {
+        // Defaulting would point the agent at localhost, where in a container
+        // there is nothing — a silent misconfiguration that looks like every
+        // check being down.
+        let err = toml::from_str::<Config>(
+            r#"
+            [agent]
+            coordinator_url = []
+            "#,
+        )
+        .expect_err("an empty list is not a coordinator");
+        assert!(
+            err.to_string().contains("at least one coordinator"),
+            "the error should say what is missing: {err}"
+        );
+    }
+
+    #[test]
+    fn rotation_walks_the_list_and_wraps_without_failing_back() {
+        let cfg = AgentConfig {
+            coordinator_url: vec!["http://a:8080".into(), "http://b:8080".into()],
+            ..Default::default()
+        };
+        assert_eq!(cfg.coordinator(), "http://a:8080");
+        cfg.rotate_coordinator();
+        assert_eq!(cfg.coordinator(), "http://b:8080");
+        // Wrapping, not stopping: the first coordinator may well be back.
+        cfg.rotate_coordinator();
+        assert_eq!(cfg.coordinator(), "http://a:8080");
+    }
+
+    #[test]
+    fn a_clone_shares_the_cursor_so_both_agent_loops_fail_over_together() {
+        // `sync_loop` and `poster_loop` each take an `AgentConfig` by value.
+        // If the cursor were copied rather than shared, the agent would poll
+        // one coordinator for work while posting results to another.
+        let cfg = AgentConfig {
+            coordinator_url: vec!["http://a:8080".into(), "http://b:8080".into()],
+            ..Default::default()
+        };
+        let poster = cfg.clone();
+        cfg.rotate_coordinator();
+        assert_eq!(poster.coordinator(), "http://b:8080");
+    }
+
+    #[test]
+    fn a_single_coordinator_never_rotates_away_from_itself() {
+        let cfg = AgentConfig::default();
+        let before = cfg.coordinator().to_string();
+        cfg.rotate_coordinator();
+        assert_eq!(cfg.coordinator(), before);
+    }
+
+    #[test]
+    fn file_seeded_checks_are_rejected() {
+        // Checks are created only through the authenticated control plane now
+        // (see SCALING.md: "File-seeded checks are removed"). `Config` has no
+        // `checks` field any more, and `deny_unknown_fields` turns a leftover
+        // `[[checks]]` table into a load error instead of a silent no-op.
         let err = toml::from_str::<Config>(
             r#"
             [[checks]]
-            name = "oops"
-            type = "gopher"
-            target = "example.com"
-            "#,
-        )
-        .expect_err("unknown type must be rejected");
-        assert!(
-            err.to_string().contains("gopher"),
-            "error names the bad type: {err}"
-        );
-    }
-
-    #[test]
-    fn check_type_defaults_to_http() {
-        let cfg: Config = toml::from_str(
-            r#"
-            [[checks]]
             name = "web"
+            type = "http"
             target = "https://example.com"
             "#,
         )
-        .unwrap();
-        assert_eq!(cfg.checks[0].kind, CheckKind::Http);
+        .expect_err("a config-file check table must not parse");
+        assert!(
+            err.to_string().contains("checks"),
+            "the error should name the rejected field: {err}"
+        );
     }
 
     fn openmetrics_check() -> CheckConfig {
@@ -1188,6 +1677,52 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn adaptive_intervals_derive_from_the_normal_schedule() {
+        let mut check = CheckConfig {
+            name: "hourly".into(),
+            target: "https://example.com".into(),
+            cron: "0 0 * * * *".into(),
+            ..Default::default()
+        };
+        assert_eq!(check.retry_interval().unwrap(), Duration::from_secs(60));
+        assert_eq!(check.down_interval().unwrap(), Duration::from_secs(300));
+
+        check.cron = "*/30 * * * * *".into();
+        assert_eq!(check.retry_interval().unwrap(), Duration::from_secs(10));
+        assert_eq!(check.down_interval().unwrap(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn explicit_adaptive_intervals_must_fit_the_timeout() {
+        let mut check = CheckConfig {
+            name: "web".into(),
+            target: "https://example.com".into(),
+            timeout_secs: 10,
+            retry_interval_secs: Some(9),
+            ..Default::default()
+        };
+        assert!(check.validate().unwrap_err().contains("retry interval"));
+
+        check.retry_interval_secs = Some(10);
+        check.down_interval_secs = Some(9);
+        assert!(check.validate().unwrap_err().contains("down interval"));
+    }
+
+    #[test]
+    fn old_documents_keep_immediate_failure_semantics() {
+        let old: CheckConfig = serde_json::from_value(serde_json::json!({
+            "name": "old",
+            "type": "http",
+            "target": "https://example.com"
+        }))
+        .unwrap();
+        assert_eq!(old.failures_before_down, 1);
+        assert_eq!(old.retry_interval_secs, None);
+        assert_eq!(old.down_interval_secs, None);
+        assert_eq!(CheckConfig::default().failures_before_down, 1);
     }
 
     #[test]
@@ -1230,22 +1765,5 @@ mod tests {
         let mut c = openmetrics_check();
         c.hosts = vec!["http://other:9100/metrics".into()];
         assert!(c.validate().unwrap_err().contains("single target"));
-    }
-
-    #[test]
-    fn prometheus_alias_deserializes_to_openmetrics() {
-        let cfg: Config = toml::from_str(
-            r#"
-            [[checks]]
-            name = "exp"
-            type = "prometheus"
-            target = "http://exp:9100/metrics"
-            [checks.metric]
-            name = "up"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(cfg.checks[0].kind, CheckKind::Openmetrics);
-        assert_eq!(cfg.checks[0].metric.name, "up");
     }
 }

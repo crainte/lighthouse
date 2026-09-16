@@ -19,7 +19,7 @@
 use super::super::{alert, cluster, error_response, gossip, hlc, internal_error};
 use super::super::{storage, Coordinator, WsEvent};
 use super::session::{bearer, require_admin};
-use crate::models::{CheckResult, Status};
+use crate::models::{CheckResult, NodeState, Status};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -40,18 +40,31 @@ use serde::{Deserialize, Serialize};
 pub(in crate::coordinator) async fn gossip_handler(
     State(coord): State<Coordinator>,
     headers: HeaderMap,
-    Json(msg): Json<gossip::Message>,
+    body: axum::body::Bytes,
 ) -> Response {
     if let Some(denied) = require_peer(&coord, &headers) {
         return denied;
     }
+    // Parsed only once the peer token has checked out: `Json<T>` as an
+    // argument would reject a malformed body before `require_peer` above
+    // ever ran, letting a caller with no peer credential — an agent's token,
+    // say — learn the body's shape was wrong instead of the uniform 401
+    // every other peer route gives it.
+    let msg: gossip::Message = match serde_json::from_slice(&body) {
+        Ok(m) => m,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
     let t = msg.transition();
-    // The peer sends only confirmed flips, so the failure count resets: this
-    // node is not mid-confirmation for a check somebody else already decided.
-    coord.inner.tracker.lock().seed(&t.check_id, t.to, 0);
+    // The peer sends only confirmed flips, so no hold-down remains in flight on
+    // this node for a check somebody else already decided.
+    coord
+        .inner
+        .tracker
+        .lock()
+        .seed_published(t.check_id, t.to, None);
     {
         let store = coord.inner.storage.lock();
-        if let Err(e) = store.update_current_state(&t.check_id, t.to, 0, msg.timestamp) {
+        if let Err(e) = store.update_current_state(t.check_id, t.to, None, msg.timestamp) {
             tracing::warn!(error = %e, check = %t.check_id, "gossip: failed to persist state");
         }
         // Same filter the local path applies, so the two alert feeds agree.
@@ -67,14 +80,14 @@ pub(in crate::coordinator) async fn gossip_handler(
             // this node happens to have open locally.
             let incident_id = msg.incident_id.clone().or_else(|| {
                 store
-                    .open_incident_for(&t.check_id)
+                    .open_incident_for(t.check_id)
                     .ok()
                     .flatten()
                     .map(|i| i.id)
             });
             if let Err(e) = store.insert_alert(
                 storage::AlertScope::Check,
-                &t.check_id,
+                &t.check_id.to_string(),
                 Some(t.from),
                 t.to,
                 msg.timestamp,
@@ -102,6 +115,31 @@ pub struct ReplicatedResult {
     pub status: Status,
 }
 
+/// One agent's confirmed belief about one check, as it replicates.
+///
+/// A zone's agents are its corroboration set, and they do not all report to the
+/// same coordinator. Replicating only the observer's *conclusion* left every
+/// node folding a partial tree — a two-agent zone read as two separate
+/// one-agent zones, so `all/all` could be satisfied by a single flaky agent and
+/// the corroboration property was unreachable in any real cluster. The leaves
+/// travel so that every node folds the same tree.
+///
+/// This carries the tracker's *confirmed* belief, not a raw probe verdict: the
+/// `failures_before_down` run belongs to the observing node and a peer must not
+/// restart it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicatedBelief {
+    pub check_id: crate::models::CheckId,
+    pub agent_id: String,
+    pub zone: String,
+    pub region: String,
+    pub status: Status,
+    pub consecutive_failures: u32,
+    /// When the observing coordinator last heard from this agent. Also the
+    /// merge key: see `StateTracker::merge_agent`.
+    pub last_check: i64,
+}
+
 /// One confirmed transition as it replicates. Mirrors `storage::AlertRow`
 /// field-for-field, but on the wire — `AlertRow` itself has no `Serialize`,
 /// being owned by a different concern, and `AlertScope` travels as its
@@ -112,8 +150,8 @@ pub struct ReplicatedAlert {
     pub id: String,
     pub scope: String,
     pub node_id: String,
-    pub previous_state: Option<Status>,
-    pub current_state: Status,
+    pub previous_state: Option<NodeState>,
+    pub current_state: NodeState,
     pub timestamp: i64,
     pub incident_id: Option<String>,
 }
@@ -169,6 +207,10 @@ pub struct ReplicationBatch {
     /// fleet rather than only the agents that happen to poll it.
     #[serde(default)]
     pub polls: Vec<storage::AgentPollRow>,
+    /// Per-agent beliefs from the sender's tracker, so every node folds the
+    /// same tree instead of only the part of the fleet it personally observed.
+    #[serde(default)]
+    pub beliefs: Vec<ReplicatedBelief>,
     /// Incident ids deleted on the sender. Applied as a delete *plus a local
     /// tombstone*, so this node will not hand the incident back later either.
     #[serde(default)]
@@ -298,7 +340,7 @@ pub struct CheckDigestDto {
 impl From<&storage::CheckDigest> for CheckDigestDto {
     fn from(d: &storage::CheckDigest) -> Self {
         CheckDigestDto {
-            check_id: d.check_id.clone(),
+            check_id: d.check_id.to_string(),
             max_ts: d.max_ts,
             count: d.count,
         }
@@ -422,12 +464,16 @@ pub(in crate::coordinator) async fn backfill_handler(
     if let Some(denied) = require_peer(&coord, &headers) {
         return denied;
     }
+    let check_id = match q.check_id.parse() {
+        Ok(id) => id,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "check_id must be a valid UUID"),
+    };
     let rows = {
         coord
             .inner
             .storage
             .lock()
-            .results_since(&q.check_id, q.since, q.until, q.limit)
+            .results_since(check_id, q.since, q.until, q.limit)
     };
     match rows {
         Ok(rows) => {
@@ -475,6 +521,9 @@ struct ClusterViewResponse {
     me: cluster::Member,
     members: Vec<cluster::Member>,
     now: i64,
+    mode: &'static str,
+    links: Vec<cluster::LinkObservation>,
+    link_stale_after_ms: i64,
 }
 
 pub(in crate::coordinator) async fn cluster_view_handler(
@@ -487,7 +536,7 @@ pub(in crate::coordinator) async fn cluster_view_handler(
     let now = chrono::Utc::now().timestamp_millis();
     // A node with clustering unconfigured still has an identity worth
     // showing, just no membership beyond itself.
-    let (me, members) = match coord.inner.cluster.as_ref() {
+    let (me, members, links, link_stale_after_ms) = match coord.inner.cluster.as_ref() {
         Some(cluster) => {
             // Lazily swept here too, not only by the background heartbeat
             // loop: a view requested between two heartbeat ticks must still
@@ -500,7 +549,12 @@ pub(in crate::coordinator) async fn cluster_view_handler(
                     .events
                     .send(WsEvent::ClusterChange { node_id, state });
             }
-            (cluster.self_member(now), cluster.snapshot())
+            (
+                cluster.self_member(now),
+                cluster.snapshot(),
+                cluster.link_snapshot(),
+                cluster.link_stale_after_ms(),
+            )
         }
         None => (
             cluster::Member {
@@ -515,9 +569,19 @@ pub(in crate::coordinator) async fn cluster_view_handler(
                 protocol: Some(cluster::PROTOCOL_VERSION),
             },
             Vec::new(),
+            Vec::new(),
+            0,
         ),
     };
-    Json(ClusterViewResponse { me, members, now }).into_response()
+    Json(ClusterViewResponse {
+        me,
+        members,
+        now,
+        mode: "coordinator",
+        links,
+        link_stale_after_ms,
+    })
+    .into_response()
 }
 
 /// Gate for `/internal/gossip`. Peers are infrastructure rather than agents, so

@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 use warden::agent;
 use warden::config::Config;
 use warden::coordinator::Coordinator;
+use warden::global::GlobalNode;
 use warden::version;
 
 /// Warden — self-hosted uptime monitor.
@@ -35,6 +36,9 @@ enum Mode {
     Agent,
     /// Ingest + storage + alerting only.
     Coordinator,
+    /// Cross-region aggregator: caches region state pushes, serves the global
+    /// dashboard, routes drill-downs to regions. Holds no raw data.
+    Global,
 }
 
 impl Mode {
@@ -43,6 +47,7 @@ impl Mode {
             Mode::Standalone => "standalone",
             Mode::Agent => "agent",
             Mode::Coordinator => "coordinator",
+            Mode::Global => "global",
         }
     }
 }
@@ -68,16 +73,16 @@ async fn main() -> Result<()> {
         Mode::Standalone => run_standalone(cfg).await,
         Mode::Agent => run_agent(cfg).await,
         Mode::Coordinator => run_coordinator(cfg).await,
+        Mode::Global => run_global(cfg).await,
     }
 }
 
 /// Standalone: agent produces results into an in-process channel that
 /// the coordinator drains directly — no HTTP hop.
-async fn run_standalone(cfg: Config) -> Result<()> {
+async fn run_standalone(mut cfg: Config) -> Result<()> {
     cfg.coordinator.validate_cluster()?;
-    let coord = Coordinator::new(&cfg.coordinator, &cfg.checks)?;
+    let coord = Coordinator::new(&cfg.coordinator)?;
     let (tx, mut rx) = mpsc::channel(1024);
-    agent::spawn_check_loops(&cfg.agent, cfg.checks, tx)?;
 
     let ingest = coord.clone();
     tokio::spawn(async move {
@@ -86,22 +91,56 @@ async fn run_standalone(cfg: Config) -> Result<()> {
         }
     });
 
+    let heartbeat = coord.clone();
+    let embedded_agent = cfg.agent.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            embedded_agent.poll_secs.max(1),
+        ));
+        loop {
+            interval.tick().await;
+            heartbeat.mark_embedded_agent_live(&embedded_agent);
+        }
+    });
+
+    let port = cfg
+        .coordinator
+        .listen
+        .rsplit_once(':')
+        .map_or("8080", |(_, port)| port);
+    cfg.agent.coordinator_url = vec![format!("http://127.0.0.1:{port}")];
+    tokio::spawn(agent::sync_loop(cfg.agent.clone(), tx, Vec::new()));
     serve(coord, &cfg.coordinator.listen).await
 }
 
 async fn run_agent(cfg: Config) -> Result<()> {
     let (tx, rx) = mpsc::channel(1024);
-    // The config file's checks are only a starting point: the coordinator owns
-    // the list, so the agent keeps itself in step with edits made in the UI.
-    tokio::spawn(agent::sync_loop(cfg.agent.clone(), tx, cfg.checks));
+    tokio::spawn(agent::sync_loop(cfg.agent.clone(), tx, Vec::new()));
     agent::poster_loop(cfg.agent, rx).await;
     Ok(())
 }
 
 async fn run_coordinator(cfg: Config) -> Result<()> {
     cfg.coordinator.validate_cluster()?;
-    let coord = Coordinator::new(&cfg.coordinator, &cfg.checks)?;
+    let coord = Coordinator::new(&cfg.coordinator)?;
     serve(coord, &cfg.coordinator.listen).await
+}
+
+/// Global: no storage, no probing. Caches state summaries pushed by regional
+/// coordinators and serves the aggregated dashboard.
+async fn run_global(cfg: Config) -> Result<()> {
+    cfg.global.validate()?;
+    let node = GlobalNode::new(&cfg.global);
+    let listen = cfg.global.listen.clone();
+    let listener = tokio::net::TcpListener::bind(&listen).await?;
+    tracing::info!(%listen, "global coordinator listening");
+    axum::serve(
+        listener,
+        node.router()
+            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
+    Ok(())
 }
 
 async fn serve(coord: Coordinator, listen: &str) -> Result<()> {
@@ -115,6 +154,9 @@ async fn serve(coord: Coordinator, listen: &str) -> Result<()> {
     // Membership heartbeat and anti-entropy against peer coordinators. A
     // no-op when clustering is not configured.
     coord.spawn_cluster();
+    // Push this region's state summary to the global coordinator, when one is
+    // configured. A no-op otherwise, like the cluster loops above.
+    coord.spawn_global_push();
     // Persist who is polling this node and share it with the peers, so every
     // coordinator reports the same fleet. Runs standalone too: it is also what
     // makes the fleet view survive a restart.

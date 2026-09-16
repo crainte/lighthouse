@@ -11,6 +11,7 @@ import type { Check, Incident, IncidentEvent, StateChange } from "./api";
 function check(id: string, status: Check["status"]): Check {
   return {
     check_id: id,
+    name: id,
     status,
     latency_ms: 5,
     last_check: 1000,
@@ -84,12 +85,17 @@ describe("applyStateChange", () => {
     expect(before[0].status).toBe("up");
   });
 
-  it("drives the overall banner: a single down makes it partial, recovery returns it", () => {
+  it("drives the overall banner through degraded, partial, and recovery", () => {
     let checks = [check("api", "up"), check("db", "up")];
     expect(overallStatus(checks)).toBe("operational");
     checks = applyStateChange(
       checks,
-      stateChange({ check_id: "api", from: "up", to: "down" }),
+      stateChange({ check_id: "api", from: "up", to: "degraded" }),
+    );
+    expect(overallStatus(checks)).toBe("degraded");
+    checks = applyStateChange(
+      checks,
+      stateChange({ check_id: "api", from: "degraded", to: "down" }),
     );
     expect(overallStatus(checks)).toBe("partial");
     checks = applyStateChange(
@@ -101,10 +107,19 @@ describe("applyStateChange", () => {
 });
 
 describe("alertForStateChange", () => {
-  it("labels a down→up transition a recovery", () => {
+  it("labels down/degraded→up transitions as recoveries", () => {
     expect(
       alertForStateChange(stateChange({ from: "down", to: "up" })).alert_type,
     ).toBe("recovery");
+    expect(
+      alertForStateChange(stateChange({ from: "degraded", to: "up" })).alert_type,
+    ).toBe("recovery");
+  });
+
+  it("labels transitions into degraded as degradation", () => {
+    expect(
+      alertForStateChange(stateChange({ from: "up", to: "degraded" })).alert_type,
+    ).toBe("degradation");
   });
 
   it("labels anything else a state_change", () => {

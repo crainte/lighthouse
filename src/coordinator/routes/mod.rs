@@ -10,6 +10,7 @@ pub(super) mod agents;
 pub(super) mod checks;
 pub(super) mod incidents;
 pub(super) mod peer;
+pub(super) mod policies;
 pub(super) mod public;
 pub(super) mod sections;
 pub(super) mod session;

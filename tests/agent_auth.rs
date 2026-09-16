@@ -11,33 +11,38 @@
 use std::net::SocketAddr;
 
 use serde_json::{json, Value};
+use uuid::Uuid;
 use warden::config::{CheckConfig, CoordinatorConfig};
 use warden::coordinator::Coordinator;
-use warden::models::CheckKind;
+use warden::models::{CheckId, CheckKind};
 
 const PASSWORD: &str = "correct horse battery staple";
 const PEER_TOKEN: &str = "peer-only-secret";
 const CHECK: &str = "payments-api";
 
+fn cid(name: &str) -> CheckId {
+    Uuid::new_v5(&Uuid::NAMESPACE_DNS, name.as_bytes())
+}
+
 fn coordinator(peer_token: Option<&str>) -> Coordinator {
-    Coordinator::new(
-        &CoordinatorConfig {
-            listen: "127.0.0.1:0".into(),
-            db_path: ":memory:".into(),
-            admin_password: Some(PASSWORD.into()),
-            peer_token: peer_token.map(str::to_owned),
-            ..Default::default()
-        },
-        &[CheckConfig {
-            name: CHECK.into(),
-            kind: CheckKind::Http,
-            target: "https://example.invalid".into(),
-            cron: "0 * * * * *".into(),
-            timeout_secs: 5,
-            ..Default::default()
-        }],
-    )
-    .unwrap()
+    let coord = Coordinator::new(&CoordinatorConfig {
+        listen: "127.0.0.1:0".into(),
+        db_path: ":memory:".into(),
+        admin_password: Some(PASSWORD.into()),
+        peer_token: peer_token.map(str::to_owned),
+        ..Default::default()
+    })
+    .unwrap();
+    coord.create_check_for_test(CheckConfig {
+        id: cid(CHECK),
+        name: CHECK.into(),
+        kind: CheckKind::Http,
+        target: "https://example.invalid".into(),
+        cron: "0 * * * * *".into(),
+        timeout_secs: 5,
+        ..Default::default()
+    });
+    coord
 }
 
 async fn serve(coord: Coordinator) -> SocketAddr {
@@ -94,7 +99,7 @@ async fn post_result(base: &str, token: &str, agent_id: &str, zone: &str, region
         .post(format!("{base}/api/v1/results"))
         .bearer_auth(token)
         .json(&json!({ "results": [{
-            "check_id": CHECK,
+            "check_id": cid(CHECK).to_string(),
             "agent_id": agent_id,
             "zone": zone,
             "region": region,
@@ -213,7 +218,7 @@ async fn nothing_is_accepted_until_a_credential_exists() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|c| c["check_id"] == CHECK)
+        .find(|c| c["check_id"] == cid(CHECK).to_string())
         .expect("the configured check is still listed");
     assert_eq!(
         c["status"], "unknown",
@@ -370,7 +375,7 @@ async fn gossip_does_not_accept_an_agent_credential() {
     let session = login(&base).await;
     let agent_token = mint(&base, &session, "eu-west-1a", "eu-west").await;
 
-    let msg = json!({ "check_id": CHECK, "from": "up", "to": "down", "timestamp": 5_000 });
+    let msg = json!({ "check_id": cid(CHECK), "from": "up", "to": "down", "timestamp": 5_000 });
     let post = |token: String| {
         let base = base.clone();
         let msg = msg.clone();

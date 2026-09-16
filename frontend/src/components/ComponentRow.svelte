@@ -33,7 +33,13 @@
   const placeholders = Array.from({ length: 90 }, (_, i) => i);
 
   const statusLabel = $derived(
-    check.status === 'up' ? 'Operational' : check.status === 'down' ? 'Down' : 'Unknown',
+    check.status === 'up'
+      ? 'Operational'
+      : check.status === 'degraded'
+        ? 'Degraded'
+        : check.status === 'down'
+          ? 'Down'
+          : 'Unknown',
   );
 
   // Why the latest attempt failed, shown under the header when there is one.
@@ -110,7 +116,7 @@
   <div class="component-head">
     <span class="component-name">
       <span class="status-dot" style="background:{statusColor(check.status)}"></span>
-      {check.check_id}
+      {check.name}
     </span>
     <span class="component-meta">
       <span class="component-uptime">{formatUptime(uptime?.overall_uptime ?? null)}</span>
@@ -126,7 +132,7 @@
   {/if}
 
   {#if reason}
-    <div class="component-reason" title={reason}>{reason}</div>
+    <div class="component-reason {check.status}" title={reason}>{reason}</div>
   {/if}
 
   <!-- Hover is handled on the container, not each bar: with per-bar handlers the

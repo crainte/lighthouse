@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { Incident } from '../lib/api';
   import { formatDuration, formatRelativeTime } from '../lib/format';
-  import { affectSourceNote, stateTone } from '../lib/incident';
+  import { affectSourceNote, checkLabel, checkNameMap, stateTone } from '../lib/incident';
 
   /** The admin console's incident table. The public status page has its own
    *  card rendering in `PastIncidents.svelte` — the two share no layout, and
@@ -9,15 +9,21 @@
    *  ended up in the middle of a page built from rounded cards. */
   let {
     incidents,
+    checks,
     onEdit,
     onAck,
   }: {
     incidents: Incident[];
+    /** For resolving a check's mutable name from the id each `IncidentCheck`
+     *  carries. */
+    checks: { check_id: string; name: string }[];
     onEdit: (i: Incident) => void;
     /** Acknowledging is posting an `investigating` update — there is no
      *  acknowledge endpoint — so this is only offered while `detected`. */
     onAck: (i: Incident) => void;
   } = $props();
+
+  const names = $derived(checkNameMap(checks));
 
   const open = $derived(incidents.filter((i) => i.state !== 'resolved'));
 </script>
@@ -75,7 +81,7 @@
                   : 'grey'}"
               title={affectSourceNote(c.source)}
             >
-              {c.check_id}
+              {checkLabel(names, c.check_id)}
             </span>
           {/each}
           {#if i.checks.length > 3}

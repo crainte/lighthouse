@@ -18,10 +18,11 @@ use axum::{extract::State, Json, Router};
 use parking_lot::Mutex;
 use serde_json::Value;
 
+use uuid::Uuid;
 use warden::agent::{execute_check, Probes};
 use warden::config::{CheckConfig, CoordinatorConfig};
 use warden::coordinator::Coordinator;
-use warden::models::{CheckKind, Status};
+use warden::models::{CheckId, CheckKind, Status};
 use warden::notify::{Notifier, NotifierKind};
 
 /// Bind an ephemeral 127.0.0.1 port and serve `app`. Returns the bound addr.
@@ -62,9 +63,14 @@ async fn wait_for_alerts(sink: &Arc<Mutex<Vec<Value>>>) -> Vec<Value> {
     panic!("no alert captured within timeout");
 }
 
+fn cid(name: &str) -> CheckId {
+    Uuid::new_v5(&Uuid::NAMESPACE_DNS, name.as_bytes())
+}
+
 fn check(target: String) -> CheckConfig {
-    // Same `name` for both routes => same check_id => transition is detectable.
+    // Same id for both routes => transition is detectable.
     CheckConfig {
+        id: cid("web"),
         name: "web".into(),
         kind: CheckKind::Http,
         target,
@@ -102,22 +108,20 @@ async fn agent_check_through_coordinator_fires_alert_on_up_to_down() {
     )
     .await;
 
-    let coord = Coordinator::new(
-        &CoordinatorConfig {
-            listen: "127.0.0.1:0".into(),
-            db_path: ":memory:".into(),
-            notifiers: vec![Notifier {
-                name: "alerts".into(),
-                default: true,
-                kind: NotifierKind::Webhook {
-                    url: format!("http://{webhook_addr}/"),
-                },
-            }],
-            ..Default::default()
-        },
-        &[],
-    )
+    let coord = Coordinator::new(&CoordinatorConfig {
+        listen: "127.0.0.1:0".into(),
+        db_path: ":memory:".into(),
+        notifiers: vec![Notifier {
+            name: "alerts".into(),
+            default: true,
+            kind: NotifierKind::Webhook {
+                url: format!("http://{webhook_addr}/"),
+            },
+        }],
+        ..Default::default()
+    })
     .unwrap();
+    coord.create_check_for_test(check(format!("http://{target_addr}/ok")));
 
     let probes = Probes::new().unwrap();
 
@@ -160,7 +164,7 @@ async fn agent_check_through_coordinator_fires_alert_on_up_to_down() {
     coord.ingest(vec![down]).await;
 
     // --- Contract 3: both results persisted, newest-first [Down, Up] ---
-    let hist = coord.history("web", 10, None, None, None).unwrap();
+    let hist = coord.history(cid("web"), 10, None, None, None).unwrap();
     assert_eq!(hist.len(), 2, "both ingested results must be persisted");
     assert_eq!(
         hist[0].status,
@@ -177,7 +181,8 @@ async fn agent_check_through_coordinator_fires_alert_on_up_to_down() {
         "baseline is silent; only the Up->Down edge alerts"
     );
     assert_eq!(
-        got[0]["check_id"], "web",
+        got[0]["check_id"],
+        cid("web").to_string(),
         "alert payload references the check_id"
     );
     assert_eq!(got[0]["from"], "up", "transition edge starts at up");

@@ -1,16 +1,22 @@
 <script lang="ts">
   import type { Incident } from '../lib/api';
   import { formatDuration, formatRelativeTime } from '../lib/format';
-  import { incidentStateColor } from '../lib/incident';
+  import { checkLabel, checkNameMap, incidentStateColor } from '../lib/incident';
 
   let {
     incidents,
+    checks,
     onOpen,
   }: {
     incidents: Incident[];
+    /** For resolving a check's mutable name from the id each `IncidentCheck`
+     *  carries. */
+    checks: { check_id: string; name: string }[];
     /** Follow the incident's public permalink. */
     onOpen: (id: string) => void;
   } = $props();
+
+  const names = $derived(checkNameMap(checks));
 
   /** Deliberately the status page's own card vocabulary rather than the admin
    *  console's table: this sits directly under the monitor cards, and a flat
@@ -41,7 +47,9 @@
           {#if i.checks.length}
             <span class="mons">
               {#each i.checks as c (c.check_id)}
-                <span class="mon" class:auto={c.source === 'dependency'}>{c.check_id}</span>
+                <span class="mon" class:auto={c.source === 'dependency'}>
+                  {checkLabel(names, c.check_id)}
+                </span>
               {/each}
             </span>
           {/if}

@@ -19,16 +19,23 @@
 
 ## Architecture Overview
 
-Single binary with three modes:
+Single binary currently has three modes:
 
 ```
-uptime --agent        # Runs checks, posts to regional coordinators
-uptime --coordinator  # Regional coordinator, clusterable
-uptime --global       # Global coordinator, receives state from regions
-uptime --standalone   # All-in-one for small deployments
+warden agent        # Runs checks, posts to regional coordinators
+warden coordinator  # Regional coordinator, clusterable
+warden standalone   # All-in-one for small deployments
+warden global       # Cross-region aggregator (Stage B / Phase 6)
 ```
 
-### Full Deployment
+The `global` mode is implemented (Phase 6). See `docker-compose.global.yaml`.
+
+### Full Deployment (Stage B)
+
+The diagram below is the Phase 6 topology, now implemented. Regional clusters
+push state summaries to a global coordinator. It caches only those summaries;
+data-bearing global reads fan out to the regions and merge their responses at
+request time, without retaining raw regional data.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -104,22 +111,31 @@ Full replication within region. All coordinators have all data.
 | Data | Storage | Replication |
 |------|---------|-------------|
 | Check results (raw) | Regional DuckDB | Full (all nodes in region) |
-| Current state | Regional DuckDB | Full (all nodes in region) |
-| Config, alerts | Regional DuckDB | Full (all nodes in region) |
-| State summaries | Global coordinator | Pushed from regions, cached |
+| Current state, per-agent beliefs, state history | Regional DuckDB | Full (all nodes in region) |
+| Config (including rollup policies), alerts | Regional DuckDB | Full (all nodes in region) |
+| State summaries (Stage B) | Global coordinator | Pushed from regions; cached (no raw data) |
 
-### Query Routing
+### Query Routing (Stage B)
+
+Phase 6 serves dashboard status and region health from the global cache. The
+cache contains state summaries only. Global data-bearing reads fan out to the
+relevant regional coordinators and merge responses for that request: logs,
+uptime, latency/sparklines, alerts, and incidents. No raw result, log, alert,
+or incident data is persisted globally. A check-specific read targets every
+live region that owns that check; fleet-wide alerts and incidents target every
+live region.
 
 | Query | Where | Latency |
 |-------|-------|---------|
-| Dashboard (all checks status) | Global (cached) | Local |
-| Region health | Global (cached) | Local |
-| Check history | Regional coordinator | Local to region |
-| Cross-region analytics | Global → fan-out to regions | Slowest region |
+| Dashboard (all checks status) | Global state-summary cache | Local |
+| Region health | Global state-summary cache | Local |
+| Logs, uptime, latency, alerts, incidents | Global → regional fan-out and request-time merge | Slowest responding region |
 
 **Example:** You're in us-west, querying Taiwan check history:
-- Dashboard load: instant (global has cached state)
-- Drill into Taiwan check: ~250ms (routes to AP region)
+- Dashboard load: instant (global cached summary)
+- Taiwan history: routed to its owning AP region
+- A cross-region uptime, latency, alert, or incident view: merged from the
+  responding regions for that request, then discarded by the global node
 
 ---
 
@@ -128,24 +144,45 @@ Full replication within region. All coordinators have all data.
 ### 1. Agent
 
 **Responsibilities:**
-- Execute health checks (HTTP, TCP, DNS, ICMP, custom scripts)
+- Poll a regional coordinator for assigned checks, using any configured
+  coordinator URL as failover
+- Execute assigned health checks (HTTP, TCP, DNS, ICMP, custom scripts)
 - Report results to coordinator
 - Run independently with minimal configuration
 
+**Placement:** By default, each enabled agent-probed check is assigned to one
+live agent in every zone. Placement is deterministic rendezvous hashing, so if
+the selected agent disappears the next-ranked live agent in that domain takes
+over without reshuffling unrelated assignments. Explicit `mode = "region"` and
+`count = 1` instead assigns one live agent per region across its zones; `count`
+is always per selected zone or region, not fleet-wide. Optional region and zone
+allow-lists constrain eligible agents.
+
+**Scheduling:** Each assigned check has its own task, so one slow or failing
+probe does not block another. The implementation evaluates six-field (seconds
+first) cron schedules against wall-clock time, rather than using startup-relative
+interval timers. Consequently, aligned expressions such as `*/30 * * * * *` can
+synchronize many probes at seconds 00 and 30. Deterministic spreading and bounded
+probe concurrency are **not implemented**; they are planned scaling work. See
+[SCALING.md](SCALING.md) for the phased 10,000-check plan and its scheduler
+requirements.
+
 **Architecture:**
 ```rust
-// One async task per check, independent timers
+// One async task per assigned check provides failure isolation.
+// Each loop sleeps until the next wall-clock cron instant.
 struct Agent {
     config: AgentConfig,
     checks: Vec<CheckDefinition>,
     result_tx: mpsc::Sender<CheckResult>,
 }
 
-// Each check runs in its own task
 async fn check_loop(check: CheckDefinition, tx: mpsc::Sender<CheckResult>) {
-    let mut interval = tokio::time::interval(check.interval);
+    let schedule = check.schedule().expect("validated before assignment");
     loop {
-        interval.tick().await;
+        let Some(next) = schedule.upcoming(Utc).next() else { return };
+        let wait = (next - Utc::now()).to_std().unwrap_or(Duration::ZERO);
+        tokio::time::sleep(wait).await;
         let result = execute_check(&check).await;
         tx.send(result).await.ok(); // Backpressure via channel capacity
     }
@@ -268,23 +305,14 @@ coordinator: https://coordinator.example.com
 agent_id: us-east-1a-agent-01
 zone: us-east-1a
 region: us-east
-
-checks:
-  - name: api-health
-    type: http
-    target: https://api.example.com/health
-    interval: 30s
-    timeout: 10s
-    expect:
-      status: 200
-      body_contains: "ok"
-  
-  - name: database
-    type: tcp
-    target: db.internal:5432
-    interval: 60s
-    timeout: 5s
 ```
+
+Agents do not load or seed checks from configuration files. Operators create,
+edit, and delete checks through the authenticated Admin/API control plane; the
+coordinator distributes the assigned definitions to agents. A check has an
+immutable UUIDv7 identity and a mutable Unicode display name. The definition
+examples above describe the fields submitted through that control plane, not
+file-seeded `[[checks]]` entries.
 
 ---
 
@@ -352,7 +380,10 @@ impl RegionalCoordinator {
 - Run global alert rules
 - Route drill-down queries to regional coordinators
 
-**No raw data storage.** Global coordinator only caches state summaries.
+**No raw data storage.** Global coordinator only caches state summaries. When an
+operator creates a global check through the authenticated control plane, the
+global coordinator mints one UUIDv7 before distributing the definition; regions
+must use that UUID rather than minting per-region identities.
 
 ```rust
 struct GlobalCoordinator {
@@ -377,10 +408,9 @@ impl GlobalCoordinator {
         }
     }
     
-    async fn query_check_history(&self, check_id: &str, region: &str) -> Results {
-        // Route to regional coordinator
-        let endpoint = self.region_endpoints.get(region).unwrap();
-        self.proxy_to_region(endpoint, check_id).await
+    async fn query_check_data(&self, check_id: &str) -> Results {
+        // Fan out to live owner regions and merge this response only.
+        self.merge_region_responses(check_id).await
     }
 }
 ```
@@ -498,100 +528,79 @@ disagree with the one it summarises.
 
 ### 6. Region Tree (Hierarchical State)
 
-**Structure:**
-```
-Global
-├── us (Region)
-│   ├── us-east-1 (Zone)
-│   │   ├── us-east-1a-agent-01
-│   │   └── us-east-1b-agent-02
-│   └── us-west-2 (Zone)
-│       └── us-west-2a-agent-01
-├── eu (Region)
-│   └── eu-west-1 (Zone)
-│       └── eu-west-1a-agent-01
-└── ap (Region)
-    └── ap-southeast-1 (Zone)
-        └── ap-southeast-1a-agent-01
-```
+Stage A is complete. Each check is evaluated as a tree of **per-agent beliefs →
+zones → regions → check root**. `NodeState` has exactly four values:
 
-**Node State:**
 ```rust
-#[derive(Clone, Copy, PartialEq)]
 enum NodeState {
-    Up,       // All children healthy (or policy satisfied)
-    Degraded, // Some children failing, but policy still satisfied
-    Down,     // Policy violated
-    Unknown,  // No recent data
-}
-
-struct TreeNode {
-    id: String,
-    node_type: NodeType, // Global, Region, Zone, Agent
-    state: NodeState,
-    policy: RollupPolicy,
-    children: Vec<TreeNode>,
-    last_update: DateTime<Utc>,
-}
-
-#[derive(Clone)]
-enum RollupPolicy {
-    Any,                    // UP if any child is UP
-    Majority,               // UP if >50% of children are UP
-    All,                    // UP only if all children are UP
-    Quorum(usize),          // UP if N children are UP
-    Weighted(Vec<(String, u32)>), // Weighted voting
+    Up,       // no configured failure threshold is satisfied
+    Degraded, // partial failure: degraded threshold met, down threshold not met
+    Down,     // down threshold met
+    Unknown,  // no current opinion
 }
 ```
 
-**Rollup Logic:**
+A leaf is one agent's confirmed opinion of one check. Confirmation counters are
+therefore per `(check_id, agent_id)` in `agent_check_state`; results from two
+agents never advance one shared failure counter. Silent/stale agents become
+`Unknown` rather than `Down`.
+
+Leaves are cluster-wide, not node-local. Every coordinator in a region folds
+the same tree over the whole regional fleet, because the leaves themselves
+replicate (**§9**, `POST /internal/replicate`). A node that no agent in a given
+zone reports to still holds that zone's full corroboration set.
+
+**Topology is derived from active credentials, not agent claims.** Each
+credential contributes its authenticated region and zone, including an empty
+`Unknown` location before an agent first reports. Observed per-agent leaves are
+admitted only beneath a credential-defined location. Revoked credentials no
+longer define topology. This prevents self-asserted location from manufacturing
+a region or zone that placement and rollup then trust.
+
+**Policies have two independent failure thresholds:**
+
 ```rust
-impl TreeNode {
-    fn compute_state(&self) -> NodeState {
-        if self.children.is_empty() {
-            return self.state; // Leaf node (agent) - direct state
-        }
-        
-        let child_states: Vec<_> = self.children.iter()
-            .map(|c| c.compute_state())
-            .collect();
-        
-        match &self.policy {
-            RollupPolicy::Any => {
-                if child_states.iter().any(|s| *s == NodeState::Up) {
-                    NodeState::Up
-                } else if child_states.iter().all(|s| *s == NodeState::Down) {
-                    NodeState::Down
-                } else {
-                    NodeState::Degraded
-                }
-            }
-            RollupPolicy::All => {
-                if child_states.iter().all(|s| *s == NodeState::Up) {
-                    NodeState::Up
-                } else if child_states.iter().any(|s| *s == NodeState::Down) {
-                    NodeState::Down
-                } else {
-                    NodeState::Degraded
-                }
-            }
-            RollupPolicy::Majority => {
-                let up_count = child_states.iter()
-                    .filter(|s| **s == NodeState::Up)
-                    .count();
-                if up_count > child_states.len() / 2 {
-                    NodeState::Up
-                } else if up_count == 0 {
-                    NodeState::Down
-                } else {
-                    NodeState::Degraded
-                }
-            }
-            // ... other policies
-        }
-    }
+enum Threshold { Any, Majority, All, Quorum(u32) }
+struct RollupPolicy {
+    degraded_when: Threshold, // failing children: Degraded or Down
+    down_when: Threshold,     // hard-Down children only
 }
 ```
+
+`down_when` must be at least as strict as `degraded_when`. `All` always means
+**all known children corroborate that failure threshold**; it does not mean the
+old, ambiguous "UP only if all children are UP." `Unknown` children are excluded
+from both numerator and denominator. With no known children the rollup is
+`Unknown`, and only the check root then falls back to `default_status`.
+
+Built-in defaults encode the Stage A intent:
+
+| Fold | `degraded_when` | `down_when` | Result |
+|---|---|---|---|
+| agents → zone | `all` | `all` | redundant agents must unanimously corroborate an outage |
+| zones → region | `any` | `all` | one zone is partial failure; all zones is regional outage |
+| regions → check | `any` | `majority` | one region is partial failure; a majority is outage |
+
+A check may override each level. Otherwise the node's stored `rollup_policy`
+row wins, then the built-in default. Policy edits and tombstones are HLC/LWW
+config entries, replicated and reconciled through the config plane just like
+checks, settings, sections, and credentials.
+
+The candidate root does not publish immediately when a hold-down is configured.
+`min_incident_secs` requires a non-UP candidate to remain continuous before the
+published transition; `min_recovery_secs` does the same for recovery. Both
+default to zero and can be set fleet-wide in `[coordinator.rollup_defaults]` or
+overridden per check. Degraded transitions alert by default
+(`notify_degraded = true`), while Degraded time counts as uptime by default
+(`degraded_is_downtime = false`): partial reachability is actionable without
+silently charging it as total downtime.
+
+Every published root transition is appended to `state_history`. Uptime is
+computed from those time-weighted state spans—not raw, agent-count-weighted
+probe rows—so hold-down and the chosen Degraded interpretation match what the
+status page actually showed. Zone and region transitions are also alert events
+for topology history, but only check-root transitions drive check state,
+incidents, and notification routing.
 
 ---
 
@@ -654,8 +663,8 @@ struct Alert {
 `alert_type` from the original model is **not stored**. `StateChange` /
 `Degradation` / `Recovery` is a pure function of the state pair, and a stored
 copy is a column that can disagree with the two fields it summarises; it is
-derived in the DTO. `scope` *is* stored — it is not derivable, and the region
-tree (Phase 5/6) is what will start writing alerts that are not about a check.
+derived in the DTO. `scope` *is* stored — it is not derivable. The completed
+Stage A region tree writes zone and region alerts as well as check-root alerts.
 
 **Incident**
 ```rust
@@ -902,10 +911,10 @@ another check still owns.
 tombstone.** Erasing a check while a peer is down removes the rows here, but
 that peer's next anti-entropy sweep sees results it still holds and this node
 no longer does, decides it is behind, and hands them straight back — the same
-wart already called out for skipping the demo seed on a clustered boot. The
+same class of anti-entropy hazard as any un-tombstoned replicated row. The
 check's *definition* and its *incidents* do not come back, because both are
-tombstoned; only the raw result rows can reappear, orphaned under a check
-name that no longer exists to own them.
+tombstoned; only the raw result rows can reappear, orphaned under an immutable
+check UUID whose definition no longer exists.
 
 ---
 
@@ -1001,7 +1010,7 @@ design.**
   paging once for one outage instead of three times, and what keeps two
   coordinators from disagreeing about a check whose Lua eval is not
   deterministic — only the coordinator that actually ran it gets to decide.
-- **Config** — checks, sections, settings, agent credentials — has no
+- **Config** — checks, sections, settings, agent credentials, rollup policies — has no
   observer. No evaluation makes one edit more authoritative than another
   written on a different node a second later, so it is last-writer-wins on a
   per-row HLC stamp, and *a replicated config write takes effect locally* —
@@ -1103,11 +1112,30 @@ worth carrying for a fan-out this small.
 
 ```
 POST /internal/replicate
-  { results: [CheckResult], state: [CurrentState], alerts: [Alert], incidents: [Incident] }
+  { results: [CheckResult], beliefs: [ReplicatedBelief], polls: [AgentPollRow],
+    alerts: [Alert], incidents: [Incident], deleted_incidents: [String] }
   → whatever the observing coordinator just wrote locally, replayed verbatim.
     Receiver persists it and stops: no re-evaluation, no notification, no
     further replication.
 ```
+
+**Leaves replicate, not just conclusions.** `beliefs` carries the observing
+node's per-agent tracker entries, because a zone's agents are its corroboration
+set and they do not all report to the same coordinator — the deployment
+topology is a coordinator cluster per region serving every agent in that
+region, not one coordinator per agent. Replicating only the folded conclusion
+left each node holding a partial tree: a two-agent zone read as two separate
+one-agent zones, so `all/all` was satisfied by a single flaky agent and the
+corroboration property was unreachable in any real cluster.
+
+A belief is the tracker's *confirmed* status plus its `consecutive_failures`,
+never a raw probe verdict — the `failures_before_down` run belongs to the
+observer and a peer must not restart it. Application is keyed on `last_check`
+(`StateTracker::merge_agent`): an older or equal observation loses. That is what
+makes it order-independent and replay-safe, which matters because
+`/internal/replicate` has no ordering guarantee and anti-entropy replays
+historical pages. A rewound leaf would be an outage the cluster invented rather
+than observed.
 
 `check_results` has no unique constraint — it never needed one for a single
 writer — so a replicated insert cannot rely on a primary key to no-op a
@@ -1121,10 +1149,15 @@ double-counting.
 
 ```
 POST /internal/config
-  { checks / sections / settings / credentials: [(row, Hlc)], tombstones: [(kind, id, Hlc)] }
+  { checks / sections / settings / credentials / rollup policies: [(row, Hlc)],
+    tombstones: [(kind, id, Hlc)] }
   → per-row LWW merge against the local (updated_at, updated_by) stamp;
     whichever value wins is applied — including this write, if it wins.
 ```
+
+Rollup policies are first-class config entries (`kind = rollup_policy`), so node
+policy edits and deletes converge through both push replication and anti-entropy;
+they are not node-local UI preferences.
 
 The merge rule is the HLC's own `Ord`: higher `millis` wins, ties break on
 `node_id`, so every node picks the same winner without a message about it. A
@@ -1208,10 +1241,9 @@ to start is cheaper than that hour.
 
 `Inner::seen` is node-local, written only by `agent_checks_handler` on
 whichever node an agent happens to be polling. That was the entire fleet view
-before this landed: on a three-node cluster spanning us-east, eu-west and
-ap-south, `:8090` reported us-east up and the other two down; `:8091` — polled
-by the other two agents — showed the mirror image. Each node was completely
-confident, and each was two-thirds wrong about its own cluster. Admin > Agents
+before this landed: in a three-node cluster, one node reported only the agents
+polling it as healthy while another showed the mirror image. Each node was
+completely confident and wrong about its own cluster. Admin > Agents
 told a third story, healthy everywhere, because it derives from replicated
 *results* over a rolling five-minute window rather than from `seen` at all —
 not the same signal as a poll heartbeat, just one that happens to also claim
@@ -1251,11 +1283,12 @@ unreachable purely because this node's own window happens to be shorter.
 Liveness is `now - at <= window_ms`, computed with the window the row already
 carries, not the one the reader would have chosen.
 
-**Placement is deliberately untouched.** `agent_checks_handler` still decides
-which agents get handed a check from local `seen` alone, so "three probes per
-check, one per zone" is exactly what it was before this landed. This
-subsection fixes what every node *says* about the fleet, not which node hands
-work to which agent — it is display-only.
+**Placement consumes the cluster-wide fresh union.** `agent_checks_handler`
+combines local `seen` with replicated `agent_polls` before assigning checks, so
+an agent failing over to another coordinator remains eligible everywhere. This
+makes the poll input cluster-wide rather than display-only: every coordinator
+makes the same placement decision from the same fresh fleet, while local `seen`
+wins ties at an equal or newer timestamp.
 
 `agent_polls` is the one table this project recreates rather than alters. It
 shipped with `window_ms` missing from the column list and, worse, with
@@ -1275,7 +1308,7 @@ there was truly nothing stored to lose, and never again once there is.
 ```rust
 #[derive(Serialize, Deserialize)]
 struct CheckResult {
-    check_id: String,
+    check_id: Uuid,        // immutable UUIDv7 identity
     agent_id: String,
     zone: String,
     region: String,
@@ -1296,33 +1329,19 @@ enum CheckStatus {
 
 **Alert:**
 ```rust
-#[derive(Serialize, Deserialize)]
 struct Alert {
-    id: Uuid,
-    alert_type: AlertType,
-    scope: AlertScope,
+    id: String,
+    scope: AlertScope,              // check | agent | zone | region
     node_id: String,
-    previous_state: NodeState,
+    previous_state: Option<NodeState>,
     current_state: NodeState,
-    timestamp: DateTime<Utc>,
-    details: AlertDetails,
-}
-
-enum AlertType {
-    StateChange,    // UP → DOWN, DOWN → UP
-    Degradation,    // Partial failure
-    Recovery,       // DOWN → UP
-    Flapping,       // Rapid state changes
-}
-
-enum AlertScope {
-    Check { check_id: String },
-    Agent { agent_id: String },
-    Zone { zone_id: String },
-    Region { region_id: String },
-    Global,
+    timestamp: i64,
+    incident_id: Option<String>,
 }
 ```
+
+The event kind is derived from the state pair rather than stored. Stage A emits
+check, zone, and region transitions; global scope remains Stage B work.
 
 ---
 
@@ -1333,8 +1352,8 @@ DuckDB is used for check result history and analytics. Its columnar storage prov
 ```sql
 -- Monitors/checks configuration
 CREATE TABLE monitors (
-    id VARCHAR PRIMARY KEY,
-    name VARCHAR NOT NULL,
+    id UUID PRIMARY KEY,              -- immutable UUIDv7 identity
+    name VARCHAR NOT NULL UNIQUE,      -- mutable Unicode display name,
     type VARCHAR NOT NULL,  -- http, tcp, dns, icmp
     target VARCHAR NOT NULL,
     interval_secs INTEGER NOT NULL DEFAULT 60,
@@ -1344,19 +1363,34 @@ CREATE TABLE monitors (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Region tree structure
-CREATE TABLE region_tree (
-    id VARCHAR PRIMARY KEY,
-    parent_id VARCHAR REFERENCES region_tree(id),
-    node_type VARCHAR NOT NULL,  -- global, region, zone, agent
-    name VARCHAR NOT NULL,
-    policy VARCHAR NOT NULL DEFAULT 'majority',
-    policy_config JSON
+-- Per-agent confirmed leaves. Credential-authenticated zone/region are stored
+-- with the belief so a restart reconstructs the same tree.
+CREATE TABLE agent_check_state (
+    check_id UUID NOT NULL,
+    agent_id VARCHAR NOT NULL,
+    status VARCHAR NOT NULL,
+    consecutive_failures INTEGER NOT NULL,
+    zone VARCHAR NOT NULL,
+    region VARCHAR NOT NULL,
+    last_check BIGINT NOT NULL,
+    PRIMARY KEY (check_id, agent_id)
+);
+
+-- Per-node two-threshold policy. Node ids are `global`, `region:<region>`, or
+-- `zone:<region>/<zone>`; quorum counts live in `config`.
+CREATE TABLE rollup_policy (
+    node_id VARCHAR PRIMARY KEY,
+    node_type VARCHAR NOT NULL,
+    degraded_when VARCHAR NOT NULL,
+    down_when VARCHAR NOT NULL,
+    config JSON,
+    updated_at BIGINT NOT NULL,
+    updated_by VARCHAR
 );
 
 -- Check results history (main time-series table)
 CREATE TABLE check_results (
-    check_id VARCHAR NOT NULL,
+    check_id UUID NOT NULL,
     agent_id VARCHAR NOT NULL,
     status VARCHAR NOT NULL,  -- up, down, timeout, error
     latency_ms INTEGER,
@@ -1366,11 +1400,19 @@ CREATE TABLE check_results (
 
 -- Current state (materialized for fast reads)
 CREATE TABLE current_state (
-    node_id VARCHAR PRIMARY KEY,
+    check_id UUID PRIMARY KEY,
     state VARCHAR NOT NULL,  -- up, down, degraded, unknown
-    last_check TIMESTAMP,
-    last_state_change TIMESTAMP,
-    consecutive_failures INTEGER DEFAULT 0
+    pending_state VARCHAR,   -- hold-down candidate, if any
+    pending_since BIGINT,
+    last_check BIGINT NOT NULL
+);
+
+-- Published check-root spans used for time-weighted uptime.
+CREATE TABLE state_history (
+    check_id UUID NOT NULL,
+    state VARCHAR NOT NULL,
+    since BIGINT NOT NULL,
+    PRIMARY KEY (check_id, since)
 );
 
 -- Alert log: one row per confirmed state transition. `incident_id` is stamped
@@ -1399,7 +1441,7 @@ CREATE TABLE incidents (
     started_at BIGINT NOT NULL,
     resolved_at BIGINT,
     global BOOLEAN NOT NULL DEFAULT FALSE,
-    origin_check VARCHAR             -- NULL for a manually opened incident
+    origin_check UUID                -- NULL for a manually opened incident
 );
 
 -- Which checks an incident affects, and how each was attached. `source`
@@ -1407,7 +1449,7 @@ CREATE TABLE incidents (
 -- operator added by hand.
 CREATE TABLE incident_checks (
     incident_id VARCHAR NOT NULL,
-    check_id VARCHAR NOT NULL,
+    check_id UUID NOT NULL,
     source VARCHAR NOT NULL,         -- origin, dependency, manual
     PRIMARY KEY (incident_id, check_id)
 );
@@ -1434,7 +1476,7 @@ CREATE TABLE incident_updates (
 -- is no `status` column, which could only ever disagree with `attempts`.
 CREATE TABLE notification_queue (
     notifier       VARCHAR NOT NULL,   -- the routing name, resolved per attempt
-    check_id       VARCHAR NOT NULL,
+    check_id       UUID    NOT NULL,
     previous_state VARCHAR,
     current_state  VARCHAR NOT NULL,
     attempts       INTEGER NOT NULL,   -- failed attempts, the first included
@@ -1451,7 +1493,7 @@ CREATE TABLE notification_queue (
 -- Average latency over last hour
 SELECT avg(latency_ms), percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) as p95
 FROM check_results
-WHERE check_id = 'api-health'
+WHERE check_id = '018f4e30-0000-7000-8000-000000000001'::UUID
   AND timestamp > now() - INTERVAL '1 hour';
 
 -- Uptime percentage over last 24h
@@ -1467,7 +1509,7 @@ SELECT
     width_bucket(latency_ms, 0, 1000, 10) as bucket,
     count(*) as count
 FROM check_results
-WHERE check_id = 'api-health'
+WHERE check_id = '018f4e30-0000-7000-8000-000000000001'::UUID
   AND timestamp > now() - INTERVAL '1 hour'
 GROUP BY bucket
 ORDER BY bucket;
@@ -1479,6 +1521,11 @@ ORDER BY bucket;
 
 ### Agent → Coordinator
 
+Heartbeat checks are invoked at `GET` or `POST /api/v1/heartbeat/{check_id}`, where
+`check_id` is the immutable UUIDv7 (for example,
+`/api/v1/heartbeat/018f4e30-0000-7000-8000-000000000001`). Renaming the display
+name does not change this URL.
+
 ```
 POST /api/v1/results
 Content-Type: application/json
@@ -1488,19 +1535,22 @@ X-Agent-Secret: <shared-secret>
 {
   "results": [
     {
-      "check_id": "api-health",
+      "check_id": "018f4e30-0000-7000-8000-000000000001",
       "timestamp": "2024-01-15T10:30:00Z",
       "status": "up",
       "latency_ms": 45
     },
     {
-      "check_id": "database",
+      "check_id": "018f4e30-0000-7000-8000-000000000002",
       "timestamp": "2024-01-15T10:30:05Z",
       "status": "down",
       "details": "Connection refused"
     }
   ]
 }
+
+Agent results identify checks only by UUID; coordinator/UI responses add the
+current display name where a human reads the result.
 
 Response: 200 OK
 {
@@ -1516,7 +1566,7 @@ GET /api/v1/status
 → Current state tree
 
 GET /api/v1/monitors
-→ List all monitors
+→ List all monitors; each response carries UUID `check_id` and display `name`
 
 GET /api/v1/monitors/{id}/history?from=&to=&limit=
 → Check history
@@ -1545,6 +1595,13 @@ POST /api/v1/admin/incidents/{id}/updates
   `detected` incident IS the ack. There is no separate acknowledge endpoint;
   the Ack button posts `{state: "investigating"}` with an empty body.
 
+POST /api/v1/admin/checks
+PUT  /api/v1/admin/checks/{check_id}
+DELETE /api/v1/admin/checks/{check_id}
+→ Authenticated check lifecycle. IDs are UUIDv7; names are mutable Unicode
+  display values. The global control plane mints one UUID before distributing a
+  global check, so every region retains the same identity.
+
 GET  /api/v1/admin/maintenance
 PUT  /api/v1/admin/maintenance
 → Scheduled windows. Admin-gated both ways: a window is a licence to go quiet.
@@ -1561,52 +1618,29 @@ WebSocket /api/v1/ws/events
 
 ## Configuration
 
-### Coordinator Config (YAML)
+### Coordinator Config (TOML)
 
-```yaml
-server:
-  listen: 0.0.0.0:8080
-  tls:
-    cert: /etc/uptime/cert.pem
-    key: /etc/uptime/key.pem
+```toml
+[coordinator]
+listen = "0.0.0.0:8080"
+db_path = "/var/lib/warden/warden.duckdb"
+# admin_password = "..."  # Prefer WARDEN_ADMIN_PASSWORD.
+# peer_token = "..."      # Prefer WARDEN_PEER_TOKEN.
+# peers = ["http://coordinator-b:8080", "http://coordinator-c:8080"]
 
-database:
-  path: /var/lib/uptime/data.duckdb
-  
-auth:
-  agents:
-    - id: us-east-1a-agent-01
-      secret: ${AGENT_SECRET_1}
-    - id: eu-west-1a-agent-01
-      secret: ${AGENT_SECRET_2}
-
-notifications:
-  channels:
-    - id: slack-ops
-      type: slack
-      webhook_url: ${SLACK_WEBHOOK}
-      
-    - id: pagerduty-critical
-      type: pagerduty
-      routing_key: ${PD_KEY}
-      
-  routing:
-    - scope: global
-      state: down
-      channels: [slack-ops, pagerduty-critical]
-    - scope: zone
-      state: degraded
-      channels: [slack-ops]
-
-alerting:
-  flap_threshold: 3        # State changes within window to detect flapping
-  flap_window_secs: 300    # 5 minute window
-  recovery_alerts: true    # Send alert when recovering from DOWN
-  
-retention:
-  results_days: 30
-  alerts_days: 90
+[coordinator.rollup_defaults]
+min_incident_secs = 60
+min_recovery_secs = 30
+notify_degraded = true
+degraded_is_downtime = false
 ```
+
+Runtime resources are not sourced from this file. Checks are created only via
+the authenticated Admin UI/API and persisted in DuckDB. Agent credentials are
+minted or provisioned through the credential control plane, and notifications,
+maintenance windows, sections, and display settings become store-authoritative
+after their supported initialization path. See `warden.example.toml` for the
+complete deployment configuration.
 ---
 
 ## Scaling
@@ -1631,6 +1665,8 @@ retention:
 At 500 writes/sec with 5 nodes, internal replication = 2,000 messages/sec. Trivial for modern networking.
 
 ### Storage
+
+The estimates above are not a claim of 10,000-check readiness. **[SCALING.md](SCALING.md)** is the source of truth for the phased 10,000-check scale plan, including scheduler spreading, bounded concurrency, storage, and protocol work; none of that planned scaling work should be inferred as implemented here.
 
 Full replication means 3-5x storage per region. For check results:
 - 1,000 checks × 10s interval × 30 days = ~260M rows
@@ -1776,9 +1812,9 @@ Deferred from Phase 3, tracked here so it isn't lost:
     placed rows; `off` with none is how the section disappears, so `show` was
     never needed. Display is deterministic: rows in configured order, the
     remainder sorted by name. Legacy `pinned` documents are folded into `rows`.
-  - Edited in **Admin > Status page**, not the config file. The block above is a
-    seed applied on first boot, exactly like `[[checks]]`; after that the store
-    is authoritative (a `settings` table holding one JSON document per key) and
+    - Edited in **Admin > Status page**, not the config file. The block above is a
+      first-boot settings seed; unlike checks, it has no `[[checks]]` counterpart.
+      After that the store is authoritative (a `settings` table holding one JSON document per key) and
     a restart cannot revert an operator's choice. `GET`/`PUT
     /api/v1/admin/status-page/agents` are both admin-gated, the PUT validates
     (0–100, `down_below ≤ warn_below`) and dedupes `rows` — a repeated entry
@@ -1803,7 +1839,7 @@ Deferred from Phase 3, tracked here so it isn't lost:
       Stored as one `settings` document with no config-file counterpart. See
       **§8 Maintenance Windows**.
 
-### Phase 5: Regional Clustering
+### Phase 5: Regional Clustering and Stage A Region Tree
 - [x] Gossip membership — push-pull over the same HTTP port as everything
       else, `POST /internal/cluster/ping`: `peers` is only a seed list, and
       every other member is discovered transitively through the exchanged
@@ -1812,25 +1848,66 @@ Deferred from Phase 3, tracked here so it isn't lost:
       need opposite rules: an observer-owned data stream
       (`POST /internal/replicate` — results, state, alerts, incidents) that a
       receiver persists and never re-evaluates or re-notifies, and an HLC
-      last-writer-wins config stream (`POST /internal/config` — checks,
-      sections, settings, credentials) that a receiver applies immediately.
+      last-writer-wins config stream       (`POST /internal/config` — checks,
+      sections, settings, credentials, rollup policies) that a receiver applies
+      immediately.
+
       A digest/backfill anti-entropy sweep bounds how long a dropped push can
       leave a node behind. See **§9 Clustering**.
 - [x] Failure detection — `alive` → `suspect` → `dead` on silence past
       `peer_timeout_secs`, retained rather than dropped so a returning node
       is recognised instead of read as new. Logged and shown in the admin UI;
       deliberately never paged — see **§9 Clustering** for why.
-- [x] CLI: `--coordinator` mode — no new flag: an empty `peers` list is the
-      standalone shape this mode already had, and a non-empty one turns on
-      membership, replication and anti-entropy. Startup now refuses a
-      half-configured cluster (`peers` set without `peer_token` or
-      `advertise_url`) instead of silently gossiping into a wall.
+- [x] CLI: `coordinator` mode — an empty `peers` list is the unclustered shape,
+      and a non-empty one turns on membership, replication and anti-entropy.
+      Startup refuses a half-configured cluster (`peers` set without
+      `peer_token` or `advertise_url`) instead of silently gossiping into a wall.
+- [x] **Reopened Phase 5 consumer:** Stage A region-tree evaluation now consumes
+      placement's redundant observations instead of feeding them into one shared
+      counter. It persists per-agent state, derives credential-backed topology,
+      rolls the four-state tree with two-threshold corroboration policies,
+      publishes through configurable hold-downs, records `state_history`, and
+      exposes/administers the tree. Rollup policy config replicates through the
+      HLC config plane. See **§6 Region Tree**.
+- [x] Mixed-version behavior is fail-soft: an older coordinator parses a
+      `degraded` transition as `Unknown`, which is excluded from rollup
+      denominators. During a rolling upgrade it can be temporarily less informed
+      about partial outages, but total-outage transitions remain compatible.
+- [x] Deployment surface reduced to exactly two Compose topologies:
+      `docker-compose.yaml` starts one `standalone` process on `:9000` with one
+      command; `docker-compose.cluster.yaml` starts three coordinators on
+      `:9001`–`:9003` and three agents in one `us-east` region. The old
+      `deploy/*.toml`, `docker-compose.agents.yaml`, and root `warden.toml` were
+      removed; configuration now lives in Compose configs. Ports `:9004` and
+      `:9005` are reserved for the Stage B multi-region/global topology and are
+      intentionally unused in Stage A.
 
-### Phase 6: Global Coordinator
-- [ ] State push from regional to global
-- [ ] Global state cache
-- [ ] Query routing to regions
-- [ ] CLI: `--global` mode
+### Phase 6: Global Coordinator (Stage B) — done
+- [x] Add at least a second regional cluster. `docker-compose.global.yaml` runs
+      a 3-node `us` cluster (`:9001`–`:9003`) alongside a single-node `tw`
+      region (`:9004`), leaving the Stage A Compose files untouched.
+- [x] State push from regional coordinators to a global coordinator. Any
+      coordinator with a `[coordinator.global]` block POSTs a summary (no raw
+      data) to `/internal/global/state` every `push_secs`; see
+      `Coordinator::spawn_global_push` and `global::wire::RegionStatePush`.
+- [x] Global state cache and cross-region tree consumption. `global::cache`
+      keeps the latest push per region (last-writer-wins), aggregates checks
+      cross-region (worst live region wins), and drops regions past the
+      staleness window. It backs `/api/v1/status`, `/api/v1/cluster` (region
+      roster), and `/api/v1/admin/region-tree` so the existing SPA renders it.
+- [x] Cluster-wide poll input for placement. Coordinators replicate fresh
+      `agent_polls`; assignment uses the union with local polls, preserving
+      default one-per-zone placement and rendezvous failover. Explicit
+      `mode = "region", count = 1` selects one observer per region.
+- [x] Global request-time merged reads. Logs, uptime, latency/sparklines,
+      alerts, and incidents fan out to their regional owners and merge only in
+      the response; the global cache retains state summaries, never raw data.
+- [x] CLI: `global` mode (`warden global`), no raw storage, no probing.
+- [x] Stage B Compose topology on reserved ports `:9004` (tw) / `:9005`
+      (global), without changing either completed Stage A topology.
+- [x] Cross-region alerting, off by default: the global node pages only when a
+      check is down in every reporting region, or a region goes dark, and only
+      when `[global] notifiers` is set. Avoids double-paging the regions.
 
 
 ## Dependencies (Rust Crates)

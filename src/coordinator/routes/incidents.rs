@@ -102,12 +102,12 @@ impl IncidentDto {
             started_at: i.started_at,
             resolved_at: i.resolved_at,
             global: i.global,
-            origin_check: i.origin_check,
+            origin_check: i.origin_check.map(|id| id.to_string()),
             checks: i
                 .checks
                 .into_iter()
                 .map(|c| IncidentCheckDto {
-                    check_id: c.check_id,
+                    check_id: c.check_id.to_string(),
                     source: c.source.as_str(),
                 })
                 .collect(),
@@ -131,6 +131,31 @@ pub(in crate::coordinator) struct IncidentQuery {
     status: Option<String>,
 }
 
+/// Bounds the destructive short-incident cleanup to the transient outages it
+/// exists to remove. A caller must deliberately choose a larger threshold.
+#[derive(Deserialize)]
+pub(in crate::coordinator) struct ShortIncidentPurgeQuery {
+    max_secs: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct ShortIncidentPurgeResponse {
+    deleted: u64,
+}
+
+#[derive(Serialize)]
+struct ResultsCountResponse {
+    raw_results: u64,
+}
+
+#[derive(Serialize)]
+struct ResultsPurgeResponse {
+    deleted: u64,
+}
+
+const DEFAULT_SHORT_INCIDENT_MAX_SECS: u64 = 60;
+const MAX_SHORT_INCIDENT_MAX_SECS: u64 = 3_600;
+
 /// Open an incident by hand. Everything is optional but the title: a
 /// maintenance notice needs no affected checks and no start time.
 #[derive(Deserialize)]
@@ -142,10 +167,7 @@ pub(in crate::coordinator) struct CreateIncidentRequest {
     started_at: Option<i64>,
     #[serde(default)]
     global: Option<bool>,
-    #[serde(default)]
-    checks: Vec<String>,
-    /// The opening update's body.
-    #[serde(default)]
+    checks: Vec<crate::models::CheckId>,
     body: Option<String>,
 }
 
@@ -160,7 +182,7 @@ pub(in crate::coordinator) struct EditIncidentRequest {
 
 #[derive(Deserialize)]
 pub(in crate::coordinator) struct IncidentChecksRequest {
-    checks: Vec<String>,
+    checks: Vec<crate::models::CheckId>,
 }
 
 #[derive(Deserialize)]
@@ -234,11 +256,20 @@ pub(in crate::coordinator) async fn incident_handler(
 pub(in crate::coordinator) async fn create_incident_handler(
     State(coord): State<Coordinator>,
     headers: HeaderMap,
-    Json(req): Json<CreateIncidentRequest>,
+    body: axum::body::Bytes,
 ) -> Response {
     if let Some(rejection) = require_admin(&coord, &headers) {
         return rejection;
     }
+    // Parsed only once the session has checked out: `Json<T>` as an argument
+    // would reject a body shaped wrong before this handler's own code — and
+    // so `require_admin` above — ever ran, letting an anonymous caller learn
+    // the body was malformed instead of the uniform "authentication
+    // required" every other admin route gives them.
+    let req: CreateIncidentRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
     let title = req.title.trim();
     if title.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "title is required");
@@ -252,7 +283,7 @@ pub(in crate::coordinator) async fn create_incident_handler(
         .checks
         .iter()
         .map(|c| crate::coordinator::storage::IncidentCheckRow {
-            check_id: c.clone(),
+            check_id: *c,
             source: crate::coordinator::storage::AffectSource::Manual,
         })
         .collect();
@@ -349,6 +380,67 @@ pub(in crate::coordinator) async fn delete_incident_handler(
     Json(DeletedResponse { deleted: id }).into_response()
 }
 
+/// Return the exact raw-result count shown in the destructive purge confirm.
+/// This is separate from the explorer's filtered result list.
+pub(in crate::coordinator) async fn results_count_handler(
+    State(coord): State<Coordinator>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(rejection) = require_admin(&coord, &headers) {
+        return rejection;
+    }
+    match coord.inner.storage.lock().count_results() {
+        Ok(raw_results) => Json(ResultsCountResponse { raw_results }).into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// Purge all raw results and their in-memory leaf beliefs. Published roots stay
+/// intact because they represent the coordinator's last announced state.
+pub(in crate::coordinator) async fn purge_results_handler(
+    State(coord): State<Coordinator>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(rejection) = require_admin(&coord, &headers) {
+        return rejection;
+    }
+    let deleted = match coord.inner.storage.lock().purge_results() {
+        Ok(deleted) => deleted,
+        Err(e) => return internal_error(e),
+    };
+    coord.inner.tracker.lock().clear_leaf_beliefs();
+    info!(deleted, "purged raw results");
+    Json(ResultsPurgeResponse { deleted }).into_response()
+}
+
+/// Delete resolved, transient incidents created by a brief probe failure.
+///
+/// This is deliberately admin-only and refuses zero or broad thresholds: it is
+/// cleanup for a known short-incident bug, not a general history-retention API.
+pub(in crate::coordinator) async fn purge_short_incidents_handler(
+    State(coord): State<Coordinator>,
+    headers: HeaderMap,
+    Query(q): Query<ShortIncidentPurgeQuery>,
+) -> Response {
+    if let Some(rejection) = require_admin(&coord, &headers) {
+        return rejection;
+    }
+    let max_secs = q.max_secs.unwrap_or(DEFAULT_SHORT_INCIDENT_MAX_SECS);
+    if !(1..=MAX_SHORT_INCIDENT_MAX_SECS).contains(&max_secs) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "max_secs must be between 1 and 3600",
+        );
+    }
+    match coord.inner.storage.lock().purge_short_incidents(max_secs) {
+        Ok(deleted) => {
+            info!(max_secs, deleted, "purged short incidents");
+            Json(ShortIncidentPurgeResponse { deleted }).into_response()
+        }
+        Err(e) => internal_error(e),
+    }
+}
+
 /// Replace the manually attached checks. Origin and dependency attachments are
 /// untouched — those belong to reconciliation, and an operator editing this
 /// list must not be able to delete the outage's own cause from it.
@@ -356,11 +448,18 @@ pub(in crate::coordinator) async fn incident_checks_handler(
     State(coord): State<Coordinator>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(req): Json<IncidentChecksRequest>,
+    body: axum::body::Bytes,
 ) -> Response {
     if let Some(rejection) = require_admin(&coord, &headers) {
         return rejection;
     }
+    // See `create_incident_handler`: parsed after auth, not before, so a
+    // caller with no session learns nothing about whether the body would
+    // even have been valid.
+    let req: IncidentChecksRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
     let now = chrono::Utc::now().timestamp_millis();
     let store = coord.inner.storage.lock();
     if let Err(e) = store.set_manual_checks(&id, &req.checks) {
@@ -439,13 +538,13 @@ fn parse_incident_state(raw: Option<&str>) -> Option<crate::coordinator::storage
 /// A single check's incident history, for the check detail view.
 pub(in crate::coordinator) async fn check_incidents_handler(
     State(coord): State<Coordinator>,
-    Path(id): Path<String>,
+    Path(id): Path<crate::models::CheckId>,
     Query(q): Query<IncidentQuery>,
 ) -> Response {
     let limit = q.limit.unwrap_or(20).min(1000);
     let now = chrono::Utc::now().timestamp_millis();
     let store = coord.inner.storage.lock();
-    match store.incidents_for_check(&id, limit) {
+    match store.incidents_for_check(id, limit) {
         Ok(rows) => {
             let incidents = rows
                 .into_iter()

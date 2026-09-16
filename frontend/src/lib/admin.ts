@@ -2,7 +2,8 @@
 // carries the session cookie and, on failure, the server sends a human-readable
 // `{error}` string that the form has to render verbatim.
 
-import type { CheckKind } from "./api";
+import type { CheckKind, ProbeStatus } from "./api";
+export type { ProbeStatus } from "./api";
 
 /** Whether every assertion in a set must hold, or just one of them. Shared by
  *  multi-host checks and DNS expected values so "any/all" reads the same way
@@ -11,7 +12,65 @@ export type MatchMode = "any" | "all";
 
 /** What a check reads as before it has ever reported. Without this a freshly
  *  created check would show as an outage until its first result lands. */
-export type DefaultStatus = "up" | "down" | "unknown";
+export type DefaultStatus = ProbeStatus;
+
+/** Serde's externally tagged representation of the Rust Threshold enum. */
+export type Threshold = "any" | "majority" | "all" | { quorum: number };
+
+export interface RollupPolicy {
+  degraded_when: Threshold;
+  down_when: Threshold;
+}
+
+/** A missing level inherits its stored node policy, then the built-in default. */
+export interface RollupOverrides {
+  zone?: RollupPolicy;
+  region?: RollupPolicy;
+  global?: RollupPolicy;
+}
+
+export type RollupNodeType = "global" | "region" | "zone";
+
+export interface StoredRollupPolicy {
+  node_id: string;
+  node_type: RollupNodeType;
+  policy: RollupPolicy;
+}
+
+export type RegionTreeState = "up" | "degraded" | "down" | "unknown";
+
+export interface RegionTreeAgent {
+  id: string;
+  state: RegionTreeState;
+  staleness_ms: number;
+}
+
+export interface RegionTreeZone {
+  zone: string;
+  state: RegionTreeState;
+  effective_policy: RollupPolicy;
+  agents: RegionTreeAgent[];
+}
+
+export interface RegionTreeRegion {
+  region: string;
+  state: RegionTreeState;
+  effective_policy: RollupPolicy;
+  zones: RegionTreeZone[];
+}
+
+export interface RegionTreeCheck {
+  check_id: string;
+  /** Mutable display name, for labels — never the identity. */
+  name: string;
+  state: RegionTreeState;
+  effective_policy: RollupPolicy;
+  regions: RegionTreeRegion[];
+}
+
+export interface RegionTreeResponse {
+  checks: RegionTreeCheck[];
+}
 
 export interface CheckHeader {
   name: string;
@@ -20,11 +79,14 @@ export interface CheckHeader {
 
 /** Where a check runs, described by location rather than by machine so that
  *  growing the fleet does not mean revisiting every check. Empty `zones` means
- *  every zone; empty `regions` means every region. `per_zone` is how many
- *  agents *within each matched zone* probe it — not a fleet-wide total. */
+ *  every zone; empty `regions` means every region. Older checks use
+ *  `per_zone`; `mode`/`count` select observers per zone or per region. */
+export type PlacementMode = "zone" | "region";
 export interface Placement {
   zones: string[];
   regions: string[];
+  mode?: PlacementMode;
+  count?: number;
   per_zone: number;
 }
 
@@ -33,6 +95,14 @@ export interface Placement {
  *  exactly one shape and no conversion. It carries the target, so it only ever
  *  arrives behind an authenticated session. */
 export interface AdminCheck {
+  /** Immutable identity, minted once at creation. Every route, lookup and
+   *  relationship (results, incidents, dependencies, maintenance) keys on
+   *  this — never on `name`. A create payload must never set this: the
+   *  server always mints it (or, for a trusted regional fan-out, carries an
+   *  existing one through) and ignores anything a browser sends. */
+  id: string;
+  /** Mutable display name. Freely renamable — doing so never changes `id`
+   *  and never orphans history, alerts or incidents. */
   name: string;
   type: CheckKind;
   /** HTTP: a URL. TCP: "host:port". DNS/ICMP/SSL: a hostname. Heartbeat: unused. */
@@ -97,14 +167,32 @@ export interface AdminCheck {
   /** Heartbeat: no ping within this window means DOWN. */
   grace_secs: number;
   /** Consecutive DOWN probes that confirm an outage. 1 = flip on the first
-   *  failure; 3 = tolerate two flaky probes. Recovery is never delayed. */
+   *  failure; 3 = tolerate two flaky probes. */
   failures_before_down: number;
+  /** Seconds between confirmation attempts after a failure, before DOWN is
+   *  confirmed. Omitted derives a sane value from the normal schedule.
+   *  Heartbeat checks ignore this — nothing is retried between pings. */
+  retry_interval_secs?: number;
+  /** Seconds between probes while DOWN, until a success returns it to the
+   *  normal cron schedule. Omitted derives a sane value from the normal
+   *  schedule. Heartbeat checks ignore this. */
+  down_interval_secs?: number;
+  /** Per-level policy overrides; omitted levels inherit coordinator defaults. */
+  rollup: RollupOverrides;
+  /** Optional per-check overrides. Explicit zero/false differ from omission. */
+  min_incident_secs?: number;
+  min_recovery_secs?: number;
+  notify_degraded?: boolean;
+  degraded_is_downtime?: boolean;
 }
 
 /** What the editor sends. A create has no position yet — the server assigns the
  *  next free one — and an update echoes back whatever the server last gave us,
- *  so nobody downstream has to invent an ordering. */
-export type CheckPayload = Omit<AdminCheck, "position"> & { position?: number };
+ *  so nobody downstream has to invent an ordering. `id` is never sent: a
+ *  create always gets a server-minted one, and an update's identity comes
+ *  from the path, not the body — a payload that generated or echoed one back
+ *  would just be an id an untrusted client could try to move. */
+export type CheckPayload = Omit<AdminCheck, "position" | "id"> & { position?: number };
 
 /** A named, ordered group on the status page. Exists independently of checks,
  *  so an empty section can be created before anything is put in it. */
@@ -173,9 +261,20 @@ function send<T>(method: string, url: string, body?: unknown): Promise<T> {
 }
 
 /** Never 401s — safe to call on mount to decide whether to offer the admin UI. */
-export async function fetchSession(): Promise<boolean> {
-  const r = await request<{ authenticated: boolean }>("/api/v1/session");
-  return r.authenticated;
+/** Which kind of node the SPA is talking to. A global node aggregates regions
+ *  and has no fleet credentials of its own, so the UI adapts by node mode. */
+export type NodeMode = "coordinator" | "global";
+
+export interface SessionInfo {
+  authenticated: boolean;
+  mode: NodeMode;
+}
+
+export async function fetchSession(): Promise<SessionInfo> {
+  const r = await request<{ authenticated: boolean; mode?: NodeMode }>(
+    "/api/v1/session",
+  );
+  return { authenticated: r.authenticated, mode: r.mode ?? "coordinator" };
 }
 
 export async function login(password: string): Promise<void> {
@@ -191,6 +290,28 @@ export async function fetchAdminChecks(): Promise<AdminCheck[]> {
   return r.checks;
 }
 
+export function fetchRegionTree(): Promise<RegionTreeResponse> {
+  return request<RegionTreeResponse>("/api/v1/admin/region-tree");
+}
+
+export async function listRollupPolicies(): Promise<StoredRollupPolicy[]> {
+  const r = await request<{ policies: StoredRollupPolicy[] }>(
+    "/api/v1/admin/rollup-policies",
+  );
+  return r.policies;
+}
+
+export function upsertRollupPolicy(policy: StoredRollupPolicy): Promise<StoredRollupPolicy> {
+  return send("PUT", "/api/v1/admin/rollup-policies", policy);
+}
+
+export async function deleteRollupPolicy(
+  node_id: string,
+  node_type: RollupNodeType,
+): Promise<void> {
+  await send("DELETE", "/api/v1/admin/rollup-policies", { node_id, node_type });
+}
+
 export async function createCheck(check: CheckPayload): Promise<AdminCheck> {
   const r = await send<{ check: AdminCheck }>(
     "POST",
@@ -201,29 +322,29 @@ export async function createCheck(check: CheckPayload): Promise<AdminCheck> {
 }
 
 export async function updateCheck(
-  name: string,
+  id: string,
   check: CheckPayload,
 ): Promise<AdminCheck> {
   const r = await send<{ check: AdminCheck }>(
     "PUT",
-    `/api/v1/admin/checks/${encodeURIComponent(name)}`,
+    `/api/v1/admin/checks/${encodeURIComponent(id)}`,
     check,
   );
   return r.check;
 }
 
-export async function deleteCheck(name: string): Promise<void> {
-  await send("DELETE", `/api/v1/admin/checks/${encodeURIComponent(name)}`);
+export async function deleteCheck(id: string): Promise<void> {
+  await send("DELETE", `/api/v1/admin/checks/${encodeURIComponent(id)}`);
 }
 
 /** Deletes the recorded history and KEEPS the check, which then reads as its
  *  default status until the next probe lands. Deliberately a separate call from
  *  deleteCheck: "I want a clean slate" and "this check should not exist" are
  *  different intentions with very different consequences. Returns rows removed. */
-export async function purgeCheckData(name: string): Promise<number> {
+export async function purgeCheckData(id: string): Promise<number> {
   const r = await send<{ purged: number }>(
     "DELETE",
-    `/api/v1/admin/checks/${encodeURIComponent(name)}/data`,
+    `/api/v1/admin/checks/${encodeURIComponent(id)}/data`,
   );
   return r.purged;
 }
@@ -239,16 +360,40 @@ export async function deleteIncident(id: string): Promise<void> {
   await send("DELETE", `/api/v1/admin/incidents/${encodeURIComponent(id)}`);
 }
 
+/** The unfiltered raw-result total, used to name the exact destructive purge. */
+export async function fetchResultsCount(): Promise<number> {
+  const r = await request<{ raw_results: number }>("/api/v1/admin/results/count");
+  return r.raw_results;
+}
+
+/** Deletes every raw probe result. The coordinator's published status remains. */
+export async function purgeResults(): Promise<number> {
+  const r = await send<{ deleted: number }>("POST", "/api/v1/admin/results/purge");
+  return r.deleted;
+}
+
+/** Removes resolved incidents no longer than the supplied duration, for cleanup
+ *  of brief false alarms. This intentionally has no results counterpart: the
+ *  storage helper exists, but the server does not expose an admin route for it. */
+export async function purgeShortIncidents(maxSecs: number): Promise<number> {
+  const r = await send<{ deleted: number }>(
+    "POST",
+    "/api/v1/admin/incidents/purge-short",
+    { max_secs: maxSecs },
+  );
+  return r.deleted;
+}
+
 /** Deletes the check definition AND every result, alert and incident it ever
  *  produced — the union of deleteCheck and purgeCheckData, plus the incidents
  *  neither of those touches. There is no partial form: once this runs the
  *  check has no trace left anywhere. Returns rows removed, by kind. */
 export async function purgeCheckEverything(
-  name: string,
+  id: string,
 ): Promise<{ results: number; incidents: number }> {
   const r = await send<{ deleted: string; results: number; incidents: number }>(
     "DELETE",
-    `/api/v1/admin/checks/${encodeURIComponent(name)}/everything`,
+    `/api/v1/admin/checks/${encodeURIComponent(id)}/everything`,
   );
   return { results: r.results, incidents: r.incidents };
 }
@@ -302,7 +447,7 @@ export async function reorderSections(order: string[]): Promise<Section[]> {
   return r.sections;
 }
 
-/** Names in display order — loose checks first, then each section's. Names left
+/** Ids in display order — loose checks first, then each section's. Ids left
  *  out keep their relative order after the listed ones. */
 export async function reorderChecks(order: string[]): Promise<AdminCheck[]> {
   const r = await send<{ checks: AdminCheck[] }>(
@@ -325,12 +470,14 @@ export function testEval(sample: EvalSample): Promise<EvalResult> {
  *  history endpoint summarises this away; here it is the whole point. */
 export interface ProbeResult {
   check_id: string;
+  /** Mutable display name, for labels — never the identity. */
+  name: string;
   agent_id: string;
   /** Epoch millis. */
   timestamp: number;
   zone?: string;
   region?: string;
-  status: DefaultStatus;
+  status: ProbeStatus;
   latency_ms: number;
   status_code?: number;
   /** Verbatim probe error. Absent on success. */
@@ -343,9 +490,10 @@ export interface ProbeResult {
  *  deliberately absent — it runs client-side on the returned batch. `limit`
  *  caps the batch; the server clamps it to 1000. */
 export interface ProbeResultsFilter {
+  /** A check id — the server rejects anything that does not parse as one. */
   check?: string;
   agent?: string;
-  status?: DefaultStatus;
+  status?: ProbeStatus;
   region?: string;
   zone?: string;
   limit?: number;
@@ -497,6 +645,8 @@ export type Notifier = {
 export interface Undelivered {
   notifier: string;
   check_id: string;
+  /** Mutable display name, for labels — never the identity. */
+  name: string;
   /** The state that was being announced. */
   to: string;
   attempts: number;
@@ -547,16 +697,24 @@ export interface MaintenanceWindow {
   starts_at: number;
   /** Epoch millis, exclusive. */
   ends_at: number;
-  /** Empty means every check. */
+  /** Check ids it covers. Empty means every check. Ids, not names, so a
+   *  rename never silently drops a check out of a scheduled window. */
   checks: string[];
   /** Show it on the public status page while it runs. */
   announce: boolean;
 }
 
+/** A check the maintenance picker can offer: the id it sends, and the name it
+ *  shows. */
+export interface MaintenanceCheckOption {
+  id: string;
+  name: string;
+}
+
 export interface MaintenanceResponse {
   windows: MaintenanceWindow[];
   /** Every configured check, so the picker needs no second request. */
-  checks: string[];
+  checks: MaintenanceCheckOption[];
 }
 
 export function fetchMaintenance(): Promise<MaintenanceResponse> {
@@ -577,6 +735,21 @@ export function saveMaintenance(
  *  believes it — the same shape for `self` and for every peer, so the panel
  *  needs no special case to show where it is standing. */
 export type ClusterState = "alive" | "suspect" | "dead";
+export type ClusterMode = "coordinator" | "global";
+export type ClusterLinkOutcome = "connected" | "failed";
+
+export interface ClusterLink {
+  source: string;
+  target: string;
+  source_generation: number;
+  observed_at: number;
+  outcome: ClusterLinkOutcome;
+}
+
+export function buildIdentity(build: string): string {
+  const match = /^(.*) \((.*), built .*\)$/.exec(build);
+  return match ? `${match[1]} (${match[2]})` : build;
+}
 
 export interface ClusterMember {
   node_id: string;
@@ -606,6 +779,9 @@ export interface ClusterResponse {
   members: ClusterMember[];
   /** Epoch millis on the responding node. */
   now: number;
+  mode?: ClusterMode;
+  links?: ClusterLink[];
+  link_stale_after_ms?: number;
 }
 
 /** Lives outside `/admin/*`: cluster membership is coordinator state, not

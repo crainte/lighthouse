@@ -26,7 +26,7 @@ use super::super::{
     alert, error_response, fleet_members, internal_error, Coordinator, FleetMemberDto,
 };
 use super::session::require_admin;
-use crate::models::Status;
+use crate::models::NodeState;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -110,7 +110,8 @@ struct NotifiersResponse {
 #[derive(Serialize)]
 struct UndeliveredDto {
     notifier: String,
-    check_id: String,
+    check_id: crate::models::CheckId,
+    name: String,
     to: &'static str,
     /// Failed attempts so far.
     attempts: i32,
@@ -134,10 +135,8 @@ fn notifiers_response(coord: &Coordinator) -> Response {
     let notifiers = coord.inner.notifiers.read().clone();
     let known: std::collections::HashSet<&str> =
         notifiers.iter().map(|n| n.name.as_str()).collect();
-    let mut unrouted: Vec<String> = coord
-        .inner
-        .checks
-        .read()
+    let checks = coord.inner.checks.read();
+    let mut unrouted: Vec<String> = checks
         .iter()
         .filter(|(_, m)| {
             m.enabled
@@ -145,7 +144,7 @@ fn notifiers_response(coord: &Coordinator) -> Response {
                 && !m.notifiers.is_empty()
                 && !m.notifiers.iter().any(|n| known.contains(n.as_str()))
         })
-        .map(|(name, _)| name.clone())
+        .map(|(_, m)| m.name.clone())
         .collect();
     unrouted.sort();
     let undelivered = coord
@@ -157,6 +156,9 @@ fn notifiers_response(coord: &Coordinator) -> Response {
         .into_iter()
         .map(|q| UndeliveredDto {
             notifier: q.notifier,
+            name: checks
+                .get(&q.check_id)
+                .map_or_else(|| q.check_id.to_string(), |m| m.name.clone()),
             check_id: q.check_id,
             to: q.current_state.as_str(),
             attempts: q.attempts,
@@ -240,8 +242,15 @@ pub(in crate::coordinator) struct MaintenanceRequest {
 struct MaintenanceResponse {
     windows: Vec<crate::maintenance::MaintenanceWindow>,
     /// Every configured check, so the window editor's picker is one request —
-    /// same reason the agent-display settings carry the fleet.
-    checks: Vec<String>,
+    /// same reason the agent-display settings carry the fleet. Windows store
+    /// checks by id; this is what lets the picker show a name for each.
+    checks: Vec<CheckOptionDto>,
+}
+
+#[derive(Serialize)]
+struct CheckOptionDto {
+    id: crate::models::CheckId,
+    name: String,
 }
 
 /// What an anonymous visitor is told about a window: the operator's title and
@@ -278,8 +287,17 @@ pub(in crate::coordinator) fn announced_maintenance(
 }
 
 fn maintenance_response(coord: &Coordinator) -> Response {
-    let mut checks: Vec<String> = coord.inner.checks.read().keys().cloned().collect();
-    checks.sort();
+    let mut checks: Vec<CheckOptionDto> = coord
+        .inner
+        .checks
+        .read()
+        .iter()
+        .map(|(id, m)| CheckOptionDto {
+            id: *id,
+            name: m.name.clone(),
+        })
+        .collect();
+    checks.sort_by(|a, b| a.name.cmp(&b.name));
     Json(MaintenanceResponse {
         windows: coord.inner.maintenance.read().clone(),
         checks,
@@ -355,11 +373,12 @@ pub(in crate::coordinator) async fn test_notifier_handler(
     // A recovery rather than an outage: a test that pages people with a fake
     // DOWN is a test nobody runs twice.
     let sample = alert::Transition {
-        check_id: "warden-test".into(),
-        from: Status::Unknown,
-        to: Status::Up,
+        check_id: crate::models::new_check_id(),
+        from: NodeState::Unknown,
+        to: NodeState::Up,
     };
-    let result = crate::notify::send(&reqwest::Client::new(), &notifier, &sample).await;
+    let result =
+        crate::notify::send(&reqwest::Client::new(), &notifier, &sample, "Warden test").await;
     Json(NotifierTestResponse {
         delivered: result.is_ok(),
         error: result.err(),

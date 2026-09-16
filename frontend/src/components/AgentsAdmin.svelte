@@ -2,11 +2,11 @@
   import type { Agent } from '../lib/api';
   import { UNKNOWN_LOCATION, fetchAgents } from '../lib/api';
   import { formatRelativeTime } from '../lib/format';
-  import { AdminError, purgeAgent } from '../lib/admin';
+  import { AdminError, fetchAdminChecks, purgeAgent } from '../lib/admin';
 
-  // `onopen` is the check editor: the orphan warning is only actionable if the
-  // named check is one click away.
-  let { onopen, onexpired }: { onopen: (name: string) => void; onexpired?: () => void } = $props();
+  // `onopen` is the check editor, keyed on the check's immutable id: the orphan
+  // warning is only actionable if the named check is one click away.
+  let { onopen, onexpired }: { onopen: (id: string) => void; onexpired?: () => void } = $props();
 
   /** Agent rows mounted before "show more". A fleet is hundreds of agents, not
    *  millions, so a cap holds where virtualisation would only add measured row
@@ -22,6 +22,9 @@
   // Separate from `orphaned` because the remedy is different: those agents are
   // not missing, they are too old to run the kind they were given.
   let unrunnable = $state<string[]>([]);
+  // `orphaned`/`unrunnable` are check names, not ids — the editor route needs
+  // the id, so this resolves one from the other for the orphan links below.
+  let idByName = $state<Map<string, string>>(new Map());
   let loading = $state(true);
   let loadError = $state<string | null>(null);
   let expired = $state(false);
@@ -326,10 +329,11 @@
     loading = true;
     loadError = null;
     try {
-      const r = await fetchAgents();
+      const [r, checks] = await Promise.all([fetchAgents(), fetchAdminChecks()]);
       agents = r.agents;
       orphaned = r.checks_with_no_live_agent;
       unrunnable = r.checks_no_agent_can_run;
+      idByName = new Map(checks.map((c) => [c.name, c.id]));
     } catch (e) {
       loadError = fail(e);
     } finally {
@@ -405,7 +409,7 @@
       <div class="orphan-list">
         <!-- Check names are map keys server-side, so they cannot repeat. -->
         {#each orphaned as n (n)}
-          <button class="orphan-link" onclick={() => onopen(n)}>{n}</button>
+          <button class="orphan-link" onclick={() => onopen(idByName.get(n) ?? n)}>{n}</button>
         {/each}
       </div>
     </div>
@@ -425,7 +429,7 @@
       </p>
       <div class="orphan-list">
         {#each unrunnable as n (n)}
-          <button class="orphan-link" onclick={() => onopen(n)}>{n}</button>
+          <button class="orphan-link" onclick={() => onopen(idByName.get(n) ?? n)}>{n}</button>
         {/each}
       </div>
     </div>

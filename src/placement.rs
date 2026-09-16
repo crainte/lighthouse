@@ -46,10 +46,25 @@ pub struct Placement {
     pub zones: Vec<String>,
     /// Regions allowed to run this. Empty means every region.
     pub regions: Vec<String>,
-    /// How many agents within each matched zone probe it. More than one buys
-    /// corroboration — a second opinion before calling a service down — at the
-    /// cost of a duplicate probe, so it is opt-in per check.
+    /// The failure-domain at which `count` is applied. Older documents omit
+    /// this and retain their per-zone behaviour.
+    pub mode: PlacementMode,
+    /// How many agents in each matched `mode` domain probe this check.
+    /// `None` keeps the legacy `per_zone` value, so stored check documents
+    /// written before mode/count existed keep exactly their fan-out.
+    pub count: Option<u32>,
+    /// Legacy spelling for the per-zone count. Kept on the wire so an older
+    /// admin client can round-trip a check; new clients send `mode`/`count`.
     pub per_zone: u32,
+}
+
+/// The domain in which placement chooses independent observers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PlacementMode {
+    #[default]
+    Zone,
+    Region,
 }
 
 impl Default for Placement {
@@ -57,12 +72,19 @@ impl Default for Placement {
         Self {
             zones: Vec::new(),
             regions: Vec::new(),
+            mode: PlacementMode::Zone,
+            count: None,
             per_zone: 1,
         }
     }
 }
 
 impl Placement {
+    /// The requested fan-out, retaining documents written with `per_zone`.
+    fn count(&self) -> u32 {
+        self.count.unwrap_or(self.per_zone).max(1)
+    }
+
     /// Whether an agent's location is eligible at all, before fan-out.
     fn admits(&self, agent: &Agent) -> bool {
         let zone_ok = self.zones.is_empty() || self.zones.contains(&agent.zone);
@@ -78,7 +100,7 @@ impl Placement {
 /// only reassigns the checks *it* held — every other pairing keeps its score
 /// and its winner — so one agent dying does not reshuffle the fleet and set off
 /// a stampede of restarts across every probe loop.
-fn score(check: &str, agent_id: &str) -> u64 {
+fn score(check: crate::models::CheckId, agent_id: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     check.hash(&mut h);
@@ -97,8 +119,12 @@ fn score(check: &str, agent_id: &str) -> u64 {
 ///
 /// Returns agent ids, sorted, so callers can compare results without caring
 /// about iteration order.
+///
+/// `check` is the check's immutable id, never its name: hashing on the name
+/// would reshuffle every assignment the moment an operator renamed a check,
+/// restarting probe loops fleet-wide for a purely cosmetic edit.
 pub fn assign(
-    check: &str,
+    check: crate::models::CheckId,
     placement: &Placement,
     pinned: &[String],
     live: &[Agent],
@@ -114,16 +140,20 @@ pub fn assign(
         return out;
     }
 
-    // Group eligible agents by zone: fan-out is per zone, so that a region with
-    // eight agents does not get eight times the coverage of one with a single
-    // agent.
-    let mut by_zone: BTreeMap<&str, Vec<&Agent>> = BTreeMap::new();
+    // Group by the selected failure domain. Per-zone is the historic default;
+    // per-region deliberately lets a region choose a small representative set
+    // across all of its zones.
+    let mut by_domain: BTreeMap<&str, Vec<&Agent>> = BTreeMap::new();
     for a in live.iter().filter(|a| placement.admits(a)) {
-        by_zone.entry(a.zone.as_str()).or_default().push(a);
+        let domain = match placement.mode {
+            PlacementMode::Zone => a.zone.as_str(),
+            PlacementMode::Region => a.region.as_str(),
+        };
+        by_domain.entry(domain).or_default().push(a);
     }
 
     let mut chosen: Vec<String> = Vec::new();
-    for (_, mut agents) in by_zone {
+    for (_, mut agents) in by_domain {
         // Highest score first; agent_id breaks ties so the result is total and
         // reproducible across coordinator replicas.
         agents.sort_by(|x, y| {
@@ -134,7 +164,7 @@ pub fn assign(
         chosen.extend(
             agents
                 .into_iter()
-                .take(placement.per_zone.max(1) as usize)
+                .take(placement.count() as usize)
                 .map(|a| a.agent_id.clone()),
         );
     }
@@ -145,6 +175,12 @@ pub fn assign(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deterministic check id for a human-readable test name, so test bodies
+    /// stay readable while placement itself only ever sees ids.
+    fn cid(name: &str) -> crate::models::CheckId {
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, name.as_bytes())
+    }
 
     fn fleet(spec: &[(&str, &str, &str)]) -> Vec<Agent> {
         spec.iter()
@@ -184,7 +220,7 @@ mod tests {
         // probes, not eighteen: that ratio is the difference between 5.8M and
         // 0.9M rows a day.
         let live = big_fleet();
-        let got = assign("api", &Placement::default(), &[], &live);
+        let got = assign(cid("api"), &Placement::default(), &[], &live);
         assert_eq!(got.len(), 6, "one per zone, got {got:?}");
 
         let zones: std::collections::BTreeSet<&str> = got
@@ -207,11 +243,12 @@ mod tests {
         // restarts a probe loop, so a reshuffle during an incident — exactly
         // when agents go quiet — would be a self-inflicted second outage.
         let live = big_fleet();
-        let checks: Vec<String> = (0..200).map(|i| format!("check-{i}")).collect();
+        let checks: Vec<crate::models::CheckId> =
+            (0..200).map(|i| cid(&format!("check-{i}"))).collect();
 
         let before: Vec<Vec<String>> = checks
             .iter()
-            .map(|c| assign(c, &Placement::default(), &[], &live))
+            .map(|c| assign(*c, &Placement::default(), &[], &live))
             .collect();
 
         let casualty = &live[0].agent_id.clone();
@@ -222,7 +259,7 @@ mod tests {
             .collect();
         let after: Vec<Vec<String>> = checks
             .iter()
-            .map(|c| assign(c, &Placement::default(), &[], &smaller))
+            .map(|c| assign(*c, &Placement::default(), &[], &smaller))
             .collect();
 
         let mut moved = 0;
@@ -243,7 +280,7 @@ mod tests {
         // Failover with no registry: the caller passes only live agents, so a
         // departed one simply is not in the input and its work is re-derived.
         let live = fleet(&[("a1", "z1", "r1"), ("a2", "z1", "r1")]);
-        let held = assign("api", &Placement::default(), &[], &live);
+        let held = assign(cid("api"), &Placement::default(), &[], &live);
         assert_eq!(held.len(), 1);
 
         let survivor: Vec<Agent> = live
@@ -251,7 +288,7 @@ mod tests {
             .filter(|a| a.agent_id != held[0])
             .cloned()
             .collect();
-        let after = assign("api", &Placement::default(), &[], &survivor);
+        let after = assign(cid("api"), &Placement::default(), &[], &survivor);
         assert_eq!(after.len(), 1, "the zone is still covered");
         assert_ne!(after, held, "by the other agent");
     }
@@ -264,7 +301,7 @@ mod tests {
             regions: vec!["eu-west".into()],
             ..Default::default()
         };
-        let got = assign("api", &eu, &[], &live);
+        let got = assign(cid("api"), &eu, &[], &live);
         assert_eq!(got.len(), 2, "eu-west has two zones: {got:?}");
         assert!(got.iter().all(|id| id.starts_with("eu-west")));
 
@@ -272,9 +309,32 @@ mod tests {
             zones: vec!["ap-south-a".into()],
             ..Default::default()
         };
-        let got = assign("api", &one_zone, &[], &live);
+        let got = assign(cid("api"), &one_zone, &[], &live);
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(got[0].starts_with("ap-south-a"));
+    }
+
+    #[test]
+    fn legacy_per_zone_documents_keep_their_fanout() {
+        let live = big_fleet();
+        let legacy: Placement =
+            serde_json::from_str(r#"{"regions":["eu-west"],"zones":[],"per_zone":2}"#).unwrap();
+        assert_eq!(legacy.mode, PlacementMode::Zone);
+        assert_eq!(assign(cid("api"), &legacy, &[], &live).len(), 4);
+    }
+
+    #[test]
+    fn per_region_count_chooses_across_the_whole_region() {
+        let live = big_fleet();
+        let placement = Placement {
+            regions: vec!["eu-west".into()],
+            mode: PlacementMode::Region,
+            count: Some(2),
+            ..Default::default()
+        };
+        let got = assign(cid("api"), &placement, &[], &live);
+        assert_eq!(got.len(), 2, "two observers total in eu-west: {got:?}");
+        assert!(got.iter().all(|id| id.starts_with("eu-west")));
     }
 
     #[test]
@@ -285,7 +345,7 @@ mod tests {
             per_zone: 2,
             ..Default::default()
         };
-        let got = assign("api", &two, &[], &live);
+        let got = assign(cid("api"), &two, &[], &live);
         assert_eq!(got.len(), 2, "two independent observers in one zone");
 
         // Asking for more agents than a zone holds gets the whole zone, not an
@@ -295,7 +355,7 @@ mod tests {
             per_zone: 99,
             ..Default::default()
         };
-        assert_eq!(assign("api", &greedy, &[], &live).len(), 3);
+        assert_eq!(assign(cid("api"), &greedy, &[], &live).len(), 3);
     }
 
     #[test]
@@ -304,7 +364,7 @@ mod tests {
         // explicit list must not be second-guessed by zone matching.
         let live = big_fleet();
         let got = assign(
-            "loopback",
+            cid("loopback"),
             &Placement {
                 regions: vec!["eu-west".into()],
                 ..Default::default()
@@ -325,7 +385,7 @@ mod tests {
             regions: vec!["sa-east".into()],
             ..Default::default()
         };
-        assert!(assign("api", &nowhere, &[], &live).is_empty());
+        assert!(assign(cid("api"), &nowhere, &[], &live).is_empty());
     }
 
     #[test]
@@ -335,10 +395,11 @@ mod tests {
         // loops forever.
         let live = big_fleet();
         let shuffled: Vec<Agent> = live.iter().rev().cloned().collect();
-        for c in ["api", "db", "cdn"] {
+        for name in ["api", "db", "cdn"] {
+            let c = cid(name);
             let a = assign(c, &Placement::default(), &[], &live);
             let b = assign(c, &Placement::default(), &[], &shuffled);
-            assert_eq!(a, b, "input order must not change the outcome for {c}");
+            assert_eq!(a, b, "input order must not change the outcome for {name}");
         }
     }
 
@@ -350,7 +411,12 @@ mod tests {
         let live = big_fleet();
         let mut load: BTreeMap<String, usize> = BTreeMap::new();
         for i in 0..600 {
-            for id in assign(&format!("check-{i}"), &Placement::default(), &[], &live) {
+            for id in assign(
+                cid(&format!("check-{i}")),
+                &Placement::default(),
+                &[],
+                &live,
+            ) {
                 *load.entry(id).or_default() += 1;
             }
         }

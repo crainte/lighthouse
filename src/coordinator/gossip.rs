@@ -16,7 +16,7 @@
 //! divergence ever matters more than the code it costs.
 
 use crate::coordinator::state::Transition;
-use crate::models::Status;
+use crate::models::NodeState;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::warn;
@@ -27,13 +27,20 @@ const GOSSIP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A transition on the wire.
 ///
-/// `Status` already serialises lowercase, so this needs no separate encoding —
-/// the JSON is `{"check_id":…,"from":"up","to":"down","timestamp":…}`.
+/// `NodeState` already serialises lowercase, so this needs no separate encoding
+/// — the JSON is `{"check_id":…,"from":"up","to":"down","timestamp":…}`.
+///
+/// **Widening `Status` to `NodeState` here is additive, not breaking.** A peer
+/// on an older binary that receives `"degraded"` parses it through a fallback
+/// that yields Unknown rather than failing, and Unknown drops out of every
+/// rollup denominator. So a mixed-version cluster is briefly less informed
+/// about partial outages and never wrong about total ones. Full-outage
+/// transitions are unaffected in either direction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
-    pub check_id: String,
-    pub from: Status,
-    pub to: Status,
+    pub check_id: crate::models::CheckId,
+    pub from: NodeState,
+    pub to: NodeState,
     /// Milliseconds since epoch, taken from the observing coordinator's result
     /// rather than the receiver's clock, so replicated history lines up.
     pub timestamp: i64,
@@ -49,7 +56,7 @@ pub struct Message {
 impl Message {
     pub fn new(t: &Transition, timestamp: i64, incident_id: Option<String>) -> Self {
         Self {
-            check_id: t.check_id.clone(),
+            check_id: t.check_id,
             from: t.from,
             to: t.to,
             timestamp,
@@ -59,7 +66,7 @@ impl Message {
 
     pub fn transition(&self) -> Transition {
         Transition {
-            check_id: self.check_id.clone(),
+            check_id: self.check_id,
             from: self.from,
             to: self.to,
         }
@@ -142,9 +149,9 @@ mod tests {
     #[test]
     fn transition_survives_the_wire_unchanged() {
         let t = Transition {
-            check_id: "api".into(),
-            from: Status::Up,
-            to: Status::Down,
+            check_id: crate::models::CheckId::from_u128(1),
+            from: NodeState::Up,
+            to: NodeState::Down,
         };
         let msg = Message::new(&t, 1_700_000_000_000, None);
 
@@ -155,5 +162,21 @@ mod tests {
         let back: Message = serde_json::from_str(&json).unwrap();
         assert_eq!(back, msg);
         assert_eq!(back.transition(), t);
+    }
+
+    /// Degraded is new vocabulary. Pin its encoding too, because this is the
+    /// word an older peer will not recognise and the whole compatibility
+    /// argument rests on how it is spelled.
+    #[test]
+    fn degraded_goes_on_the_wire_as_a_plain_lowercase_word() {
+        let t = Transition {
+            check_id: crate::models::CheckId::from_u128(1),
+            from: NodeState::Up,
+            to: NodeState::Degraded,
+        };
+        let json = serde_json::to_string(&Message::new(&t, 1, None)).unwrap();
+        assert!(json.contains(r#""to":"degraded""#), "{json}");
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.to, NodeState::Degraded);
     }
 }

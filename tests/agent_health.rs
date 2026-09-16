@@ -14,9 +14,10 @@ use std::net::SocketAddr;
 
 use serde_json::{json, Value};
 
+use uuid::Uuid;
 use warden::config::{AgentsDisplay, AgentsMode, CheckConfig, CoordinatorConfig, StatusPageConfig};
 use warden::coordinator::Coordinator;
-use warden::models::CheckKind;
+use warden::models::{CheckId, CheckKind};
 
 const PASSWORD: &str = "correct horse battery staple";
 
@@ -31,28 +32,29 @@ fn coordinator(agents: AgentsDisplay) -> Coordinator {
     coord
 }
 
+fn cid(name: &str) -> CheckId {
+    Uuid::new_v5(&Uuid::NAMESPACE_DNS, name.as_bytes())
+}
+
 fn coordinator_at(db_path: &str, agents: AgentsDisplay) -> Coordinator {
-    Coordinator::new(
-        &CoordinatorConfig {
-            listen: "127.0.0.1:0".into(),
-            db_path: db_path.into(),
-            admin_password: Some(PASSWORD.into()),
-            status_page: StatusPageConfig { agents },
-            ..Default::default()
-        },
-        // A configured check keeps the demo seed from running: its synthetic
-        // "seed" agent would otherwise appear in the fleet as a region of its
-        // own, which is a fixture artifact rather than the thing under test.
-        &[CheckConfig {
-            name: "payments-api".into(),
-            kind: CheckKind::Http,
-            target: "https://example.invalid".into(),
-            cron: "0 * * * * *".into(),
-            timeout_secs: 5,
-            ..Default::default()
-        }],
-    )
-    .unwrap()
+    let coord = Coordinator::new(&CoordinatorConfig {
+        listen: "127.0.0.1:0".into(),
+        db_path: db_path.into(),
+        admin_password: Some(PASSWORD.into()),
+        status_page: StatusPageConfig { agents },
+        ..Default::default()
+    })
+    .unwrap();
+    coord.create_check_for_test(CheckConfig {
+        id: cid("payments-api"),
+        name: "payments-api".into(),
+        kind: CheckKind::Http,
+        target: "https://example.invalid".into(),
+        cron: "0 * * * * *".into(),
+        timeout_secs: 5,
+        ..Default::default()
+    });
+    coord
 }
 
 /// Open the same database file again after the previous coordinator was shut
@@ -530,7 +532,7 @@ async fn poll_rtt_surfaces_on_the_admin_agent_list() {
         .post(format!("{base}/api/v1/results"))
         .bearer_auth("wac_eu.secret")
         .json(&serde_json::json!({"results": [{
-            "check_id": "payments-api",
+            "check_id": cid("payments-api"),
             "agent_id": "rtt-agent",
             "timestamp": "2026-01-01T00:00:00Z",
             "latency_ms": 12,

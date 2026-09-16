@@ -1,20 +1,46 @@
-# Warden standalone config example.
-# Run: warden standalone --config warden.example.toml
+# Warden bare-metal standalone config example.
+# Run directly on the host: warden standalone --config warden.example.toml
+# The coordinator listens on the host address below; arrange any firewall, TLS
+# termination, and public port mapping outside Warden.
 #
-# The [[checks]] below seed the store on first boot. After that the store is
-# authoritative: checks are created and edited in the admin UI, and editing this
-# file will not change a check that already exists. With no checks anywhere the
-# coordinator seeds demo data so the dashboard has something to show.
+# This is the only standalone TOML example. The only two Compose examples
+# (`docker-compose.yaml` and `docker-compose.cluster.yaml`) inline their own
+# per-service configuration and do not consume this file.
+#
+# Checks are created through the Admin UI or API and persisted in the
+# database; this file does not seed them. A new database starts with no checks.
 
 [agent]
 agent_id = "local-01"
 flush_secs = 5
+# Ignored in standalone. In agent mode this is where results are posted and
+# work is polled for. One URL, or a list for failover across the coordinators
+# of a region — they are interchangeable for an agent, since config and
+# per-agent beliefs both replicate between them:
+#   coordinator_url = ["http://coordinator-a:8080", "http://coordinator-b:8080"]
 
 [coordinator]
 listen = "0.0.0.0:8080"
 db_path = "warden.duckdb"
-# Notification backends. Like [[checks]], these only seed the store on first
-# boot — after that they are edited in Admin > Notifications. A check with no
+
+# Fleet-wide defaults for region-tree alert handling. A check can override any
+# of these optional fields below. `min_incident_secs` holds a non-UP rollup
+# before opening an incident; `min_recovery_secs` holds an UP rollup before
+# resolving it. Zero (the built-in default) means no hold-down.
+#
+# Degraded notification and downtime are separate: `notify_degraded = true`
+# (the default) sends a Degraded transition to the check's notifiers, while
+# `degraded_is_downtime = false` (the default) keeps Degraded out of incident
+# downtime accounting. Set the latter only when partial outages are downtime
+# for this check.
+[coordinator.rollup_defaults]
+min_incident_secs = 60
+min_recovery_secs = 30
+notify_degraded = true
+degraded_is_downtime = false
+
+# Notification backends. These only seed the store on first boot — after
+# that they are edited in Admin > Notifications. A check with no
 # `notifiers` of its own goes to every one marked `default = true`.
 #
 # [[coordinator.notifiers]]
@@ -90,14 +116,68 @@ db_path = "warden.duckdb"
 # divergence from a dropped replication push can last; it is a correctness
 # backstop, not the main replication path.
 # anti_entropy_secs = 60
+#
+# Which region this coordinator belongs to. Only used to label the state
+# summaries it pushes to a global coordinator (Stage B / Phase 6). A
+# single-region deployment can leave it at "default".
+# region = "us-east"
+
+# Push this coordinator's state summary up to a global coordinator (Phase 6).
+# Presence of this block is what turns the push loop on; without it the node
+# behaves exactly as a Stage A regional coordinator. Every coordinator in a
+# region cluster may push — the global node keeps last-writer-wins, so three
+# identical pushes collapse to one cached entry.
+#
+# [coordinator.global]
+# url = "http://global:8080"           # base URL of the global coordinator
+# token_env = "WARDEN_GLOBAL_TOKEN"    # or: token = "..."; the global node's secret
+# push_secs = 5                        # 5-10s; default 5
+
+# Placement chooses probes by failure domain with rendezvous hashing: if a
+# selected agent disappears, the next-ranked live agent in that domain takes
+# over without reshuffling unrelated checks. The default is one probe per zone
+# (`mode = "zone"`, `count = 1`); the historical `per_zone = 1` remains
+# accepted with that meaning. Explicit `mode = "region"`, `count = 1` chooses
+# one probe per region across its zones. `count` is per selected domain, never
+# fleet-wide. Both `regions` and `zones` are optional allow-lists, set when
+# creating or editing a check through the Admin UI or API.
+
+# --- Global coordinator (`warden global`) -----------------------------------
+# Only read in `global` mode. The global node caches the state summaries the
+# regions push, serves an aggregated dashboard, and proxies drill-down reads
+# back to the owning region. It holds no raw data and probes nothing.
+#
+# [global]
+# listen = "0.0.0.0:8080"
+# token_env = "WARDEN_GLOBAL_TOKEN"    # required: the shared push secret
+# region_staleness_secs = 20           # a region silent this long reads as dark
+#
+# Cross-region alerting. Empty (the default) means the global node never pages:
+# the regions already alert, and double-paging is the failure mode to avoid.
+# Configured, it fires only on what a single region cannot see — a check down in
+# every reporting region, or a region going dark. Same notifier shapes as
+# [[coordinator.notifiers]].
+# [[global.notifiers]]
+# name = "global-webhook"
+# type = "webhook"
+# url = "https://example.com/hook"
+#
+# Seed the query-routing table so drill-downs work before the first push and
+# after a restart. Endpoints are also learned from each push's advertise_url.
+# [[global.region]]
+# name = "us"
+# endpoints = ["http://coordinator-us-a:8080", "http://coordinator-us-b:8080"]
+# [[global.region]]
+# name = "tw"
+# endpoints = ["http://coordinator-tw:8080"]
 
 # Agent credentials whose token is chosen in advance instead of minted in the
-# UI. For a fleet that has to be configured before this coordinator has ever
-# run — a compose stack, a Kubernetes manifest, a test fixture — where there is
-# no browser to mint in and nowhere to paste the result. Everything else about
-# them is identical to a minted credential, zone and region included: the
-# coordinator takes an agent's location from here, never from what the agent
-# claims.
+# UI. Use this when bare-metal agents must be configured before this coordinator
+# has ever run and no browser is available to mint credentials. The two Compose
+# files instead inline their own provisioned credentials and agent configs.
+# Everything else about them is identical to a minted credential, zone and
+# region included: the coordinator takes an agent's location from here, never
+# from what the agent claims.
 #
 # Use `token_env` outside a fixture and keep the secret out of this file. An
 # unresolvable or malformed token stops startup rather than being skipped: the
@@ -118,80 +198,7 @@ db_path = "warden.duckdb"
 # region = "us-east"
 # token_env = "WARDEN_AGENT_TOKEN_A"    # or: token = "wac_....." (fixtures)
 
-# --- HTTP -------------------------------------------------------------------
-# Default eval: any 2xx-3xx is UP.
-[[checks]]
-name = "example-http"
-type = "http"
-target = "https://example.com"
-interval_secs = 30
-timeout_secs = 10
-
-# Assert an exact status code and a body substring. Useful when "200 OK" isn't
-# enough — a page that returns 200 while printing "database error" is DOWN.
-[[checks]]
-name = "api-health"
-type = "http"
-target = "https://api.example.com/health"
-interval_secs = 30
-timeout_secs = 10
-[checks.expect]
-status = 200
-body_contains = "ok"
-
-# An endpoint that is *supposed* to reject you: expect 401, so a 200 is DOWN.
-[[checks]]
-name = "api-auth-required"
-type = "http"
-target = "https://api.example.com/private"
-interval_secs = 60
-timeout_secs = 10
-[checks.expect]
-status = 401
-
-# --- TCP --------------------------------------------------------------------
-# Connection success + latency. Target is "host:port".
-[[checks]]
-name = "database"
-type = "tcp"
-target = "db.internal:5432"
-interval_secs = 60
-timeout_secs = 5
-
-# --- DNS --------------------------------------------------------------------
-# Resolution success. The name is queried as a FQDN, so a resolver `search`
-# domain can never silently answer for a different name.
-#
-# Robustness: caching is disabled (a probe must never report a stale success),
-# a dropped UDP packet is retried (2 retries, 3 sends total) instead of counting
-# as an outage, and UDP falls back to TCP on error. NXDOMAIN is a real answer and
-# is deliberately not retried — it reports DOWN.
-[[checks]]
-name = "dns-example"
-type = "dns"
-target = "example.com"
-interval_secs = 60
-timeout_secs = 10
-
-# Assert the record still points where you expect.
-[[checks]]
-name = "dns-record-pinned"
-type = "dns"
-target = "one.one.one.one"
-interval_secs = 60
-timeout_secs = 10
-[checks.expect]
-body_contains = "1.1.1.1"
-
-# --- ICMP -------------------------------------------------------------------
-# Ping success + RTT. Requires CAP_NET_RAW, or a permissive
-# net.ipv4.ping_group_range sysctl. Without it the check reports a permission
-# error rather than silently passing.
-#
-# Docker: docker run --cap-add=NET_RAW ...
-[[checks]]
-name = "gateway"
-type = "icmp"
-target = "1.1.1.1"
-interval_secs = 60
-timeout_secs = 5
+# --- Checks -------------------------------------------------------------
+# Checks (HTTP, TCP, DNS, ICMP, ...) are created through the Admin UI or the
+# API, not this file. Once created they are persisted in the database and
+# survive restarts; this file has no equivalent [[checks]] section.

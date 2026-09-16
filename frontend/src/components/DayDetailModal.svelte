@@ -12,11 +12,15 @@
 
   let {
     checkId,
+    name,
     kind,
     bucket,
     onclose,
   }: {
     checkId: string;
+    /** Mutable display name, for the heading. Falls back to the id when the
+     *  caller has none handy (e.g. a check deleted since this bucket loaded). */
+    name?: string;
     /** Probe type, so the panel says what it measured. Absent for checks no
      *  longer in the config. */
     kind?: CheckKind;
@@ -174,7 +178,7 @@
     <div class="modal-header">
       <div>
         <div class="title-line">
-          <h2>{checkId}</h2>
+          <h2>{name ?? checkId}</h2>
           {#if kind}<span class="kind-pill">{kind}</span>{/if}
         </div>
         <p class="modal-span">{spanLabel}</p>

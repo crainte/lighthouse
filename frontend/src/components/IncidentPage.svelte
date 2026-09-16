@@ -2,9 +2,27 @@
   import { fetchIncident } from '../lib/api';
   import type { Incident } from '../lib/api';
   import { formatDuration } from '../lib/format';
-  import { affectSourceNote, formatAbsolute, incidentStateColor } from '../lib/incident';
+  import {
+    affectSourceNote,
+    checkLabel,
+    checkNameMap,
+    formatAbsolute,
+    incidentStateColor,
+  } from '../lib/incident';
 
-  let { incidentId, onBack }: { incidentId: string; onBack: () => void } = $props();
+  let {
+    incidentId,
+    checks,
+    onBack,
+  }: {
+    incidentId: string;
+    /** For resolving a check's mutable name from the id each `IncidentCheck`
+     *  and `origin_check` carries. */
+    checks: { check_id: string; name: string }[];
+    onBack: () => void;
+  } = $props();
+
+  const names = $derived(checkNameMap(checks));
 
   let incident = $state<Incident | null>(null);
   let loading = $state(true);
@@ -108,7 +126,7 @@
         <ul class="mons">
           {#each incident.checks as c (c.check_id)}
             <li>
-              <span class="mono">{c.check_id}</span>
+              <span class="mono">{checkLabel(names, c.check_id)}</span>
               {#if c.source === 'dependency'}
                 <span class="via" title={affectSourceNote(c.source)}>via dependency</span>
               {/if}

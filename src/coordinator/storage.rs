@@ -1,10 +1,11 @@
 use crate::config::{CheckConfig, Expect};
 use crate::coordinator::hlc::Hlc;
 use crate::credential::AgentCredential;
-use crate::models::{CheckKind, CheckResult, Status};
-use anyhow::Result;
+use crate::models::{CheckId, CheckKind, CheckResult, NodeState, Status};
+use anyhow::{bail, Result};
 use duckdb::Connection;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as ShaDigest, Sha256};
 use std::collections::BTreeMap;
 
 /// DuckDB-backed store for check results and materialized current state.
@@ -37,7 +38,7 @@ pub struct HistoryRow {
 /// *where* without having already narrowed to one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResultRow {
-    pub check_id: String,
+    pub check_id: CheckId,
     pub agent_id: String,
     pub timestamp: i64, // unix millis
     /// Where the probe ran. `None` for results recorded before agents declared
@@ -59,7 +60,7 @@ pub struct ResultRow {
 /// deliberately absent — it runs client-side on the returned batch.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ResultsFilter {
-    pub check_id: Option<String>,
+    pub check_id: Option<CheckId>,
     pub agent_id: Option<String>,
     pub status: Option<Status>,
     pub region: Option<String>,
@@ -69,11 +70,14 @@ pub struct ResultsFilter {
 /// Current status of a check plus recent uptime, for the status grid.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatusRow {
-    pub check_id: String,
-    pub status: Status,
+    pub check_id: CheckId,
+    /// The coordinator's published conclusion, which may be Degraded.
+    pub state: NodeState,
     pub latency_ms: u64,
     pub last_check: i64, // unix millis of latest result
-    pub uptime_24h: f64, // fraction 0.0..=1.0 of UP results in the 24h before now
+    /// Time-weighted fraction 0.0..=1.0 of the 24h before now spent Up,
+    /// computed from `state_history` spans rather than from raw result rows.
+    pub uptime_24h: f64,
     /// Status code from the most recent result.
     pub status_code: Option<u16>,
     /// Failure reason from the most recent result, so the dashboard can say why
@@ -83,14 +87,82 @@ pub struct StatusRow {
     pub failure: Option<crate::models::FailureKind>,
 }
 
-/// The coordinator's CONFIRMED decision per check, materialized so the status
+/// The coordinator's PUBLISHED decision per check, materialized so the status
 /// page and a restarted process agree with the in-memory tracker.
+///
+/// `consecutive_failures` no longer lives here: failures are counted per agent
+/// now, in `agent_check_state`. The column survives in the table for older
+/// readers but the coordinator no longer means anything by it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CurrentStateRow {
-    pub check_id: String,
+    pub check_id: CheckId,
+    pub state: NodeState,
+    /// The state the hold-down timer is arguing for, and when it first said so.
+    /// `None` when the rollup agrees with what is published.
+    pub pending: Option<(NodeState, i64)>,
+}
+
+/// One agent's confirmed opinion of one check — a leaf of the region tree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentCheckStateRow {
+    pub check_id: CheckId,
+    pub agent_id: String,
+    /// Auth-stamped leaf topology, persisted so restart rollups use the same
+    /// zone/region membership as the observation that established the belief.
+    pub zone: String,
+    pub region: String,
     pub status: Status,
-    /// Consecutive DOWN observations toward `failures_before_down`.
     pub consecutive_failures: u32,
+    pub last_check: i64,
+}
+
+/// A stored rollup policy for one node of the tree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RollupPolicyRow {
+    /// Namespaced: `global`, `region:us-east`, `zone:us-east-1a`.
+    pub node_id: String,
+    pub node_type: NodeType,
+    pub policy: crate::rollup::RollupPolicy,
+    pub updated_at: i64,
+    pub updated_by: Option<String>,
+}
+
+/// Which level of the tree a node sits at.
+///
+/// Unrelated to `Incident.global`, which means "shown page-wide" and is about
+/// presentation. Two different words called global; do not conflate them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeType {
+    Global,
+    Region,
+    Zone,
+}
+
+impl NodeType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NodeType::Global => "global",
+            NodeType::Region => "region",
+            NodeType::Zone => "zone",
+        }
+    }
+
+    pub fn from_db(s: &str) -> NodeType {
+        match s {
+            "region" => NodeType::Region,
+            "zone" => NodeType::Zone,
+            _ => NodeType::Global,
+        }
+    }
+}
+
+/// One span of published state for a check: it entered `state` at `since` and
+/// stayed there until the next row's `since` (or until now, for the last one).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StateSpan {
+    pub state: NodeState,
+    pub since: i64,
 }
 
 /// A probe agent that has reported results, derived from observed `agent_id`s.
@@ -117,14 +189,15 @@ pub struct AgentRow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AlertRow {
     pub id: String,
-    /// What kind of thing moved. Only `Check` is written today; the region
-    /// tree (Phase 5/6) is what will start writing the others.
+    /// What kind of thing moved. `Check` is what pages; `Zone` and `Region`
+    /// rows are the event log behind it, written so the fleet view can show
+    /// "us-east lost reach to X" as an event rather than as an inference.
     pub scope: AlertScope,
     /// The check, agent or zone that moved.
     pub node_id: String,
     /// `None` for a first-ever observation, which has nothing to move from.
-    pub previous_state: Option<Status>,
-    pub current_state: Status,
+    pub previous_state: Option<NodeState>,
+    pub current_state: NodeState,
     pub timestamp: i64,
     /// The incident this transition belongs to, when it belongs to one.
     pub incident_id: Option<String>,
@@ -139,9 +212,9 @@ pub struct QueuedRow {
     /// attempt. Editing a backend therefore fixes its queued notifications;
     /// deleting it drops them, because there is no longer anyone to page.
     pub notifier: String,
-    pub check_id: String,
-    pub previous_state: Option<Status>,
-    pub current_state: Status,
+    pub check_id: CheckId,
+    pub previous_state: Option<NodeState>,
+    pub current_state: NodeState,
     /// Failed attempts so far, first included.
     pub attempts: i32,
     /// When to try next. `None` means given up — attempts exhausted.
@@ -268,7 +341,7 @@ impl AffectSource {
 /// A check attached to an incident, and how it got there.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IncidentCheckRow {
-    pub check_id: String,
+    pub check_id: CheckId,
     pub source: AffectSource,
 }
 
@@ -305,7 +378,7 @@ pub struct IncidentRow {
     pub global: bool,
     /// The check whose DOWN opened it. `None` for a manually opened incident,
     /// which reconciliation therefore ignores entirely.
-    pub origin_check: Option<String>,
+    pub origin_check: Option<CheckId>,
     /// Every check this incident affects, with how each was attached.
     pub checks: Vec<IncidentCheckRow>,
 }
@@ -318,16 +391,17 @@ impl IncidentRow {
 
     /// The checks whose recovery gates auto-resolve — everything except what
     /// an operator attached by hand.
-    pub fn gating_checks(&self) -> impl Iterator<Item = &str> {
+    pub fn gating_checks(&self) -> impl Iterator<Item = CheckId> + '_ {
         self.checks
             .iter()
             .filter(|c| c.source.gates_resolution())
-            .map(|c| c.check_id.as_str())
+            .map(|c| c.check_id)
     }
 }
 
 /// One segment of the uptime strip. Not necessarily a day: the window is split
 /// into a fixed number of segments, so a 7-day view has ~2-hour segments.
+/// `up` and `total` count probe results; uptime itself remains time-weighted.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UptimeBucket {
     /// Exclusive lower bound of the segment, unix millis.
@@ -337,17 +411,25 @@ pub struct UptimeBucket {
     pub end: i64,
     /// Fraction 0.0..=1.0, or None when the segment has no data at all.
     pub uptime: Option<f64>,
-    pub up: u32,
-    pub total: u32,
+    /// Successful probe attempts in this segment.
+    pub up: u64,
+    /// All probe attempts in this segment.
+    pub total: u64,
 }
 
 /// A single latency data point for the sparkline chart.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LatencyPoint {
     pub timestamp: i64, // unix millis of the window start
-    /// Mean latency across the segment, or `None` when nothing was recorded in
-    /// it. A segment with no attempts is not a 0ms response, and collapsing the
-    /// two paints an imaginary flat line along the axis.
+    /// Every probe outcome in the segment. This is distinct from `up`: failed
+    /// attempts establish that the check was observed, but do not measure its
+    /// response latency.
+    pub attempts: u32,
+    /// Successful probe outcomes in the segment.
+    pub up: u32,
+    /// Mean latency across successful attempts, or `None` when none passed.
+    /// A segment with no successful attempts is not a 0ms response, and
+    /// collapsing the two paints an imaginary flat line along the axis.
     pub avg_latency_ms: Option<f64>,
 }
 
@@ -444,6 +526,39 @@ fn non_empty(s: &str) -> Option<&str> {
     (!s.trim().is_empty()).then_some(s)
 }
 
+/// Return known UP and total duration for the half-open interval `[from, to)`.
+/// `Unknown` is deliberately no-data, while Degraded follows the check's
+/// already-resolved SLA setting.
+fn uptime_counts(
+    spans: &[StateSpan],
+    from: i64,
+    to: i64,
+    degraded_is_downtime: bool,
+) -> Option<(u64, u64)> {
+    if spans.is_empty() || to <= from {
+        return None;
+    }
+
+    let mut up_ms = 0u64;
+    let mut known_ms = 0u64;
+    for (i, span) in spans.iter().enumerate() {
+        let span_end = spans.get(i + 1).map(|next| next.since).unwrap_or(i64::MAX);
+        let start = span.since.max(from);
+        let end = span_end.min(to);
+        if end <= start || span.state == NodeState::Unknown {
+            continue;
+        }
+        let duration = (end - start) as u64;
+        known_ms = known_ms.saturating_add(duration);
+        if span.state == NodeState::Up
+            || (span.state == NodeState::Degraded && !degraded_is_downtime)
+        {
+            up_ms = up_ms.saturating_add(duration);
+        }
+    }
+    (known_ms > 0).then_some((up_ms, known_ms))
+}
+
 /// Latency shape over a window plus exact per-agent attribution for it.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct LatencySeries {
@@ -465,8 +580,8 @@ pub struct ReplicatedIncident {
     pub started_at: i64,
     pub resolved_at: Option<i64>,
     pub global: bool,
-    pub origin_check: Option<String>,
-    pub checks: Vec<(String, AffectSource)>,
+    pub origin_check: Option<CheckId>,
+    pub checks: Vec<(CheckId, AffectSource)>,
     pub updates: Vec<IncidentUpdateRow>,
 }
 
@@ -475,7 +590,7 @@ pub struct ReplicatedIncident {
 /// rows themselves.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CheckDigest {
-    pub check_id: String,
+    pub check_id: CheckId,
     pub max_ts: i64,
     pub count: i64,
 }
@@ -489,6 +604,7 @@ pub enum ConfigKind {
     Section,
     Setting,
     Credential,
+    RollupPolicy,
 }
 
 impl ConfigKind {
@@ -496,11 +612,12 @@ impl ConfigKind {
     /// `GET /internal/config`, and config anti-entropy. Adding a variant above
     /// without adding it here would silently stop replicating that table, so
     /// the exhaustive match in `as_str` is the reminder to come back.
-    pub const ALL: [ConfigKind; 4] = [
+    pub const ALL: [ConfigKind; 5] = [
         ConfigKind::Check,
         ConfigKind::Section,
         ConfigKind::Setting,
         ConfigKind::Credential,
+        ConfigKind::RollupPolicy,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -509,6 +626,7 @@ impl ConfigKind {
             ConfigKind::Section => "section",
             ConfigKind::Setting => "setting",
             ConfigKind::Credential => "credential",
+            ConfigKind::RollupPolicy => "rollup_policy",
         }
     }
 
@@ -522,6 +640,7 @@ impl ConfigKind {
             "section" => Some(ConfigKind::Section),
             "setting" => Some(ConfigKind::Setting),
             "credential" => Some(ConfigKind::Credential),
+            "rollup_policy" => Some(ConfigKind::RollupPolicy),
             _ => None,
         }
     }
@@ -531,10 +650,11 @@ impl ConfigKind {
     /// writer of a config row agrees on it.
     fn table_and_pk(&self) -> (&'static str, &'static str) {
         match self {
-            ConfigKind::Check => ("checks", "name"),
+            ConfigKind::Check => ("checks", "id"),
             ConfigKind::Section => ("sections", "name"),
             ConfigKind::Setting => ("settings", "key"),
             ConfigKind::Credential => ("agent_credentials", "id"),
+            ConfigKind::RollupPolicy => ("rollup_policy", "node_id"),
         }
     }
 }
@@ -571,7 +691,7 @@ pub struct Digest {
 pub struct ConfigEntry {
     pub kind: ConfigKind,
     /// The row's primary key: check name, section name, setting key,
-    /// credential id.
+    /// credential id, or rollup node id.
     pub id: String,
     pub hlc: Hlc,
     /// The whole row as a JSON document. `None` iff this is a tombstone.
@@ -590,6 +710,12 @@ impl ConfigEntry {
 /// shape. It carries hashes and salts, never a plaintext secret, because
 /// there is no plaintext left after mint to leak. Pinned by a round-trip test
 /// that fails the moment the two struct shapes drift apart.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(in crate::coordinator) struct RollupPolicyDoc {
+    pub node_type: NodeType,
+    pub policy: crate::rollup::RollupPolicy,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct CredentialDoc {
     id: String,
@@ -683,6 +809,711 @@ pub struct AgentPollRow {
     pub kinds: Option<String>,
 }
 
+/// Every table/column outside `checks` that stores a check's identity.
+const DEPENDENT_CHECK_COLUMNS: [(&str, &str); 7] = [
+    ("check_results", "check_id"),
+    ("current_state", "check_id"),
+    ("agent_check_state", "check_id"),
+    ("state_history", "check_id"),
+    ("incident_checks", "check_id"),
+    ("notification_queue", "check_id"),
+    ("incidents", "origin_check"),
+];
+
+/// Whether `table.column` exists and still holds text. False for a column
+/// already converted to native `UUID`, which is what makes the identity
+/// migration idempotent table by table rather than all-or-nothing.
+fn column_is_varchar(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(
+        "SELECT data_type FROM information_schema.columns
+         WHERE table_name = ? AND column_name = ?",
+    )?;
+    let mut rows = stmt.query_map(duckdb::params![table, column], |r| r.get::<_, String>(0))?;
+    Ok(matches!(
+        rows.next().transpose()?.as_deref(),
+        Some("VARCHAR")
+    ))
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?",
+        duckdb::params![table],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+fn table_column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT column_name FROM information_schema.columns WHERE table_name = ?")?;
+    let rows = stmt.query_map(duckdb::params![table], |r| r.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<_, _>>()
+        .map_err(Into::into)
+}
+
+/// `(name, data_type, nullable)` for every column of `table`, in declaration
+/// order — enough to reconstruct an equivalent `CREATE TABLE` for the
+/// recreate-and-swap migration below, without hardcoding which optional
+/// columns a given database has already had ALTERed onto it.
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<(String, String, bool)>> {
+    let mut stmt = conn.prepare(
+        "SELECT column_name, data_type, is_nullable FROM information_schema.columns
+         WHERE table_name = ? ORDER BY ordinal_position",
+    )?;
+    let rows = stmt.query_map(duckdb::params![table], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)? == "YES",
+        ))
+    })?;
+    rows.collect::<std::result::Result<_, _>>()
+        .map_err(Into::into)
+}
+
+/// Recreate `table` with its `check_id` column (VARCHAR name) converted to a
+/// native `UUID`, resolving old values against `check_id_map`. DuckDB refuses
+/// `ALTER COLUMN ... SET DATA TYPE` on a column carrying a PRIMARY KEY/UNIQUE
+/// constraint, so any table whose primary key includes `check_id` has to be
+/// rebuilt rather than altered in place — every other column is carried over
+/// unchanged, discovered from `information_schema` so this does not need to
+/// know about columns ALTERed onto an older database after this code was
+/// written.
+///
+/// Verified row-count-preserving: `check_id_map` is built to cover every
+/// distinct value this migration will ever join against (including checks
+/// deleted before the upgrade), so the join must not drop rows. A mismatch
+/// aborts rather than silently discarding history.
+fn recreate_with_uuid_check_id(conn: &Connection, table: &str, pk: &[&str]) -> Result<()> {
+    let cols = table_columns(conn, table)?;
+    let mut coldefs = Vec::new();
+    let mut selects = Vec::new();
+    for (name, data_type, nullable) in &cols {
+        let nn = if *nullable { "" } else { " NOT NULL" };
+        if name == "check_id" {
+            coldefs.push(format!("check_id UUID{nn}"));
+            selects.push("m.id AS check_id".to_string());
+        } else {
+            coldefs.push(format!("{name} {data_type}{nn}"));
+            selects.push(format!("t.{name}"));
+        }
+    }
+    coldefs.push(format!("PRIMARY KEY ({})", pk.join(", ")));
+    let staging = format!("{table}__uuid_migration");
+    conn.execute_batch(&format!(
+        "DROP TABLE IF EXISTS {staging}; CREATE TABLE {staging} ({});",
+        coldefs.join(", ")
+    ))?;
+    conn.execute(
+        &format!(
+            "INSERT INTO {staging} SELECT {} FROM {table} t JOIN check_id_map m ON m.name = t.check_id",
+            selects.join(", ")
+        ),
+        [],
+    )?;
+    let before: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+    let after: i64 =
+        conn.query_row(&format!("SELECT COUNT(*) FROM {staging}"), [], |r| r.get(0))?;
+    if before != after {
+        bail!(
+            "check-identity migration would drop rows converting {table}.check_id to UUID \
+             ({before} -> {after}); refusing to touch the database"
+        );
+    }
+    conn.execute_batch(&format!(
+        "DROP TABLE {table}; ALTER TABLE {staging} RENAME TO {table};"
+    ))?;
+    Ok(())
+}
+
+fn retype_check_id_column(conn: &Connection, table: &str, column: &str) -> Result<()> {
+    let cols = table_columns(conn, table)?;
+    let mut coldefs = Vec::new();
+    let mut selects = Vec::new();
+    for (name, data_type, nullable) in &cols {
+        let nn = if *nullable { "" } else { " NOT NULL" };
+        if name == column {
+            coldefs.push(format!("{name} UUID{nn}"));
+            selects.push(format!("m.id AS {name}"));
+        } else {
+            coldefs.push(format!("{name} {data_type}{nn}"));
+            selects.push(format!("t.{name}"));
+        }
+    }
+    let staging = format!("{table}__uuid_migration");
+    conn.execute_batch(&format!(
+        "DROP TABLE IF EXISTS {staging}; CREATE TABLE {staging} ({});",
+        coldefs.join(", ")
+    ))?;
+    conn.execute(
+        &format!(
+            "INSERT INTO {staging} SELECT {} FROM {table} t LEFT JOIN check_id_map m ON m.name = t.{column}",
+            selects.join(", ")
+        ),
+        [],
+    )?;
+    let before: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+    let after: i64 =
+        conn.query_row(&format!("SELECT COUNT(*) FROM {staging}"), [], |r| r.get(0))?;
+    if before != after {
+        bail!(
+            "check-identity migration would drop rows converting {table}.{column} to UUID ({before} -> {after})"
+        );
+    }
+    conn.execute_batch(&format!(
+        "DROP TABLE {table}; ALTER TABLE {staging} RENAME TO {table};"
+    ))?;
+    Ok(())
+}
+
+/// Schema-migration marker for the migration-only deterministic legacy ids.
+const LEGACY_CHECK_IDS_CANONICALIZED: &str = "legacy_check_ids_canonicalized_v1";
+
+/// Stable UUIDv7 for a legacy name-keyed check. This is deliberately migration-only:
+/// new checks must use `models::new_check_id()` / `Uuid::now_v7()` instead.
+fn deterministic_legacy_check_id(name: &str) -> CheckId {
+    let mut bytes = [0u8; 16];
+    // Fixed 48-bit timestamp makes this a valid but stable UUIDv7, not a clock value.
+    bytes[..6].copy_from_slice(&0x018f_0000_0000u64.to_be_bytes()[2..]);
+    bytes[6..].copy_from_slice(&Sha256::digest(name.as_bytes())[..10]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    CheckId::from_bytes(bytes)
+}
+
+fn legacy_id_marker_exists(conn: &Connection) -> Result<bool> {
+    if !table_exists(conn, "schema_migrations")? {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM schema_migrations WHERE name = ?",
+        duckdb::params![LEGACY_CHECK_IDS_CANONICALIZED],
+        |r| r.get::<_, i64>(0),
+    )? > 0)
+}
+
+fn mark_legacy_ids_canonicalized(conn: &Connection) -> Result<()> {
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_migrations (name VARCHAR PRIMARY KEY)")?;
+    conn.execute(
+        "INSERT INTO schema_migrations VALUES (?) ON CONFLICT DO NOTHING",
+        duckdb::params![LEGACY_CHECK_IDS_CANONICALIZED],
+    )?;
+    Ok(())
+}
+
+/// One-time, in-place conversion of check identity from the mutable `name`
+/// to an immutable UUIDv7 `id`, preserving every row and every relationship
+/// that referenced a check by name. See `SCALING.md`'s "UUIDv7 implementation
+/// plan" and `uptime-monitor-design.md`.
+///
+/// No-ops on a brand-new database (the `CREATE TABLE` block right after this
+/// call already declares the UUID-native schema) and on one this code has
+/// already migrated (detected by `checks.id` already existing) — so this is
+/// safe to run unconditionally on every boot.
+fn migrate_check_identity_inner(conn: &Connection) -> Result<()> {
+    let checks_cols = if table_exists(conn, "checks")? {
+        table_column_names(conn, "checks")?
+    } else {
+        Vec::new()
+    };
+    // A `checks` table still keyed by `name` is the usual trigger, but a
+    // database can also hold check-keyed history with no surviving definitions
+    // (every check deleted, or a partial older schema). Those `check_id`
+    // columns are just as name-shaped and must convert too, so the check is
+    // "does anything here still key a check by text?" rather than "does
+    // `checks.id` exist?".
+    let legacy_checks = table_exists(conn, "checks")? && !checks_cols.iter().any(|c| c == "id");
+    let mut legacy_dependents = false;
+    for (table, column) in DEPENDENT_CHECK_COLUMNS {
+        if column_is_varchar(conn, table, column)? {
+            legacy_dependents = true;
+            break;
+        }
+    }
+    if !legacy_checks && !legacy_dependents {
+        // A fresh database is marked before its UUID-native schema is created.
+        // An unmarked database with surviving UUID checks is a deployed version
+        // that minted legacy ids randomly and needs the follow-up below.
+        if !table_exists(conn, "checks")? || legacy_id_marker_exists(conn)? {
+            mark_legacy_ids_canonicalized(conn)?;
+            return Ok(());
+        }
+        return canonicalize_random_legacy_check_ids(conn);
+    }
+
+    tracing::info!("check identity migration: converting name-keyed checks to UUIDv7 in place");
+
+    // 1. Every distinct string this database has ever used as a check
+    // identifier, including checks deleted before this upgrade whose results,
+    // alerts or state history still linger — those get a stable synthetic id
+    // too, so their existing rows stay joinable to each other even though
+    // there is no longer (and never will be again) a `checks` row for them.
+    let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    if legacy_checks {
+        let mut stmt = conn.prepare("SELECT name FROM checks")?;
+        for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            names.insert(row?);
+        }
+    }
+    for (table, column) in DEPENDENT_CHECK_COLUMNS {
+        if !column_is_varchar(conn, table, column)? {
+            continue;
+        }
+        let mut stmt = conn.prepare(&format!(
+            "SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL"
+        ))?;
+        for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            names.insert(row?);
+        }
+    }
+    if table_exists(conn, "alerts")? {
+        let mut stmt = conn.prepare("SELECT DISTINCT node_id FROM alerts WHERE scope = 'check'")?;
+        for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            names.insert(row?);
+        }
+    }
+    if table_exists(conn, "config_tombstones")? {
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT id FROM config_tombstones WHERE kind = 'check'")?;
+        for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            names.insert(row?);
+        }
+    }
+
+    // 2. Mint one UUIDv7 per distinct name, staged so every subsequent step is
+    // a set-based join instead of a per-row Rust loop against tables that may
+    // hold millions of results.
+    conn.execute_batch("CREATE TABLE check_id_map (name VARCHAR PRIMARY KEY, id UUID NOT NULL)")?;
+    {
+        let mut stmt = conn.prepare("INSERT INTO check_id_map VALUES (?, ?)")?;
+        for name in &names {
+            stmt.execute(duckdb::params![name, deterministic_legacy_check_id(name)])?;
+        }
+    }
+
+    // 3. `checks` itself: add `id`, populate it, then swap the primary key
+    // from `name` to `id` by rebuilding the table — DuckDB has no `ALTER
+    // TABLE ... DROP CONSTRAINT` / `ADD PRIMARY KEY` to do this column by
+    // column. Every existing column (including whichever of `visible`,
+    // `eval`, `position`, `agents`, `config` an older database has or has not
+    // already had ALTERed on) is carried over as-is via `table_columns`.
+    if legacy_checks {
+        let cols = table_columns(conn, "checks")?;
+        let mut coldefs = vec!["id UUID PRIMARY KEY".to_string()];
+        let mut selects = vec!["m.id".to_string()];
+        for (name, data_type, nullable) in &cols {
+            if name == "name" {
+                coldefs.push("name VARCHAR NOT NULL UNIQUE".to_string());
+            } else {
+                let nn = if *nullable { "" } else { " NOT NULL" };
+                coldefs.push(format!("{name} {data_type}{nn}"));
+            }
+            selects.push(format!("t.{name}"));
+        }
+        conn.execute_batch(&format!(
+            "CREATE TABLE checks__uuid_migration ({});",
+            coldefs.join(", ")
+        ))?;
+        conn.execute(
+            &format!(
+                "INSERT INTO checks__uuid_migration SELECT {} FROM checks t \
+                 JOIN check_id_map m ON m.name = t.name",
+                selects.join(", ")
+            ),
+            [],
+        )?;
+        conn.execute_batch(
+            "DROP TABLE checks; ALTER TABLE checks__uuid_migration RENAME TO checks;",
+        )?;
+    }
+
+    // 4. Every other table that keys on `check_id`. Each is converted only if
+    // it is still text-keyed, so a database that failed partway through an
+    // earlier attempt (or predates one of these tables) converts exactly the
+    // tables that still need it.
+    if column_is_varchar(conn, "check_results", "check_id")? {
+        retype_check_id_column(conn, "check_results", "check_id")?;
+    }
+    if column_is_varchar(conn, "incidents", "origin_check")? {
+        retype_check_id_column(conn, "incidents", "origin_check")?;
+    }
+    if column_is_varchar(conn, "current_state", "check_id")? {
+        recreate_with_uuid_check_id(conn, "current_state", &["check_id"])?;
+    }
+    if column_is_varchar(conn, "agent_check_state", "check_id")? {
+        recreate_with_uuid_check_id(conn, "agent_check_state", &["check_id", "agent_id"])?;
+    }
+    if column_is_varchar(conn, "state_history", "check_id")? {
+        recreate_with_uuid_check_id(conn, "state_history", &["check_id", "since"])?;
+    }
+    if column_is_varchar(conn, "incident_checks", "check_id")? {
+        recreate_with_uuid_check_id(conn, "incident_checks", &["incident_id", "check_id"])?;
+    }
+    if column_is_varchar(conn, "notification_queue", "check_id")? {
+        recreate_with_uuid_check_id(
+            conn,
+            "notification_queue",
+            &["notifier", "check_id", "queued_at"],
+        )?;
+    }
+
+    // `alerts.node_id` stays VARCHAR — it names an agent, zone or region for
+    // every scope but `Check`, so it cannot become a UUID column. Only the
+    // check-scoped rows are rewritten, to the check's id as text, so alert
+    // lookups keyed on the new identity still find them.
+    if table_exists(conn, "alerts")? {
+        conn.execute(
+            "UPDATE alerts a SET node_id = m.id::VARCHAR FROM check_id_map m \
+             WHERE a.scope = 'check' AND a.node_id = m.name",
+            [],
+        )?;
+    }
+
+    // Config-replication tombstones for a check deleted before this upgrade:
+    // rewritten where the deleted check's id is still known from lingering
+    // data above, left as an orphan (harmless — nothing can collide with a
+    // UUID) otherwise.
+    if table_exists(conn, "config_tombstones")? {
+        conn.execute(
+            "UPDATE config_tombstones t SET id = m.id::VARCHAR FROM check_id_map m \
+             WHERE t.kind = 'check' AND t.id = m.name",
+            [],
+        )?;
+    }
+
+    // 5. Every check's stored `config` document: inject the matching `id` and
+    // remap `depends_on` from names to ids, dropping a dependency on a check
+    // name that no longer resolves (renamed or deleted before the upgrade —
+    // nothing sane to point it at any more).
+    if legacy_checks && checks_cols.iter().any(|column| column == "config") {
+        let name_to_id: std::collections::HashMap<String, uuid::Uuid> = {
+            let mut stmt = conn.prepare("SELECT name, id FROM checks")?;
+            stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, uuid::Uuid>(1)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?
+        };
+        let rows: Vec<(uuid::Uuid, String)> = {
+            let mut stmt =
+                conn.prepare("SELECT id, config FROM checks WHERE config IS NOT NULL")?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        for (id, raw) in rows {
+            let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            let Some(obj) = doc.as_object_mut() else {
+                continue;
+            };
+            obj.insert("id".into(), serde_json::Value::String(id.to_string()));
+            if let Some(serde_json::Value::Array(deps)) = obj.get("depends_on") {
+                let remapped: Vec<serde_json::Value> = deps
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .filter_map(|n| name_to_id.get(n))
+                    .map(|id| serde_json::Value::String(id.to_string()))
+                    .collect();
+                obj.insert("depends_on".into(), serde_json::Value::Array(remapped));
+            }
+            let new_raw = serde_json::to_string(&doc)?;
+            conn.execute(
+                "UPDATE checks SET config = ? WHERE id = ?",
+                duckdb::params![new_raw, id],
+            )?;
+        }
+    }
+
+    // 6. The one settings document that embeds check identifiers outside the
+    // `checks` table: maintenance windows. Best-effort — a window covering a
+    // check with no trace left anywhere (fully purged before this upgrade)
+    // has nothing to remap to and is dropped from that window's list, same
+    // as an unresolvable `depends_on` entry above.
+    if table_exists(conn, "settings")? {
+        let row: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'maintenance.windows'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(raw) = row {
+            if let Ok(serde_json::Value::Array(mut windows)) =
+                serde_json::from_str::<serde_json::Value>(&raw)
+            {
+                let id_by_name: std::collections::HashMap<String, uuid::Uuid> = {
+                    let mut stmt = conn.prepare("SELECT name, id FROM check_id_map")?;
+                    stmt.query_map([], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, uuid::Uuid>(1)?))
+                    })?
+                    .collect::<std::result::Result<_, _>>()?
+                };
+                for window in windows.iter_mut() {
+                    let Some(obj) = window.as_object_mut() else {
+                        continue;
+                    };
+                    if let Some(serde_json::Value::Array(checks)) = obj.get("checks") {
+                        let remapped: Vec<serde_json::Value> = checks
+                            .iter()
+                            .filter_map(|v| v.as_str())
+                            .filter_map(|n| id_by_name.get(n))
+                            .map(|id| serde_json::Value::String(id.to_string()))
+                            .collect();
+                        obj.insert("checks".into(), serde_json::Value::Array(remapped));
+                    }
+                }
+                let new_raw = serde_json::to_string(&serde_json::Value::Array(windows))?;
+                conn.execute(
+                    "UPDATE settings SET value = ? WHERE key = 'maintenance.windows'",
+                    duckdb::params![new_raw],
+                )?;
+            }
+        }
+    }
+
+    conn.execute_batch("DROP TABLE check_id_map;")?;
+    mark_legacy_ids_canonicalized(conn)?;
+    tracing::info!(checks = names.len(), "check identity migration complete");
+    Ok(())
+}
+
+/// Canonicalize UUIDs written by the previously shipped name migration, which
+/// used random UUIDv7 values independently on each node. This only runs for an
+/// unmarked, non-empty UUID schema; fresh schemas are marked before they can
+/// accept a check, so future random UUIDv7 ids are never candidates.
+fn canonicalize_random_legacy_check_ids(conn: &Connection) -> Result<()> {
+    let checks: Vec<(CheckId, String)> = {
+        let mut stmt = conn.prepare("SELECT id, name FROM checks")?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?
+    };
+    if checks.is_empty() {
+        mark_legacy_ids_canonicalized(conn)?;
+        return Ok(());
+    }
+    conn.execute_batch(
+        "CREATE TABLE check_uuid_remap (old_id UUID PRIMARY KEY, id UUID NOT NULL UNIQUE, name VARCHAR NOT NULL UNIQUE)",
+    )?;
+    {
+        let mut stmt = conn.prepare("INSERT INTO check_uuid_remap VALUES (?, ?, ?)")?;
+        for (old_id, name) in &checks {
+            stmt.execute(duckdb::params![
+                old_id,
+                deterministic_legacy_check_id(name),
+                name
+            ])?;
+        }
+    }
+    let mapped: i64 = conn.query_row("SELECT COUNT(*) FROM check_uuid_remap", [], |r| r.get(0))?;
+    if mapped != checks.len() as i64 {
+        bail!("deterministic legacy check-id collision; refusing to merge checks");
+    }
+
+    // PK-bearing tables must be rebuilt. The mapping is injective and every
+    // insert is checked against the source count, so no relationship can vanish.
+    for (table, pk) in [
+        ("current_state", vec!["check_id"]),
+        ("agent_check_state", vec!["check_id", "agent_id"]),
+        ("state_history", vec!["check_id", "since"]),
+        ("incident_checks", vec!["incident_id", "check_id"]),
+        (
+            "notification_queue",
+            vec!["notifier", "check_id", "queued_at"],
+        ),
+    ] {
+        if !table_exists(conn, table)? {
+            continue;
+        }
+        let cols = table_columns(conn, table)?;
+        let defs: Vec<String> = cols
+            .iter()
+            .map(|(name, ty, nullable)| {
+                format!("{name} {ty}{}", if *nullable { "" } else { " NOT NULL" })
+            })
+            .chain(std::iter::once(format!("PRIMARY KEY ({})", pk.join(", "))))
+            .collect();
+        let select: Vec<String> = cols
+            .iter()
+            .map(|(name, _, _)| {
+                if name == "check_id" {
+                    "COALESCE(m.id, t.check_id) AS check_id".into()
+                } else {
+                    format!("t.{name}")
+                }
+            })
+            .collect();
+        let staging = format!("{table}__legacy_id_canonicalization");
+        conn.execute_batch(&format!("CREATE TABLE {staging} ({});", defs.join(", ")))?;
+        conn.execute(&format!("INSERT INTO {staging} SELECT {} FROM {table} t LEFT JOIN check_uuid_remap m ON m.old_id = t.check_id", select.join(", ")), [])?;
+        let before: i64 =
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+        let after: i64 =
+            conn.query_row(&format!("SELECT COUNT(*) FROM {staging}"), [], |r| r.get(0))?;
+        if before != after {
+            bail!(
+                "legacy check-id canonicalization would drop rows in {table} ({before} -> {after})"
+            );
+        }
+        conn.execute_batch(&format!(
+            "DROP TABLE {table}; ALTER TABLE {staging} RENAME TO {table};"
+        ))?;
+    }
+    for (table, column) in [("check_results", "check_id"), ("incidents", "origin_check")] {
+        if table_exists(conn, table)? {
+            conn.execute(&format!("UPDATE {table} t SET {column} = m.id FROM check_uuid_remap m WHERE t.{column} = m.old_id"), [])?;
+        }
+    }
+    if table_exists(conn, "alerts")? {
+        conn.execute("UPDATE alerts a SET node_id = m.id::VARCHAR FROM check_uuid_remap m WHERE a.scope = 'check' AND a.node_id = m.old_id::VARCHAR", [])?;
+    }
+    if table_exists(conn, "config_tombstones")? {
+        conn.execute("UPDATE config_tombstones t SET id = m.id::VARCHAR FROM check_uuid_remap m WHERE t.kind = 'check' AND t.id = m.old_id::VARCHAR", [])?;
+    }
+    // `checks.id` is itself a primary key, so rebuild rather than UPDATE it.
+    let check_columns = table_columns(conn, "checks")?;
+    let defs: Vec<String> = check_columns
+        .iter()
+        .map(|(name, ty, nullable)| {
+            if name == "name" {
+                "name VARCHAR NOT NULL UNIQUE".into()
+            } else {
+                format!("{name} {ty}{}", if *nullable { "" } else { " NOT NULL" })
+            }
+        })
+        .chain(std::iter::once("PRIMARY KEY (id)".into()))
+        .collect();
+    let select: Vec<String> = check_columns
+        .iter()
+        .map(|(name, _, _)| {
+            if name == "id" {
+                "m.id AS id".into()
+            } else {
+                format!("c.{name}")
+            }
+        })
+        .collect();
+    conn.execute_batch(&format!(
+        "CREATE TABLE checks__legacy_id_canonicalization ({});",
+        defs.join(", ")
+    ))?;
+    conn.execute(&format!("INSERT INTO checks__legacy_id_canonicalization SELECT {} FROM checks c JOIN check_uuid_remap m ON m.old_id = c.id", select.join(", ")), [])?;
+    let rebuilt: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM checks__legacy_id_canonicalization",
+        [],
+        |r| r.get(0),
+    )?;
+    if rebuilt != checks.len() as i64 {
+        bail!(
+            "legacy check-id canonicalization would drop checks ({} -> {rebuilt})",
+            checks.len()
+        );
+    }
+    conn.execute_batch(
+        "DROP TABLE checks; ALTER TABLE checks__legacy_id_canonicalization RENAME TO checks;",
+    )?;
+
+    // Config documents and maintenance windows carry UUIDs as text, so rewrite
+    // them in Rust rather than relying on database-specific JSON mutation.
+    let id_by_old: std::collections::HashMap<String, String> = checks
+        .iter()
+        .map(|(old, name)| {
+            (
+                old.to_string(),
+                deterministic_legacy_check_id(name).to_string(),
+            )
+        })
+        .collect();
+    let rows: Vec<(CheckId, String)> = conn
+        .prepare("SELECT id, config FROM checks WHERE config IS NOT NULL")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    for (id, raw) in rows {
+        let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(obj) = doc.as_object_mut() else {
+            continue;
+        };
+        obj.insert("id".into(), serde_json::Value::String(id.to_string()));
+        if let Some(serde_json::Value::Array(deps)) = obj.get("depends_on") {
+            let remapped = deps
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(|v| id_by_old.get(v).cloned().unwrap_or_else(|| v.into()))
+                .map(serde_json::Value::String)
+                .collect();
+            obj.insert("depends_on".into(), serde_json::Value::Array(remapped));
+        }
+        conn.execute(
+            "UPDATE checks SET config = ? WHERE id = ?",
+            duckdb::params![serde_json::to_string(&doc)?, id],
+        )?;
+    }
+    if table_exists(conn, "settings")? {
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'maintenance.windows'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(raw) = raw {
+            if let Ok(serde_json::Value::Array(mut windows)) =
+                serde_json::from_str::<serde_json::Value>(&raw)
+            {
+                for window in &mut windows {
+                    if let Some(obj) = window.as_object_mut() {
+                        if let Some(serde_json::Value::Array(ids)) = obj.get("checks") {
+                            obj.insert(
+                                "checks".into(),
+                                serde_json::Value::Array(
+                                    ids.iter()
+                                        .filter_map(|v| v.as_str())
+                                        .map(|v| {
+                                            serde_json::Value::String(
+                                                id_by_old
+                                                    .get(v)
+                                                    .cloned()
+                                                    .unwrap_or_else(|| v.into()),
+                                            )
+                                        })
+                                        .collect(),
+                                ),
+                            );
+                        }
+                    }
+                }
+                conn.execute(
+                    "UPDATE settings SET value = ? WHERE key = 'maintenance.windows'",
+                    duckdb::params![serde_json::to_string(&windows)?],
+                )?;
+            }
+        }
+    }
+    conn.execute_batch("DROP TABLE check_uuid_remap")?;
+    mark_legacy_ids_canonicalized(conn)?;
+    tracing::info!(
+        checks = checks.len(),
+        "canonicalized random legacy check UUIDs"
+    );
+    Ok(())
+}
+
+fn migrate_check_identity(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN")?;
+    match migrate_check_identity_inner(conn) {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 impl Storage {
     /// Open (or create) the database at `path` and ensure the schema exists.
     /// `path` may be ":memory:" for tests.
@@ -692,11 +1523,16 @@ impl Storage {
         } else {
             Connection::open(path)?
         };
-        // The one schema change this project makes by recreation rather than by
-        // ALTER, because `agent_polls` shipped with a column missing and with
-        // no writer: there is no row anywhere to migrate. Conditional so a
-        // deployment that already holds the new shape keeps its rows across a
-        // restart, which is half the reason the table exists at all.
+        // Convert a pre-UUID database in place before anything below assumes
+        // the new shape. No-ops on a fresh database and on one already
+        // migrated. See `migrate_check_identity`.
+        migrate_check_identity(&conn)?;
+        // `agent_polls` is the other schema change this project makes by
+        // recreation rather than by ALTER, because it shipped with a column
+        // missing and with no writer: there is no row anywhere to migrate.
+        // Conditional so a deployment that already holds the new shape keeps
+        // its rows across a restart, which is half the reason the table
+        // exists at all.
         {
             let cols: Vec<String> = {
                 let mut stmt = conn.prepare(
@@ -712,7 +1548,7 @@ impl Storage {
         }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS check_results (
-                check_id   VARCHAR NOT NULL,
+                check_id   UUID    NOT NULL,
                 agent_id   VARCHAR NOT NULL,
                 ts_millis  BIGINT  NOT NULL,
                 status     VARCHAR NOT NULL,
@@ -762,14 +1598,14 @@ impl Storage {
                 global      BOOLEAN NOT NULL DEFAULT FALSE,
                 -- NULL for a manually opened incident, which reconciliation
                 -- therefore never touches.
-                origin_check VARCHAR
+                origin_check UUID
             );
             -- Which checks an incident affects. `source` (origin, dependency,
             -- manual) exists so reconciliation can retract what it added
             -- without disturbing what an operator added by hand.
             CREATE TABLE IF NOT EXISTS incident_checks (
                 incident_id VARCHAR NOT NULL,
-                check_id    VARCHAR NOT NULL,
+                check_id    UUID    NOT NULL,
                 source      VARCHAR NOT NULL,
                 PRIMARY KEY (incident_id, check_id)
             );
@@ -792,17 +1628,87 @@ impl Storage {
             -- failed probes. Read by the status page, seeded into the in-memory
             -- tracker on startup so a restart resumes a confirmation in flight.
             CREATE TABLE IF NOT EXISTS current_state (
-                check_id   VARCHAR PRIMARY KEY,
+                check_id   UUID PRIMARY KEY,
                 status     VARCHAR NOT NULL,
                 last_check BIGINT  NOT NULL,
                 consecutive_failures INTEGER NOT NULL DEFAULT 0
             );
+            -- One agent's confirmed opinion of one check: the leaves of the
+            -- region tree. `current_state` above is the rolled-up conclusion;
+            -- this is the evidence it was rolled up from.
+            --
+            -- Persisted for the same reason `current_state` is — so a restart
+            -- resumes confirmations rather than restarting them — but *per
+            -- agent*, because that is now where `failures_before_down` is
+            -- counted. Without this, a restart would reset every agent's
+            -- in-flight confirmation at once and a real outage would take
+            -- another full threshold to re-confirm.
+            CREATE TABLE IF NOT EXISTS agent_check_state (
+                check_id   UUID    NOT NULL,
+                agent_id   VARCHAR NOT NULL,
+                 status     VARCHAR NOT NULL,
+                 consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                 zone       VARCHAR NOT NULL DEFAULT 'unknown',
+                 region     VARCHAR NOT NULL DEFAULT 'unknown',
+                 last_check BIGINT  NOT NULL,
+                PRIMARY KEY (check_id, agent_id)
+            );
+            -- Rollup policy per tree node. Deliberately NOT named `region_tree`
+            -- (design doc :1348), because it does not store the tree: structure
+            -- is derived from agent credentials, which cannot drift from the
+            -- real fleet the way a declared topology can. Only the policy — a
+            -- genuine operator decision that nothing else can supply — is
+            -- stored here.
+            --
+            -- `node_id` is a namespaced key: 'global', 'region:us-east',
+            -- 'zone:us-east-1a'. A node with no row uses the built-in default
+            -- for its level.
+            --
+            -- (updated_at, updated_by) makes this a citizen of the HLC
+            -- last-writer-wins config stream alongside checks, sections,
+            -- settings and credentials. A policy that existed only on whichever
+            -- coordinator an admin happened to hit would make two nodes
+            -- disagree about whether a service is down, which is precisely the
+            -- disagreement clustering exists to prevent.
+            CREATE TABLE IF NOT EXISTS rollup_policy (
+                node_id       VARCHAR PRIMARY KEY,
+                node_type     VARCHAR NOT NULL,
+                degraded_when VARCHAR NOT NULL,
+                down_when     VARCHAR NOT NULL,
+                -- JSON, e.g. {\"degraded_q\":2,\"down_q\":3}. Quorum counts live
+                -- here rather than in the threshold strings so those stay a
+                -- closed vocabulary.
+                config        VARCHAR,
+                updated_at    BIGINT  NOT NULL,
+                updated_by    VARCHAR
+            );
+            -- One row per published transition: the state a check was in, and
+            -- when it entered it. The open span is the row with the greatest
+            -- `since`.
+            --
+            -- This exists because uptime was being computed as the UP fraction
+            -- of raw result rows, which is wrong twice over: it is agent-blind
+            -- (a check probed by four agents with one permanently broken reads
+            -- 75% forever) and it is count-weighted, so changing a check's
+            -- interval silently reweights its history. Spans are
+            -- time-weighted, agree with what the status page actually showed,
+            -- and can express whether Degraded counted as downtime.
+            CREATE TABLE IF NOT EXISTS state_history (
+                check_id UUID    NOT NULL,
+                state    VARCHAR NOT NULL,
+                since    BIGINT  NOT NULL,
+                PRIMARY KEY (check_id, since)
+            );
             -- Check definitions, editable at runtime from the admin UI. Seeded
             -- from the config file on first boot; the table is authoritative
             -- afterwards, so an edit isn't silently reverted by a restart.
-            -- `group` is a SQL keyword, hence group_name.
+            -- `id` is the immutable identity — a UUIDv7 minted once, by the
+            -- application, and never reassigned; `name` is the mutable,
+            -- initially-unique display value everything else here is keyed
+            -- against. `group` is a SQL keyword, hence group_name.
             CREATE TABLE IF NOT EXISTS checks (
-                name        VARCHAR PRIMARY KEY,
+                id          UUID PRIMARY KEY,
+                name        VARCHAR NOT NULL UNIQUE,
                 kind        VARCHAR NOT NULL,
                 target      VARCHAR NOT NULL,
                 interval_secs BIGINT NOT NULL,
@@ -882,7 +1788,7 @@ impl Storage {
             -- a `status` column that can disagree with `attempts`.
             CREATE TABLE IF NOT EXISTS notification_queue (
                 notifier       VARCHAR NOT NULL,
-                check_id       VARCHAR NOT NULL,
+                check_id       UUID    NOT NULL,
                 previous_state VARCHAR,
                 current_state  VARCHAR NOT NULL,
                 attempts       INTEGER NOT NULL,
@@ -909,7 +1815,7 @@ impl Storage {
             -- we are behind, and hands the deleted check straight back.
             -- `kind` names the config table, `id` its primary key.
             CREATE TABLE IF NOT EXISTS config_tombstones (
-                kind       VARCHAR NOT NULL,   -- check | section | setting | credential
+                kind       VARCHAR NOT NULL,   -- check | section | setting | credential | rollup_policy
                 id         VARCHAR NOT NULL,
                 deleted_at BIGINT  NOT NULL,   -- HLC millis
                 node_id    VARCHAR NOT NULL,   -- HLC tiebreak
@@ -1020,12 +1926,60 @@ impl Storage {
         if !section_columns.iter().any(|c| c == "collapsed") {
             conn.execute_batch("ALTER TABLE sections ADD COLUMN collapsed BOOLEAN DEFAULT FALSE")?;
         }
+        // The hold-down timer, persisted. `pending_since` is what makes a
+        // hold-down survive a restart: without it a node rebooting mid-window
+        // would start the window again, so a coordinator restarting more often
+        // than the configured hold-down could suppress an outage indefinitely.
+        //
+        // `pending_state` is stored alongside it, which the plan did not name
+        // but the timer cannot work without: "something has been pending for
+        // 90 seconds" is not enough to decide whether a newly-arrived Down
+        // inherits that clock or restarts it.
+        let state_columns: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT column_name FROM information_schema.columns
+                 WHERE table_name = 'current_state'",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        for (column, ddl) in [
+            (
+                "pending_state",
+                "ALTER TABLE current_state ADD COLUMN pending_state VARCHAR",
+            ),
+            (
+                "pending_since",
+                "ALTER TABLE current_state ADD COLUMN pending_since BIGINT",
+            ),
+        ] {
+            if !state_columns.iter().any(|c| c == column) {
+                conn.execute_batch(ddl)?;
+            }
+        }
+        let agent_state_columns: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT column_name FROM information_schema.columns
+                 WHERE table_name = 'agent_check_state'",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        for column in ["zone", "region"] {
+            if !agent_state_columns.iter().any(|c| c == column) {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE agent_check_state ADD COLUMN {column} VARCHAR DEFAULT 'unknown'"
+                ))?;
+            }
+        }
         // The added columns are nullable (DuckDB won't take NOT NULL here), so
         // give pre-existing rows the intended value rather than letting a NULL
         // reach a non-optional read.
         conn.execute_batch(
             "UPDATE checks SET visible = TRUE WHERE visible IS NULL;
-             UPDATE checks SET position = 0 WHERE position IS NULL;",
+             UPDATE checks SET position = 0 WHERE position IS NULL;
+             UPDATE agent_check_state SET zone = 'unknown' WHERE zone IS NULL;
+             UPDATE agent_check_state SET region = 'unknown' WHERE region IS NULL;",
         )?;
         let store = Self { conn };
         store.backfill_configs()?;
@@ -1038,33 +1992,40 @@ impl Storage {
     fn backfill_configs(&self) -> Result<()> {
         let legacy: Vec<CheckConfig> = {
             let mut stmt = self.conn.prepare(
-                "SELECT name, kind, target, interval_secs, timeout_secs, group_name,
+                "SELECT id, name, kind, target, interval_secs, timeout_secs, group_name,
                         latency_graph, enabled, expect_status, expect_body_contains,
                         visible, eval, position, agents
                  FROM checks WHERE config IS NULL",
             )?;
             let rows = stmt.query_map([], |row| {
-                let interval = row.get::<_, i64>(3)?.max(5);
+                let interval = row.get::<_, i64>(4)?.max(5);
                 Ok(CheckConfig {
-                    name: row.get(0)?,
-                    kind: CheckKind::from_db(&row.get::<_, String>(1)?),
-                    target: row.get(2)?,
+                    // The row's own `id` column, not a freshly minted one:
+                    // this backfill only fills in a missing JSON document for
+                    // a row whose identity was already assigned (by the
+                    // check-identity migration, or by `upsert_check` for any
+                    // row created since) — never generate a second id for a
+                    // check that already has one.
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    kind: CheckKind::from_db(&row.get::<_, String>(2)?),
+                    target: row.get(3)?,
                     // An interval becomes the equivalent cron, so an upgrade
                     // doesn't silently change how often anything runs.
                     cron: seconds_to_cron(interval as u64),
-                    timeout_secs: row.get::<_, i64>(4)? as u64,
-                    group: row.get::<_, Option<String>>(5)?,
-                    latency_graph: row.get(6)?,
-                    enabled: row.get(7)?,
+                    timeout_secs: row.get::<_, i64>(5)? as u64,
+                    group: row.get::<_, Option<String>>(6)?,
+                    latency_graph: row.get(7)?,
+                    enabled: row.get(8)?,
                     expect: Expect {
-                        status: row.get::<_, Option<i32>>(8)?.map(|s| s as u16),
-                        body_contains: row.get(9)?,
+                        status: row.get::<_, Option<i32>>(9)?.map(|s| s as u16),
+                        body_contains: row.get(10)?,
                     },
-                    visible: row.get(10)?,
-                    eval: row.get::<_, Option<String>>(11)?,
-                    position: row.get::<_, Option<i32>>(12)?.unwrap_or(0),
+                    visible: row.get(11)?,
+                    eval: row.get::<_, Option<String>>(12)?,
+                    position: row.get::<_, Option<i32>>(13)?.unwrap_or(0),
                     agents: row
-                        .get::<_, Option<String>>(13)?
+                        .get::<_, Option<String>>(14)?
                         .and_then(|raw| serde_json::from_str(&raw).ok())
                         .unwrap_or_default(),
                     ..Default::default()
@@ -1075,8 +2036,8 @@ impl Storage {
         for check in legacy {
             let json = serde_json::to_string(&check)?;
             self.conn.execute(
-                "UPDATE checks SET config = ? WHERE name = ?",
-                duckdb::params![json, check.name],
+                "UPDATE checks SET config = ? WHERE id = ?",
+                duckdb::params![json, check.id],
             )?;
         }
         Ok(())
@@ -1102,7 +2063,9 @@ impl Storage {
         Ok(out)
     }
 
-    /// Create or replace a check by name.
+    /// Create or replace a check by id — the immutable identity, never the
+    /// mutable `name`, so an edit that only renames a check still updates the
+    /// same row instead of leaving a stale one behind under the old name.
     ///
     /// `config` is the definition; the other columns are a projection of it so
     /// SQL can order and filter without parsing every document.
@@ -1110,14 +2073,15 @@ impl Storage {
         // DuckDB's ON CONFLICT needs the same column list twice; deleting first
         // is shorter and the two statements are cheap at this table's size.
         self.conn
-            .execute("DELETE FROM checks WHERE name = ?", duckdb::params![c.name])?;
+            .execute("DELETE FROM checks WHERE id = ?", duckdb::params![c.id])?;
         self.conn.execute(
             "INSERT INTO checks
-                (name, kind, target, interval_secs, timeout_secs, group_name,
+                (id, name, kind, target, interval_secs, timeout_secs, group_name,
                  latency_graph, enabled, expect_status, expect_body_contains,
                  visible, eval, position, agents, config, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             duckdb::params![
+                c.id,
                 c.name,
                 c.kind.as_db(),
                 c.target,
@@ -1151,24 +2115,24 @@ impl Storage {
         )?)
     }
 
-    /// Apply an explicit display order. Names not listed keep their relative
-    /// order after the listed ones.
-    pub fn reorder_checks(&self, order: &[String], now_millis: i64) -> Result<()> {
+    /// Apply an explicit display order, by id. Ids not listed keep their
+    /// relative order after the listed ones.
+    pub fn reorder_checks(&self, order: &[CheckId], now_millis: i64) -> Result<()> {
         // Rewrite whole rows rather than UPDATE-ing the position column: the
         // document is authoritative, so touching only the column would reorder
         // the index and leave every reader seeing the old order.
         let mut checks = self.list_checks()?;
-        let rank = |name: &str| {
+        let rank = |id: CheckId| {
             order
                 .iter()
-                .position(|n| n == name)
-                // Names the caller didn't mention keep their relative order
+                .position(|n| *n == id)
+                // Ids the caller didn't mention keep their relative order
                 // after the ones it did.
                 .unwrap_or(usize::MAX)
         };
         checks.sort_by(|a, b| {
-            rank(&a.name)
-                .cmp(&rank(&b.name))
+            rank(a.id)
+                .cmp(&rank(b.id))
                 .then_with(|| a.position.cmp(&b.position))
                 .then_with(|| a.name.cmp(&b.name))
         });
@@ -1194,42 +2158,25 @@ impl Storage {
 
     /// Delete a check's recorded results and alerts, keeping its definition.
     /// Returns how many result rows went, so the UI can say what it did.
-    pub fn purge_check_data(&self, name: &str) -> Result<u64> {
+    pub fn purge_check_data(&self, check_id: CheckId) -> Result<u64> {
         let rows = self.conn.execute(
             "DELETE FROM check_results WHERE check_id = ?",
-            duckdb::params![name],
+            duckdb::params![check_id],
         )?;
         self.conn.execute(
             "DELETE FROM alerts WHERE node_id = ?",
-            duckdb::params![name],
+            duckdb::params![check_id.to_string()],
         )?;
         Ok(rows as u64)
     }
 
     /// Returns whether a row was actually removed, so the handler can 404
-    /// instead of reporting success for a name that never existed.
-    pub fn delete_check(&self, name: &str) -> Result<bool> {
+    /// instead of reporting success for an id that never existed.
+    pub fn delete_check(&self, check_id: CheckId) -> Result<bool> {
         let n = self
             .conn
-            .execute("DELETE FROM checks WHERE name = ?", duckdb::params![name])?;
+            .execute("DELETE FROM checks WHERE id = ?", duckdb::params![check_id])?;
         Ok(n > 0)
-    }
-
-    /// Adopt the config file's checks the first time we run against an empty
-    /// table. Existing deployments keep their checks; afterwards the table wins,
-    /// so an admin edit survives a restart instead of being overwritten by the
-    /// file it came from.
-    pub fn seed_checks_if_empty(&self, checks: &[CheckConfig], now_millis: i64) -> Result<bool> {
-        let existing: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM checks", [], |r| r.get(0))?;
-        if existing > 0 || checks.is_empty() {
-            return Ok(false);
-        }
-        for c in checks {
-            self.upsert_check(c, now_millis)?;
-        }
-        Ok(true)
     }
 
     /// Sections in display order.
@@ -1406,6 +2353,46 @@ impl Storage {
         }
     }
 
+    /// Same rows as `insert_results`, loaded through DuckDB's Appender rather
+    /// than a prepared statement executed once per row. For a real ingest
+    /// batch the two cost about the same; for a many-thousand-row bulk load
+    /// — `seed_mock`'s reason for existing — the Appender is the difference
+    /// between seconds and tens of seconds, which is why it exists as its own
+    /// method instead of replacing `insert_results` outright.
+    fn append_results_bulk(&self, rows: &[(CheckResult, Status)]) -> Result<()> {
+        let mut appender = self.conn.appender_with_columns(
+            "check_results",
+            &[
+                "check_id",
+                "agent_id",
+                "ts_millis",
+                "status",
+                "latency_ms",
+                "status_code",
+                "error",
+                "failure",
+                "zone",
+                "region",
+            ],
+        )?;
+        for (r, status) in rows {
+            appender.append_row(duckdb::params![
+                r.check_id,
+                r.agent_id,
+                r.timestamp.timestamp_millis(),
+                status.as_str(),
+                r.latency_ms as i64,
+                r.status_code.map(|c| c as i32),
+                r.error,
+                r.failure.as_ref().map(serde_json::to_string).transpose()?,
+                non_empty(&r.zone),
+                non_empty(&r.region),
+            ])?;
+        }
+        appender.flush()?;
+        Ok(())
+    }
+
     /// Return history rows for a check, newest first, optionally within a time
     /// range and optionally restricted to one evaluated status.
     ///
@@ -1413,7 +2400,7 @@ impl Storage {
     /// failures worth reading about are not necessarily in the newest `limit`.
     pub fn history(
         &self,
-        check_id: &str,
+        check_id: CheckId,
         limit: usize,
         from: Option<i64>,
         to: Option<i64>,
@@ -1437,7 +2424,7 @@ impl Storage {
         let mut stmt = self.conn.prepare(&sql)?;
         // Build params dynamically.
         let mut params: Vec<duckdb::types::Value> =
-            vec![duckdb::types::Value::Text(check_id.to_owned())];
+            vec![duckdb::types::Value::Text(check_id.to_string())];
         if let Some(f) = from {
             params.push(duckdb::types::Value::BigInt(f));
         }
@@ -1506,7 +2493,7 @@ impl Storage {
         // Must be pushed in the same order the clauses were appended above.
         let mut params: Vec<duckdb::types::Value> = Vec::new();
         if let Some(c) = &filter.check_id {
-            params.push(duckdb::types::Value::Text(c.clone()));
+            params.push(duckdb::types::Value::Text(c.to_string()));
         }
         if let Some(a) = &filter.agent_id {
             params.push(duckdb::types::Value::Text(a.clone()));
@@ -1528,7 +2515,7 @@ impl Storage {
         let rows = stmt
             .query_map(param_refs.as_slice(), |row| {
                 Ok(ResultRow {
-                    check_id: row.get::<_, String>(0)?,
+                    check_id: row.get::<_, CheckId>(0)?,
                     agent_id: row.get::<_, String>(1)?,
                     timestamp: row.get::<_, i64>(2)?,
                     zone: row.get::<_, Option<String>>(3)?,
@@ -1548,6 +2535,29 @@ impl Storage {
         Ok(rows)
     }
 
+    /// Return an unused stable local event id. The first event keeps the
+    /// readable base; same-millisecond events receive a deterministic suffix.
+    /// IDs are persisted and replicated as written, so replication retains the
+    /// exact event identity rather than generating another one.
+    fn next_event_id(&self, table: &str, base: &str) -> Result<String> {
+        for suffix in 0_u64.. {
+            let id = if suffix == 0 {
+                base.to_owned()
+            } else {
+                format!("{base}-{suffix}")
+            };
+            let exists: bool = self.conn.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE id = ?)"),
+                duckdb::params![id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(id);
+            }
+        }
+        unreachable!("u64 event id suffixes are exhausted")
+    }
+
     /// Persist an alert: one confirmed state transition. `incident_id` is
     /// stamped here, by the caller that just decided which incident this
     /// transition belongs to.
@@ -1555,12 +2565,15 @@ impl Storage {
         &self,
         scope: AlertScope,
         node_id: &str,
-        previous_state: Option<Status>,
-        current_state: Status,
+        previous_state: Option<NodeState>,
+        current_state: NodeState,
         ts_millis: i64,
         incident_id: Option<&str>,
     ) -> Result<String> {
-        let id = format!("{node_id}-{ts_millis}-{}", current_state.as_str());
+        let id = self.next_event_id(
+            "alerts",
+            &format!("{node_id}-{ts_millis}-{}", current_state.as_str()),
+        )?;
         self.conn.execute(
             "INSERT INTO alerts
                  (id, scope, node_id, previous_state, current_state, ts_millis, incident_id)
@@ -1672,7 +2685,7 @@ impl Storage {
     pub fn delete_notification(
         &self,
         notifier: &str,
-        check_id: &str,
+        check_id: CheckId,
         queued_at: i64,
     ) -> Result<()> {
         self.conn.execute(
@@ -1686,12 +2699,12 @@ impl Storage {
     fn queued_row(row: &duckdb::Row) -> duckdb::Result<QueuedRow> {
         Ok(QueuedRow {
             notifier: row.get::<_, String>(0)?,
-            check_id: row.get::<_, String>(1)?,
+            check_id: row.get::<_, CheckId>(1)?,
             previous_state: row
                 .get::<_, Option<String>>(2)?
                 .as_deref()
-                .map(Status::from_db),
-            current_state: Status::from_db(&row.get::<_, String>(3)?),
+                .map(NodeState::from_db),
+            current_state: NodeState::from_db(&row.get::<_, String>(3)?),
             attempts: row.get::<_, i32>(4)?,
             next_attempt: row.get::<_, Option<i64>>(5)?,
             last_error: row.get::<_, String>(6)?,
@@ -1707,8 +2720,8 @@ impl Storage {
             previous_state: row
                 .get::<_, Option<String>>(3)?
                 .as_deref()
-                .map(Status::from_db),
-            current_state: Status::from_db(&row.get::<_, String>(4)?),
+                .map(NodeState::from_db),
+            current_state: NodeState::from_db(&row.get::<_, String>(4)?),
             timestamp: row.get::<_, i64>(5)?,
             incident_id: row.get::<_, Option<String>>(6)?,
         })
@@ -1724,7 +2737,7 @@ impl Storage {
     /// it must not adopt dependents into it, must not let a failing check ride
     /// it instead of opening a real one, and above all must not resolve it. A
     /// maintenance notice is over when a human says so.
-    pub fn open_incident_for(&self, check_id: &str) -> Result<Option<IncidentRow>> {
+    pub fn open_incident_for(&self, check_id: CheckId) -> Result<Option<IncidentRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT i.id
              FROM incidents i
@@ -1756,7 +2769,7 @@ impl Storage {
         state: IncidentState,
         started_at: i64,
         global: bool,
-        origin_check: Option<&str>,
+        origin_check: Option<CheckId>,
         checks: &[IncidentCheckRow],
         first_update: Option<(&str, Option<&str>)>,
     ) -> Result<IncidentRow> {
@@ -1766,7 +2779,7 @@ impl Storage {
             duckdb::params![id, title, state.as_str(), started_at, global, origin_check],
         )?;
         for c in checks {
-            self.attach_check(id, &c.check_id, c.source)?;
+            self.attach_check(id, c.check_id, c.source)?;
         }
         if let Some((body, author)) = first_update {
             self.add_update(id, state, body, author, started_at)?;
@@ -1780,7 +2793,7 @@ impl Storage {
     pub fn attach_check(
         &self,
         incident_id: &str,
-        check_id: &str,
+        check_id: CheckId,
         source: AffectSource,
     ) -> Result<()> {
         let existing: Option<String> = {
@@ -1823,7 +2836,7 @@ impl Storage {
     pub fn detach_check(
         &self,
         incident_id: &str,
-        check_id: &str,
+        check_id: CheckId,
         only_source: Option<AffectSource>,
     ) -> Result<()> {
         match only_source {
@@ -1842,13 +2855,13 @@ impl Storage {
 
     /// Replace exactly the manual attachments, leaving origin and dependency
     /// rows alone. The affects editor saves through this.
-    pub fn set_manual_checks(&self, incident_id: &str, checks: &[String]) -> Result<()> {
+    pub fn set_manual_checks(&self, incident_id: &str, checks: &[CheckId]) -> Result<()> {
         self.conn.execute(
             "DELETE FROM incident_checks WHERE incident_id = ? AND source = 'manual'",
             duckdb::params![incident_id],
         )?;
         for check_id in checks {
-            self.attach_check(incident_id, check_id, AffectSource::Manual)?;
+            self.attach_check(incident_id, *check_id, AffectSource::Manual)?;
         }
         Ok(())
     }
@@ -1868,7 +2881,7 @@ impl Storage {
         author: Option<&str>,
         now_millis: i64,
     ) -> Result<IncidentUpdateRow> {
-        let id = format!("{incident_id}-u{now_millis}");
+        let id = self.next_event_id("incident_updates", &format!("{incident_id}-u{now_millis}"))?;
         self.conn.execute(
             "INSERT INTO incident_updates (id, incident_id, state, body, author, created_at)
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -1981,7 +2994,7 @@ impl Storage {
         let rows = stmt
             .query_map(duckdb::params![incident_id], |row| {
                 Ok(IncidentCheckRow {
-                    check_id: row.get::<_, String>(0)?,
+                    check_id: row.get::<_, CheckId>(0)?,
                     source: AffectSource::from_db(&row.get::<_, String>(1)?),
                 })
             })?
@@ -2018,7 +3031,7 @@ impl Storage {
 
     /// A check's incidents, newest first — every incident it was attached to,
     /// however it got there.
-    pub fn incidents_for_check(&self, check_id: &str, limit: usize) -> Result<Vec<IncidentRow>> {
+    pub fn incidents_for_check(&self, check_id: CheckId, limit: usize) -> Result<Vec<IncidentRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT i.id, i.title, i.state, i.started_at, i.resolved_at, i.global, i.origin_check
              FROM incidents i
@@ -2036,29 +3049,6 @@ impl Storage {
         Ok(rows)
     }
 
-    /// Whether a check's last `runs` observations were all UP — the up-side
-    /// mirror of `failures_before_down`, and what gates auto-resolve. Reading
-    /// it from the results rather than keeping a counter means it is correct
-    /// across a restart with nothing to seed or resync.
-    ///
-    /// A check with fewer than `runs` results has not cleared the bar yet.
-    pub fn recovered_for(&self, check_id: &str, runs: u32) -> Result<bool> {
-        let runs = runs.max(1);
-        let mut stmt = self.conn.prepare(
-            "SELECT status FROM check_results
-             WHERE check_id = ?
-             ORDER BY ts_millis DESC
-             LIMIT ?",
-        )?;
-        let statuses = stmt
-            .query_map(duckdb::params![check_id, runs as i64], |r| {
-                r.get::<_, String>(0)
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(statuses.len() == runs as usize
-            && statuses.iter().all(|s| Status::from_db(s) == Status::Up))
-    }
-
     fn incident_row(row: &duckdb::Row) -> duckdb::Result<IncidentRow> {
         Ok(IncidentRow {
             id: row.get::<_, String>(0)?,
@@ -2067,32 +3057,50 @@ impl Storage {
             started_at: row.get::<_, i64>(3)?,
             resolved_at: row.get::<_, Option<i64>>(4)?,
             global: row.get::<_, bool>(5)?,
-            origin_check: row.get::<_, Option<String>>(6)?,
+            origin_check: row.get::<_, Option<CheckId>>(6)?,
             checks: Vec::new(),
         })
     }
 
-    /// One StatusRow per check_id: the latest result's status/latency/code/error,
-    /// plus the fraction of UP results in the 24h window `(now-24h, now]`.
-    /// A check with no rows at all is absent; uptime is over in-window rows only.
+    /// One StatusRow per check_id: the latest result's latency/code/error, the
+    /// coordinator's published state, and time-weighted uptime over the 24h
+    /// window `(now-24h, now]`. A check with no results at all is absent.
+    ///
+    /// **Uptime is no longer the UP fraction of raw result rows.** That figure
+    /// was agent-blind in exactly the way the state machine used to be: a check
+    /// probed by four agents with one permanently broken read 75% uptime
+    /// forever, because every agent's rows landed in the same numerator. It was
+    /// also count-weighted, so changing a check's interval retroactively
+    /// reweighted its history, and it had no way to express Degraded because
+    /// raw results cannot be Degraded. It is now computed from `state_history`
+    /// spans — the same states the status page actually displayed.
     pub fn list_status(&self, now_millis: i64) -> Result<Vec<StatusRow>> {
         let window_start = now_millis - 86_400_000;
+        // Which checks count Degraded minutes against their SLA. Read once per
+        // call rather than per check: the config document is authoritative for
+        // every field that is not a projected column, and this is one of them.
+        let degraded_downtime: std::collections::HashSet<CheckId> = self
+            .list_checks()?
+            .into_iter()
+            .filter(|c| c.degraded_is_downtime.unwrap_or(false))
+            .map(|c| c.id)
+            .collect();
+
         // Every "latest" field is read from a single row, picked by row_number.
         // Per-column `arg_max` is wrong here: it skips NULLs, so a recovered
         // check would keep reporting the stale error of its last failure.
         //
-        // The displayed status is the coordinator's CONFIRMED state
-        // (`current_state`), not the raw last observation: with
-        // `failures_before_down` > 1 a check stays UP through its first failed
-        // probes, and that decision must survive a restart. Checks with no
-        // row yet (pre-upgrade data) fall back to the raw latest status.
+        // The displayed status is the coordinator's PUBLISHED state
+        // (`current_state`), not the raw last observation: it already accounts
+        // for per-agent confirmation, the rollup and hold-down, and that
+        // decision must survive a restart. Checks with no row yet (pre-upgrade
+        // data) fall back to the raw latest status, lifted into a NodeState.
         let mut stmt = self.conn.prepare(
             "SELECT
                  latest.check_id,
                  COALESCE(cs.status, latest.status) AS status,
                  latest.latency_ms,
                  latest.ts_millis,
-                 win.uptime,
                  latest.status_code,
                  latest.error,
                  latest.failure
@@ -2101,72 +3109,308 @@ impl Storage {
                         row_number() OVER (PARTITION BY check_id ORDER BY ts_millis DESC) AS rn
                  FROM check_results
              ) AS latest
-             JOIN (
-                 SELECT check_id,
-                     CAST(SUM(CASE WHEN status = 'up' AND ts_millis > ? AND ts_millis <= ? THEN 1 ELSE 0 END) AS DOUBLE)
-                       / NULLIF(SUM(CASE WHEN ts_millis > ? AND ts_millis <= ? THEN 1 ELSE 0 END), 0) AS uptime
-                 FROM check_results
-                 GROUP BY check_id
-             ) AS win ON win.check_id = latest.check_id
              LEFT JOIN current_state cs ON cs.check_id = latest.check_id
              WHERE latest.rn = 1",
         )?;
+        let mut rows = stmt
+            .query_map([], |row| {
+                Ok(StatusRow {
+                    check_id: row.get::<_, CheckId>(0)?,
+                    state: NodeState::from_db(&row.get::<_, String>(1)?),
+                    latency_ms: row.get::<_, i64>(2)? as u64,
+                    last_check: row.get::<_, i64>(3)?,
+                    // Filled below: uptime needs a per-check window walk that
+                    // does not belong inside a row mapper.
+                    uptime_24h: 0.0,
+                    status_code: row.get::<_, Option<i32>>(4)?.map(|c| c as u16),
+                    error: row.get::<_, Option<String>>(5)?,
+                    failure: row
+                        .get::<_, Option<String>>(6)?
+                        .and_then(|f| serde_json::from_str(&f).ok()),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        for row in &mut rows {
+            let degraded_counts = degraded_downtime.contains(&row.check_id);
+            row.uptime_24h = self
+                .uptime_between(row.check_id, window_start, now_millis, degraded_counts)?
+                // No spans in the window at all — a check upgraded into this
+                // scheme moments ago, or one nobody was probing. Reads as fully
+                // up rather than fully down: an absence of recorded outage is
+                // not an outage, and 0% on every check after an upgrade would
+                // be a worse lie than 100%.
+                .unwrap_or(1.0);
+        }
+        Ok(rows)
+    }
+
+    /// Persist what the coordinator currently publishes for a check: the
+    /// rolled-up state, the hold-down timer in flight, and when it was last
+    /// observed. Read back at startup so a restart resumes both the published
+    /// state and any window it was part-way through.
+    pub fn update_current_state(
+        &self,
+        check_id: CheckId,
+        state: NodeState,
+        pending: Option<(NodeState, i64)>,
+        last_check: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO current_state
+                 (check_id, status, last_check, consecutive_failures, pending_state, pending_since)
+             VALUES (?, ?, ?, 0, ?, ?)",
+            duckdb::params![
+                check_id,
+                state.as_str(),
+                last_check,
+                pending.map(|(s, _)| s.as_str()),
+                pending.map(|(_, since)| since),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// All persisted published states, for seeding the tracker on startup.
+    pub fn list_current_state(&self) -> Result<Vec<CurrentStateRow>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT check_id, status, pending_state, pending_since FROM current_state")?;
         let rows = stmt
-            .query_map(
-                duckdb::params![window_start, now_millis, window_start, now_millis],
-                |row| {
-                    Ok(StatusRow {
-                        check_id: row.get::<_, String>(0)?,
-                        status: Status::from_db(&row.get::<_, String>(1)?),
-                        latency_ms: row.get::<_, i64>(2)? as u64,
-                        last_check: row.get::<_, i64>(3)?,
-                        uptime_24h: row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
-                        status_code: row.get::<_, Option<i32>>(5)?.map(|c| c as u16),
-                        error: row.get::<_, Option<String>>(6)?,
-                        failure: row
-                            .get::<_, Option<String>>(7)?
-                            .and_then(|f| serde_json::from_str(&f).ok()),
-                    })
-                },
-            )?
+            .query_map([], |row| {
+                let pending_state = row.get::<_, Option<String>>(2)?;
+                let pending_since = row.get::<_, Option<i64>>(3)?;
+                Ok(CurrentStateRow {
+                    check_id: row.get::<_, CheckId>(0)?,
+                    state: NodeState::from_db(&row.get::<_, String>(1)?),
+                    // Both halves or neither: a `pending_state` with no
+                    // timestamp cannot be resumed and a timestamp with no state
+                    // cannot be matched against a candidate, so a half-written
+                    // pair is discarded rather than guessed at.
+                    pending: pending_state
+                        .zip(pending_since)
+                        .map(|(s, since)| (NodeState::from_db(&s), since)),
+                })
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    /// Persist what the coordinator decided a check reads as now: the confirmed
-    /// status, the in-flight DOWN count toward its threshold, and when it was
-    /// last observed. Written on every observation; read back at startup so the
-    /// in-memory tracker resumes confirmations exactly where it left off.
-    pub fn update_current_state(
+    /// Persist one agent's confirmed opinion of one check.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_agent_check_state(
         &self,
-        check_id: &str,
+        check_id: CheckId,
+        agent_id: &str,
+        zone: &str,
+        region: &str,
         status: Status,
         consecutive_failures: u32,
         last_check: i64,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO current_state (check_id, status, last_check, consecutive_failures)
-             VALUES (?, ?, ?, ?)",
-            duckdb::params![check_id, status.as_str(), last_check, consecutive_failures as i32],
+            "INSERT INTO agent_check_state
+                 (check_id, agent_id, status, consecutive_failures, zone, region, last_check)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (check_id, agent_id) DO UPDATE SET
+                 status = excluded.status,
+                 consecutive_failures = excluded.consecutive_failures,
+                 zone = excluded.zone,
+                 region = excluded.region,
+                 last_check = excluded.last_check
+             WHERE excluded.last_check >= agent_check_state.last_check",
+            duckdb::params![
+                check_id,
+                agent_id,
+                status.as_str(),
+                consecutive_failures as i32,
+                zone,
+                region,
+                last_check
+            ],
         )?;
         Ok(())
     }
 
-    /// All persisted confirmed states, for seeding the tracker on startup.
-    pub fn list_current_state(&self) -> Result<Vec<CurrentStateRow>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT check_id, status, consecutive_failures FROM current_state")?;
+    /// Every persisted per-agent belief, for seeding the tracker's leaves.
+    pub fn list_agent_check_state(&self) -> Result<Vec<AgentCheckStateRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT check_id, agent_id, zone, region, status, consecutive_failures, last_check
+              FROM agent_check_state",
+        )?;
         let rows = stmt
             .query_map([], |row| {
-                Ok(CurrentStateRow {
-                    check_id: row.get::<_, String>(0)?,
-                    status: Status::from_db(&row.get::<_, String>(1)?),
-                    consecutive_failures: row.get::<_, i32>(2)? as u32,
+                Ok(AgentCheckStateRow {
+                    check_id: row.get::<_, CheckId>(0)?,
+                    agent_id: row.get::<_, String>(1)?,
+                    zone: row.get::<_, String>(2)?,
+                    region: row.get::<_, String>(3)?,
+                    status: Status::from_db(&row.get::<_, String>(4)?),
+                    consecutive_failures: row.get::<_, i32>(5)? as u32,
+                    last_check: row.get::<_, i64>(6)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    // ---- Rollup policy ----
+
+    /// Every stored policy. Nodes without a row use their level's default, so
+    /// this is usually short and is cached by the caller.
+    pub fn list_rollup_policies(&self) -> Result<Vec<RollupPolicyRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT node_id, node_type, degraded_when, down_when, config, updated_at, updated_by
+             FROM rollup_policy ORDER BY node_id",
+        )?;
+        let rows = stmt
+            .query_map([], Self::rollup_policy_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    fn rollup_policy_row(row: &duckdb::Row) -> duckdb::Result<RollupPolicyRow> {
+        let config: Option<String> = row.get(4)?;
+        let quorums: serde_json::Value = config
+            .as_deref()
+            .and_then(|c| serde_json::from_str(c).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let q = |key: &str| quorums.get(key).and_then(|v| v.as_u64()).map(|v| v as u32);
+        Ok(RollupPolicyRow {
+            node_id: row.get::<_, String>(0)?,
+            node_type: NodeType::from_db(&row.get::<_, String>(1)?),
+            policy: crate::rollup::RollupPolicy {
+                degraded_when: crate::rollup::Threshold::from_db(
+                    &row.get::<_, String>(2)?,
+                    q("degraded_q"),
+                ),
+                down_when: crate::rollup::Threshold::from_db(
+                    &row.get::<_, String>(3)?,
+                    q("down_q"),
+                ),
+            },
+            updated_at: row.get::<_, i64>(5)?,
+            updated_by: row.get::<_, Option<String>>(6)?,
+        })
+    }
+
+    /// Write a node's policy, last-writer-wins on the HLC like every other
+    /// replicated config row.
+    pub fn upsert_rollup_policy(
+        &self,
+        node_id: &str,
+        node_type: NodeType,
+        policy: &crate::rollup::RollupPolicy,
+        hlc: &Hlc,
+    ) -> Result<()> {
+        use crate::rollup::Threshold;
+        let mut config = serde_json::Map::new();
+        if let Threshold::Quorum(q) = policy.degraded_when {
+            config.insert("degraded_q".into(), q.into());
+        }
+        if let Threshold::Quorum(q) = policy.down_when {
+            config.insert("down_q".into(), q.into());
+        }
+        let config = if config.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(config).to_string())
+        };
+        self.conn.execute(
+            "INSERT OR REPLACE INTO rollup_policy
+                 (node_id, node_type, degraded_when, down_when, config, updated_at, updated_by)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            duckdb::params![
+                node_id,
+                node_type.as_str(),
+                policy.degraded_when.as_str(),
+                policy.down_when.as_str(),
+                config,
+                hlc.millis,
+                hlc.node_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Drop a node's policy, returning it to its level's default.
+    pub fn delete_rollup_policy(&self, node_id: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM rollup_policy WHERE node_id = ?",
+            duckdb::params![node_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    // ---- State history ----
+
+    /// Open a new span for a check, closing the previous one implicitly.
+    ///
+    /// Idempotent on `(check_id, since)`, and a no-op when the newest span
+    /// already carries this state: a coordinator that re-publishes the same
+    /// conclusion must not fragment its own history into thousands of
+    /// zero-length spans.
+    pub fn record_state(&self, check_id: CheckId, state: NodeState, since: i64) -> Result<()> {
+        let newest: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT state FROM state_history WHERE check_id = ?
+                 ORDER BY since DESC LIMIT 1",
+                duckdb::params![check_id],
+                |r| r.get(0),
+            )
+            .ok();
+        if newest.as_deref().map(NodeState::from_db) == Some(state) {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT OR REPLACE INTO state_history (check_id, state, since) VALUES (?, ?, ?)",
+            duckdb::params![check_id, state.as_str(), since],
+        )?;
+        Ok(())
+    }
+
+    /// Every span for a check, oldest first.
+    pub fn state_spans(&self, check_id: CheckId) -> Result<Vec<StateSpan>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT state, since FROM state_history WHERE check_id = ? ORDER BY since ASC",
+        )?;
+        let rows = stmt
+            .query_map(duckdb::params![check_id], |r| {
+                Ok(StateSpan {
+                    state: NodeState::from_db(&r.get::<_, String>(0)?),
+                    since: r.get::<_, i64>(1)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Time-weighted uptime over `(from, to]`, as a fraction.
+    ///
+    /// Counted over spans rather than probes, which fixes three things at once:
+    /// a check probed by many agents is no longer scored on how many of them
+    /// were healthy, a check whose interval changed is no longer reweighted
+    /// retroactively, and `degraded_is_downtime` becomes expressible at all —
+    /// raw results have no Degraded to count.
+    ///
+    /// `Unknown` time is excluded from both numerator and denominator: a
+    /// coordinator that was not running, or a check nobody was probing, did not
+    /// observe downtime and must not invent uptime either. A window that is
+    /// entirely Unknown returns `None` rather than 0.0, so callers can tell
+    /// "perfectly broken" from "nothing known".
+    pub fn uptime_between(
+        &self,
+        check_id: CheckId,
+        from: i64,
+        to: i64,
+        degraded_is_downtime: bool,
+    ) -> Result<Option<f64>> {
+        let spans = self.state_spans(check_id)?;
+        let Some((up_ms, known_ms)) = uptime_counts(&spans, from, to, degraded_is_downtime) else {
+            return Ok(None);
+        };
+        Ok(Some(up_ms as f64 / known_ms as f64))
     }
 
     // ---- Agent credentials ----
@@ -2284,10 +3528,83 @@ impl Storage {
              WHERE next_attempt IS NULL AND queued_at < ?",
             duckdb::params![alerts_before],
         )? as u64;
+        // State spans age out with results, since that is the history they
+        // describe. The *open* span is kept regardless of age: it is not
+        // history, it is what the check reads as right now, and deleting it
+        // would make a long-stable check look unknown.
+        removed += self.conn.execute(
+            "DELETE FROM state_history
+             WHERE since < ?
+               AND since <> (SELECT MAX(since) FROM state_history h
+                             WHERE h.check_id = state_history.check_id)",
+            duckdb::params![results_before],
+        )? as u64;
         let tombstone_days = results_days.max(alerts_days);
         let tombstone_before = now_millis - (tombstone_days as i64) * 86_400_000;
         removed += self.prune_tombstones(tombstone_before)? as u64;
         removed += self.prune_incident_tombstones(tombstone_before)? as u64;
+        Ok(removed)
+    }
+
+    /// Delete resolved incidents shorter than `max_secs`, with everything
+    /// stamped as belonging to them.
+    ///
+    /// This exists to clean up after the bug the region tree fixes: with
+    /// `failures_before_down = 1` and no hold-down, one agent's single failed
+    /// probe opened an incident that the next probe closed 50 seconds later.
+    /// Those rows are not history anybody wants, and leaving them makes the
+    /// incident list unreadable for exactly the checks with the most agents.
+    ///
+    /// Only *resolved* incidents are touched. An open incident has no duration
+    /// yet, and a short-lived open one is simply a new one.
+    pub fn purge_short_incidents(&self, max_secs: u64) -> Result<u64> {
+        let max_ms = (max_secs as i64).saturating_mul(1000);
+        // DuckDB has no ON DELETE CASCADE, so remove every dependent row before
+        // its incident. Alerts are deliberately included: this cleanup erases a
+        // known false-positive outage, not merely its operator narrative.
+        let selector = "SELECT id FROM incidents
+             WHERE state = 'resolved' AND resolved_at IS NOT NULL
+                AND resolved_at - started_at < ?";
+        let mut removed = 0u64;
+        for table in ["incident_updates", "incident_checks", "alerts"] {
+            removed += self.conn.execute(
+                &format!("DELETE FROM {table} WHERE incident_id IN ({selector})"),
+                duckdb::params![max_ms],
+            )? as u64;
+        }
+
+        removed += self.conn.execute(
+            "DELETE FROM incidents
+             WHERE state = 'resolved' AND resolved_at IS NOT NULL
+               AND resolved_at - started_at < ?",
+            duckdb::params![max_ms],
+        )? as u64;
+        Ok(removed)
+    }
+
+    /// How many raw results are stored. Shown before a purge, so the confirm
+    /// dialog can name what it is about to destroy.
+    pub fn count_results(&self) -> Result<u64> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM check_results", [], |r| r.get(0))?;
+        Ok(n as u64)
+    }
+
+    /// Delete every raw result, and the per-agent beliefs derived from them.
+    ///
+    /// Needed when the fleet's topology is relabelled. Zone and region are
+    /// stamped onto each result from the agent's *credential*, so re-minting
+    /// credentials under new labels leaves old rows carrying the old ones — and
+    /// since the region tree derives its structure from observed locations,
+    /// those rows would surface as permanently-stale single-agent regions that
+    /// no agent can ever refresh or remove.
+    ///
+    /// `state_history` is deliberately NOT cleared: it is the coordinator's
+    /// record of what it published, which relabelling does not invalidate.
+    pub fn purge_results(&self) -> Result<u64> {
+        let mut removed = self.conn.execute("DELETE FROM check_results", [])? as u64;
+        removed += self.conn.execute("DELETE FROM agent_check_state", [])? as u64;
         Ok(removed)
     }
 
@@ -2346,10 +3663,11 @@ impl Storage {
     /// "no data" rather than as an outage. Always returns exactly `buckets`.
     pub fn uptime_buckets(
         &self,
-        check_id: &str,
+        check_id: CheckId,
         days: usize,
         buckets: usize,
         now_millis: i64,
+        degraded_is_downtime: bool,
     ) -> Result<Vec<UptimeBucket>> {
         const DAY: i64 = 86_400_000;
         let buckets = buckets.max(1);
@@ -2358,11 +3676,10 @@ impl Storage {
         // Recompute the span from the bucket width so segment edges tile exactly:
         // integer division would otherwise leave a sliver unaccounted for.
         let span = bucket_ms * buckets as i64;
-        let lower = now_millis - span; // exclusive
-
-        let mut up = vec![0u32; buckets];
-        let mut total = vec![0u32; buckets];
-
+        let lower = now_millis - span;
+        let spans = self.state_spans(check_id)?;
+        let mut result_up = vec![0_u64; buckets];
+        let mut result_total = vec![0_u64; buckets];
         let mut stmt = self.conn.prepare(
             "SELECT ts_millis, status FROM check_results
              WHERE check_id = ? AND ts_millis > ? AND ts_millis <= ?",
@@ -2370,84 +3687,57 @@ impl Storage {
         let rows = stmt.query_map(duckdb::params![check_id, lower, now_millis], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
-        for r in rows {
-            let (ts, status) = r?;
-            // Segments ago: 0 = the one ending at `now`. The range guarantees
-            // 0 <= d < buckets.
-            let d = ((now_millis - ts) / bucket_ms) as usize;
-            let i = buckets - 1 - d;
-            total[i] += 1;
-            if Status::from_db(&status) == Status::Up {
-                up[i] += 1;
+        for row in rows {
+            let (ts, status) = row?;
+            let index = (((ts - lower - 1).max(0) / bucket_ms) as usize).min(buckets - 1);
+            result_total[index] = result_total[index].saturating_add(1);
+            if status == "up" {
+                result_up[index] = result_up[index].saturating_add(1);
             }
         }
 
-        let out = (0..buckets)
+        Ok((0..buckets)
             .map(|i| {
-                let t = total[i];
-                let start = now_millis - (buckets as i64 - i as i64) * bucket_ms;
+                let start = lower + i as i64 * bucket_ms;
+                let end = start + bucket_ms;
+                let uptime = uptime_counts(&spans, start, end, degraded_is_downtime)
+                    .map(|(up_ms, known_ms)| up_ms as f64 / known_ms as f64);
                 UptimeBucket {
                     start,
-                    end: start + bucket_ms,
-                    up: up[i],
-                    total: t,
-                    uptime: if t > 0 {
-                        Some(up[i] as f64 / t as f64)
-                    } else {
-                        None
-                    },
+                    end,
+                    uptime,
+                    up: result_up[i],
+                    total: result_total[i],
                 }
             })
-            .collect();
-        Ok(out)
+            .collect())
     }
 
-    /// Average latency for a check over an explicit window, split into equal
-    /// segments (oldest first), plus exact per-agent attribution over the same
-    /// window. Segments with no attempts carry `None`, not zero.
-    ///
-    /// Returns at most `buckets` points: the split is capped at one segment per
-    /// recorded instant, because slicing finer than the data only manufactures
-    /// empty segments.
+    /// Average latency for a check over an explicit window, split into the
+    /// requested number of equal segments (oldest first), plus exact per-agent
+    /// attribution over the same window. Segments with no attempts carry
+    /// `None`, not zero, so sparse timestamps are represented faithfully.
     ///
     /// The window is explicit rather than `now`-anchored so a historical
     /// segment (a clicked uptime bar) can be charted truthfully instead of
     /// being approximated by the newest N rows.
     pub fn latency_series(
         &self,
-        check_id: &str,
+        check_id: CheckId,
         from: i64,
         to: i64,
         buckets: usize,
     ) -> Result<LatencySeries> {
-        // The window is exactly what the caller asked for. An earlier attempt
-        // narrowed it to the data inside it, which made a young check readable
-        // but silently broke the range selector: every range shorter than the
-        // check's history rendered identically, so the control did nothing.
-        // The selector is the viewer's instrument for choosing a span, and a
-        // 30-day view of a check that is five hours old *should* look mostly
-        // empty — that emptiness is the check's age, honestly drawn.
-        //
-        // Slicing finer than the recorded instants is a different matter: it
-        // manufactures empty segments between real ones, a picket fence of
-        // imaginary 0ms readings. One segment per instant is the finest split
-        // that carries information.
-        let instants: i64 = self.conn.query_row(
-            "SELECT COUNT(DISTINCT ts_millis) FROM check_results
-             WHERE check_id = ? AND ts_millis > ? AND ts_millis <= ?",
-            duckdb::params![check_id, from, to],
-            |row| row.get(0),
-        )?;
-        if instants == 0 {
-            // Nothing recorded in the window: an empty series, not a row of
-            // imaginary 0ms readings.
-            return Ok(LatencySeries::default());
-        }
-        let buckets = buckets.max(1).min(instants as usize);
+        // The window and grid are exactly what the caller asked for. A young
+        // check or sparse probe schedule legitimately leaves empty segments;
+        // those are `None`, never invented 0ms measurements. Keeping every
+        // requested segment also lets the client align series across ranges.
+        let buckets = buckets.max(1);
         let bucket_ms = ((to - from) / buckets as i64).max(1);
 
         let mut sum = vec![0.0f64; buckets];
-        let mut count = vec![0u32; buckets];
+        let mut attempts = vec![0u32; buckets];
+        let mut up = vec![0u32; buckets];
         let mut agents: BTreeMap<String, LatencyBand> = BTreeMap::new();
 
         let mut stmt = self.conn.prepare(
@@ -2467,18 +3757,24 @@ impl Storage {
             // Lower bound is exclusive, so shift before dividing: a timestamp
             // landing exactly on a boundary belongs to the segment below it.
             let i = (((ts - from - 1).max(0) / bucket_ms) as usize).min(buckets - 1);
-            sum[i] += lat as f64;
-            count[i] += 1;
+            attempts[i] += 1;
+            let successful = status == "up";
+            if successful {
+                sum[i] += lat as f64;
+                up[i] += 1;
+            }
             agents
                 .entry(agent_id)
                 .or_default()
-                .observe(lat as u64, status == "up");
+                .observe(lat as u64, successful);
         }
 
         let points = (0..buckets)
             .map(|i| LatencyPoint {
                 timestamp: from + i as i64 * bucket_ms,
-                avg_latency_ms: (count[i] > 0).then(|| sum[i] / count[i] as f64),
+                attempts: attempts[i],
+                up: up[i],
+                avg_latency_ms: (up[i] > 0).then(|| sum[i] / up[i] as f64),
             })
             .collect();
 
@@ -2513,6 +3809,13 @@ impl Storage {
             "redis-cache",
             "web-frontend",
         ];
+        // Demo data has no corresponding `checks` row (there is nothing to
+        // seed identity from), so each mock name gets its own synthetic id,
+        // used consistently for every row this function writes about it.
+        let ids: std::collections::HashMap<&str, CheckId> = checks
+            .iter()
+            .map(|name| (*name, crate::models::new_check_id()))
+            .collect();
         let days = 90usize;
         const DAY: i64 = 86_400_000;
         // Sample timestamps oldest-first. Older days are sparse (30-min); the
@@ -2569,7 +3872,7 @@ impl Storage {
                         metrics: None,
                         zone: "seed".into(),
                         region: "seed".into(),
-                        check_id: name.to_string(),
+                        check_id: ids[name],
                         agent_id: "seed".to_string(),
                         kind: crate::models::CheckKind::Http,
                         timestamp: chrono::DateTime::from_timestamp_millis(ts).unwrap(),
@@ -2587,7 +3890,14 @@ impl Storage {
                 ));
             }
         }
-        self.insert_results(&rows)?;
+        // `insert_results` goes through a prepared statement per row, which
+        // is the right shape for a real ingest batch (tens of rows) but not
+        // for the ~18k rows 90 days of demo history produces: DuckDB's
+        // execution engine is vectorized, and single-row `execute` calls pay
+        // for that on every call. The Appender API is the bulk-load path it
+        // documents for exactly this case, so seeding stays fast even though
+        // ordinary ingest has no reason to use it.
+        self.append_results_bulk(&rows)?;
 
         // Matching incidents at the start of each bad day and its recovery, so
         // the incidents list mirrors the bars. Seeded through the real
@@ -2596,6 +3906,7 @@ impl Storage {
         // the coordinator writes.
         let day_start_ts = |day: usize| now_millis - (days - 1 - day) as i64 * DAY;
         let outage = |name: &str, down_day: usize| -> Result<()> {
+            let check_id = ids[name];
             let started = day_start_ts(down_day);
             let ended = day_start_ts(down_day + 1);
             let id = format!("{name}-{started}");
@@ -2605,26 +3916,26 @@ impl Storage {
                 IncidentState::Detected,
                 started,
                 false,
-                Some(name),
+                Some(check_id),
                 &[IncidentCheckRow {
-                    check_id: name.to_owned(),
+                    check_id,
                     source: AffectSource::Origin,
                 }],
                 Some(("connection refused", None)),
             )?;
             self.insert_alert(
                 AlertScope::Check,
-                name,
-                Some(Status::Up),
-                Status::Down,
+                &check_id.to_string(),
+                Some(NodeState::Up),
+                NodeState::Down,
                 started,
                 Some(&id),
             )?;
             self.insert_alert(
                 AlertScope::Check,
-                name,
-                Some(Status::Down),
-                Status::Up,
+                &check_id.to_string(),
+                Some(NodeState::Down),
+                NodeState::Up,
                 ended,
                 Some(&id),
             )?;
@@ -2770,13 +4081,27 @@ impl Storage {
         }
     }
 
-    /// Idempotent by id — a replicated alert that arrives twice must not
-    /// become two rows in the event log. Local writes still go through
-    /// `insert_alert`, which mints the id from node/time/state; this is for a
-    /// row arriving with that id already decided by whoever wrote it first.
-    pub fn upsert_alert(&self, a: &AlertRow) -> Result<()> {
+    /// Insert a replicated alert exactly once. An existing id is a replay only
+    /// when its complete immutable payload agrees; replacing a different event
+    /// would silently corrupt the event log after an id collision.
+    pub fn upsert_alert(&self, a: &AlertRow) -> Result<bool> {
+        let existing = self
+            .conn
+            .query_row(
+                "SELECT id, scope, node_id, previous_state, current_state, ts_millis, incident_id
+             FROM alerts WHERE id = ?",
+                duckdb::params![a.id],
+                Self::alert_row,
+            )
+            .ok();
+        if let Some(existing) = existing {
+            if existing == *a {
+                return Ok(false);
+            }
+            bail!("replicated alert id {} conflicts with existing event", a.id);
+        }
         self.conn.execute(
-            "INSERT OR REPLACE INTO alerts
+            "INSERT INTO alerts
                  (id, scope, node_id, previous_state, current_state, ts_millis, incident_id)
              VALUES (?, ?, ?, ?, ?, ?, ?)",
             duckdb::params![
@@ -2789,20 +4114,57 @@ impl Storage {
                 a.incident_id,
             ],
         )?;
-        Ok(())
+        Ok(true)
     }
 
-    /// Idempotent by id — replaces the incident row and its affects set, and
-    /// inserts any update whose id is new without ever duplicating one that
-    /// already landed. What closes the `ponytail:` at the gossip handler: a
-    /// replicated alert can be stamped with the *real* incident id once this
-    /// has run, instead of staying unstamped or naming a local-only one.
-    pub fn upsert_incident(&self, i: &ReplicatedIncident) -> Result<()> {
+    /// Apply a replicated incident by id. Exact replays are no-ops; an update
+    /// id may be reused only for its identical immutable payload, never to
+    /// overwrite a different incident's narrative.
+    pub fn upsert_incident(&self, i: &ReplicatedIncident) -> Result<bool> {
         // A deleted incident stays deleted. Without this a peer's push, or the
         // reconciler replaying an incident it still holds, walks it straight
         // back in — and the operator who deleted it watches it reappear.
         if self.incident_tombstoned(&i.id)? {
-            return Ok(());
+            return Ok(false);
+        }
+        if self.replicated_incident(&i.id)?.as_ref() == Some(i) {
+            return Ok(false);
+        }
+        for update in &i.updates {
+            if update.incident_id != i.id {
+                bail!(
+                    "replicated update {} belongs to {}, not {}",
+                    update.id,
+                    update.incident_id,
+                    i.id
+                );
+            }
+            let existing = self
+                .conn
+                .query_row(
+                    "SELECT id, incident_id, state, body, author, created_at
+                 FROM incident_updates WHERE id = ?",
+                    duckdb::params![update.id],
+                    |row| {
+                        Ok(IncidentUpdateRow {
+                            id: row.get(0)?,
+                            incident_id: row.get(1)?,
+                            state: IncidentState::from_db(&row.get::<_, String>(2)?),
+                            body: row.get(3)?,
+                            author: row.get(4)?,
+                            created_at: row.get(5)?,
+                        })
+                    },
+                )
+                .ok();
+            if let Some(existing) = existing {
+                if existing != *update {
+                    bail!(
+                        "replicated incident update id {} conflicts with existing update",
+                        update.id
+                    );
+                }
+            }
         }
         self.conn.execute_batch("BEGIN")?;
         let write = || -> Result<()> {
@@ -2856,7 +4218,7 @@ impl Storage {
         match write() {
             Ok(()) => {
                 self.conn.execute_batch("COMMIT")?;
-                Ok(())
+                Ok(true)
             }
             Err(e) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
@@ -2921,15 +4283,10 @@ impl Storage {
             duckdb::params![window_start],
             |r| r.get(0),
         )?;
-        let config = [
-            ConfigKind::Check,
-            ConfigKind::Section,
-            ConfigKind::Setting,
-            ConfigKind::Credential,
-        ]
-        .into_iter()
-        .map(|k| self.config_digest_for(k))
-        .collect::<Result<Vec<_>>>()?;
+        let config = ConfigKind::ALL
+            .into_iter()
+            .map(|k| self.config_digest_for(k))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Digest {
             checks,
             window_start,
@@ -2989,7 +4346,7 @@ impl Storage {
     /// re-evaluating it on every node.
     pub fn results_since(
         &self,
-        check_id: &str,
+        check_id: CheckId,
         since: i64,
         until: i64,
         limit: usize,
@@ -3023,7 +4380,7 @@ impl Storage {
         let mut out = Vec::with_capacity(rows.len());
         for (agent_id, ts, status, latency_ms, status_code, error, failure, zone, region) in rows {
             let result = CheckResult {
-                check_id: check_id.to_owned(),
+                check_id,
                 agent_id,
                 zone: zone.unwrap_or_default(),
                 region: region.unwrap_or_default(),
@@ -3097,7 +4454,15 @@ impl Storage {
         let row_hlc: Option<Hlc> = {
             let sql = format!("SELECT updated_at, updated_by FROM {table} WHERE {pk} = ?");
             let mut stmt = self.conn.prepare(&sql)?;
-            let mut rows = stmt.query_map(duckdb::params![id], |r| {
+            let check_id = (kind == ConfigKind::Check)
+                .then(|| id.parse::<CheckId>().ok())
+                .flatten();
+            let param: &dyn duckdb::types::ToSql = check_id
+                .as_ref()
+                .map_or(&id as &dyn duckdb::types::ToSql, |id| {
+                    id as &dyn duckdb::types::ToSql
+                });
+            let mut rows = stmt.query_map([param], |r| {
                 Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?))
             })?;
             // A row whose `updated_at` is NULL was written before stamps
@@ -3125,15 +4490,28 @@ impl Storage {
 
     fn delete_config_row(&self, kind: ConfigKind, id: &str) -> Result<()> {
         let (table, pk) = kind.table_and_pk();
-        self.conn.execute(
-            &format!("DELETE FROM {table} WHERE {pk} = ?"),
-            duckdb::params![id],
-        )?;
+        if kind == ConfigKind::Check {
+            // An id that is not a UUID matches no row, so the delete is
+            // already satisfied — the tombstone written beside it is what
+            // carries the deletion to peers.
+            let Ok(id) = id.parse::<CheckId>() else {
+                return Ok(());
+            };
+            self.conn.execute(
+                &format!("DELETE FROM {table} WHERE {pk} = ?"),
+                duckdb::params![id],
+            )?;
+        } else {
+            self.conn.execute(
+                &format!("DELETE FROM {table} WHERE {pk} = ?"),
+                duckdb::params![id],
+            )?;
+        }
         Ok(())
     }
 
     /// Write a document over the row named `id`, stamped at `hlc`. The only
-    /// place any config table is written from a parsed document, so the four
+    /// place any config table is written from a parsed document, so the
     /// encodings live here and nowhere else.
     fn apply_config_document(
         &self,
@@ -3151,9 +4529,15 @@ impl Storage {
                 // hand-maintained field list that drifts from the first.
                 let config: CheckConfig = serde_json::from_str(doc)
                     .map_err(|e| anyhow::anyhow!("malformed check document for {id}: {e}"))?;
+                if config.id.to_string() != id {
+                    bail!(
+                        "check document id {} does not match config key {id}",
+                        config.id
+                    );
+                }
                 self.upsert_check(&config, hlc.millis)?;
                 self.conn.execute(
-                    "UPDATE checks SET updated_by = ? WHERE name = ?",
+                    "UPDATE checks SET updated_by = ? WHERE id = ?",
                     duckdb::params![hlc.node_id, id],
                 )?;
             }
@@ -3203,6 +4587,15 @@ impl Storage {
                         hlc.node_id,
                     ],
                 )?;
+            }
+            ConfigKind::RollupPolicy => {
+                let doc: RollupPolicyDoc = serde_json::from_str(doc).map_err(|e| {
+                    anyhow::anyhow!("malformed rollup policy document for {id}: {e}")
+                })?;
+                doc.policy
+                    .validate()
+                    .map_err(|e| anyhow::anyhow!("invalid rollup policy for {id}: {e}"))?;
+                self.upsert_rollup_policy(id, doc.node_type, &doc.policy, hlc)?;
             }
         }
         Ok(())
@@ -3274,9 +4667,15 @@ impl Storage {
     pub fn config_entry(&self, kind: ConfigKind, id: &str) -> Result<Option<ConfigEntry>> {
         let doc: Option<(String, Option<i64>, Option<String>)> = match kind {
             ConfigKind::Check => {
+                // A caller (or a peer on an older binary) can name an id that
+                // is not a UUID at all. That is not an error here: nothing in
+                // this table can match it, which is exactly "no such row".
+                let Ok(id) = id.parse::<CheckId>() else {
+                    return Ok(None);
+                };
                 let mut stmt = self
                     .conn
-                    .prepare("SELECT config, updated_at, updated_by FROM checks WHERE name = ?")?;
+                    .prepare("SELECT config, updated_at, updated_by FROM checks WHERE id = ?")?;
                 let mut rows = stmt.query_map(duckdb::params![id], |r| {
                     Ok((
                         r.get::<_, Option<String>>(0)?,
@@ -3353,6 +4752,28 @@ impl Storage {
                     None => None,
                 }
             }
+            ConfigKind::RollupPolicy => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT node_id, node_type, degraded_when, down_when, config,
+                            updated_at, updated_by
+                     FROM rollup_policy WHERE node_id = ?",
+                )?;
+                let mut rows = stmt.query_map(duckdb::params![id], |r| {
+                    let policy = Self::rollup_policy_row(r)?;
+                    Ok((
+                        RollupPolicyDoc {
+                            node_type: policy.node_type,
+                            policy: policy.policy,
+                        },
+                        Some(policy.updated_at),
+                        policy.updated_by,
+                    ))
+                })?;
+                match rows.next().transpose()? {
+                    Some((doc, at, by)) => Some((serde_json::to_string(&doc)?, at, by)),
+                    None => None,
+                }
+            }
         };
         Ok(doc.map(|(document, at, by)| ConfigEntry {
             kind,
@@ -3369,7 +4790,10 @@ impl Storage {
     pub fn config_entries(&self, kind: ConfigKind) -> Result<Vec<ConfigEntry>> {
         let (table, pk) = kind.table_and_pk();
         let ids: Vec<String> = {
-            let sql = format!("SELECT {pk} FROM {table}");
+            // Cast explicitly: `pk` is a native `UUID` column for checks and
+            // `VARCHAR` for everything else, and `FromSql for String` does not
+            // accept a UUID column directly.
+            let sql = format!("SELECT {pk}::VARCHAR FROM {table}");
             let mut stmt = self.conn.prepare(&sql)?;
             stmt.query_map([], |r| r.get::<_, String>(0))?
                 .collect::<std::result::Result<_, _>>()?
@@ -3401,10 +4825,20 @@ impl Storage {
     /// a row through an older helper that doesn't know about replication.
     pub fn stamp_config(&self, kind: ConfigKind, id: &str, hlc: &Hlc) -> Result<()> {
         let (table, pk) = kind.table_and_pk();
-        self.conn.execute(
-            &format!("UPDATE {table} SET updated_at = ?, updated_by = ? WHERE {pk} = ?"),
-            duckdb::params![hlc.millis, hlc.node_id, id],
-        )?;
+        if kind == ConfigKind::Check {
+            let Ok(id) = id.parse::<CheckId>() else {
+                return Ok(());
+            };
+            self.conn.execute(
+                &format!("UPDATE {table} SET updated_at = ?, updated_by = ? WHERE {pk} = ?"),
+                duckdb::params![hlc.millis, hlc.node_id, id],
+            )?;
+        } else {
+            self.conn.execute(
+                &format!("UPDATE {table} SET updated_at = ?, updated_by = ? WHERE {pk} = ?"),
+                duckdb::params![hlc.millis, hlc.node_id, id],
+            )?;
+        }
         Ok(())
     }
 
@@ -3593,16 +5027,16 @@ impl Storage {
     /// DELETE, so each leaves a tombstone and the erase survives replication.
     pub fn purge_check_everything(
         &self,
-        name: &str,
+        check_id: CheckId,
         now_millis: i64,
         node_id: &str,
     ) -> Result<PurgeSummary> {
-        let results = self.purge_check_data(name)?;
+        let results = self.purge_check_data(check_id)?;
         let owned: Vec<String> = {
             let mut stmt = self
                 .conn
                 .prepare("SELECT id FROM incidents WHERE origin_check = ?")?;
-            stmt.query_map(duckdb::params![name], |r| r.get::<_, String>(0))?
+            stmt.query_map(duckdb::params![check_id], |r| r.get::<_, String>(0))?
                 .collect::<std::result::Result<_, _>>()?
         };
         let mut incidents = 0u64;
@@ -3615,7 +5049,7 @@ impl Storage {
         // they survive; only this check's membership of them goes.
         self.conn.execute(
             "DELETE FROM incident_checks WHERE check_id = ?",
-            duckdb::params![name],
+            duckdb::params![check_id],
         )?;
         Ok(PurgeSummary {
             results,
@@ -3639,13 +5073,25 @@ mod tests {
     use super::*;
     use chrono::DateTime;
 
+    /// Deterministic per-name check id so test bodies stay readable while
+    /// storage only ever sees `CheckId`. Packing the name's bytes (rather than
+    /// hashing) also keeps `Ord` on the id agreeing with `Ord` on the name for
+    /// these short ASCII fixtures, which several tests rely on for ordering.
+    pub(super) fn cid(name: &str) -> CheckId {
+        let mut bytes = [0u8; 16];
+        let src = name.as_bytes();
+        let n = src.len().min(16);
+        bytes[..n].copy_from_slice(&src[..n]);
+        CheckId::from_u128(u128::from_be_bytes(bytes))
+    }
+
     pub(super) fn result(check_id: &str, ts_millis: i64, latency_ms: u64) -> CheckResult {
         CheckResult {
             zone: "test-zone".into(),
             region: "test-region".into(),
             body: None,
             headers: None,
-            check_id: check_id.into(),
+            check_id: cid(check_id),
             agent_id: "agent".into(),
             kind: crate::models::CheckKind::Http,
             timestamp: DateTime::from_timestamp_millis(ts_millis).unwrap(),
@@ -3657,6 +5103,169 @@ mod tests {
             metric: None,
             metrics: None,
         }
+    }
+
+    #[test]
+    fn legacy_name_migration_uses_identical_deterministic_uuidv7_ids() {
+        let migrate = || -> CheckId {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE checks (name VARCHAR PRIMARY KEY, kind VARCHAR NOT NULL, target VARCHAR NOT NULL);
+                 INSERT INTO checks VALUES ('api', 'http', 'https://api.example');",
+            )
+            .unwrap();
+            migrate_check_identity(&conn).unwrap();
+            conn.query_row("SELECT id FROM checks WHERE name = 'api'", [], |r| r.get(0))
+                .unwrap()
+        };
+        let first = migrate();
+        let second = migrate();
+        assert_eq!(first, second, "separate legacy databases converge by name");
+        assert_eq!(first.get_version_num(), 7);
+        assert_eq!(first.get_variant(), uuid::Variant::RFC4122);
+        assert_ne!(first, deterministic_legacy_check_id("web"));
+    }
+
+    #[test]
+    fn canonicalizes_random_legacy_uuid_relationships_and_embedded_ids() {
+        let conn = Connection::open_in_memory().unwrap();
+        let old = CheckId::now_v7();
+        let other = CheckId::now_v7();
+        conn.execute_batch(
+            "CREATE TABLE checks (id UUID PRIMARY KEY, name VARCHAR NOT NULL UNIQUE, config VARCHAR);
+             CREATE TABLE check_results (check_id UUID NOT NULL, agent_id VARCHAR NOT NULL);
+             CREATE TABLE current_state (check_id UUID PRIMARY KEY, status VARCHAR NOT NULL);
+             CREATE TABLE agent_check_state (check_id UUID NOT NULL, agent_id VARCHAR NOT NULL, PRIMARY KEY(check_id, agent_id));
+             CREATE TABLE state_history (check_id UUID NOT NULL, since BIGINT NOT NULL, PRIMARY KEY(check_id, since));
+             CREATE TABLE incidents (id VARCHAR PRIMARY KEY, origin_check UUID);
+             CREATE TABLE incident_checks (incident_id VARCHAR NOT NULL, check_id UUID NOT NULL, PRIMARY KEY(incident_id, check_id));
+             CREATE TABLE notification_queue (notifier VARCHAR NOT NULL, check_id UUID NOT NULL, queued_at BIGINT NOT NULL, PRIMARY KEY(notifier, check_id, queued_at));
+             CREATE TABLE alerts (id VARCHAR PRIMARY KEY, scope VARCHAR NOT NULL, node_id VARCHAR NOT NULL);
+             CREATE TABLE config_tombstones (kind VARCHAR NOT NULL, id VARCHAR NOT NULL, PRIMARY KEY(kind, id));
+             CREATE TABLE settings (key VARCHAR PRIMARY KEY, value VARCHAR NOT NULL);",
+        ).unwrap();
+        let config = serde_json::json!({"id": old.to_string(), "depends_on": [other.to_string()]})
+            .to_string();
+        conn.execute(
+            "INSERT INTO checks VALUES (?, 'api', ?), (?, 'web', NULL)",
+            duckdb::params![old, config, other],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO check_results VALUES (?, 'agent')",
+            duckdb::params![old],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO current_state VALUES (?, 'up')",
+            duckdb::params![old],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agent_check_state VALUES (?, 'agent')",
+            duckdb::params![old],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO state_history VALUES (?, 1)",
+            duckdb::params![old],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO incidents VALUES ('incident', ?)",
+            duckdb::params![old],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO incident_checks VALUES ('incident', ?)",
+            duckdb::params![old],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO notification_queue VALUES ('notifier', ?, 1)",
+            duckdb::params![old],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO alerts VALUES ('a', 'check', ?)",
+            duckdb::params![old.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO config_tombstones VALUES ('check', ?)",
+            duckdb::params![old.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO settings VALUES ('maintenance.windows', ?)",
+            duckdb::params![serde_json::json!([{"checks": [old.to_string()]}]).to_string()],
+        )
+        .unwrap();
+        canonicalize_random_legacy_check_ids(&conn).unwrap();
+        let canonical = deterministic_legacy_check_id("api");
+        assert_eq!(
+            conn.query_row("SELECT check_id FROM check_results", [], |r| r
+                .get::<_, CheckId>(0))
+                .unwrap(),
+            canonical
+        );
+        assert_eq!(
+            conn.query_row("SELECT check_id FROM current_state", [], |r| r
+                .get::<_, CheckId>(0))
+                .unwrap(),
+            canonical
+        );
+        for query in [
+            "SELECT check_id FROM agent_check_state",
+            "SELECT check_id FROM state_history",
+            "SELECT origin_check FROM incidents",
+            "SELECT check_id FROM incident_checks",
+            "SELECT check_id FROM notification_queue",
+        ] {
+            assert_eq!(
+                conn.query_row(query, [], |r| r.get::<_, CheckId>(0))
+                    .unwrap(),
+                canonical
+            );
+        }
+        assert_eq!(
+            conn.query_row("SELECT node_id FROM alerts", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            canonical.to_string()
+        );
+        let config: String = conn
+            .query_row("SELECT config FROM checks WHERE name = 'api'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let config: serde_json::Value = serde_json::from_str(&config).unwrap();
+        assert_eq!(config["id"], canonical.to_string());
+        assert_eq!(
+            config["depends_on"][0],
+            deterministic_legacy_check_id("web").to_string()
+        );
+        assert!(legacy_id_marker_exists(&conn).unwrap());
+    }
+
+    #[test]
+    fn fresh_schema_marker_never_rewrites_new_random_check_ids() {
+        let path =
+            std::env::temp_dir().join(format!("warden-storage-{}.duckdb", uuid::Uuid::now_v7()));
+        let path = path.to_string_lossy().into_owned();
+        let id = CheckId::now_v7();
+        let check = CheckConfig {
+            id,
+            name: "new-check".into(),
+            target: "https://example.test".into(),
+            ..Default::default()
+        };
+        Storage::open(&path)
+            .unwrap()
+            .upsert_check(&check, 1)
+            .unwrap();
+        let reopened = Storage::open(&path).unwrap();
+        assert_eq!(reopened.list_checks().unwrap()[0].id, id);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -3676,7 +5285,7 @@ mod tests {
             .unwrap();
 
         // history() surfaces the per-attempt reason.
-        let hist = s.history("a", 10, None, None, None).unwrap();
+        let hist = s.history(cid("a"), 10, None, None, None).unwrap();
         assert_eq!(hist[0].error.as_deref(), Some("connection refused"));
         assert_eq!(
             hist[0].status_code, None,
@@ -3694,7 +5303,7 @@ mod tests {
 
         // list_status() surfaces the reason for the *latest* attempt only.
         let rows = s.list_status(now).unwrap();
-        let a = rows.iter().find(|r| r.check_id == "a").unwrap();
+        let a = rows.iter().find(|r| r.check_id == cid("a")).unwrap();
         assert_eq!(
             a.error.as_deref(),
             Some("connection refused"),
@@ -3772,20 +5381,20 @@ mod tests {
             all.windows(2).all(|w| w[0].timestamp >= w[1].timestamp),
             "newest first"
         );
-        assert_eq!(all[0].check_id, "ddns-wa", "1s ago is the newest");
+        assert_eq!(all[0].check_id, cid("ddns-wa"), "1s ago is the newest");
 
         // Per-column filters narrow correctly.
         let by_check = s
             .recent_results(
                 &ResultsFilter {
-                    check_id: Some("web".into()),
+                    check_id: Some(cid("web")),
                     ..Default::default()
                 },
                 100,
             )
             .unwrap();
         assert_eq!(by_check.len(), 2);
-        assert!(by_check.iter().all(|r| r.check_id == "web"));
+        assert!(by_check.iter().all(|r| r.check_id == cid("web")));
 
         let by_agent = s
             .recent_results(
@@ -3843,7 +5452,7 @@ mod tests {
         let combined = s
             .recent_results(
                 &ResultsFilter {
-                    check_id: Some("web".into()),
+                    check_id: Some(cid("web")),
                     status: Some(Status::Down),
                     region: Some("eu-west".into()),
                     ..Default::default()
@@ -3859,7 +5468,7 @@ mod tests {
         // ahead of the web rows at 3s/4s.
         let capped = s.recent_results(&ResultsFilter::default(), 2).unwrap();
         assert_eq!(capped.len(), 2);
-        assert!(capped.iter().all(|r| r.check_id == "ddns-wa"));
+        assert!(capped.iter().all(|r| r.check_id == cid("ddns-wa")));
         assert!(capped[0].timestamp >= capped[1].timestamp);
     }
 
@@ -3907,8 +5516,12 @@ mod tests {
             .unwrap();
 
         let rows = s.list_status(now).unwrap();
-        let a = rows.iter().find(|r| r.check_id == "a").unwrap();
-        assert_eq!(a.status, Status::Up, "latest row is the success");
+        let a = rows.iter().find(|r| r.check_id == cid("a")).unwrap();
+        assert_eq!(
+            a.state,
+            NodeState::Up,
+            "without a published state, the latest observation is lifted"
+        );
         assert_eq!(
             a.error, None,
             "a recovered check must not carry the old error"
@@ -3933,7 +5546,7 @@ mod tests {
         .unwrap();
 
         // Full history for "a": newest first, and "b"'s row (latency 99) excluded.
-        let hist = s.history("a", 10, None, None, None).unwrap();
+        let hist = s.history(cid("a"), 10, None, None, None).unwrap();
         assert_eq!(
             hist,
             vec![
@@ -3968,7 +5581,7 @@ mod tests {
         );
 
         // Limit caps to the N newest rows.
-        let capped = s.history("a", 2, None, None, None).unwrap();
+        let capped = s.history(cid("a"), 2, None, None, None).unwrap();
         assert_eq!(
             capped,
             vec![
@@ -4004,8 +5617,8 @@ mod tests {
             .insert_alert(
                 AlertScope::Check,
                 "a",
-                Some(Status::Up),
-                Status::Down,
+                Some(NodeState::Up),
+                NodeState::Down,
                 1000,
                 Some("inc-1"),
             )
@@ -4014,15 +5627,15 @@ mod tests {
             .insert_alert(
                 AlertScope::Check,
                 "b",
-                Some(Status::Down),
-                Status::Up,
+                Some(NodeState::Down),
+                NodeState::Up,
                 2000,
                 None,
             )
             .unwrap();
         // A first-ever observation has nothing to move from.
         let a2 = s
-            .insert_alert(AlertScope::Check, "a", None, Status::Unknown, 3000, None)
+            .insert_alert(AlertScope::Check, "a", None, NodeState::Unknown, 3000, None)
             .unwrap();
 
         let got = s.recent_alerts(10).unwrap();
@@ -4034,7 +5647,7 @@ mod tests {
                     scope: AlertScope::Check,
                     node_id: "a".into(),
                     previous_state: None,
-                    current_state: Status::Unknown,
+                    current_state: NodeState::Unknown,
                     timestamp: 3000,
                     incident_id: None,
                 },
@@ -4042,8 +5655,8 @@ mod tests {
                     id: b1,
                     scope: AlertScope::Check,
                     node_id: "b".into(),
-                    previous_state: Some(Status::Down),
-                    current_state: Status::Up,
+                    previous_state: Some(NodeState::Down),
+                    current_state: NodeState::Up,
                     timestamp: 2000,
                     incident_id: None,
                 },
@@ -4051,12 +5664,52 @@ mod tests {
                     id: a1,
                     scope: AlertScope::Check,
                     node_id: "a".into(),
-                    previous_state: Some(Status::Up),
-                    current_state: Status::Down,
+                    previous_state: Some(NodeState::Up),
+                    current_state: NodeState::Down,
                     timestamp: 1000,
                     incident_id: Some("inc-1".into()),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn local_alerts_with_identical_payloads_in_one_millisecond_are_not_lost() {
+        let s = Storage::open(":memory:").unwrap();
+        let first = s
+            .insert_alert(
+                AlertScope::Check,
+                "web",
+                Some(NodeState::Up),
+                NodeState::Down,
+                1_000,
+                None,
+            )
+            .unwrap();
+        let second = s
+            .insert_alert(
+                AlertScope::Check,
+                "web",
+                Some(NodeState::Up),
+                NodeState::Down,
+                1_000,
+                None,
+            )
+            .unwrap();
+
+        assert_ne!(
+            first, second,
+            "distinct local events need distinct replication ids"
+        );
+        let alerts = s.recent_alerts(10).unwrap();
+        assert_eq!(alerts.len(), 2, "neither same-ms alert may be lost");
+        assert_eq!(
+            alerts
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            2
         );
     }
 
@@ -4067,8 +5720,8 @@ mod tests {
             s.insert_alert(
                 AlertScope::Check,
                 node,
-                Some(Status::Up),
-                Status::Down,
+                Some(NodeState::Up),
+                NodeState::Down,
                 ts,
                 None,
             )
@@ -4091,8 +5744,8 @@ mod tests {
         s.insert_alert(
             AlertScope::Check,
             "a",
-            Some(Status::Up),
-            Status::Down,
+            Some(NodeState::Up),
+            NodeState::Down,
             1000,
             Some("inc-1"),
         )
@@ -4102,8 +5755,8 @@ mod tests {
         s.insert_alert(
             AlertScope::Check,
             "b",
-            Some(Status::Up),
-            Status::Down,
+            Some(NodeState::Up),
+            NodeState::Down,
             1000,
             Some("inc-2"),
         )
@@ -4111,8 +5764,8 @@ mod tests {
         s.insert_alert(
             AlertScope::Check,
             "a",
-            Some(Status::Down),
-            Status::Up,
+            Some(NodeState::Down),
+            NodeState::Up,
             2000,
             Some("inc-1"),
         )
@@ -4147,13 +5800,22 @@ mod tests {
             (result("b", now - day, 99), Status::Down),
         ])
         .unwrap();
+        // Uptime is derived from published-state spans, rather than raw probe
+        // counts. The three seconds Up followed by one second Down yield 75%.
+        s.record_state(cid("a"), NodeState::Up, now - 4000).unwrap();
+        s.record_state(cid("a"), NodeState::Down, now - 1000)
+            .unwrap();
 
         let rows = s.list_status(now).unwrap();
         assert_eq!(rows.len(), 2, "one row per distinct check_id");
-        let find = |id: &str| rows.iter().find(|r| r.check_id == id).unwrap().clone();
+        let find = |id: &str| rows.iter().find(|r| r.check_id == cid(id)).unwrap().clone();
 
         let a = find("a");
-        assert_eq!(a.status, Status::Down, "latest row wins");
+        assert_eq!(
+            a.state,
+            NodeState::Down,
+            "without a published state, the latest observation is lifted"
+        );
         assert_eq!(a.latency_ms, 50, "latest row's latency");
         assert_eq!(a.last_check, now, "latest row's timestamp");
         assert!(
@@ -4163,7 +5825,7 @@ mod tests {
         );
 
         let b = find("b");
-        assert_eq!(b.status, Status::Up);
+        assert_eq!(b.state, NodeState::Up);
         assert_eq!(b.latency_ms, 21);
         assert_eq!(b.last_check, now - 4000);
         // Stale DOWN at the exclusive lower bound is filtered out, so 2 UP / 2 in-window.
@@ -4192,52 +5854,48 @@ mod tests {
     }
 
     #[test]
-    fn uptime_buckets_windows_filters_and_boundary() {
+    fn uptime_buckets_are_time_weighted_from_state_spans() {
         let s = Storage::open(":memory:").unwrap();
         let now = 1_000_000_000_000i64;
         let day = 86_400_000i64;
 
+        // Raw results provide tooltip counts, but only published state spans
+        // determine the time-weighted uptime ratio.
         s.insert_results(&[
-            // Bucket 2 (today, (now-DAY, now]): 2 UP + 1 DOWN -> up=2, total=3.
-            (result("x", now, 10), Status::Up),
-            (result("x", now - 1000, 11), Status::Up),
-            (result("x", now - 2000, 12), Status::Down),
-            // Bucket 1 ((now-2*DAY, now-DAY]): nothing -> up=0, total=0, uptime=None.
-            // Bucket 0 ((now-3*DAY, now-2*DAY]): 1 UP -> up=1, total=1, uptime=Some(1.0).
-            (result("x", now - 2 * day - 1000, 13), Status::Up),
-            // Boundary: exactly at bucket 0's exclusive lower bound now-3*DAY -> excluded.
-            (result("x", now - 3 * day, 14), Status::Up),
-            // Decoy check "y" at now: must never count toward "x".
-            (result("y", now, 99), Status::Up),
+            (result("x", now - 3 * day + 1, 10), Status::Down),
+            (result("x", now - 2 * day + 1, 10), Status::Up),
+            (result("x", now - day + 1, 10), Status::Up),
         ])
         .unwrap();
+        s.record_state(cid("x"), NodeState::Up, now - 3 * day)
+            .unwrap();
+        s.record_state(cid("x"), NodeState::Down, now - day - day / 2)
+            .unwrap();
+        s.record_state(cid("x"), NodeState::Degraded, now - day / 2)
+            .unwrap();
 
-        let buckets = s.uptime_buckets("x", 3, 3, now).unwrap();
+        let buckets = s.uptime_buckets(cid("x"), 3, 3, now, false).unwrap();
         assert_eq!(buckets.len(), 3, "exactly `days` buckets, oldest-first");
-
-        // Bucket 0: oldest day; boundary row at now-3*DAY excluded, one UP remains.
-        assert_eq!(buckets[0].start, now - 3 * day);
-        assert_eq!(buckets[0].up, 1);
-        assert_eq!(
-            buckets[0].total, 1,
-            "row at exclusive lower bound now-3*DAY excluded"
-        );
         assert_eq!(buckets[0].uptime, Some(1.0));
-
-        // Bucket 1: empty middle day.
-        assert_eq!(buckets[1].start, now - 2 * day);
-        assert_eq!(buckets[1].up, 0);
-        assert_eq!(buckets[1].total, 0);
-        assert_eq!(buckets[1].uptime, None, "no rows -> uptime None, not 0.0");
-
-        // Bucket 2: today; 2 UP + 1 DOWN; decoy "y" excluded.
-        assert_eq!(buckets[2].start, now - day);
-        assert_eq!(buckets[2].up, 2);
-        assert_eq!(buckets[2].total, 3, "decoy check \"y\" must not count");
-        let uptime = buckets[2].uptime.expect("today has data");
+        assert_eq!(buckets[0].up, 0);
+        assert_eq!(buckets[0].total, 1);
+        assert_eq!(buckets[1].uptime, Some(0.5));
+        assert_eq!(buckets[1].up, 1);
+        assert_eq!(buckets[1].total, 1);
+        assert_eq!(buckets[2].uptime, Some(0.5));
+        assert_eq!(buckets[2].up, 1);
+        assert_eq!(buckets[2].total, 1);
         assert!(
-            (uptime - 2.0 / 3.0).abs() < 1e-9,
-            "2 UP / 3 total, got {uptime}"
+            buckets.iter().all(|bucket| bucket.total <= 1),
+            "tooltip counts are probe attempts, not milliseconds"
+        );
+
+        let degraded_down = s.uptime_buckets(cid("x"), 3, 3, now, true).unwrap();
+        assert_eq!(degraded_down[2].uptime, Some(0.0));
+        assert_eq!(
+            s.uptime_between(cid("x"), now - 3 * day, now, true)
+                .unwrap(),
+            Some(0.5)
         );
     }
 
@@ -4247,7 +5905,7 @@ mod tests {
         let now = 1_000_000_000_000i64;
         let day = 86_400_000i64;
 
-        let buckets = s.uptime_buckets("absent", 4, 4, now).unwrap();
+        let buckets = s.uptime_buckets(cid("absent"), 4, 4, now, false).unwrap();
         assert_eq!(
             buckets.len(),
             4,
@@ -4284,7 +5942,7 @@ mod tests {
         .unwrap();
 
         let points = s
-            .latency_series("x", now - 4 * hour, now, 4)
+            .latency_series(cid("x"), now - 4 * hour, now, 4)
             .unwrap()
             .points;
         assert_eq!(points.len(), 4, "four instants support four buckets");
@@ -4307,7 +5965,7 @@ mod tests {
 
         // Decoy "y" must not be counted.
         let y_points = s
-            .latency_series("y", now - 4 * hour, now, 4)
+            .latency_series(cid("y"), now - 4 * hour, now, 4)
             .unwrap()
             .points;
         assert_eq!(
@@ -4341,7 +5999,7 @@ mod tests {
 
         let span_of = |window: i64| {
             let p = s
-                .latency_series("young", now - window, now, 120)
+                .latency_series(cid("young"), now - window, now, 120)
                 .unwrap()
                 .points;
             (p.last().unwrap().timestamp - p[0].timestamp, p.len())
@@ -4375,7 +6033,9 @@ mod tests {
             .collect();
         s.insert_results(&rows).unwrap();
 
-        let series = s.latency_series("young", now - month, now, 120).unwrap();
+        let series = s
+            .latency_series(cid("young"), now - month, now, 120)
+            .unwrap();
         let populated: Vec<_> = series
             .points
             .iter()
@@ -4410,7 +6070,9 @@ mod tests {
             .collect();
         s.insert_results(&rows).unwrap();
 
-        let points = s.latency_series("quiet", now - 24 * hour, now, 12).unwrap();
+        let points = s
+            .latency_series(cid("quiet"), now - 24 * hour, now, 12)
+            .unwrap();
         let trailing_empty = points
             .points
             .iter()
@@ -4438,9 +6100,14 @@ mod tests {
         // zeroes, which would read as "responded instantly" rather than "never
         // ran".
         let points = s
-            .latency_series("absent", now - 6 * 3_600_000, now, 6)
+            .latency_series(cid("absent"), now - 6 * 3_600_000, now, 6)
             .unwrap()
             .points;
+        assert_eq!(
+            points.len(),
+            6,
+            "an empty window still preserves its requested grid"
+        );
         assert!(
             points.iter().all(|p| p.avg_latency_ms.is_none()),
             "no data must yield no measurements, got {points:?}"
@@ -4448,13 +6115,13 @@ mod tests {
     }
 
     #[test]
-    fn latency_series_caps_buckets_at_the_data_resolution() {
+    fn latency_series_preserves_the_requested_grid_for_sparse_timestamps() {
         let s = Storage::open(":memory:").unwrap();
         let now = 1_000_000_000_000i64;
         let min = 60_000i64;
 
-        // The case behind the picket-fence bug: a short window probed every few
-        // minutes, asked for far more buckets than there are attempts.
+        // A short window probed every few minutes still gets its requested
+        // grid; unobserved segments are explicitly empty, not 0ms readings.
         s.insert_results(&[
             (result("x", now - 12 * min, 40), Status::Up),
             (result("x", now - 8 * min, 50), Status::Up),
@@ -4464,21 +6131,22 @@ mod tests {
         .unwrap();
 
         let points = s
-            .latency_series("x", now - 16 * min, now, 120)
+            .latency_series(cid("x"), now - 16 * min, now, 120)
             .unwrap()
             .points;
-        assert_eq!(points.len(), 4, "one segment per recorded instant, not 120");
-        assert!(
-            points.iter().all(|p| p.avg_latency_ms.is_some()),
-            "capping to the data leaves no empty segments, got {points:?}"
-        );
         assert_eq!(
-            points
-                .iter()
-                .filter_map(|p| p.avg_latency_ms)
-                .collect::<Vec<_>>(),
-            vec![40.0, 50.0, 60.0, 70.0],
-            "oldest first, one attempt each"
+            points.len(),
+            120,
+            "the requested grid is never capped to data"
+        );
+        assert_eq!(points[29].avg_latency_ms, Some(40.0));
+        assert_eq!(points[59].avg_latency_ms, Some(50.0));
+        assert_eq!(points[89].avg_latency_ms, Some(60.0));
+        assert_eq!(points[119].avg_latency_ms, Some(70.0));
+        assert_eq!(
+            points.iter().filter(|p| p.avg_latency_ms.is_none()).count(),
+            116,
+            "unobserved segments remain empty rather than reading as zero latency"
         );
     }
 
@@ -4500,12 +6168,18 @@ mod tests {
         .unwrap();
 
         let points = s
-            .latency_series("x", now - 60 * min, now, 4)
+            .latency_series(cid("x"), now - 60 * min, now, 4)
             .unwrap()
             .points;
         assert_eq!(points.len(), 4, "exactly `buckets` points");
         assert_eq!(points[3].avg_latency_ms, Some(30.0), "avg of 40 and 20");
+        assert_eq!(points[3].attempts, 2);
+        assert_eq!(points[3].up, 2);
         assert_eq!(points[0].avg_latency_ms, Some(90.0), "avg of 80 and 100");
+        assert_eq!(points[0].attempts, 2);
+        assert_eq!(points[0].up, 2);
+        assert_eq!(points[1].attempts, 0, "middle segment is unobserved");
+        assert_eq!(points[1].up, 0);
         assert_eq!(points[1].avg_latency_ms, None, "middle segment empty");
         assert_eq!(points[2].avg_latency_ms, None, "middle segment empty");
     }
@@ -4542,7 +6216,7 @@ mod tests {
 
         // Two distinct instants in the window, so ask for the two segments the
         // data can actually support.
-        let series = s.latency_series("web", from, to, 2).unwrap();
+        let series = s.latency_series(cid("web"), from, to, 2).unwrap();
 
         assert_eq!(series.overall.attempts, 4, "only rows inside the window");
         assert_eq!(series.overall.up, 3);
@@ -4565,18 +6239,19 @@ mod tests {
             "the failing agent is identifiable"
         );
 
-        // The chart still buckets every attempt, so an outage stays visible as a
-        // spike rather than vanishing from the shape.
+        // Point counts retain failed evidence separately from latency. Both
+        // recorded instants land in the first half of this four-hour window;
+        // the timeout is observed but excluded from the latency average.
         assert_eq!(series.points.len(), 2);
+        assert_eq!(series.points[0].attempts, 4);
+        assert_eq!(series.points[0].up, 3);
+        assert_eq!(series.points[0].avg_latency_ms, Some(20.0));
+        assert_eq!(series.points[1].attempts, 0);
+        assert_eq!(series.points[1].up, 0);
         // The series covers the window the caller asked for.
         assert_eq!(
             series.points[0].timestamp, from,
             "oldest segment starts at the requested bound"
-        );
-        assert_eq!(
-            series.points[0].avg_latency_ms,
-            Some(1265.0),
-            "averages 10, 30, 20 and the 5000ms timeout"
         );
         // Silence after the last result means the check stopped reporting,
         // which must stay visible rather than being trimmed away.
@@ -4655,7 +6330,7 @@ mod tests {
         s.insert_results(&[(a, Status::Up), (b, Status::Up)])
             .unwrap();
 
-        let hist = s.history("web", 10, None, None, None).unwrap();
+        let hist = s.history(cid("web"), 10, None, None, None).unwrap();
         assert_eq!(hist.len(), 2, "both agents' results are kept");
         assert_eq!(
             hist[0].timestamp, hist[1].timestamp,
@@ -4701,7 +6376,7 @@ mod tests {
         s.insert_results(&rows).unwrap();
 
         // The newest 100 rows contain no failures at all — the original bug.
-        let newest = s.history("web", 100, None, None, None).unwrap();
+        let newest = s.history(cid("web"), 100, None, None, None).unwrap();
         assert_eq!(newest.len(), 100);
         assert!(
             newest.iter().all(|r| r.status == Status::Up),
@@ -4710,13 +6385,15 @@ mod tests {
 
         // Filtering by status surfaces exactly the two failures, with reasons.
         let bad = s
-            .history("web", 500, None, None, Some(Status::Down))
+            .history(cid("web"), 500, None, None, Some(Status::Down))
             .unwrap();
         assert_eq!(bad.len(), 2, "both failures found regardless of recency");
         assert!(bad.iter().all(|r| r.error.as_deref() == Some("timeout")));
 
         // And the filter is a filter, not a truncation: successes still queryable.
-        let good = s.history("web", 500, None, None, Some(Status::Up)).unwrap();
+        let good = s
+            .history(cid("web"), 500, None, None, Some(Status::Up))
+            .unwrap();
         assert_eq!(good.len(), 300);
     }
 
@@ -4739,8 +6416,8 @@ mod tests {
         s.insert_alert(
             AlertScope::Check,
             "a",
-            Some(Status::Up),
-            Status::Down,
+            Some(NodeState::Up),
+            NodeState::Down,
             now - 1000,
             None,
         )
@@ -4748,8 +6425,8 @@ mod tests {
         s.insert_alert(
             AlertScope::Check,
             "a",
-            Some(Status::Down),
-            Status::Up,
+            Some(NodeState::Down),
+            NodeState::Up,
             now - 100 * day,
             None,
         )
@@ -4763,9 +6440,9 @@ mod tests {
                 IncidentState::Detected,
                 started,
                 false,
-                Some(check),
+                Some(cid(check)),
                 &[IncidentCheckRow {
-                    check_id: check.into(),
+                    check_id: cid(check),
                     source: AffectSource::Origin,
                 }],
                 Some(("down", None)),
@@ -4787,9 +6464,9 @@ mod tests {
         // pruning it would silently un-page an outage.
         let queued = |check: &str, attempts: i32, next_attempt: Option<i64>| QueuedRow {
             notifier: "oncall".into(),
-            check_id: check.into(),
-            previous_state: Some(Status::Up),
-            current_state: Status::Down,
+            check_id: cid(check),
+            previous_state: Some(NodeState::Up),
+            current_state: NodeState::Down,
             attempts,
             next_attempt,
             last_error: "the endpoint answered 500".into(),
@@ -4807,12 +6484,12 @@ mod tests {
         );
         let left = s.undelivered_notifications(10).unwrap();
         assert_eq!(left.len(), 1, "the one still being retried survives");
-        assert_eq!(left[0].check_id, "b");
+        assert_eq!(left[0].check_id, cid("b"));
 
         // The recent result and alert survive.
         let status = s.list_status(now).unwrap();
         assert_eq!(status.len(), 1, "only the recent result's check remains");
-        assert_eq!(status[0].check_id, "a");
+        assert_eq!(status[0].check_id, cid("a"));
         assert_eq!(s.recent_alerts(10).unwrap().len(), 1);
         // The open incident survives whole; the resolved one is gone entirely.
         let incidents = s.list_incidents(10, None).unwrap();
@@ -4867,7 +6544,7 @@ mod tests {
             .insert_results_dedup(&[(r1.clone(), Status::Up), (r2.clone(), Status::Up)])
             .unwrap();
         assert_eq!(replayed, 0, "replaying a batch must not duplicate it");
-        assert_eq!(s.history("a", 10, None, None, None).unwrap().len(), 2);
+        assert_eq!(s.history(cid("a"), 10, None, None, None).unwrap().len(), 2);
 
         // A batch mixing an old row with a genuinely new one only adds the new one.
         let r3 = result("a", now - 2000, 7);
@@ -4878,7 +6555,7 @@ mod tests {
             mixed, 1,
             "only the row this node did not already have is inserted"
         );
-        assert_eq!(s.history("a", 10, None, None, None).unwrap().len(), 3);
+        assert_eq!(s.history(cid("a"), 10, None, None, None).unwrap().len(), 3);
     }
 
     #[test]
@@ -4897,28 +6574,33 @@ mod tests {
             inserted, 2,
             "same check and millisecond, different agents, must not collide"
         );
-        assert_eq!(s.history("x", 10, None, None, None).unwrap().len(), 2);
+        assert_eq!(s.history(cid("x"), 10, None, None, None).unwrap().len(), 2);
     }
 
     #[test]
-    fn upsert_alert_is_idempotent_by_id() {
+    fn upsert_alert_replays_identical_rows_but_rejects_collisions() {
         let s = Storage::open(":memory:").unwrap();
         let a = AlertRow {
             id: "fixed-id".into(),
             scope: AlertScope::Check,
             node_id: "web".into(),
-            previous_state: Some(Status::Up),
-            current_state: Status::Down,
+            previous_state: Some(NodeState::Up),
+            current_state: NodeState::Down,
             timestamp: 1000,
             incident_id: Some("inc-1".into()),
         };
-        s.upsert_alert(&a).unwrap();
-        s.upsert_alert(&a).unwrap();
-        assert_eq!(
-            s.recent_alerts(10).unwrap().len(),
-            1,
-            "a replicated alert arriving twice is one row, not two"
+        assert!(s.upsert_alert(&a).unwrap());
+        assert!(
+            !s.upsert_alert(&a).unwrap(),
+            "an identical replay is a no-op"
         );
+        let mut collision = a.clone();
+        collision.current_state = NodeState::Up;
+        assert!(
+            s.upsert_alert(&collision).is_err(),
+            "a reused id must not replace an event"
+        );
+        assert_eq!(s.recent_alerts(10).unwrap(), vec![a]);
     }
 
     // ---- Clustering: config replication ----
@@ -5052,6 +6734,112 @@ mod tests {
         );
     }
 
+    fn rollup_policy_entry(
+        id: &str,
+        millis: i64,
+        node: &str,
+        node_type: NodeType,
+        policy: crate::rollup::RollupPolicy,
+    ) -> ConfigEntry {
+        ConfigEntry {
+            kind: ConfigKind::RollupPolicy,
+            id: id.into(),
+            hlc: Hlc::new(millis, node),
+            document: Some(serde_json::to_string(&RollupPolicyDoc { node_type, policy }).unwrap()),
+        }
+    }
+
+    #[test]
+    fn rollup_policy_config_replicates_with_stable_document() {
+        use crate::rollup::{RollupPolicy, Threshold};
+
+        let source = Storage::open(":memory:").unwrap();
+        let replica = Storage::open(":memory:").unwrap();
+        let entry = rollup_policy_entry(
+            "region:eu",
+            100,
+            "source",
+            NodeType::Region,
+            RollupPolicy::new(Threshold::Any, Threshold::Quorum(2)),
+        );
+        assert!(source.apply_config_entry(&entry).unwrap());
+        let wire = source
+            .config_entry(ConfigKind::RollupPolicy, "region:eu")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            wire.document.as_deref(),
+            Some(
+                r#"{"node_type":"region","policy":{"degraded_when":"any","down_when":{"quorum":2}}}"#
+            )
+        );
+
+        assert!(replica.apply_config_entry(&wire).unwrap());
+        assert_eq!(
+            replica.list_rollup_policies().unwrap()[0].policy,
+            entry
+                .document
+                .as_deref()
+                .map(|doc| serde_json::from_str::<RollupPolicyDoc>(doc).unwrap().policy)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn rollup_policy_config_newer_write_wins() {
+        use crate::rollup::{RollupPolicy, Threshold};
+
+        let s = Storage::open(":memory:").unwrap();
+        let newer = rollup_policy_entry(
+            "zone:r:z",
+            200,
+            "b",
+            NodeType::Zone,
+            RollupPolicy::new(Threshold::Majority, Threshold::All),
+        );
+        let older = rollup_policy_entry(
+            "zone:r:z",
+            100,
+            "a",
+            NodeType::Zone,
+            RollupPolicy::new(Threshold::Any, Threshold::All),
+        );
+        assert!(s.apply_config_entry(&newer).unwrap());
+        assert!(!s.apply_config_entry(&older).unwrap());
+        assert_eq!(
+            s.list_rollup_policies().unwrap()[0].policy,
+            RollupPolicy::new(Threshold::Majority, Threshold::All)
+        );
+    }
+
+    #[test]
+    fn rollup_policy_config_tombstone_deletes_and_blocks_older_write() {
+        use crate::rollup::{RollupPolicy, Threshold};
+
+        let s = Storage::open(":memory:").unwrap();
+        let live = rollup_policy_entry(
+            "global",
+            100,
+            "a",
+            NodeType::Global,
+            RollupPolicy::new(Threshold::Any, Threshold::All),
+        );
+        assert!(s.apply_config_entry(&live).unwrap());
+        let tombstone = ConfigEntry {
+            kind: ConfigKind::RollupPolicy,
+            id: "global".into(),
+            hlc: Hlc::new(200, "b"),
+            document: None,
+        };
+        assert!(s.apply_config_entry(&tombstone).unwrap());
+        assert!(s.list_rollup_policies().unwrap().is_empty());
+        assert!(!s.apply_config_entry(&live).unwrap());
+        assert_eq!(
+            s.config_entries(ConfigKind::RollupPolicy).unwrap(),
+            vec![tombstone]
+        );
+    }
+
     #[test]
     fn config_entry_round_trips_each_kind_through_apply_and_read_back() {
         let s = Storage::open(":memory:").unwrap();
@@ -5060,12 +6848,15 @@ mod tests {
         let check = check_config("web", "https://example.com");
         let e = ConfigEntry {
             kind: ConfigKind::Check,
-            id: "web".into(),
+            id: check.id.to_string(),
             hlc: hlc.clone(),
             document: Some(serde_json::to_string(&check).unwrap()),
         };
         assert!(s.apply_config_entry(&e).unwrap());
-        let back = s.config_entry(ConfigKind::Check, "web").unwrap().unwrap();
+        let back = s
+            .config_entry(ConfigKind::Check, &check.id.to_string())
+            .unwrap()
+            .unwrap();
         assert_eq!(back.hlc, hlc);
         let round: CheckConfig = serde_json::from_str(back.document.as_ref().unwrap()).unwrap();
         assert_eq!(round, check);
@@ -5121,13 +6912,33 @@ mod tests {
         let round: CredentialDoc = serde_json::from_str(back.document.as_ref().unwrap()).unwrap();
         assert_eq!(round, CredentialDoc::from(&cred));
 
+        let policy = crate::rollup::RollupPolicy::new(
+            crate::rollup::Threshold::Any,
+            crate::rollup::Threshold::All,
+        );
+        let e = rollup_policy_entry(
+            "region:test",
+            hlc.millis,
+            &hlc.node_id,
+            NodeType::Region,
+            policy,
+        );
+        assert!(s.apply_config_entry(&e).unwrap());
+        let back = s
+            .config_entry(ConfigKind::RollupPolicy, "region:test")
+            .unwrap()
+            .unwrap();
+        let round: RollupPolicyDoc = serde_json::from_str(back.document.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            round,
+            RollupPolicyDoc {
+                node_type: NodeType::Region,
+                policy
+            }
+        );
+
         // Every kind now has exactly its one applied entry, no tombstones.
-        for kind in [
-            ConfigKind::Check,
-            ConfigKind::Section,
-            ConfigKind::Setting,
-            ConfigKind::Credential,
-        ] {
+        for kind in ConfigKind::ALL {
             let entries = s.config_entries(kind).unwrap();
             assert_eq!(entries.len(), 1, "{kind:?} should have exactly one entry");
             assert!(!entries[0].is_tombstone());
@@ -5204,8 +7015,8 @@ mod tests {
             started_at: 100,
             resolved_at: None,
             global: false,
-            origin_check: Some("a".into()),
-            checks: vec![("a".into(), AffectSource::Origin)],
+            origin_check: Some(cid("a")),
+            checks: vec![(cid("a"), AffectSource::Origin)],
             updates: vec![IncidentUpdateRow {
                 id: "inc-1-u1".into(),
                 incident_id: "inc-1".into(),
@@ -5245,6 +7056,25 @@ mod tests {
     }
 
     #[test]
+    fn upsert_incident_replays_identically_and_rejects_update_id_collisions() {
+        let s = Storage::open(":memory:").unwrap();
+        let incident = sample_replicated_incident();
+        assert!(s.upsert_incident(&incident).unwrap());
+        assert!(
+            !s.upsert_incident(&incident).unwrap(),
+            "an identical replay is a no-op"
+        );
+
+        let mut collision = incident.clone();
+        collision.id = "inc-2".into();
+        collision.updates[0].incident_id = collision.id.clone();
+        collision.updates[0].body = "different event with reused id".into();
+        assert!(s.upsert_incident(&collision).is_err());
+        assert_eq!(s.replicated_incident("inc-1").unwrap(), Some(incident));
+        assert_eq!(s.replicated_incident("inc-2").unwrap(), None);
+    }
+
+    #[test]
     fn replicated_incident_round_trips_through_upsert() {
         let s = Storage::open(":memory:").unwrap();
         let i = sample_replicated_incident();
@@ -5264,7 +7094,7 @@ mod tests {
             (result("a", 2000, 2), Status::Down),
         ])
         .unwrap();
-        let page = s.results_since("a", 1000, 5000, 10).unwrap();
+        let page = s.results_since(cid("a"), 1000, 5000, 10).unwrap();
         assert_eq!(page.len(), 1, "since is exclusive of the cursor");
         assert_eq!(page[0].0.timestamp.timestamp_millis(), 2000);
         assert_eq!(page[0].1, Status::Down);
@@ -5276,8 +7106,8 @@ mod tests {
         s.insert_alert(
             AlertScope::Check,
             "a",
-            Some(Status::Up),
-            Status::Down,
+            Some(NodeState::Up),
+            NodeState::Down,
             2000,
             None,
         )
@@ -5291,9 +7121,9 @@ mod tests {
             IncidentState::Detected,
             2000,
             false,
-            Some("a"),
+            Some(cid("a")),
             &[IncidentCheckRow {
-                check_id: "a".into(),
+                check_id: cid("a"),
                 source: AffectSource::Origin,
             }],
             None,
@@ -5321,14 +7151,21 @@ mod tests {
         s.insert_alert(
             AlertScope::Check,
             "a",
-            Some(Status::Up),
-            Status::Down,
+            Some(NodeState::Up),
+            NodeState::Down,
             now - 1000,
             None,
         )
         .unwrap();
-        s.insert_alert(AlertScope::Check, "a", None, Status::Up, now - 90_000, None)
-            .unwrap();
+        s.insert_alert(
+            AlertScope::Check,
+            "a",
+            None,
+            NodeState::Up,
+            now - 90_000,
+            None,
+        )
+        .unwrap();
 
         s.create_incident(
             "inc-1",
@@ -5336,9 +7173,9 @@ mod tests {
             IncidentState::Detected,
             now - 2000,
             false,
-            Some("a"),
+            Some(cid("a")),
             &[IncidentCheckRow {
-                check_id: "a".into(),
+                check_id: cid("a"),
                 source: AffectSource::Origin,
             }],
             None,
@@ -5350,7 +7187,7 @@ mod tests {
             IncidentState::Detected,
             now - 90_000,
             false,
-            Some("b"),
+            Some(cid("b")),
             &[],
             None,
         )
@@ -5359,11 +7196,11 @@ mod tests {
         let window_start = now - 10_000;
         let d = s.digest(window_start).unwrap();
 
-        let a_digest = d.checks.iter().find(|c| c.check_id == "a").unwrap();
+        let a_digest = d.checks.iter().find(|c| c.check_id == cid("a")).unwrap();
         assert_eq!(a_digest.count, 2);
         assert_eq!(a_digest.max_ts, now - 1000);
         assert!(
-            d.checks.iter().all(|c| c.check_id != "b"),
+            d.checks.iter().all(|c| c.check_id != cid("b")),
             "the out-of-window check is excluded entirely"
         );
 
@@ -5495,9 +7332,9 @@ mod tests {
             IncidentState::Detected,
             1000,
             false,
-            Some(check),
+            Some(cid(check)),
             &[IncidentCheckRow {
-                check_id: check.into(),
+                check_id: cid(check),
                 source: AffectSource::Origin,
             }],
             Some(("down", None)),
@@ -5507,12 +7344,33 @@ mod tests {
             id: format!("{id}-a1"),
             scope: AlertScope::Check,
             node_id: check.into(),
-            previous_state: Some(Status::Up),
-            current_state: Status::Down,
+            previous_state: Some(NodeState::Up),
+            current_state: NodeState::Down,
             timestamp: 1000,
             incident_id: Some(id.into()),
         })
         .unwrap();
+    }
+
+    #[test]
+    fn purging_short_incidents_removes_their_stamped_alerts() {
+        let s = Storage::open(":memory:").unwrap();
+        seeded_incident(&s, "short", "web");
+        s.add_update("short", IncidentState::Resolved, "recovered", None, 1_500)
+            .unwrap();
+        s.insert_alert(
+            AlertScope::Check,
+            "api",
+            Some(NodeState::Up),
+            NodeState::Down,
+            2_000,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(s.purge_short_incidents(1).unwrap(), 5);
+        assert!(s.incident("short").unwrap().is_none());
+        assert_eq!(s.recent_alerts(10).unwrap().len(), 1);
     }
 
     #[test]
@@ -5549,8 +7407,8 @@ mod tests {
             started_at: 1000,
             resolved_at: None,
             global: false,
-            origin_check: Some("web".into()),
-            checks: vec![("web".into(), AffectSource::Origin)],
+            origin_check: Some(cid("web")),
+            checks: vec![(cid("web"), AffectSource::Origin)],
             updates: Vec::new(),
         })
         .unwrap();
@@ -5567,12 +7425,14 @@ mod tests {
         seeded_incident(&s, "inc-web", "web");
         seeded_incident(&s, "inc-api", "api");
         // `web` merely joined the api incident, behind a dependency.
-        s.attach_check("inc-api", "web", AffectSource::Dependency)
+        s.attach_check("inc-api", cid("web"), AffectSource::Dependency)
             .unwrap();
         s.insert_results(&[(result("web", 1000, 5), Status::Up)])
             .unwrap();
 
-        let summary = s.purge_check_everything("web", 4000, "node-a").unwrap();
+        let summary = s
+            .purge_check_everything(cid("web"), 4000, "node-a")
+            .unwrap();
         assert_eq!(summary.results, 1);
         assert_eq!(summary.incidents, 1);
         assert_eq!(summary.deleted_incidents, vec!["inc-web".to_string()]);
@@ -5584,7 +7444,7 @@ mod tests {
             1,
             "the erased check left the incident it had joined, and nothing else did"
         );
-        assert_eq!(api.checks[0].check_id, "api");
+        assert_eq!(api.checks[0].check_id, cid("api"));
     }
 
     #[test]
@@ -5633,6 +7493,7 @@ mod tests {
 
     #[test]
     fn replicated_incident_wire_form_is_stable() {
+        let web = cid("web");
         let i = ReplicatedIncident {
             id: "inc-1".into(),
             title: "Outage".into(),
@@ -5640,8 +7501,8 @@ mod tests {
             started_at: 10,
             resolved_at: None,
             global: false,
-            origin_check: Some("web".into()),
-            checks: vec![("web".into(), AffectSource::Origin)],
+            origin_check: Some(web),
+            checks: vec![(web, AffectSource::Origin)],
             updates: vec![IncidentUpdateRow {
                 id: "inc-1-u10".into(),
                 incident_id: "inc-1".into(),
@@ -5653,7 +7514,9 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&i).unwrap(),
-            r#"{"id":"inc-1","title":"Outage","state":"investigating","started_at":10,"resolved_at":null,"global":false,"origin_check":"web","checks":[["web","origin"]],"updates":[{"id":"inc-1-u10","incident_id":"inc-1","state":"detected","body":"down","author":null,"created_at":10}]}"#
+            format!(
+                r#"{{"id":"inc-1","title":"Outage","state":"investigating","started_at":10,"resolved_at":null,"global":false,"origin_check":"{web}","checks":[["{web}","origin"]],"updates":[{{"id":"inc-1-u10","incident_id":"inc-1","state":"detected","body":"down","author":null,"created_at":10}}]}}"#
+            )
         );
     }
 
@@ -5709,6 +7572,7 @@ mod tests {
 
 #[cfg(test)]
 mod segment_tests {
+    use super::tests::cid;
     use super::*;
     use crate::models::CheckKind;
     use chrono::DateTime;
@@ -5720,7 +7584,7 @@ mod segment_tests {
                 region: "test-region".into(),
                 body: None,
                 headers: None,
-                check_id: check_id.into(),
+                check_id: cid(check_id),
                 agent_id: "agent".into(),
                 kind: CheckKind::Http,
                 timestamp: DateTime::from_timestamp_millis(ts_millis).unwrap(),
@@ -5745,7 +7609,7 @@ mod segment_tests {
         const DAY: i64 = 86_400_000;
 
         for days in [7usize, 30, 90] {
-            let b = s.uptime_buckets("x", days, 90, now).unwrap();
+            let b = s.uptime_buckets(cid("x"), days, 90, now, false).unwrap();
             assert_eq!(b.len(), 90, "{days}d must still yield 90 segments");
 
             let width = b[0].end - b[0].start;
@@ -5761,29 +7625,22 @@ mod segment_tests {
     }
 
     #[test]
-    fn a_result_lands_in_the_segment_covering_its_timestamp() {
+    fn raw_results_create_counts_but_not_uptime_data() {
         let s = Storage::open(":memory:").unwrap();
         let now = 1_000_000_000_000i64;
-        const DAY: i64 = 86_400_000;
-        // 7 days / 90 segments => 6720000 ms each.
-        let width = 7 * DAY / 90;
 
-        // One result inside the newest segment, one inside the oldest.
-        s.insert_results(&[up_at("x", now - 1), up_at("x", now - 90 * width + 1)])
-            .unwrap();
+        s.insert_results(&[up_at("x", now - 1)]).unwrap();
 
-        let b = s.uptime_buckets("x", 7, 90, now).unwrap();
-        assert_eq!(b[89].total, 1, "newest segment holds the recent result");
-        assert_eq!(b[0].total, 1, "oldest segment holds the old result");
-        let empty = b[1..89].iter().map(|x| x.total).sum::<u32>();
-        assert_eq!(empty, 0, "nothing leaks into the segments between");
-        assert_eq!(b[45].uptime, None, "an empty segment is no-data, not 0%");
+        let buckets = s.uptime_buckets(cid("x"), 7, 90, now, false).unwrap();
+        assert!(buckets.iter().all(|bucket| bucket.uptime.is_none()));
+        assert_eq!(buckets.iter().map(|bucket| bucket.total).sum::<u64>(), 1);
+        assert_eq!(buckets.iter().map(|bucket| bucket.up).sum::<u64>(), 1);
     }
 }
 
 #[cfg(test)]
 mod migration_tests {
-    use super::tests::result;
+    use super::tests::cid;
     use super::*;
 
     /// Opening a database written by an older build must migrate it, not
@@ -5859,9 +7716,9 @@ mod migration_tests {
             IncidentState::Detected,
             at,
             false,
-            Some(check),
+            Some(cid(check)),
             &[IncidentCheckRow {
-                check_id: check.into(),
+                check_id: cid(check),
                 source: AffectSource::Origin,
             }],
             Some(("connection refused", None)),
@@ -5870,10 +7727,84 @@ mod migration_tests {
     }
 
     #[test]
+    fn agent_leaf_topology_is_persisted_monotonically() {
+        let s = Storage::open(":memory:").unwrap();
+        s.update_agent_check_state(
+            cid("svc"),
+            "agent-a",
+            "zone-a",
+            "region-a",
+            Status::Up,
+            0,
+            2_000,
+        )
+        .unwrap();
+        // A delayed report must not rewind either status/timestamp or topology.
+        s.update_agent_check_state(
+            cid("svc"),
+            "agent-a",
+            "old-zone",
+            "old-region",
+            Status::Down,
+            3,
+            1_000,
+        )
+        .unwrap();
+
+        assert_eq!(
+            s.list_agent_check_state().unwrap(),
+            vec![AgentCheckStateRow {
+                check_id: cid("svc"),
+                agent_id: "agent-a".into(),
+                zone: "zone-a".into(),
+                region: "region-a".into(),
+                status: Status::Up,
+                consecutive_failures: 0,
+                last_check: 2_000,
+            }]
+        );
+    }
+
+    #[test]
+    fn legacy_agent_leaf_topology_migrates_to_unknown() {
+        let dir = std::env::temp_dir().join(format!(
+            "warden-agent-state-migration-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.duckdb");
+        let path_str = path.to_str().unwrap().to_string();
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE agent_check_state (
+                    check_id VARCHAR NOT NULL,
+                    agent_id VARCHAR NOT NULL,
+                    status VARCHAR NOT NULL,
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                    last_check BIGINT NOT NULL,
+                    PRIMARY KEY (check_id, agent_id)
+                );
+                INSERT INTO agent_check_state VALUES ('svc', 'agent-a', 'up', 1, 1_000);",
+            )
+            .unwrap();
+        }
+
+        let s = Storage::open(&path_str).unwrap();
+        let leaves = s.list_agent_check_state().unwrap();
+        assert_eq!(leaves[0].zone, "unknown");
+        assert_eq!(leaves[0].region, "unknown");
+        drop(s);
+        Storage::open(&path_str).expect("migration remains idempotent");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn incident_lifecycle_open_and_resolve() {
         let s = Storage::open(":memory:").unwrap();
 
-        assert_eq!(s.open_incident_for("svc").unwrap(), None);
+        assert_eq!(s.open_incident_for(cid("svc")).unwrap(), None);
 
         let opened = open_incident(&s, "svc", 1_000);
         assert_eq!(opened.state, IncidentState::Detected);
@@ -5887,7 +7818,7 @@ mod migration_tests {
 
         // The check is attached, so a lookup by check finds the open incident.
         assert_eq!(
-            s.open_incident_for("svc").unwrap().map(|i| i.id),
+            s.open_incident_for(cid("svc")).unwrap().map(|i| i.id),
             Some("svc-1000".to_string())
         );
 
@@ -5898,7 +7829,7 @@ mod migration_tests {
         assert_eq!(resolved.state, IncidentState::Resolved);
         assert_eq!(resolved.resolved_at, Some(2_000));
         assert_eq!(
-            s.open_incident_for("svc").unwrap(),
+            s.open_incident_for(cid("svc")).unwrap(),
             None,
             "a resolved incident is not open"
         );
@@ -5911,6 +7842,55 @@ mod migration_tests {
     /// Reopening: an operator posting a non-resolved update on a closed
     /// incident must clear `resolved_at`, or it would read as open and finished
     /// at the same time.
+    #[test]
+    fn local_incident_updates_in_one_millisecond_are_not_lost() {
+        let s = Storage::open(":memory:").unwrap();
+        s.create_incident(
+            "inc-1",
+            "Outage",
+            IncidentState::Detected,
+            1_000,
+            false,
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+        let first = s
+            .add_update(
+                "inc-1",
+                IncidentState::Investigating,
+                "investigating",
+                None,
+                2_000,
+            )
+            .unwrap();
+        let second = s
+            .add_update(
+                "inc-1",
+                IncidentState::Identified,
+                "identified",
+                Some("admin"),
+                2_000,
+            )
+            .unwrap();
+
+        assert_ne!(
+            first.id, second.id,
+            "distinct local updates need distinct replication ids"
+        );
+        let updates = s.updates_for_incident("inc-1").unwrap();
+        assert_eq!(updates.len(), 2, "neither same-ms update may be lost");
+        assert_eq!(
+            updates
+                .iter()
+                .map(|u| u.id.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            2
+        );
+    }
+
     #[test]
     fn reopening_an_incident_clears_its_resolution_time() {
         let s = Storage::open(":memory:").unwrap();
@@ -5970,95 +7950,57 @@ mod migration_tests {
     fn attachments_record_how_each_check_got_there() {
         let s = Storage::open(":memory:").unwrap();
         open_incident(&s, "db", 1_000);
-        s.attach_check("db-1000", "api", AffectSource::Dependency)
+        s.attach_check("db-1000", cid("api"), AffectSource::Dependency)
             .unwrap();
-        s.attach_check("db-1000", "web", AffectSource::Manual)
+        s.attach_check("db-1000", cid("web"), AffectSource::Manual)
             .unwrap();
 
         let row = s.incident("db-1000").unwrap().unwrap();
         assert_eq!(
             row.checks
                 .iter()
-                .map(|c| (c.check_id.as_str(), c.source))
+                .map(|c| (c.check_id, c.source))
                 .collect::<Vec<_>>(),
             vec![
-                ("api", AffectSource::Dependency),
-                ("db", AffectSource::Origin),
-                ("web", AffectSource::Manual),
+                (cid("api"), AffectSource::Dependency),
+                (cid("db"), AffectSource::Origin),
+                (cid("web"), AffectSource::Manual),
             ]
         );
 
         // Only the origin and the dependency gate auto-resolve.
-        assert_eq!(row.gating_checks().collect::<Vec<_>>(), vec!["api", "db"]);
+        assert_eq!(
+            row.gating_checks().collect::<Vec<_>>(),
+            vec![cid("api"), cid("db")]
+        );
 
         // Re-attaching the origin as something else must not demote it.
-        s.attach_check("db-1000", "db", AffectSource::Manual)
+        s.attach_check("db-1000", cid("db"), AffectSource::Manual)
             .unwrap();
         let row = s.incident("db-1000").unwrap().unwrap();
         assert_eq!(
             row.checks
                 .iter()
-                .find(|c| c.check_id == "db")
+                .find(|c| c.check_id == cid("db"))
                 .map(|c| c.source),
             Some(AffectSource::Origin),
             "the cause of the incident cannot be reclassified"
         );
 
         // Replacing the manual set leaves origin and dependency alone.
-        s.set_manual_checks("db-1000", &["cdn".to_string()])
-            .unwrap();
+        s.set_manual_checks("db-1000", &[cid("cdn")]).unwrap();
         let row = s.incident("db-1000").unwrap().unwrap();
         assert_eq!(
             row.checks
                 .iter()
-                .map(|c| (c.check_id.as_str(), c.source))
+                .map(|c| (c.check_id, c.source))
                 .collect::<Vec<_>>(),
             vec![
-                ("api", AffectSource::Dependency),
-                ("cdn", AffectSource::Manual),
-                ("db", AffectSource::Origin),
+                (cid("api"), AffectSource::Dependency),
+                (cid("cdn"), AffectSource::Manual),
+                (cid("db"), AffectSource::Origin),
             ],
             "only the manual attachment was replaced"
-        );
-    }
-
-    /// The up-side mirror of `failures_before_down`. A check needs a full run
-    /// of UP observations, so a flapping check never clears the bar and stays
-    /// inside one incident.
-    #[test]
-    fn recovered_for_requires_a_full_run_of_up_observations() {
-        let s = Storage::open(":memory:").unwrap();
-        s.insert_results(&[(result("svc", 1_000, 1), Status::Down)])
-            .unwrap();
-        assert!(!s.recovered_for("svc", 1).unwrap(), "still down");
-
-        s.insert_results(&[(result("svc", 2_000, 1), Status::Up)])
-            .unwrap();
-        assert!(
-            s.recovered_for("svc", 1).unwrap(),
-            "one UP clears a run of 1"
-        );
-        assert!(
-            !s.recovered_for("svc", 3).unwrap(),
-            "one UP does not clear a run of 3"
-        );
-
-        s.insert_results(&[
-            (result("svc", 3_000, 1), Status::Up),
-            (result("svc", 4_000, 1), Status::Up),
-        ])
-        .unwrap();
-        assert!(
-            s.recovered_for("svc", 3).unwrap(),
-            "three in a row clears it"
-        );
-
-        // A flap inside the window puts it back: the run has to be unbroken.
-        s.insert_results(&[(result("svc", 5_000, 1), Status::Down)])
-            .unwrap();
-        assert!(
-            !s.recovered_for("svc", 3).unwrap(),
-            "a DOWN inside the window breaks the run"
         );
     }
 
@@ -6085,7 +8027,7 @@ mod migration_tests {
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].id, "a-1000");
 
-        let for_a = s.incidents_for_check("a", 100).unwrap();
+        let for_a = s.incidents_for_check(cid("a"), 100).unwrap();
         assert_eq!(
             for_a.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
             vec!["a-1000"]
@@ -6093,9 +8035,9 @@ mod migration_tests {
 
         // A check attached as a dependency is found by the same lookup: the
         // blast radius is what "this check's incidents" means, not the origin.
-        s.attach_check("b-2000", "a", AffectSource::Dependency)
+        s.attach_check("b-2000", cid("a"), AffectSource::Dependency)
             .unwrap();
-        let for_a = s.incidents_for_check("a", 100).unwrap();
+        let for_a = s.incidents_for_check(cid("a"), 100).unwrap();
         assert_eq!(
             for_a.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
             vec!["b-2000", "a-1000"]

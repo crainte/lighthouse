@@ -50,7 +50,12 @@
   /// guard only suppressed real data: a check with 132 results in the last five
   /// hours, viewed over 30 days, fills one segment and claimed to be
   /// "collecting" while sitting on a full history.
-  const enoughData = $derived(points.some((p) => p.avg_latency_ms !== null));
+  // Counts were added after this endpoint existed, so fall back to the old
+  // latency-only shape while a browser is talking to an older coordinator.
+  const attempts = (p: LatencyPoint) => p.attempts ?? (p.avg_latency_ms === null ? 0 : 1);
+  const successes = (p: LatencyPoint) => p.up ?? (p.avg_latency_ms === null ? 0 : 1);
+  const enoughData = $derived(points.some((p) => attempts(p) > 0));
+  const hasSuccessfulAttempt = $derived(points.some((p) => successes(p) > 0));
 
   // `i` is the index in `points`, kept because empty segments are dropped from
   // this list and positional index would no longer line up with the hover.
@@ -58,10 +63,10 @@
   const bars = $derived.by<Bar[]>(() => {
     if (points.length === 0) return [];
     const step = CHART_W / points.length;
-    // A bar's width is its bucket span, but a sparse window makes that span
-    // enormous and the chart reads as blocks rather than a trend. Cap it so a
-    // reading stays a mark at its point in time.
-    const w = Math.min(step, CHART_W * 0.04);
+    const populated = points.flatMap((p, i) => (p.avg_latency_ms === null ? [] : [i]));
+    const gaps = populated.slice(1).map((i, n) => i - populated[n]).sort((a, b) => a - b);
+    const cadence = gaps.length > 0 ? gaps[Math.floor(gaps.length / 2)] : 1;
+    const w = Math.min(step * cadence, CHART_W * 0.08);
     // Segments with no attempts are skipped entirely — drawing them as a stub
     // would lay down a flat line of imaginary 0ms readings. A segment that *was*
     // measured always gets a visible bar, even at sub-millisecond latency, so
@@ -71,8 +76,7 @@
       if (p.avg_latency_ms === null) return [];
       // Peaks fill only the lower ~78% so the floating readout up top stays clear.
       const h = Math.max(MIN_H, (p.avg_latency_ms / maxLatency) * (CHART_H * 0.78));
-      // Centre the bar in its slot when it is narrower than the slot.
-      return [{ i, x: i * step + (step - w) / 2, y: CHART_H - h, w, h }];
+      return [{ i, x: i * step + step / 2 - w / 2, y: CHART_H - h, w, h }];
     });
   });
 
@@ -113,6 +117,8 @@
 <div class="latency-graph" class:tall>
   {#if !enoughData}
     <p class="lat-empty">Collecting latency data…</p>
+  {:else if !hasSuccessfulAttempt}
+    <p class="lat-empty">Attempts recorded, but none succeeded yet.</p>
   {:else}
   <div class="latency-plot">
     <span class="lat-scale">{scaleLabel}</span>
@@ -120,8 +126,10 @@
       {#if hoverPoint}
         <div class="lat-readout" style="left:{hoverPct}%">
           <span class="lat-value">
-            {#if hoverPoint.avg_latency_ms === null}
-              <span class="lat-nodata">no data</span>
+            {#if attempts(hoverPoint) === 0}
+              <span class="lat-nodata">no attempts</span>
+            {:else if hoverPoint.avg_latency_ms === null}
+              <span class="lat-nodata">Down</span>
             {:else if Math.round(hoverPoint.avg_latency_ms) === 0}
               <!-- Whole-millisecond probes: a mean that rounds to zero means
                    "under our resolution", not "instantaneous". -->
@@ -132,6 +140,7 @@
           </span>
           <span class="lat-time">
             {(spansDays ? stampFmt : timeFmt).format(new Date(hoverPoint.timestamp))}
+            · {successes(hoverPoint)}/{attempts(hoverPoint)} succeeded
           </span>
         </div>
         <div class="lat-cursor" style="left:{hoverPct}%"></div>

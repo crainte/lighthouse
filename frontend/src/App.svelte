@@ -52,7 +52,9 @@
   import ProbeResultsAdmin from './components/ProbeResultsAdmin.svelte';
   import MaintenanceAdmin from './components/MaintenanceAdmin.svelte';
   import ClusterAdmin from './components/ClusterAdmin.svelte';
-  import { fetchSession, logout } from './lib/admin';
+  import RegionTreeAdmin from './components/RegionTreeAdmin.svelte';
+  import DataAdmin from './components/DataAdmin.svelte';
+  import { fetchSession, logout, type NodeMode } from './lib/admin';
 
   // One array drives the sidebar and the content switch, so a new admin area is
   // a single line here plus its panel. `group` buckets them under the sidebar's
@@ -109,6 +111,13 @@
       blurb: 'The coordinators gossiping with each other, and what each one currently believes.',
     },
     {
+      id: 'region-tree',
+      label: 'Region tree',
+      group: 'Fleet',
+      title: 'Region tree',
+      blurb: 'Effective check state and rollup policy from regions down to individual agents.',
+    },
+    {
       id: 'status',
       label: 'Status page',
       group: 'Platform',
@@ -129,6 +138,13 @@
       title: 'Maintenance',
       blurb: 'Scheduled windows and alert suppression.',
     },
+    {
+      id: 'data',
+      label: 'Data',
+      group: 'Platform',
+      title: 'Data cleanup',
+      blurb: 'Remove short-lived incident records left by transient probe failures.',
+    },
   ] as const;
   type AdminPanel = (typeof ADMIN_PANELS)[number]['id'];
 
@@ -142,13 +158,13 @@
     // any notification link to.
     | { name: 'incident'; incidentId: string }
     // `edit` present = the check editor page rather than the panel's own
-    // content; `edit.name === null` is a check that does not exist yet.
+    // content; `edit.id === null` is a check that does not exist yet.
     // `incident` present = the incident editor, open on that id (or `null` for
     // one being created).
     | {
         name: 'admin';
         panel: AdminPanel;
-        edit?: { name: string | null };
+        edit?: { id: string | null };
         incident?: { id: string | null };
       };
   type DayModal = { checkId: string; bucket: UptimeBucket } | null;
@@ -157,14 +173,14 @@
   // back into the app instead of leaving it — and a check page can be linked
   // and survives a refresh.
   function viewFromHash(): View {
-    // #/admin/checks/<name> — or /new — is the editor page for one check.
-    // "new" is therefore a reserved name: a check actually called "new" would
-    // open the create form instead. Accepted rather than paid for with a query
+    // #/admin/checks/<id> — or /new — is the editor page for one check. "new"
+    // is therefore a reserved id: no check ever has the literal id "new", since
+    // ids are server-minted UUIDs. Accepted rather than paid for with a query
     // parameter hanging off every other admin URL.
     const editor = location.hash.match(/^#\/admin\/checks\/(.+?)\/?$/);
     if (editor) {
       const raw = decodeURIComponent(editor[1]);
-      return { name: 'admin', panel: 'checks', edit: { name: raw === 'new' ? null : raw } };
+      return { name: 'admin', panel: 'checks', edit: { id: raw === 'new' ? null : raw } };
     }
     // #/admin/incidents/<id> — the editor for one incident, so the Alerts feed
     // can link straight to the thing an operator would act on, and the URL
@@ -217,6 +233,19 @@
   let view = $state<View>(viewFromHash());
   let dayModal = $state<DayModal>(null);
   let authenticated = $state(false);
+  // Which node the SPA is talking to. A global node has no fleet credentials of
+  // its own, so the Credentials panel is hidden there. Defaults to coordinator
+  // until the session probe reports otherwise.
+  let nodeMode = $state<NodeMode>('coordinator');
+  // Panels the current node actually supports. Credentials are minted per zone
+  // on a regional coordinator; a global node relays config but owns no zones.
+  const GLOBAL_HIDDEN_PANELS: AdminPanel[] = ['credentials'];
+  const visiblePanels = $derived(
+    nodeMode === 'global'
+      ? ADMIN_PANELS.filter((p) => !GLOBAL_HIDDEN_PANELS.includes(p.id))
+      : ADMIN_PANELS,
+  );
+  const visibleGroups = $derived([...new Set(visiblePanels.map((p) => p.group))]);
   // Until the session probe answers, "logged out" is a guess — and on #/admin
   // acting on that guess flashes a sign-in prompt at someone already signed in.
   let sessionChecked = $state(false);
@@ -258,11 +287,12 @@
     view = { name: 'admin', panel };
   }
 
-  /** Opens the check editor page. `null` is a check that does not exist yet. */
-  function openCheckEditor(name: string | null) {
-    history.pushState(null, '', `#/admin/checks/${name === null ? 'new' : encodeURIComponent(name)}`);
+  /** Opens the check editor page, by immutable id. `null` is a check that does
+   *  not exist yet. */
+  function openCheckEditor(id: string | null) {
+    history.pushState(null, '', `#/admin/checks/${id === null ? 'new' : encodeURIComponent(id)}`);
     pushedNav = true;
-    view = { name: 'admin', panel: 'checks', edit: { name } };
+    view = { name: 'admin', panel: 'checks', edit: { id } };
   }
 
   function goHome() {
@@ -346,7 +376,18 @@
     { label: '90d', days: 90 },
   ] as const;
   const STRIP_SEGMENTS = 90;
-  let days = $state(30);
+  const RANGE_STORAGE_KEY = 'warden.status.days';
+
+  function storedDays(): number {
+    try {
+      const stored = Number(localStorage.getItem(RANGE_STORAGE_KEY));
+      return RANGES.some((range) => range.days === stored) ? stored : 30;
+    } catch {
+      return 30;
+    }
+  }
+
+  let days = $state(storedDays());
 
   // Refetch one check's uptime strip and (if it opted in) its latency graph,
   // replacing just that check's entry. Used after a live state change so the
@@ -358,7 +399,9 @@
     try {
       const [u, line] = await Promise.all([
         fetchUptime(id, days, STRIP_SEGMENTS),
-        c.latency_graph ? fetchLatencySparkline(id, days * 24) : Promise.resolve(null),
+        c.latency_graph
+          ? fetchLatencySparkline(id, days * 24, STRIP_SEGMENTS)
+          : Promise.resolve(null),
       ]);
       uptime = { ...uptime, [id]: u };
       if (line) sparkline = { ...sparkline, [id]: line };
@@ -378,8 +421,10 @@
     statusTimer = setTimeout(async () => {
       statusTimer = null;
       try {
-        const s = await fetchStatus();
+        const [s, a, inc] = await Promise.all([fetchStatus(), fetchAlerts(), fetchIncidents()]);
         checks = s.checks;
+        alerts = a.alerts;
+        incidents = inc.incidents;
         fleet = s.agents;
         maintenance = s.maintenance;
       } catch {
@@ -420,7 +465,9 @@
       );
       uptime = Object.fromEntries(strips.map((u) => [u.check_id, u]));
       const lines = await Promise.all(
-        s.checks.filter((c) => c.latency_graph).map((c) => fetchLatencySparkline(c.check_id, days * 24)),
+        s.checks
+          .filter((c) => c.latency_graph)
+          .map((c) => fetchLatencySparkline(c.check_id, days * 24, STRIP_SEGMENTS)),
       );
       sparkline = Object.fromEntries(lines.map((l) => [l.check_id, l]));
     } catch {
@@ -433,12 +480,15 @@
   async function setDays(next: number) {
     if (next === days) return;
     days = next;
+    try {
+      localStorage.setItem(RANGE_STORAGE_KEY, String(next));
+    } catch {}
     const [strips, lines] = await Promise.all([
       Promise.all(checks.map((c) => fetchUptime(c.check_id, next, STRIP_SEGMENTS))),
       Promise.all(
         checks
           .filter((c) => c.latency_graph)
-          .map((c) => fetchLatencySparkline(c.check_id, next * 24)),
+          .map((c) => fetchLatencySparkline(c.check_id, next * 24, STRIP_SEGMENTS)),
       ),
     ]);
     uptime = Object.fromEntries(strips.map((u) => [u.check_id, u]));
@@ -449,7 +499,7 @@
   // stays stable for checks that have never been explicitly ordered.
   const ordered = $derived(
     [...checks].sort(
-      (a, b) => (a.position ?? 0) - (b.position ?? 0) || a.check_id.localeCompare(b.check_id),
+      (a, b) => (a.position ?? 0) - (b.position ?? 0) || a.name.localeCompare(b.name),
     ),
   );
 
@@ -507,7 +557,7 @@
       const lines = await Promise.all(
         s.checks
           .filter((c) => c.latency_graph)
-          .map((c) => fetchLatencySparkline(c.check_id, days * 24)),
+          .map((c) => fetchLatencySparkline(c.check_id, days * 24, STRIP_SEGMENTS)),
       );
       sparkline = Object.fromEntries(lines.map((l) => [l.check_id, l]));
     } catch (e) {
@@ -526,9 +576,10 @@
     if (view.name !== 'admin') return;
     void view.panel;
     fetchSession()
-      .then((ok) => {
-        authenticated = ok;
-        if (!ok) adminView = 'login';
+      .then((s) => {
+        authenticated = s.authenticated;
+        nodeMode = s.mode;
+        if (!s.authenticated) adminView = 'login';
       })
       .finally(() => (sessionChecked = true));
   });
@@ -537,7 +588,10 @@
     load();
     // Cookie-only: the server is the sole authority on whether we're signed in.
     fetchSession()
-      .then((ok) => (authenticated = ok))
+      .then((s) => {
+        authenticated = s.authenticated;
+        nodeMode = s.mode;
+      })
       .finally(() => (sessionChecked = true));
     const conn = connectWs({
       onStatus: (s) => (wsStatus = s),
@@ -623,10 +677,10 @@
           <span class="brand-tag">admin</span>
         </div>
         {#if sessionChecked && authenticated}
-          {#each NAV_GROUPS as g (g)}
+          {#each visibleGroups as g (g)}
             <div class="nav-group">{g}</div>
             <div class="admin-nav-items">
-              {#each ADMIN_PANELS.filter((p) => p.group === g) as p (p.id)}
+              {#each visiblePanels.filter((p) => p.group === g) as p (p.id)}
                 <button
                   class="admin-nav-item"
                   class:active={panel === p.id}
@@ -670,15 +724,15 @@
           </div>
         {:else if panel === 'checks' && editing}
           <!-- Keyed so back/forward between two checks rebuilds the editor
-               instead of leaving one check's draft under another's name. -->
-          {#key editing.name}
-            <CheckEditor name={editing.name} onsaved={load} onclose={() => openAdmin('checks')} />
+               instead of leaving one check's draft under another's id. -->
+          {#key editing.id}
+            <CheckEditor id={editing.id} onsaved={load} onclose={() => openAdmin('checks')} />
           {/key}
         {:else if panel === 'incidents' && incEditing}
           {#key incEditing.id}
             <IncidentEditor
               incidentId={incEditing.id}
-              checks={checks.map((c) => c.check_id)}
+              checks={checks.map((c) => ({ id: c.check_id, name: c.name }))}
               onClose={() => openAdmin('incidents')}
               onSaved={onIncidentSaved}
             />
@@ -702,24 +756,29 @@
             <AgentDisplayAdmin onchanged={load} onexpired={onExpired} />
           {:else if panel === 'agents'}
             <AgentsAdmin onopen={openCheckEditor} onexpired={onExpired} />
-          {:else if panel === 'credentials'}
+          {:else if panel === 'credentials' && nodeMode !== 'global'}
             <AgentCredentials onexpired={onExpired} />
           {:else if panel === 'results'}
             <ProbeResultsAdmin onopen={openCheckEditor} onexpired={onExpired} />
           {:else if panel === 'cluster'}
             <ClusterAdmin onexpired={onExpired} />
+          {:else if panel === 'region-tree'}
+            <RegionTreeAdmin onexpired={onExpired} />
           {:else if panel === 'alerts'}
-            <AlertsList {alerts} onOpenIncident={openIncidentEditor} />
+            <AlertsList {alerts} {checks} onOpenIncident={openIncidentEditor} />
           {:else if panel === 'incidents'}
             <IncidentsList
               {incidents}
+              {checks}
               onEdit={(i) => openIncidentEditor(i.id)}
               onAck={acknowledge}
             />
           {:else if panel === 'notifications'}
             <NotifiersAdmin onexpired={onExpired} />
-          {:else}
+          {:else if panel === 'maintenance'}
             <MaintenanceAdmin onexpired={onExpired} />
+          {:else}
+            <DataAdmin onexpired={onExpired} />
           {/if}
         {/if}
       </div>
@@ -733,7 +792,7 @@
     </div>
   {:else if view.name === 'incident'}
     {@const id = view.incidentId}
-    <IncidentPage incidentId={id} onBack={goBack} />
+    <IncidentPage incidentId={id} {checks} onBack={goBack} />
   {:else if view.name === 'detail'}
     <!-- Bound once: the narrowing on `view` doesn't survive into the callback below. -->
     {@const id = view.checkId}
@@ -838,7 +897,7 @@
 
     <section class="section">
       <h2 class="section-title">Past Incidents</h2>
-      <PastIncidents {incidents} onOpen={openIncident} />
+      <PastIncidents {incidents} {checks} onOpen={openIncident} />
     </section>
   {/if}
 </div>
@@ -846,6 +905,7 @@
 {#if dayModal}
   <DayDetailModal
     checkId={dayModal.checkId}
+    name={checks.find((c) => c.check_id === dayModal?.checkId)?.name}
     kind={checks.find((c) => c.check_id === dayModal?.checkId)?.type}
     bucket={dayModal.bucket}
     onclose={() => (dayModal = null)}

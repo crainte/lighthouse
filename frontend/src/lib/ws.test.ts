@@ -138,6 +138,25 @@ describe("connectWs", () => {
     });
   });
 
+  it("routes degraded state_change messages", () => {
+    const onStateChange = vi.fn();
+    connectWs({ onStateChange });
+    latest().emitMessage({
+      type: "state_change",
+      check_id: "api",
+      from: "up",
+      to: "degraded",
+      timestamp: 6,
+    });
+    expect(onStateChange).toHaveBeenCalledWith({
+      type: "state_change",
+      check_id: "api",
+      from: "up",
+      to: "degraded",
+      timestamp: 6,
+    });
+  });
+
   it("does not reconnect after close() is called", () => {
     const conn = connectWs({ onStateChange: () => {} });
     latest().emitOpen();

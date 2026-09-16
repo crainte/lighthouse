@@ -1,13 +1,23 @@
 // Types + fetch wrappers for the Warden coordinator HTTP API.
 // Same-origin in production; /api is proxied to the backend during `vite dev`.
 
-export type Status = "up" | "down" | "unknown";
+/** A single probe attempt remains three-state; degradation is derived only
+ * when the coordinator rolls several attempts up for publication. */
+export type ProbeStatus = "up" | "down" | "unknown";
+
+/** Published rollup state. A check can be degraded when only part of its
+ * configured probe fleet is healthy. */
+export type Status = ProbeStatus | "degraded";
 
 export type CheckKind =
   "http" | "tcp" | "dns" | "icmp" | "ssl" | "heartbeat" | "openmetrics";
 
 export interface Check {
+  /** Immutable identity. Every route, key and lookup uses this — never `name`. */
   check_id: string;
+  /** Mutable display name. Render this in labels; renaming does not change
+   *  `check_id` or orphan any history, alert or incident. */
+  name: string;
   status: Status;
   latency_ms: number | null;
   last_check: number;
@@ -43,7 +53,7 @@ export interface Agent {
   last_seen: number;
   checks_reporting: number;
   results_24h: number;
-  status: Status;
+  status: ProbeStatus;
   /** Silent long enough to read as decommissioned. Still listed and still owns
    *  its history — retirement is derived from silence, not a state anyone sets. */
   retired: boolean;
@@ -76,8 +86,8 @@ export interface AgentsResponse {
   checks_no_agent_can_run: string[];
 }
 
-/** Agent liveness on the public page. Three states, unlike a check's `Status`:
- *  an agent answering is healthy even if every check it probes is down. */
+/** Agent liveness on the public page. An agent answering is healthy even if
+ *  every check it probes is down. */
 export type Health = "up" | "degraded" | "down";
 
 /** One row of the public agent section: a single agent, or a whole region. */
@@ -110,7 +120,7 @@ export interface HistoryPoint {
   timestamp: number;
   /** Several agents probe the same check, so (timestamp, agent_id) is the key. */
   agent_id: string;
-  status: Status;
+  status: ProbeStatus;
   latency_ms: number | null;
   status_code?: number;
   error?: string;
@@ -118,6 +128,7 @@ export interface HistoryPoint {
 
 export interface HistoryResponse {
   check_id: string;
+  name: string;
   history: HistoryPoint[];
 }
 
@@ -128,6 +139,8 @@ export interface Alert {
   id: string;
   scope: "check" | "agent" | "zone" | "region";
   node_id: string;
+  /** Human-readable check or rollup label; identity remains in node_id. */
+  name?: string;
   alert_type: "state_change" | "degradation" | "recovery";
   previous_state: Status | null;
   current_state: Status;
@@ -170,6 +183,7 @@ export interface UptimeBucket {
 
 export interface UptimeResponse {
   check_id: string;
+  name: string;
   days: number;
   overall_uptime: number | null;
   buckets: UptimeBucket[];
@@ -177,8 +191,13 @@ export interface UptimeResponse {
 
 export interface LatencyPoint {
   timestamp: number;
-  /** `null` when the segment holds no attempts. Not the same as a 0ms reply,
-   *  and drawing it as one paints an imaginary flat line along the axis. */
+  /** All outcomes observed in the segment, including failures. Optional while
+   * talking to an older coordinator which did not publish bucket counts. */
+  attempts?: number;
+  /** Successful outcomes in the segment. Only these contribute latency. */
+  up?: number;
+  /** `null` when no attempt passed. Not the same as a 0ms reply, and drawing
+   *  it as one paints an imaginary flat line along the axis. */
   avg_latency_ms: number | null;
 }
 
@@ -198,6 +217,7 @@ export interface AgentBand extends LatencyBand {
 
 export interface LatencySparklineResponse {
   check_id: string;
+  name: string;
   /** Window actually charted; echoed back so the client never assumes it. */
   from: number;
   to: number;
@@ -222,7 +242,7 @@ export function fetchHistory(
   limit = 100,
   from?: number,
   to?: number,
-  status?: Status,
+  status?: ProbeStatus,
 ): Promise<HistoryResponse> {
   let url = `/api/v1/checks/${encodeURIComponent(id)}/history?limit=${limit}`;
   if (from !== undefined) url += `&from=${from}`;

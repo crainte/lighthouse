@@ -29,7 +29,13 @@
   let open = $state(!collapsed);
 
   const statusLabel = $derived(
-    status === 'up' ? 'Operational' : status === 'down' ? 'Down' : 'Unknown',
+    status === 'up'
+      ? 'Operational'
+      : status === 'degraded'
+        ? 'Degraded'
+        : status === 'down'
+          ? 'Down'
+          : 'Unknown',
   );
 </script>
 

@@ -20,10 +20,12 @@ pub struct MaintenanceWindow {
     /// Epoch millis, exclusive — so two back-to-back windows do not both own
     /// the instant they share.
     pub ends_at: i64,
-    /// Checks it covers. Empty means every check: the "whole platform is down
-    /// for twenty minutes" case, and the reason there is no separate `all` flag.
+    /// Checks it covers, by immutable id. Empty means every check: the "whole
+    /// platform is down for twenty minutes" case, and the reason there is no
+    /// separate `all` flag. IDs rather than names so a rename never silently
+    /// drops a check out of a scheduled window.
     #[serde(default)]
-    pub checks: Vec<String>,
+    pub checks: Vec<crate::models::CheckId>,
     /// Show it to anonymous visitors while it runs. Off is a silent window:
     /// suppress the pages, tell nobody.
     #[serde(default)]
@@ -36,12 +38,7 @@ impl MaintenanceWindow {
     pub fn sanitized(mut self) -> Self {
         self.title = self.title.trim().to_string();
         let mut seen = std::collections::HashSet::new();
-        self.checks = self
-            .checks
-            .into_iter()
-            .map(|c| c.trim().to_string())
-            .filter(|c| !c.is_empty() && seen.insert(c.clone()))
-            .collect();
+        self.checks.retain(|c| seen.insert(*c));
         self
     }
 
@@ -63,21 +60,22 @@ impl MaintenanceWindow {
     /// Running at `at` *and* covering this check — the question the notifier
     /// path asks. Answered against the transition's own timestamp, not the
     /// clock, so a batch posted late is judged by when it happened.
-    pub fn covers(&self, check_id: &str, at: i64) -> bool {
-        self.active_at(at) && (self.checks.is_empty() || self.checks.iter().any(|c| c == check_id))
+    pub fn covers(&self, check_id: crate::models::CheckId, at: i64) -> bool {
+        self.active_at(at) && (self.checks.is_empty() || self.checks.contains(&check_id))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::CheckId;
 
-    fn window(checks: &[&str]) -> MaintenanceWindow {
+    fn window(checks: &[CheckId]) -> MaintenanceWindow {
         MaintenanceWindow {
             title: "db upgrade".into(),
             starts_at: 1_000,
             ends_at: 2_000,
-            checks: checks.iter().map(|c| (*c).to_string()).collect(),
+            checks: checks.to_vec(),
             announce: false,
         }
     }
@@ -99,16 +97,19 @@ mod tests {
     #[test]
     fn an_empty_check_list_covers_every_check() {
         let w = window(&[]);
-        assert!(w.covers("anything", 1_500));
-        assert!(!w.covers("anything", 2_500));
+        assert!(w.covers(crate::models::new_check_id(), 1_500));
+        assert!(!w.covers(crate::models::new_check_id(), 2_500));
     }
 
     #[test]
     fn a_named_window_covers_only_what_it_names() {
-        let w = window(&["db", "api"]);
-        assert!(w.covers("db", 1_500));
-        assert!(w.covers("api", 1_500));
-        assert!(!w.covers("web", 1_500));
+        let db = crate::models::new_check_id();
+        let api = crate::models::new_check_id();
+        let web = crate::models::new_check_id();
+        let w = window(&[db, api]);
+        assert!(w.covers(db, 1_500));
+        assert!(w.covers(api, 1_500));
+        assert!(!w.covers(web, 1_500));
     }
 
     #[test]
@@ -120,17 +121,17 @@ mod tests {
         assert!(w.validate().is_err());
     }
 
-    /// A check name typed with a trailing space would match nothing, which
-    /// reads as the window silently not working.
+    /// Duplicate ids in the submitted list collapse to one.
     #[test]
-    fn names_are_trimmed_and_deduplicated() {
+    fn duplicate_ids_are_deduplicated() {
+        let db = crate::models::new_check_id();
         let w = MaintenanceWindow {
             title: "  db upgrade  ".into(),
-            checks: vec![" db ".into(), "db".into(), "  ".into()],
+            checks: vec![db, db],
             ..window(&[])
         }
         .sanitized();
         assert_eq!(w.title, "db upgrade");
-        assert_eq!(w.checks, vec!["db".to_string()]);
+        assert_eq!(w.checks, vec![db]);
     }
 }

@@ -24,9 +24,10 @@
 use std::net::SocketAddr;
 
 use serde_json::{json, Value};
+use uuid::Uuid;
 use warden::config::{CheckConfig, CoordinatorConfig, ProvisionedCredential};
 use warden::coordinator::Coordinator;
-use warden::models::CheckKind;
+use warden::models::{CheckId, CheckKind};
 
 const PASSWORD: &str = "correct horse battery staple";
 const PEER_TOKEN: &str = "peer-only-secret";
@@ -63,10 +64,13 @@ fn config(db_path: &str, provision: Vec<ProvisionedCredential>) -> CoordinatorCo
     }
 }
 
-/// One check, so `seed_mock` does not run: the demo seed writes thousands of
-/// rows and none of these tests look at results.
+fn cid(name: &str) -> CheckId {
+    Uuid::new_v5(&Uuid::NAMESPACE_DNS, name.as_bytes())
+}
+
 fn checks() -> Vec<CheckConfig> {
     vec![CheckConfig {
+        id: cid(CHECK),
         name: CHECK.into(),
         kind: CheckKind::Http,
         target: "https://example.invalid".into(),
@@ -77,7 +81,11 @@ fn checks() -> Vec<CheckConfig> {
 }
 
 fn boot(db_path: &str, provision: Vec<ProvisionedCredential>) -> anyhow::Result<Coordinator> {
-    Coordinator::new(&config(db_path, provision), &checks())
+    let coord = Coordinator::new(&config(db_path, provision))?;
+    for check in checks() {
+        coord.create_check_for_test(check);
+    }
+    Ok(coord)
 }
 
 /// The refusal message, or a failure naming what booted when it should not
@@ -128,7 +136,7 @@ async fn post_result(base: &str, token: &str, agent_id: &str, zone: &str, region
         .post(format!("{base}/api/v1/results"))
         .bearer_auth(token)
         .json(&json!({ "results": [{
-            "check_id": CHECK,
+            "check_id": cid(CHECK),
             "agent_id": agent_id,
             "zone": zone,
             "region": region,
@@ -483,18 +491,18 @@ struct Peer {
 async fn spawn_peer(node_id: &str, provision: Vec<ProvisionedCredential>) -> Peer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let coord = Coordinator::new(
-        &CoordinatorConfig {
-            node_id: Some(node_id.into()),
-            advertise_url: Some(format!("http://{addr}")),
-            // Generous: nothing here exercises failure detection, and a
-            // spurious suspect mid-test must not drop a config push.
-            peer_timeout_secs: 7_200,
-            ..config(":memory:", provision)
-        },
-        &checks(),
-    )
+    let coord = Coordinator::new(&CoordinatorConfig {
+        node_id: Some(node_id.into()),
+        advertise_url: Some(format!("http://{addr}")),
+        // Generous: nothing here exercises failure detection, and a
+        // spurious suspect mid-test must not drop a config push.
+        peer_timeout_secs: 7_200,
+        ..config(":memory:", provision)
+    })
     .unwrap();
+    for check in checks() {
+        coord.create_check_for_test(check);
+    }
     let app = coord
         .clone()
         .router()

@@ -13,6 +13,8 @@
   import { formatDuration, formatRelativeTime } from '../lib/format';
   import {
     affectSourceNote,
+    checkLabel,
+    checkNameMap,
     fromDatetimeLocal,
     incidentStateColor,
     stateTone,
@@ -28,11 +30,14 @@
     /** `null` is the create form. Otherwise the editor loads the incident
      *  itself, so the page can be deep-linked and survives a refresh. */
     incidentId: string | null;
-    /** Every check name, for the affects picker. */
-    checks: string[];
+    /** Every check's id and mutable name, for the affects picker: the id is
+     *  what `setIncidentChecks` sends, the name is what the picker shows. */
+    checks: { id: string; name: string }[];
     onClose: () => void;
     onSaved: (i: Incident) => void;
   } = $props();
+
+  const names = $derived(checkNameMap(checks.map((c) => ({ check_id: c.id, name: c.name }))));
 
   // The server's answer, and the draft over it. Separate so a half-typed title
   // never leaks into the list behind the editor.
@@ -99,8 +104,8 @@
   const attached = $derived(new Set((current?.checks ?? []).map((c) => c.check_id)));
   const pickable = $derived(
     checks
-      .filter((c) => !attached.has(c))
-      .filter((c) => c.toLowerCase().includes(checkFilter.trim().toLowerCase()))
+      .filter((c) => !attached.has(c.id))
+      .filter((c) => c.name.toLowerCase().includes(checkFilter.trim().toLowerCase()))
       .slice(0, 8),
   );
 
@@ -197,7 +202,8 @@
             {formatDuration(current.duration_ms)}</span
           >
           {#if current.origin_check}
-            <span class="dim">· opened by</span> <span class="ot-id">{current.origin_check}</span>
+            <span class="dim">· opened by</span>
+            <span class="ot-id">{checkLabel(names, current.origin_check)}</span>
           {:else}
             <span class="dim">· created by hand</span>
           {/if}
@@ -279,7 +285,7 @@
             <ul class="affect-list">
               {#each current.checks as c (c.check_id)}
                 <li>
-                  <span class="ot-id">{c.check_id}</span>
+                  <span class="ot-id">{checkLabel(names, c.check_id)}</span>
                   <span
                     class="opill {c.source === 'origin'
                       ? 'cyan'
@@ -309,9 +315,9 @@
             <input type="search" bind:value={checkFilter} placeholder="Search checks" />
           </label>
           <div class="picker">
-            {#each pickable as name (name)}
-              <button class="btn" onclick={() => saveManual([...manualChecks, name])}>
-                + {name}
+            {#each pickable as c (c.id)}
+              <button class="btn" onclick={() => saveManual([...manualChecks, c.id])}>
+                + {c.name}
               </button>
             {:else}
               <span class="field-note">No unattached check matches.</span>

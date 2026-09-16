@@ -1,14 +1,15 @@
 # Warden — session handoff
 
-Repo: `~/code/uptime`. `uptime-monitor-design.md` is yours; the rest of the
-working tree is this session's agent-health work, uncommitted.
+Repo: `~/code/uptime`. The working tree contains the completed Stage A region
+tree and deployment cleanup, uncommitted.
 
-The compose stack was recreated onto the rebuilt image and its credential table
-turned out to be empty — the previous containers' credentials never lived in
-the `coordinator-data` volume. Two were re-minted through Admin > Credentials
-and written to `.env` as `WARDEN_AGENT_TOKEN_A` / `_B`, which is what
-`docker-compose.agents.yaml` actually reads (the bare `WARDEN_AGENT_TOKEN`
-already in `.env` is read by nothing).
+There are exactly two supported Compose topologies. `docker-compose.yaml` runs
+one all-in-one `standalone` process on `:9000`; `docker-compose.cluster.yaml`
+runs three regional coordinators on `:9001`–`:9003` plus three agents, all in
+one `us-east` region. `:9004` and `:9005` are unused and reserved for the Stage
+B multi-region/global deployment. The old `deploy/*.toml`,
+`docker-compose.agents.yaml`, and root `warden.toml` have been removed; both
+stacks now carry their config as Compose configs.
 
 **Security-relevant behaviour change, read this before an incident makes you
 find it the hard way:** admin sessions are now stateless HMAC-signed tokens
@@ -28,9 +29,13 @@ until it would have expired anyway.
 | `33a368f` | One-hop gossip replication between coordinator peers |
 | `0763999` | Admin panels no longer honour an expired session |
 | `88c909e` | Per-zone agent credentials, fail-closed ingest, Credentials panel |
+| _(this one)_ | Completed Stage A region tree: per-agent beliefs, credential-derived topology, four-state/two-threshold rollups, hold-down, state history, replicated policy config, and admin tree UI |
+| _(this one)_ | Deployment cleanup: exactly two Compose topologies on `:9000` and `:9001`–`:9003`; old deploy configs, agents Compose file, and root config removed |
 | _(this one)_ | Agent health on the public status page; notifier management with test-send and a per-check opt-out; the homepage no longer 401s |
 | _(also this one)_ | Slack, PagerDuty and email notifier kinds, each with a delivery test; persistent retry queue for failed notifications |
 | _(also this one)_ | Maintenance windows: scheduled spans that suppress paging, optionally announced on the public page |
+| _(also this one)_ | Region Tree admin rewritten as one canonical policy tree with an inline editor, a TS mirror of `rollup()` for live preview, and per-check shadowing surfaced |
+| _(also this one)_ | Per-agent beliefs replicate, so every coordinator in a region folds the whole regional fleet; agents take a coordinator *list* and fail over |
 
 ### Notifications (`Admin > Notifications`, `NotifiersAdmin.svelte`)
 The backends always existed; nothing could reach them. `cfg.notifiers` was read
@@ -190,8 +195,8 @@ collision: "Pinned" in the Agents panel means *checks pinned to an agent*, so
 the row editor says "Rows, in order" and never uses the word.
 
 **The editor is built for a big fleet.** Verified against a throwaway
-coordinator holding 20 regions and 120 agents, not against the two-agent compose
-stack. The picker is a search box over regions and agents that mounts at most 8
+coordinator holding 20 regions and 120 agents, not only against the small Compose
+demo. The picker is a search box over regions and agents that mounts at most 8
 of each and says how many it is hiding (`+112 more — narrow the search`); a
 chip per fleet member was fine at two agents and unusable at 120. Rows reorder
 by native drag (grip, drop-edge shadow) exactly like the sections list above
@@ -272,20 +277,27 @@ Agent `[agent] zone`/`region` are authoritative in **standalone** mode only. In
 agent mode the coordinator overwrites them from the credential, and the agent no
 longer sends them on the check-list request at all.
 
-### Running a cluster locally
+### Running locally
+
+Standalone is one command and serves `:9000`:
 
 ```bash
-echo 'WARDEN_PEER_TOKEN=anything-identical-on-every-node' >> .env
-echo 'WARDEN_ADMIN_PASSWORD=...' >> .env
-docker compose -f docker-compose.cluster.yaml up -d --build
+docker compose up -d --build
 ```
 
-Three coordinators on `:8090` / `:8091` / `:8092` (renumbered away from the
-single-node stack's `:8082`, so both run side by side) and one agent each, in
-`us-east-1a` / `eu-west-1a` / `ap-south-1a`. No manual minting step: the agent
-credentials are provisioned from coordinator-a's config, with committed
-throwaway defaults (`wac_demoa.demo-secret-a` and friends) that `.env` overrides
-one line at a time. Treat any stack running on the defaults as unauthenticated.
+The Stage A regional cluster requires explicit secrets—there are no committed
+token defaults—and serves `:9001`, `:9002`, and `:9003`:
+
+```bash
+WARDEN_PEER_TOKEN=... WARDEN_AGENT_TOKEN_A=... WARDEN_AGENT_TOKEN_B=... \
+  docker compose -f docker-compose.cluster.yaml up -d --build
+```
+
+The cluster is intentionally one `us-east` region: `agent-a1` and `agent-a2`
+corroborate `us-east-1a` using credential A, while `agent-b1` observes
+`us-east-1b` using credential B. Coordinator seeds form `a → b → c → a`.
+This validates regional Stage A only; no global coordinator or second region is
+present, and `:9004` / `:9005` remain reserved for Stage B.
 
 **The demo seed no longer runs on a node with `peers` set.** An empty store
 means "nobody has configured anything yet" standalone and "the config is on its
@@ -298,16 +310,57 @@ from a peer. Covered by
 (`tests/cluster.rs`), which asserts the standalone half too so it cannot pass
 vacuously.
 
-The file's header is the documentation — it lists what to watch and why each
-thing is shaped the way it is: transitive membership from a seed *chain*, a
-check created on one node appearing on the others, every node's grid filling
-with all three zones though each ingests from one, credentials on `:8091` that
-node was never configured with, and what `stop coordinator-b` then `start`
-proves about anti-entropy. Expect 401s from agent-b/agent-c for a few seconds at
-first boot while the credentials replicate; that is the config plane working.
+The cluster file's header gives the current matrix. Verify transitive
+membership from the seed chain, checks and credentials converging from
+coordinator A, all nodes showing both `us-east` zones, and policy edits
+converging through the config plane. Brief first-boot 401s are possible while
+provisioned credentials replicate.
 
 Drop the volumes (`down -v`) before a rebuild: no migrations, so a stale volume
 fails on missing HLC columns.
+
+### Stage A region tree (Phase 5 consumer complete)
+
+Phase 5 was reopened because clustering had replicated observations but the
+placement model still had no consumer: redundant agents advanced one shared
+failure counter rather than corroborating one another. That consumer is now
+complete.
+
+- `NodeState` is exactly `Up | Degraded | Down | Unknown`. Per-agent confirmed
+  beliefs and counters live in `agent_check_state`; stale leaves become
+  `Unknown`.
+- Active credentials derive the region/zone topology. Agent-submitted locations
+  cannot create nodes, and empty credential-backed locations remain visible as
+  `Unknown` until an agent reports.
+- Every policy has `degraded_when` and `down_when`, each `any`, `majority`,
+  `all`, or `quorum(n)`. These count failure evidence; `all` therefore means
+  unanimous corroboration. `Unknown` is excluded from both numerator and
+  denominator.
+- Defaults are agents→zone `all/all`, zones→region `any/all`, and
+  regions→check `any/majority`. Per-check overrides beat stored node policies,
+  which beat built-ins. Stored policy writes/deletes are HLC/LWW config entries
+  and replicate/anti-entropy with the rest of the config plane.
+- `min_incident_secs` and `min_recovery_secs` hold candidate transitions before
+  publication (both default zero). Degraded alerts default on; Degraded time
+  defaults to uptime, not downtime.
+- `state_history` records published root spans and is the source for
+  time-weighted uptime. Zone/region alerts describe topology transitions; only
+  root transitions drive check incidents and notifications.
+- Mixed coordinator versions fail soft: old nodes decode `degraded` as
+  `Unknown`, so a rolling upgrade may temporarily hide partial-outage detail but
+  does not invent or suppress total-outage transitions.
+
+Stage B / Phase 6 is implemented: regional-to-global state push
+(`Coordinator::spawn_global_push` → `/internal/global/state`), an in-memory
+global cache with cross-region aggregation and query routing (`src/global/`),
+the `global` CLI mode, and `docker-compose.global.yaml` (a 3-node `us` cluster
+on `:9001`–`:9003`, a single-node `tw` region on `:9004`, and the global node on
+`:9005`). The global node holds no raw data; drill-down reads reverse-proxy to
+the owning region. Cross-region alerting is off unless `[global] notifiers` is
+set and pages only on all-regions-down or a dark region. Not done (deliberately
+deferred): global-to-global HA replication of the cache — the wire format and
+the single `apply_push` mutation point are shaped for it, but multiple global
+nodes do not yet sync.
 
 ## Ground rules worth keeping
 
@@ -393,10 +446,10 @@ narrative), and `#/incident/<id>` in the SPA. Writes are all under
 Still deliberately out: severity, owner per incident, transitive dependencies,
 and suppressing a dependent's notification.
 
-**Deploying a no-migration schema change onto the live volume.** "No migrations"
-is fine for the code and a trap for the deployment: `deploy/coordinator.toml`
-sets `db_path = /data/warden.duckdb` on the `uptime_coordinator-data` volume, so
-the old `alerts`/`incidents` tables survive a rebuild and
+**Deploying a no-migration schema change onto an existing volume.** "No
+migrations" is fine for the code and a trap for deployment: the Compose config
+sets `db_path = /data/warden.duckdb` on its named volume, so old
+`alerts`/`incidents` tables survive a rebuild and
 `CREATE TABLE IF NOT EXISTS` silently no-ops on them. The new binary then boots
 cleanly and 500s on every incident and alert read:
 
@@ -411,10 +464,10 @@ status-page settings and **both agent credentials** — losing those means
 re-minting and rewriting `.env` before the fleet reports again. Drop only the
 tables whose shape changed and everything else survives:
 
-1. Prove the incompatibility against a **copy** first
-   (`docker cp uptime-coordinator-1:/data/warden.duckdb /tmp/...`, point a local
-   coordinator at it). Never diagnose on the live file.
-2. `docker compose stop coordinator`, then copy **both** `warden.duckdb` *and*
+1. Prove the incompatibility against a **copy** first (`docker cp` the active
+   service's `/data/warden.duckdb` to `/tmp/...`, then point a local coordinator
+   at it). Never diagnose on the live file.
+2. Stop the active service, then copy **both** `warden.duckdb` *and*
    `warden.duckdb.wal` out. **Stopping the container does not checkpoint the
    WAL** — there were 2.3 MB of committed rows in it, and taking only the main
    file loses them *and* leaves a mismatched WAL behind. Opening the pair with
@@ -423,13 +476,11 @@ tables whose shape changed and everything else survives:
 3. `DROP TABLE IF EXISTS incident_updates, incident_checks, incidents, alerts`
    — anything with no `duckdb` CLI on the host can borrow the crate's bundled
    engine from a throwaway test in `tests/`.
-4. Copy the single file back, deleting the stale `.wal`, and
-   `docker compose up -d coordinator`.
+4. Copy the single file back, delete the stale `.wal`, and restart that service.
 
-Keep a backup of the untouched pair until the new stack is verified. The
-`warden-docker-rebuild` skill predates the compose files and says there is no
-compose file — there are two, and the coordinator is `uptime-coordinator-1`
-publishing 8082.
+Keep a backup of the untouched pair until the new stack is verified. Service and
+volume names differ between the standalone and cluster topologies; inspect the
+selected Compose file rather than relying on old `uptime-*` container names.
 
 ### 2. Routing by section _(per-check routing landed this session)_
 A check names its notifiers and there is a default set, so "payments pages the
@@ -491,10 +542,11 @@ listed under item 2 above.
 - **`last_used_at`**: deliberately not stored — it would be a DB write per
   ingest. Without it there is no safe way to tell whether a credential is idle
   before revoking it. Sample it periodically rather than per request.
-- **Per-agent credentials**: current grain is per-zone, so an agent can still
-  impersonate a sibling *within its own zone*. Only worth it if agents run on
-  hosts you do not control. `Coordinator::provision_agent_credential` already
-  takes a chosen token, so per-agent provisioning needs no new primitive.
+- **Optional one-token-per-agent hardening**: credentials currently derive
+  topology at region/zone grain, and the demo intentionally shares credential A
+  between two corroborating agents in `us-east-1a`. Minting one credential per
+  agent would narrow revocation/impersonation scope but needs no new credential
+  primitive.
 - **Config seeding** _(landed)_: `[[coordinator.provision]]` gives
   `provision_agent_credential` a config surface, so an unattended first boot
   works — see the credentials section above and `docker-compose.cluster.yaml`.
@@ -539,13 +591,35 @@ listed under item 2 above.
 - Test-send builds its own `reqwest::Client` per call rather than sharing the
   dispatcher's. One TLS handshake on a button press, against not threading a
   client through the handler.
-- Closed: `docker-compose.yaml` still runs a single coordinator, by design —
-  the multi-coordinator setup now lives in `docker-compose.cluster.yaml`,
-  three coordinators seeded in a ring (`a → b → c → a`) to exercise
-  membership, both replication planes and anti-entropy under compose on ports
-  8080/8081/8082. Boot order does not matter — seeds are retried — and each
-  node gets its own volume; an existing single-coordinator volume is not
-  reusable, the schema changed and this project does not migrate.
+- Closed: a zone's agents no longer split across coordinators. Per-agent
+  beliefs replicate in `ReplicationBatch.beliefs`, keyed on `last_check` by
+  `StateTracker::merge_agent`, so every node folds the same tree. Before this,
+  `agent-a1` and `agent-a2` — the redundant pair in `us-east-1a`, pointed at
+  different coordinators — read as two separate one-agent zones on each node,
+  and the zone's `all/all` policy was satisfied by whichever single agent
+  reported locally. The unit test for that property passed the whole time; it
+  was unreachable in any real deployment. `tests/cluster.rs`
+  (`a_zones_agents_fold_into_one_zone_on_every_coordinator`) now pins it over
+  real sockets.
+- Closed: `agent.coordinator_url` takes a list, so a coordinator going down no
+  longer stops an agent. Rotation is on transport failure only — a 401 is an
+  answer, and rotating away from it would spread a bad token across the region.
+  The cursor is an `Arc` inside `AgentConfig`, so the sync loop and the poster
+  loop fail over together rather than drifting onto different coordinators.
+  There is deliberately no failback: flapping on every blip would move
+  placement around for nothing.
+- This was regional HA for *reads and probes*. Stage B is now built on top of
+  it: `CoordinatorConfig` has a `region` field (used only to label pushes), a
+  `[coordinator.global]` push block, and the `global` CLI mode exists. `:9004`
+  (tw region) and `:9005` (global node) are now used by
+  `docker-compose.global.yaml`. A coordinator still mints a credential for any
+  region it is asked for — placement, not the global tier, owns that.
+- Closed: deployment now has exactly two Compose files. The standalone file is
+  one process on `:9000`; the Stage A cluster file is three coordinators on
+  `:9001`–`:9003` with three agents in one `us-east` region. Boot order does
+  not matter—seeds are retried—and each coordinator has its own volume. Do not
+  reintroduce `deploy/*.toml`, `docker-compose.agents.yaml`, or root
+  `warden.toml`; reserve `:9004` / `:9005` for Stage B.
 - `git stash` holds an earlier AgentsAdmin experiment of yours
   ("superseded by scale rebuild") — `git stash pop` if you want it back,
   `git stash drop` to bin it.
@@ -557,18 +631,19 @@ sensitive to it.
 
 | Gate | Expected |
 |---|---|
-| `cargo test` | 295 passed, 0 failed |
+| `cargo test` | 363 passed, 0 failed across 13 suites |
 | `cargo fmt --check` | clean |
 | `cargo clippy --all-targets` | 0 warnings |
-| `npx svelte-check --threshold error` (in `frontend/`) | 220 files, 0 errors, 1 pre-existing warning in `IncidentEditor.svelte` |
-| `npx vitest run` (in `frontend/`) | 28 passed |
-| served bundle vs `frontend/dist` | hashes match |
+| `npm run build` (in `frontend/`) | clean |
+| `npx svelte-check --threshold error` (in `frontend/`) | 0 errors, 0 warnings |
+| `npx vitest run` (in `frontend/`) | 59 passed across 4 files |
+| `docker compose config -q` (both Compose files) | clean |
 
 Incident work is covered by seven tests in `tests/admin_api.rs`
 (`incidents_open_on_down_and_resolve_on_up`,
 `a_dependent_check_joins_its_upstreams_incident`,
 `unrelated_checks_falling_together_stay_separate_incidents`,
-`a_flapping_check_stays_inside_one_incident`,
+`failure_confirmation_does_not_invent_a_recovery_window`,
 `auto_resolve_fires_even_after_a_human_has_acknowledged`,
 `a_manual_incident_is_never_auto_resolved`,
 `incident_writes_are_admin_only_while_reads_are_public`) plus the wire-shape

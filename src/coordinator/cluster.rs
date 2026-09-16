@@ -100,6 +100,24 @@ pub struct PingBody {
     pub url: String,
     pub generation: i64,
     pub members: Vec<Member>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<LinkObservation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LinkOutcome {
+    Connected,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkObservation {
+    pub source: String,
+    pub target: String,
+    pub source_generation: i64,
+    pub observed_at: i64,
+    pub outcome: LinkOutcome,
 }
 
 /// The peer wire protocol this build speaks.
@@ -124,6 +142,7 @@ pub struct Cluster {
     self_url: String,
     generation: i64,
     members: RwLock<HashMap<String, Member>>,
+    links: RwLock<HashMap<(String, String), LinkObservation>>,
     /// Contacted whenever we have no member entry for them yet — the only way
     /// a completely fresh node, with nothing persisted, ever hears from the
     /// rest of the cluster for the first time.
@@ -151,6 +170,7 @@ impl Cluster {
             self_url: self_url.into(),
             generation,
             members: RwLock::new(HashMap::new()),
+            links: RwLock::new(HashMap::new()),
             seeds,
             client: reqwest::Client::new(),
             token,
@@ -218,6 +238,33 @@ impl Cluster {
         for m in &incoming.members {
             Self::merge_one(&mut guard, m.clone(), &self.self_id);
         }
+        drop(guard);
+        self.merge_links(&incoming.links);
+    }
+
+    fn merge_links(&self, incoming: &[LinkObservation]) {
+        let mut guard = self.links.write();
+        for observation in incoming {
+            let key = (observation.source.clone(), observation.target.clone());
+            let replace = guard.get(&key).is_none_or(|known| {
+                observation.source_generation > known.source_generation
+                    || (observation.source_generation == known.source_generation
+                        && observation.observed_at > known.observed_at)
+            });
+            if replace {
+                guard.insert(key, observation.clone());
+            }
+        }
+    }
+
+    fn observe_link(&self, target: String, observed_at: i64, outcome: LinkOutcome) {
+        self.merge_links(&[LinkObservation {
+            source: self.self_id.clone(),
+            target,
+            source_generation: self.generation,
+            observed_at,
+            outcome,
+        }]);
     }
 
     fn merge_one(guard: &mut HashMap<String, Member>, incoming: Member, self_id: &str) {
@@ -259,6 +306,7 @@ impl Cluster {
             url: self.self_url.clone(),
             generation: self.generation,
             members,
+            links: self.link_snapshot(),
         }
     }
 
@@ -281,23 +329,24 @@ impl Cluster {
     /// Each response is merged as it arrives; failures are logged and
     /// abandoned, since this runs off a timer with nobody to report to.
     pub async fn ping_all(&self, now_millis: i64) {
-        let targets: Vec<String> = {
+        let targets: Vec<(String, Option<String>)> = {
             let guard = self.members.read();
-            let known: Vec<String> = guard
+            let known: Vec<(String, Option<String>)> = guard
                 .values()
                 .filter(|m| m.state != MemberState::Dead)
-                .map(|m| m.url.clone())
+                .map(|m| (m.url.clone(), Some(m.node_id.clone())))
                 .collect();
             let unknown_seeds = self
                 .seeds
                 .iter()
                 .filter(|s| !guard.values().any(|m| &m.url == *s) && s.as_str() != self.self_url)
-                .cloned();
+                .cloned()
+                .map(|url| (url, None));
             known.into_iter().chain(unknown_seeds).collect()
         };
 
         let body = self.ping_body(now_millis);
-        for peer in targets {
+        for (peer, known_id) in targets {
             let url = Self::endpoint(&peer, "internal/cluster/ping");
             let mut req = self.client.post(&url).json(&body);
             if let Some(t) = &self.token {
@@ -305,12 +354,39 @@ impl Cluster {
             }
             match tokio::time::timeout(PING_TIMEOUT, req.send()).await {
                 Ok(Ok(r)) if r.status().is_success() => match r.json::<PingBody>().await {
-                    Ok(reply) => self.merge(&reply, now_millis),
-                    Err(e) => warn!(%peer, error = %e, "cluster ping reply unreadable"),
+                    Ok(reply) => {
+                        self.observe_link(
+                            reply.node_id.clone(),
+                            now_millis,
+                            LinkOutcome::Connected,
+                        );
+                        self.merge(&reply, now_millis);
+                    }
+                    Err(e) => {
+                        if let Some(target) = known_id.clone() {
+                            self.observe_link(target, now_millis, LinkOutcome::Failed);
+                        }
+                        warn!(%peer, error = %e, "cluster ping reply unreadable");
+                    }
                 },
-                Ok(Ok(r)) => warn!(%peer, status = %r.status(), "cluster ping rejected"),
-                Ok(Err(e)) => warn!(%peer, error = %e, "cluster ping failed"),
-                Err(_) => warn!(%peer, "cluster ping timed out"),
+                Ok(Ok(r)) => {
+                    if let Some(target) = known_id.clone() {
+                        self.observe_link(target, now_millis, LinkOutcome::Failed);
+                    }
+                    warn!(%peer, status = %r.status(), "cluster ping rejected");
+                }
+                Ok(Err(e)) => {
+                    if let Some(target) = known_id.clone() {
+                        self.observe_link(target, now_millis, LinkOutcome::Failed);
+                    }
+                    warn!(%peer, error = %e, "cluster ping failed");
+                }
+                Err(_) => {
+                    if let Some(target) = known_id {
+                        self.observe_link(target, now_millis, LinkOutcome::Failed);
+                    }
+                    warn!(%peer, "cluster ping timed out");
+                }
             }
         }
     }
@@ -362,6 +438,16 @@ impl Cluster {
     /// The full member view, for persistence or the admin API.
     pub fn snapshot(&self) -> Vec<Member> {
         self.members.read().values().cloned().collect()
+    }
+
+    pub fn link_snapshot(&self) -> Vec<LinkObservation> {
+        let mut links: Vec<_> = self.links.read().values().cloned().collect();
+        links.sort_by(|a, b| (&a.source, &a.target).cmp(&(&b.source, &b.target)));
+        links
+    }
+
+    pub fn link_stale_after_ms(&self) -> i64 {
+        self.peer_timeout_ms
     }
 
     /// POST a JSON body to one peer at `path`, returning whether it accepted.
@@ -449,6 +535,7 @@ mod tests {
             url: "http://b".into(),
             generation: 1,
             members: vec![member("c", "http://c", 1, 100, MemberState::Alive)],
+            links: vec![],
         };
         a.merge(&incoming, 200);
 
@@ -472,6 +559,7 @@ mod tests {
             url: "http://b".into(),
             generation: 1,
             members: vec![],
+            links: vec![],
         };
         a.merge(&incoming, 200);
 
@@ -493,6 +581,7 @@ mod tests {
             url: "http://x".into(),
             generation: 1,
             members: vec![member("b", "http://b", 2, 50, MemberState::Alive)],
+            links: vec![],
         };
         a.merge(&incoming, 200);
 
@@ -515,6 +604,7 @@ mod tests {
             url: "http://x".into(),
             generation: 1,
             members: vec![member("b", "http://b", 3, 999, MemberState::Alive)],
+            links: vec![],
         };
         a.merge(&incoming, 200);
 
@@ -556,6 +646,7 @@ mod tests {
             url: "http://b".into(),
             generation: 1,
             members: vec![],
+            links: vec![],
         };
         c.merge(&incoming, 10_000);
 
@@ -578,6 +669,7 @@ mod tests {
             url: "http://x".into(),
             generation: 1,
             members: vec![member("b", "http://b", 2, 100, MemberState::Alive)],
+            links: vec![],
         };
         c.merge(&incoming, 200);
 
@@ -617,6 +709,7 @@ mod tests {
                 url: "http://b".into(),
                 generation: 5,
                 members: vec![sender],
+                links: vec![],
             },
             10,
         );
@@ -642,6 +735,7 @@ mod tests {
                 url: "http://b".into(),
                 generation: 5,
                 members: vec![member("b", "http://b", 5, 5, MemberState::Alive)],
+                links: vec![],
             },
             10,
         );
@@ -726,6 +820,7 @@ mod tests {
                 1_700_000_000_002,
                 MemberState::Suspect,
             )],
+            links: vec![],
         };
         let json = serde_json::to_string(&body).unwrap();
         assert!(json.contains(r#""node_id":"a""#), "{json}");
@@ -733,6 +828,60 @@ mod tests {
 
         let back: PingBody = serde_json::from_str(&json).unwrap();
         assert_eq!(back, body);
+    }
+
+    #[test]
+    fn an_old_ping_body_defaults_links_to_empty() {
+        let body: PingBody =
+            serde_json::from_str(r#"{"node_id":"a","url":"http://a","generation":1,"members":[]}"#)
+                .unwrap();
+        assert!(body.links.is_empty());
+    }
+
+    #[test]
+    fn link_observations_merge_by_source_generation_then_time() {
+        let c = cluster("a", "http://a", 1);
+        let observation = |source_generation, observed_at, outcome| LinkObservation {
+            source: "b".into(),
+            target: "c".into(),
+            source_generation,
+            observed_at,
+            outcome,
+        };
+        for link in [
+            observation(2, 100, LinkOutcome::Connected),
+            observation(1, 999, LinkOutcome::Failed),
+            observation(2, 90, LinkOutcome::Failed),
+            observation(2, 110, LinkOutcome::Failed),
+        ] {
+            c.merge_links(&[link]);
+        }
+        assert_eq!(
+            c.link_snapshot(),
+            vec![observation(2, 110, LinkOutcome::Failed)]
+        );
+    }
+
+    #[test]
+    fn opposite_link_directions_are_independent() {
+        let c = cluster("a", "http://a", 1);
+        c.merge_links(&[
+            LinkObservation {
+                source: "b".into(),
+                target: "c".into(),
+                source_generation: 1,
+                observed_at: 100,
+                outcome: LinkOutcome::Connected,
+            },
+            LinkObservation {
+                source: "c".into(),
+                target: "b".into(),
+                source_generation: 1,
+                observed_at: 100,
+                outcome: LinkOutcome::Failed,
+            },
+        ]);
+        assert_eq!(c.link_snapshot().len(), 2);
     }
 
     #[test]

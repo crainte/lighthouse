@@ -9,7 +9,7 @@ import type {
 } from "./api";
 import { INCIDENT_STATES } from "./api";
 
-const STATUSES: Status[] = ["up", "down", "unknown"];
+const STATUSES: Status[] = ["up", "degraded", "down", "unknown"];
 const AFFECT_SOURCES: AffectSource[] = ["origin", "dependency", "manual"];
 
 function isStatus(v: unknown): v is Status {

@@ -19,12 +19,12 @@
 //! otherwise turn into a leak by accident.
 
 use super::super::fleet::FleetRowDto;
-use super::super::{fleet_health, internal_error, storage, Coordinator};
+use super::super::{error_response, fleet_health, internal_error, storage, Coordinator};
 use super::session::{require_admin, session_token};
 use super::settings::{announced_maintenance, MaintenanceNoticeDto};
-use crate::models::Status;
+use crate::models::{CheckId, NodeState, Status};
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -48,8 +48,11 @@ struct StatusResponse {
 
 #[derive(Serialize)]
 struct CheckStatusDto {
-    check_id: String,
-    status: Status,
+    check_id: CheckId,
+    /// Mutable display name. The status page renders this, never `check_id`.
+    name: String,
+    #[serde(rename = "status")]
+    state: NodeState,
     latency_ms: u64,
     last_check: i64,
     uptime_24h: f64,
@@ -77,7 +80,8 @@ struct CheckStatusDto {
 
 #[derive(Serialize)]
 struct HistoryResponse {
-    check_id: String,
+    check_id: CheckId,
+    name: String,
     history: Vec<HistoryDto>,
 }
 
@@ -105,7 +109,8 @@ struct ResultsResponse {
 /// `HistoryDto` there is no `public_error` downgrade.
 #[derive(Serialize)]
 struct ResultDto {
-    check_id: String,
+    check_id: CheckId,
+    name: String,
     agent_id: String,
     timestamp: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -136,24 +141,26 @@ struct AlertDto {
     id: String,
     scope: &'static str,
     node_id: String,
+    name: String,
     alert_type: &'static str,
-    previous_state: Option<Status>,
-    current_state: Status,
+    previous_state: Option<NodeState>,
+    current_state: NodeState,
     timestamp: i64,
     incident_id: Option<String>,
 }
 
-impl From<storage::AlertRow> for AlertDto {
-    fn from(r: storage::AlertRow) -> Self {
+impl AlertDto {
+    fn from_row(r: storage::AlertRow, name: String) -> Self {
         let alert_type = match (r.previous_state, r.current_state) {
-            (_, Status::Unknown) => "degradation",
-            (Some(Status::Down), Status::Up) => "recovery",
+            (_, NodeState::Degraded) => "degradation",
+            (Some(NodeState::Down | NodeState::Degraded), NodeState::Up) => "recovery",
             _ => "state_change",
         };
         Self {
             id: r.id,
             scope: r.scope.as_str(),
             node_id: r.node_id,
+            name,
             alert_type,
             previous_state: r.previous_state,
             current_state: r.current_state,
@@ -197,7 +204,8 @@ pub(in crate::coordinator) struct DaysQuery {
 
 #[derive(Serialize)]
 struct UptimeResponse {
-    check_id: String,
+    check_id: CheckId,
+    name: String,
     days: usize,
     overall_uptime: Option<f64>,
     buckets: Vec<UptimeBucketDto>,
@@ -205,8 +213,6 @@ struct UptimeResponse {
 
 #[derive(Serialize)]
 struct UptimeBucketDto {
-    /// Exclusive lower bound of the segment. Not a day boundary unless the
-    /// window happens to divide into whole days.
     start: i64,
     end: i64,
     uptime: Option<f64>,
@@ -216,7 +222,8 @@ struct UptimeBucketDto {
 
 #[derive(Serialize)]
 struct LatencySparklineResponse {
-    check_id: String,
+    check_id: CheckId,
+    name: String,
     /// Window actually charted, so the client never has to assume it.
     from: i64,
     to: i64,
@@ -232,7 +239,11 @@ struct LatencySparklineResponse {
 #[derive(Serialize)]
 struct LatencyPointDto {
     timestamp: i64,
-    /// `null` when the segment holds no attempts — not the same as a 0ms reply.
+    /// All outcomes observed in this segment, including failures.
+    attempts: u32,
+    /// Successful outcomes in this segment. Only these contribute latency.
+    up: u32,
+    /// `null` when no attempt passed — not the same as a 0ms reply.
     avg_latency_ms: Option<f64>,
 }
 
@@ -292,31 +303,32 @@ pub(in crate::coordinator) async fn status_handler(
         // `list_status` row to carry that state on.
         (store.list_status(now), store.list_current_state())
     };
-    let confirmed: std::collections::HashMap<String, Status> = confirmed
+    let confirmed: std::collections::HashMap<CheckId, NodeState> = confirmed
         .unwrap_or_default()
         .into_iter()
-        .map(|r| (r.check_id, r.status))
+        .map(|r| (r.check_id, r.state))
         .collect();
     match rows {
         Ok(rows) => {
-            let by_name = coord.inner.checks.read();
+            let by_id = coord.inner.checks.read();
             let mut checks: Vec<CheckStatusDto> = rows
                 .into_iter()
                 // Only currently-configured, published checks. A row with no
                 // config was deleted; its history stays queryable, but a status
                 // page claiming "blackhole — Down" for something nobody is
                 // monitoring any more is worse than saying nothing.
-                .filter(|r| by_name.get(&r.check_id).is_some_and(|m| m.visible))
+                .filter(|r| by_id.get(&r.check_id).is_some_and(|m| m.visible))
                 .map(|r| {
-                    let meta = by_name.get(&r.check_id);
+                    let meta = by_id.get(&r.check_id);
                     CheckStatusDto {
                         kind: meta.map(|m| m.kind),
                         group: meta.and_then(|m| m.group.clone()),
                         latency_graph: meta.is_some_and(|m| m.latency_graph),
                         cron: meta.map(|m| m.cron.clone()),
                         position: meta.map_or(i32::MAX, |m| m.position),
+                        name: meta.map_or_else(|| r.check_id.to_string(), |m| m.name.clone()),
                         check_id: r.check_id,
-                        status: r.status,
+                        state: r.state,
                         latency_ms: r.latency_ms,
                         last_check: r.last_check,
                         uptime_24h: r.uptime_24h,
@@ -330,20 +342,24 @@ pub(in crate::coordinator) async fn status_handler(
             // page. Omitting it means adding a five-minute check looks like
             // nothing happened until its first run — the monitor is missing
             // exactly when someone is watching for it to appear.
-            let reported: std::collections::HashSet<&str> =
-                checks.iter().map(|c| c.check_id.as_str()).collect();
-            let pending: Vec<CheckStatusDto> = by_name
+            let reported: std::collections::HashSet<CheckId> =
+                checks.iter().map(|c| c.check_id).collect();
+            let pending: Vec<CheckStatusDto> = by_id
                 .iter()
-                .filter(|(name, m)| m.visible && !reported.contains(name.as_str()))
-                .map(|(name, m)| CheckStatusDto {
-                    check_id: name.clone(),
+                .filter(|(id, m)| m.visible && !reported.contains(id))
+                .map(|(id, m)| CheckStatusDto {
+                    check_id: *id,
+                    name: m.name.clone(),
                     // A check with no measurements here still has a confirmed
                     // state if a peer gossiped one to us. Prefer it over the
                     // configured default: a cluster that knows a service is
                     // DOWN must not read "unknown" on the node that heard it
                     // second-hand. Falls back to `default_status`, which is what
                     // a check reads as before its first result.
-                    status: confirmed.get(name).copied().unwrap_or(m.default_status),
+                    state: confirmed
+                        .get(id)
+                        .copied()
+                        .unwrap_or_else(|| m.default_status.into()),
                     latency_ms: 0,
                     last_check: 0,
                     uptime_24h: 0.0,
@@ -370,7 +386,7 @@ pub(in crate::coordinator) async fn status_handler(
 
 pub(in crate::coordinator) async fn history_handler(
     State(coord): State<Coordinator>,
-    Path(id): Path<String>,
+    Path(id): Path<CheckId>,
     Query(q): Query<LimitQuery>,
     headers: HeaderMap,
 ) -> Response {
@@ -386,7 +402,8 @@ pub(in crate::coordinator) async fn history_handler(
     // feeds the public check page, and raw probe errors quote resolved
     // addresses and expected values.
     let detailed = is_admin(&coord, &headers);
-    match coord.history(&id, limit, q.from, q.to, status) {
+    let name = coord.check_name(id);
+    match coord.history(id, limit, q.from, q.to, status) {
         Ok(rows) => {
             let history = rows
                 .into_iter()
@@ -401,6 +418,7 @@ pub(in crate::coordinator) async fn history_handler(
                 .collect();
             Json(HistoryResponse {
                 check_id: id,
+                name,
                 history,
             })
             .into_response()
@@ -428,18 +446,29 @@ pub(in crate::coordinator) async fn results_handler(
         "unknown" => Some(Status::Unknown),
         _ => None,
     });
+    let check_id = match q.check.as_deref().map(|s| s.parse::<CheckId>()) {
+        Some(Ok(id)) => Some(id),
+        Some(Err(_)) => {
+            return error_response(StatusCode::BAD_REQUEST, "check must be a valid check id")
+        }
+        None => None,
+    };
     let filter = storage::ResultsFilter {
-        check_id: q.check,
+        check_id,
         agent_id: q.agent,
         status,
         region: q.region,
         zone: q.zone,
     };
+    let names = coord.inner.checks.read();
     match coord.recent_results(&filter, limit) {
         Ok(rows) => {
             let results = rows
                 .into_iter()
                 .map(|r| ResultDto {
+                    name: names
+                        .get(&r.check_id)
+                        .map_or_else(|| r.check_id.to_string(), |m| m.name.clone()),
                     check_id: r.check_id,
                     agent_id: r.agent_id,
                     timestamp: r.timestamp,
@@ -466,7 +495,22 @@ pub(in crate::coordinator) async fn results_handler(
 /// how much detail a public response gets, never whether it is sent.
 pub(in crate::coordinator) fn is_admin(coord: &Coordinator, headers: &HeaderMap) -> bool {
     let now = chrono::Utc::now().timestamp_millis();
-    session_token(headers).is_some_and(|t| coord.inner.auth.validate(t, now))
+    if session_token(headers).is_some_and(|t| coord.inner.auth.validate(t, now)) {
+        return true;
+    }
+    // Phase 6: the global coordinator relays admin operations on an operator's
+    // behalf, authenticating with the shared cross-region secret rather than a
+    // per-node session it could never mint. Constant-time compare so the token
+    // cannot be recovered by timing, matching how the password is checked.
+    if let Some(trust) = coord.inner.admin_trust_token.as_deref() {
+        if let Some(presented) = super::session::bearer(headers) {
+            use subtle::ConstantTimeEq;
+            if bool::from(presented.as_bytes().ct_eq(trust.as_bytes())) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Raw failure text for admins, the probe's own classification for everyone else.
@@ -491,7 +535,7 @@ fn public_error(
 
 pub(in crate::coordinator) async fn uptime_handler(
     State(coord): State<Coordinator>,
-    Path(id): Path<String>,
+    Path(id): Path<CheckId>,
     Query(q): Query<DaysQuery>,
 ) -> Response {
     let days = q.days.unwrap_or(90).clamp(1, 365);
@@ -499,33 +543,31 @@ pub(in crate::coordinator) async fn uptime_handler(
     // segments rather than fewer bars.
     let buckets = q.buckets.unwrap_or(90).clamp(1, 500);
     let now = chrono::Utc::now().timestamp_millis();
-    match coord
-        .inner
-        .storage
-        .lock()
-        .uptime_buckets(&id, days, buckets, now)
-    {
-        Ok(rows) => {
-            // Overall uptime = total UP across segments / total samples.
-            let up: u32 = rows.iter().map(|b| b.up).sum();
-            let total: u32 = rows.iter().map(|b| b.total).sum();
-            let overall_uptime = if total > 0 {
-                Some(up as f64 / total as f64)
-            } else {
-                None
-            };
+    // Use the resolved metadata, not the persisted optional override: a check
+    // inherits the coordinator default when its own setting is absent.
+    let degraded_is_downtime = coord.degraded_is_downtime(id);
+    let window_start = now - days as i64 * 86_400_000;
+    let result = (|| -> anyhow::Result<_> {
+        let storage = coord.inner.storage.lock();
+        let rows = storage.uptime_buckets(id, days, buckets, now, degraded_is_downtime)?;
+        let overall = storage.uptime_between(id, window_start, now, degraded_is_downtime)?;
+        Ok((rows, overall))
+    })();
+    match result {
+        Ok((rows, overall_uptime)) => {
             let buckets = rows
                 .into_iter()
                 .map(|b| UptimeBucketDto {
                     start: b.start,
                     end: b.end,
                     uptime: b.uptime,
-                    up: b.up,
-                    total: b.total,
+                    up: b.up.min(u32::MAX as u64) as u32,
+                    total: b.total.min(u32::MAX as u64) as u32,
                 })
                 .collect();
             Json(UptimeResponse {
                 check_id: id,
+                name: coord.check_name(id),
                 days,
                 overall_uptime,
                 buckets,
@@ -538,7 +580,7 @@ pub(in crate::coordinator) async fn uptime_handler(
 
 pub(in crate::coordinator) async fn latency_sparkline_handler(
     State(coord): State<Coordinator>,
-    Path(id): Path<String>,
+    Path(id): Path<CheckId>,
     Query(q): Query<HoursQuery>,
 ) -> Response {
     let buckets = q.buckets.unwrap_or(120).clamp(1, 500);
@@ -557,7 +599,7 @@ pub(in crate::coordinator) async fn latency_sparkline_handler(
         .inner
         .storage
         .lock()
-        .latency_series(&id, from, to, buckets)
+        .latency_series(id, from, to, buckets)
     {
         Ok(series) => {
             let points = series
@@ -565,11 +607,14 @@ pub(in crate::coordinator) async fn latency_sparkline_handler(
                 .into_iter()
                 .map(|p| LatencyPointDto {
                     timestamp: p.timestamp,
+                    attempts: p.attempts,
+                    up: p.up,
                     avg_latency_ms: p.avg_latency_ms,
                 })
                 .collect();
             Json(LatencySparklineResponse {
                 check_id: id,
+                name: coord.check_name(id),
                 from,
                 to,
                 buckets,
@@ -595,9 +640,16 @@ pub(in crate::coordinator) async fn alerts_handler(
     Query(q): Query<LimitQuery>,
 ) -> Response {
     let limit = q.limit.unwrap_or(50).min(1000);
-    match coord.inner.storage.lock().recent_alerts(limit) {
+    let rows = coord.inner.storage.lock().recent_alerts(limit);
+    match rows {
         Ok(rows) => {
-            let alerts = rows.into_iter().map(AlertDto::from).collect();
+            let alerts = rows
+                .into_iter()
+                .map(|row| {
+                    let name = coord.alert_name(row.scope, &row.node_id);
+                    AlertDto::from_row(row, name)
+                })
+                .collect();
             Json(AlertsResponse { alerts }).into_response()
         }
         Err(e) => internal_error(e),

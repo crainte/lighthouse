@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { AgentsDisplay, AgentsMode, FleetEntry, FleetMember } from '../lib/admin';
   import { AdminError, fetchAgentsDisplay, saveAgentsDisplay } from '../lib/admin';
+  import NumberField from './NumberField.svelte';
 
   // `onchanged` refreshes the public page behind the admin view, so a change is
   // visible without a reload.
@@ -317,11 +318,11 @@
     <div class="field-row">
       <label class="field">
         <span class="flabel">Amber below</span>
-        <input type="number" min="0" max="100" step="1" bind:value={form.warn_below} />
+        <NumberField min={0} max={100} step={1} bind:value={form.warn_below} />
       </label>
       <label class="field">
         <span class="flabel">Red below</span>
-        <input type="number" min="0" max="100" step="1" bind:value={form.down_below} />
+        <NumberField min={0} max={100} step={1} bind:value={form.down_below} />
       </label>
       <p class="admin-muted thresholds">
         Percent of a region row's agents that must be healthy. At the defaults one silent
@@ -477,7 +478,9 @@
     flex-direction: column;
     gap: 0.25rem;
   }
-  .field input {
+  /* :global because the control is now a component; the width belongs to the
+     slot it sits in, not to the component. */
+  .field :global(.num) {
     width: 6rem;
   }
   .thresholds {

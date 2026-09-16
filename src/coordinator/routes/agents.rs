@@ -79,6 +79,7 @@ struct AgentDto {
 /// What one agent last said about itself, from either half of the fleet view:
 /// a local poll, or a peer's replicated poll row.
 struct Declared {
+    at: i64,
     rtt_ms: Option<i64>,
     build: Option<String>,
     /// Wire names as sent, not parsed — a kind this node has never heard of
@@ -102,11 +103,22 @@ fn split_kinds(raw: &str) -> Vec<String> {
 pub(in crate::coordinator) async fn ingest_handler(
     State(coord): State<Coordinator>,
     headers: HeaderMap,
-    Json(mut batch): Json<ResultBatch>,
+    body: axum::body::Bytes,
 ) -> Response {
     let caller = match authenticate_agent(&coord, &headers) {
         Ok(c) => c,
         Err(denied) => return *denied,
+    };
+    // The body is only parsed once a credential has checked out. `Json<T>`
+    // as an extractor argument would parse before this handler's body ever
+    // runs, so a malformed or stale-shaped payload (like a check identified
+    // by name rather than the UUID it must carry now) would reject with 422
+    // even from a caller presenting no credential at all — a caller must
+    // never learn anything about the payload's shape before it has proven
+    // who it is.
+    let mut batch: ResultBatch = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
     // An agent does not get to say where it is. Zone and region decide placement
     // and are shown as the location an outage was seen from, so a caller able to
@@ -163,16 +175,14 @@ pub(in crate::coordinator) async fn agents_handler(
                 && !m.agents.is_empty()
                 && !m.agents.iter().any(|a| live.contains(a))
         })
-        .map(|(name, _)| name.clone())
+        .map(|(_, m)| m.name.clone())
         .collect();
 
     // What each agent said about itself on its last poll, wherever it polled.
     //
-    // Replicated poll rows first, local `seen` over the top: a declaration
-    // arrives on a poll and a poll goes to one coordinator, so without the
-    // replicated half an operator would see builds and capabilities only for
-    // the agents that happen to poll the node they opened. Local is preferred
-    // where both exist, being at most one gossip tick fresher.
+    // Choose the newest declaration per agent, with local `seen` winning only
+    // timestamp ties. Without replicated rows an operator would see builds and
+    // capabilities only for agents that poll the node they opened.
     //
     // Kinds stay as the wire names the agent sent, unparsed. A peer may
     // legitimately name a kind this node has never heard of, and narrowing to
@@ -189,6 +199,7 @@ pub(in crate::coordinator) async fn agents_handler(
             (
                 p.agent_id,
                 Declared {
+                    at: p.at,
                     rtt_ms: p.rtt_ms,
                     build: p.build,
                     kinds: p.kinds.map(|k| split_kinds(&k)),
@@ -196,19 +207,25 @@ pub(in crate::coordinator) async fn agents_handler(
             )
         })
         .collect();
-    declared.extend(coord.inner.seen.read().iter().map(|(id, s)| {
-        (
-            id.clone(),
-            Declared {
-                rtt_ms: s.rtt_ms,
-                build: s.build.clone(),
-                kinds: s
-                    .kinds
-                    .as_ref()
-                    .map(|ks| ks.iter().map(|k| k.as_db().to_string()).collect()),
-            },
-        )
-    }));
+    for (id, s) in coord.inner.seen.read().iter() {
+        if declared
+            .get(id)
+            .is_none_or(|replicated| s.at >= replicated.at)
+        {
+            declared.insert(
+                id.clone(),
+                Declared {
+                    at: s.at,
+                    rtt_ms: s.rtt_ms,
+                    build: s.build.clone(),
+                    kinds: s
+                        .kinds
+                        .as_ref()
+                        .map(|ks| ks.iter().map(|k| k.as_db().to_string()).collect()),
+                },
+            );
+        }
+    }
 
     let unrunnable: Vec<String> = coord
         .inner
@@ -237,7 +254,7 @@ pub(in crate::coordinator) async fn agents_handler(
                         .is_some_and(|kinds| !kinds.iter().any(|k| k == m.kind.as_db()))
                 })
         })
-        .map(|(name, _)| name.clone())
+        .map(|(_, m)| m.name.clone())
         .collect();
 
     let agents = rows
@@ -300,7 +317,7 @@ pub(in crate::coordinator) async fn purge_agent_handler(
         .read()
         .iter()
         .filter(|(_, m)| m.agents.contains(&agent_id))
-        .map(|(name, _)| name.clone())
+        .map(|(_, m)| m.name.clone())
         .collect();
     // Purging an agent that checks are still pinned to would leave those checks
     // silently unrunnable. Name them and refuse.
@@ -441,23 +458,18 @@ pub(in crate::coordinator) async fn agent_checks_handler(
         Err(e) => return internal_error(e),
     };
 
-    // The fleet is everyone in recent contact. Polling alone is enough: waiting
-    // for a first result would mean a booting agent is invisible exactly while
-    // it needs placing, and twenty agents starting together would each conclude
-    // they were alone and take the entire workload.
-    let fleet: Vec<crate::placement::Agent> = coord
+    // Placement needs the cluster-wide fresh union, not just this node's
+    // callers: an agent can fail over to a peer between polls without losing
+    // its assignment here. For each agent, select the newest live observation;
+    // local `seen` wins only when timestamps tie. The selected observation
+    // supplies location and capabilities together.
+    let polls = coord
         .inner
-        .seen
-        .read()
-        .iter()
-        .filter(|(_, s)| now - s.at <= s.window_ms)
-        .map(|(agent_id, s)| crate::placement::Agent {
-            agent_id: agent_id.clone(),
-            zone: s.zone.clone(),
-            region: s.region.clone(),
-            kinds: s.kinds.clone(),
-        })
-        .collect();
+        .storage
+        .lock()
+        .list_agent_polls()
+        .unwrap_or_default();
+    let fleet = placement_fleet(now, &coord.inner.seen.read(), &polls);
 
     let mine = checks
         .into_iter()
@@ -470,7 +482,7 @@ pub(in crate::coordinator) async fn agent_checks_handler(
             // negotiation exists to end. Excluding it here lets the next
             // eligible agent take the work instead.
             let capable = fleet_for(&fleet, c.kind);
-            crate::placement::assign(&c.name, &c.placement, &c.agents, &capable)
+            crate::placement::assign(c.id, &c.placement, &c.agents, &capable)
                 .iter()
                 .any(|id| id == caller)
         })
@@ -516,6 +528,59 @@ pub(in crate::coordinator) struct AgentIdentity {
 /// Kinds this coordinator does not recognise are dropped rather than rejected,
 /// because an agent *newer* than its coordinator is a legitimate ordering too —
 /// it can simply never be assigned a kind this node has no checks of.
+/// Build placement's live per-agent fleet from local and replicated polls.
+///
+/// A replicated observation supersedes an older local one; local wins an equal
+/// timestamp so a coordinator keeps the exact record it just received.
+fn placement_fleet(
+    now: i64,
+    seen: &std::collections::HashMap<String, SeenAgent>,
+    polls: &[storage::AgentPollRow],
+) -> Vec<crate::placement::Agent> {
+    let mut freshest: std::collections::HashMap<String, (i64, crate::placement::Agent)> = polls
+        .iter()
+        .filter(|p| now - p.at <= p.window_ms)
+        .map(|p| {
+            (
+                p.agent_id.clone(),
+                (
+                    p.at,
+                    crate::placement::Agent {
+                        agent_id: p.agent_id.clone(),
+                        zone: p.zone.clone(),
+                        region: p.region.clone(),
+                        kinds: declared_kinds(p.kinds.as_deref()),
+                    },
+                ),
+            )
+        })
+        .collect();
+    for (agent_id, s) in seen {
+        if now - s.at > s.window_ms {
+            continue;
+        }
+        let local = (
+            s.at,
+            crate::placement::Agent {
+                agent_id: agent_id.clone(),
+                zone: s.zone.clone(),
+                region: s.region.clone(),
+                kinds: s.kinds.clone(),
+            },
+        );
+        match freshest.entry(agent_id.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) if s.at >= entry.get().0 => {
+                entry.insert(local);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(local);
+            }
+            _ => {}
+        }
+    }
+    freshest.into_values().map(|(_, agent)| agent).collect()
+}
+
 fn declared_kinds(raw: Option<&str>) -> Option<Vec<crate::models::CheckKind>> {
     Some(
         split_kinds(raw?)
@@ -673,9 +738,11 @@ struct RevokedResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{declared_kinds, fleet_for};
+    use super::{declared_kinds, fleet_for, placement_fleet, SeenAgent};
+    use crate::coordinator::storage::AgentPollRow;
     use crate::models::CheckKind;
     use crate::placement::Agent;
+    use std::collections::HashMap;
 
     fn agent(id: &str, kinds: Option<&[CheckKind]>) -> Agent {
         Agent {
@@ -684,6 +751,50 @@ mod tests {
             region: "eu-west".into(),
             kinds: kinds.map(|k| k.to_vec()),
         }
+    }
+
+    #[test]
+    fn placement_fleet_selects_newest_record_and_local_on_ties() {
+        let mut seen = HashMap::new();
+        seen.insert(
+            "agent".into(),
+            SeenAgent {
+                zone: "local-zone".into(),
+                region: "local-region".into(),
+                at: 100,
+                window_ms: 100,
+                rtt_ms: None,
+                kinds: Some(vec![CheckKind::Http]),
+                build: None,
+            },
+        );
+        let replicated = AgentPollRow {
+            agent_id: "agent".into(),
+            zone: "peer-zone".into(),
+            region: "peer-region".into(),
+            at: 101,
+            window_ms: 100,
+            rtt_ms: None,
+            build: None,
+            kinds: Some("tcp".into()),
+        };
+
+        let fleet = placement_fleet(101, &seen, std::slice::from_ref(&replicated));
+        assert_eq!(fleet[0].zone, "peer-zone");
+        assert_eq!(fleet[0].region, "peer-region");
+        assert_eq!(fleet[0].kinds, Some(vec![CheckKind::Tcp]));
+
+        let fleet = placement_fleet(
+            100,
+            &seen,
+            &[AgentPollRow {
+                at: 100,
+                ..replicated
+            }],
+        );
+        assert_eq!(fleet[0].zone, "local-zone");
+        assert_eq!(fleet[0].region, "local-region");
+        assert_eq!(fleet[0].kinds, Some(vec![CheckKind::Http]));
     }
 
     #[test]

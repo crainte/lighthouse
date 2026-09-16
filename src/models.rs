@@ -1,6 +1,24 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Immutable check identity. Generated once, UUIDv7 so it sorts by creation
+/// order and stores natively as DuckDB's `UUID` column type. Every table that
+/// references a check — results, current state, agent beliefs, state
+/// history, incident attachments, notification queues, dependencies,
+/// maintenance associations — keys on this, never on the mutable display
+/// `name`. See `uptime-monitor-design.md` and `SCALING.md` for the identity
+/// migration rationale.
+pub type CheckId = uuid::Uuid;
+
+/// Mint a fresh check identity. The application always generates this; a
+/// caller-selected ID from an untrusted client must never reach here (public
+/// admin creation ignores any `id` in the request body). Trusted internal
+/// paths — regional creation folded into a global check, replication,
+/// fanout — pass an existing ID through instead of calling this again.
+pub fn new_check_id() -> CheckId {
+    uuid::Uuid::now_v7()
+}
+
 /// What kind of probe a check performs. Deserialized from the config `type` key;
 /// an unrecognized value fails config load rather than silently probing HTTP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
@@ -96,7 +114,7 @@ pub const HEARTBEAT_AGENT: &str = "heartbeat";
 /// The coordinator runs eval logic to derive UP/DOWN.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckResult {
-    pub check_id: String,
+    pub check_id: CheckId,
     pub agent_id: String,
     /// Where the probe ran. Stamped by the agent because only it knows, and
     /// carried on every result because "the API was slow" and "the API was slow
@@ -175,6 +193,71 @@ impl Status {
     }
 }
 
+/// The rolled-up state of a *node* in the region tree — an agent, a zone, a
+/// region, or the check itself.
+///
+/// Deliberately a separate type from [`Status`], which stays three-state.
+/// `Status` is an *observation*: what one probe saw. `NodeState` is a
+/// *conclusion*: what a group of observations means. `Degraded` is only ever
+/// meaningful for the latter — a single probe cannot be partially up — and
+/// keeping the types apart makes it impossible for `eval()` or a Lua script to
+/// invent one. See `uptime-monitor-design.md:520-526`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeState {
+    Up,
+    /// Some part of the tree is failing, but not enough of it to call the whole
+    /// node down. A regional outage of a globally-served check lands here.
+    Degraded,
+    Down,
+    Unknown,
+}
+
+impl NodeState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NodeState::Up => "up",
+            NodeState::Degraded => "degraded",
+            NodeState::Down => "down",
+            NodeState::Unknown => "unknown",
+        }
+    }
+
+    /// Parse back from the stored string form.
+    ///
+    /// Unrecognised values read as `Unknown` rather than failing, exactly as
+    /// [`Status::from_db`] does. That is what lets `degraded` reach an older
+    /// peer over gossip without breaking it: it reads the state as Unknown,
+    /// which drops out of every rollup denominator, so a mixed-version cluster
+    /// is briefly less informed but never wrong.
+    pub fn from_db(s: &str) -> NodeState {
+        match s {
+            "up" => NodeState::Up,
+            "degraded" => NodeState::Degraded,
+            "down" => NodeState::Down,
+            _ => NodeState::Unknown,
+        }
+    }
+
+    /// Anything that is not affirmatively Up. The incident-open gate.
+    pub fn is_failing(&self) -> bool {
+        matches!(self, NodeState::Degraded | NodeState::Down)
+    }
+}
+
+/// The leaf boundary: one agent's observation becomes that agent's node state.
+/// There is no inverse, because collapsing Degraded back onto a probe result
+/// would be a lie about what was measured.
+impl From<Status> for NodeState {
+    fn from(s: Status) -> NodeState {
+        match s {
+            Status::Up => NodeState::Up,
+            Status::Down => NodeState::Down,
+            Status::Unknown => NodeState::Unknown,
+        }
+    }
+}
+
 /// Derive UP/DOWN from an observation plus the check's optional status
 /// expectation. A probe error, or a failed content match, is always DOWN.
 ///
@@ -240,7 +323,7 @@ mod tests {
             region: "test-region".into(),
             body: None,
             headers: None,
-            check_id: "check".into(),
+            check_id: CheckId::from_u128(1),
             agent_id: "agent".into(),
             kind: CheckKind::Http,
             timestamp: Utc::now(),
@@ -252,6 +335,29 @@ mod tests {
             metric: None,
             metrics: None,
         }
+    }
+
+    #[test]
+    fn node_state_round_trips_through_the_db_form() {
+        for s in [
+            NodeState::Up,
+            NodeState::Degraded,
+            NodeState::Down,
+            NodeState::Unknown,
+        ] {
+            assert_eq!(NodeState::from_db(s.as_str()), s, "{s:?}");
+        }
+        // An older peer's vocabulary, and a future one's: both read as Unknown
+        // rather than panicking or defaulting to Up.
+        assert_eq!(NodeState::from_db("partial"), NodeState::Unknown);
+        assert_eq!(NodeState::from_db(""), NodeState::Unknown);
+    }
+
+    #[test]
+    fn status_lifts_into_node_state_without_inventing_degraded() {
+        assert_eq!(NodeState::from(Status::Up), NodeState::Up);
+        assert_eq!(NodeState::from(Status::Down), NodeState::Down);
+        assert_eq!(NodeState::from(Status::Unknown), NodeState::Unknown);
     }
 
     #[test]

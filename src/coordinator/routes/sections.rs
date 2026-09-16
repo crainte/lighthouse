@@ -206,16 +206,16 @@ pub(in crate::coordinator) async fn rename_section_handler(
     // `restamp_and_push` below takes a write lock on this same map via
     // `reload_checks` — holding the read guard that long would deadlock it
     // against itself.
-    let moved: Vec<String> = coord
+    let moved: Vec<crate::models::CheckId> = coord
         .inner
         .checks
         .read()
         .iter()
         .filter(|(_, m)| m.group.as_deref() == Some(name.as_str()))
-        .map(|(n, _)| n.clone())
+        .map(|(id, _)| *id)
         .collect();
-    for check_name in moved {
-        coord.restamp_and_push(storage::ConfigKind::Check, &check_name);
+    for check_id in moved {
+        coord.restamp_and_push(storage::ConfigKind::Check, &check_id.to_string());
     }
     info!(from = %current, to = %name, "section renamed");
     let collapsed = coord
@@ -248,13 +248,13 @@ pub(in crate::coordinator) async fn delete_section_handler(
     // Captured before the delete moves them: the checks that are about to be
     // loosened, so every one of them can be stamped and pushed too — its
     // document changed (`group` is now `None`), the same as any other edit.
-    let affected: Vec<String> = coord
+    let affected: Vec<crate::models::CheckId> = coord
         .inner
         .checks
         .read()
         .iter()
         .filter(|(_, m)| m.group.as_deref() == Some(name.as_str()))
-        .map(|(n, _)| n.clone())
+        .map(|(id, _)| *id)
         .collect();
     match coord
         .inner
@@ -277,8 +277,8 @@ pub(in crate::coordinator) async fn delete_section_handler(
             tracing::warn!(error = %e, section = %name, "config: failed to push section tombstone")
         }
     }
-    for check_name in &affected {
-        coord.restamp_and_push(storage::ConfigKind::Check, check_name);
+    for check_id in &affected {
+        coord.restamp_and_push(storage::ConfigKind::Check, &check_id.to_string());
     }
     info!(section = %name, "section deleted, its checks are now loose");
     Json(DeletedResponse { deleted: name }).into_response()

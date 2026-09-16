@@ -1,5 +1,9 @@
 <script lang="ts">
-  import type { MaintenanceResponse, MaintenanceWindow } from '../lib/admin';
+  import type {
+    MaintenanceCheckOption,
+    MaintenanceResponse,
+    MaintenanceWindow,
+  } from '../lib/admin';
   import { AdminError, fetchMaintenance, saveMaintenance } from '../lib/admin';
 
   let { onexpired }: { onexpired: () => void } = $props();
@@ -13,13 +17,14 @@
     title: string;
     starts: string;
     ends: string;
+    /** Check ids, not names — what the window actually stores. */
     checks: string[];
     announce: boolean;
   };
   let nextKey = 0;
 
   let rows = $state<Row[]>([]);
-  let checks = $state<string[]>([]);
+  let checks = $state<MaintenanceCheckOption[]>([]);
   let saved = $state('');
   let loading = $state(true);
   let loadError = $state<string | null>(null);
@@ -180,8 +185,8 @@
                   : `${row.checks.length} check${row.checks.length === 1 ? '' : 's'}`}
               </span>
               <select multiple size="3" bind:value={row.checks}>
-                {#each checks as name (name)}
-                  <option value={name}>{name}</option>
+                {#each checks as c (c.id)}
+                  <option value={c.id}>{c.name}</option>
                 {/each}
               </select>
             </label>

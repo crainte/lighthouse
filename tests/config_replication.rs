@@ -81,31 +81,31 @@ async fn spawn_node(node_id: &str, peers: Vec<String>, checks: Vec<CheckConfig>)
     let (sink, addr_sink) = alert_sink().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let coord = Coordinator::new(
-        &CoordinatorConfig {
-            listen: "127.0.0.1:0".into(),
-            db_path: ":memory:".into(),
-            admin_password: Some(ADMIN_PASSWORD.into()),
-            notifiers: vec![Notifier {
-                name: "alerts".into(),
-                default: true,
-                kind: NotifierKind::Webhook {
-                    url: format!("http://{addr_sink}/"),
-                },
-            }],
-            peer_token: Some(PEER_TOKEN.into()),
-            node_id: Some(node_id.into()),
-            advertise_url: Some(format!("http://{addr}")),
-            peers,
-            // Generous: none of these tests exercise failure detection, and a
-            // spurious suspect/dead transition mid-test must not be able to
-            // affect a config-plane assertion.
-            peer_timeout_secs: 7_200,
-            ..Default::default()
-        },
-        &checks,
-    )
+    let coord = Coordinator::new(&CoordinatorConfig {
+        listen: "127.0.0.1:0".into(),
+        db_path: ":memory:".into(),
+        admin_password: Some(ADMIN_PASSWORD.into()),
+        notifiers: vec![Notifier {
+            name: "alerts".into(),
+            default: true,
+            kind: NotifierKind::Webhook {
+                url: format!("http://{addr_sink}/"),
+            },
+        }],
+        peer_token: Some(PEER_TOKEN.into()),
+        node_id: Some(node_id.into()),
+        advertise_url: Some(format!("http://{addr}")),
+        peers,
+        // Generous: none of these tests exercise failure detection, and a
+        // spurious suspect/dead transition mid-test must not be able to
+        // affect a config-plane assertion.
+        peer_timeout_secs: 7_200,
+        ..Default::default()
+    })
     .unwrap();
+    for check in checks {
+        coord.create_check_for_test(check);
+    }
     let app = coord
         .clone()
         .router()
@@ -222,6 +222,12 @@ fn check_body(name: &str, target: &str) -> Value {
     })
 }
 
+fn check_document(id: &str, name: &str, target: &str) -> String {
+    let mut body = check_body(name, target);
+    body["id"] = json!(id);
+    body.to_string()
+}
+
 fn config_entry(
     kind: &str,
     id: &str,
@@ -313,7 +319,7 @@ async fn post_result(addr: SocketAddr, token: &str, agent_id: &str) -> u16 {
         .post(format!("http://{addr}/api/v1/results"))
         .bearer_auth(token)
         .json(&json!({ "results": [{
-            "check_id": CHECK,
+            "check_id": uuid::Uuid::now_v7(),
             "agent_id": agent_id,
             "zone": "z",
             "region": "r",
@@ -426,8 +432,9 @@ async fn deleting_a_check_is_a_tombstone_a_stale_replay_cannot_undo() {
     // itself, with an HLC this test controls, rather than through the admin
     // API — so the "stale replay" step later is unambiguously older.
     let create_hlc = 1_000_i64;
-    let doc = check_body(CHECK, "https://docs.test/health").to_string();
-    let create_entry = config_entry("check", CHECK, create_hlc, "a", Some(doc));
+    let check_id = uuid::Uuid::now_v7().to_string();
+    let doc = check_document(&check_id, CHECK, "https://docs.test/health");
+    let create_entry = config_entry("check", &check_id, create_hlc, "a", Some(doc));
     apply_config(a.addr, "a", vec![create_entry.clone()]).await;
     apply_config(b.addr, "a", vec![create_entry.clone()]).await;
     assert!(
@@ -442,7 +449,7 @@ async fn deleting_a_check_is_a_tombstone_a_stale_replay_cannot_undo() {
     // Delete on A through the real admin path — this is the write an
     // operator actually makes.
     let res = reqwest::Client::new()
-        .delete(format!("http://{}/api/v1/admin/checks/{CHECK}", a.addr))
+        .delete(format!("http://{}/api/v1/admin/checks/{check_id}", a.addr))
         .header(reqwest::header::COOKIE, &session_a)
         .send()
         .await
@@ -455,7 +462,7 @@ async fn deleting_a_check_is_a_tombstone_a_stale_replay_cannot_undo() {
 
     // Push a tombstone to B, newer than the create, standing in for the
     // anti-entropy sweep this test is driving by hand.
-    let tombstone = config_entry("check", CHECK, create_hlc + 1, "a", None);
+    let tombstone = config_entry("check", &check_id, create_hlc + 1, "a", None);
     apply_config(b.addr, "a", vec![tombstone]).await;
     assert!(
         !has_check(b.addr, &session_b, CHECK).await,
@@ -494,19 +501,20 @@ async fn concurrent_edits_from_both_nodes_converge_on_the_higher_hlc() {
     let session_a = login(a.addr).await;
     let session_b = login(b.addr).await;
 
+    let check_id = uuid::Uuid::now_v7().to_string();
     let edit_a = config_entry(
         "check",
-        NAME,
+        &check_id,
         9_000,
         "a",
-        Some(check_body(NAME, "https://a.test/health").to_string()),
+        Some(check_document(&check_id, NAME, "https://a.test/health")),
     );
     let edit_b = config_entry(
         "check",
-        NAME,
+        &check_id,
         5_000,
         "b",
-        Some(check_body(NAME, "https://b.test/health").to_string()),
+        Some(check_document(&check_id, NAME, "https://b.test/health")),
     );
 
     // A's higher-HLC edit is applied everywhere FIRST; B's lower-HLC edit
@@ -821,29 +829,43 @@ async fn an_anti_entropy_pull_does_not_overwrite_a_newer_local_edit() {
     let session_b = login(b.addr).await;
 
     // A holds an old edit of CHECK, plus a second check B has never seen.
+    let check_id = uuid::Uuid::now_v7().to_string();
+    let other_id = uuid::Uuid::now_v7().to_string();
     let stale = config_entry(
         "check",
-        CHECK,
+        &check_id,
         1_000,
         "a",
-        Some(check_body(CHECK, "https://stale.test/health").to_string()),
+        Some(check_document(
+            &check_id,
+            CHECK,
+            "https://stale.test/health",
+        )),
     );
     let other = config_entry(
         "check",
-        OTHER,
+        &other_id,
         1_000,
         "a",
-        Some(check_body(OTHER, "https://other.test/health").to_string()),
+        Some(check_document(
+            &other_id,
+            OTHER,
+            "https://other.test/health",
+        )),
     );
     apply_config(a.addr, "a", vec![stale, other]).await;
 
     // B holds a strictly newer edit of the same check.
     let fresh = config_entry(
         "check",
-        CHECK,
+        &check_id,
         9_000,
         "b",
-        Some(check_body(CHECK, "https://fresh.test/health").to_string()),
+        Some(check_document(
+            &check_id,
+            CHECK,
+            "https://fresh.test/health",
+        )),
     );
     apply_config(b.addr, "b", vec![fresh]).await;
 

@@ -15,7 +15,9 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio_tungstenite::connect_async;
 
-use warden::config::CoordinatorConfig;
+use uuid::Uuid;
+use warden::config::{CheckConfig, CoordinatorConfig};
+use warden::models::CheckId;
 
 /// Ingest accepts only minted agent credentials, so the test provisions one.
 const AGENT_TOKEN: &str = "wac_ws.ws-test-agent-secret";
@@ -38,6 +40,10 @@ fn spawn_server(coord: Coordinator) -> SocketAddr {
 
 /// A request JSON for the ingest endpoint carrying one CheckResult.
 /// `status_code` drives default_eval: 200 -> up, 500 -> down.
+fn cid(name: &str) -> CheckId {
+    Uuid::new_v5(&Uuid::NAMESPACE_DNS, name.as_bytes())
+}
+
 fn result_body(check_id: &str, ts: &str, status_code: u16) -> Value {
     json!({
         "results": [{
@@ -59,19 +65,18 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
     // Ingest refuses anything but a minted credential, so provision one rather
     // than relying on an ambient `WARDEN_AGENT_TOKEN`. This test is therefore
     // independent of whatever the machine exports.
-    let coord = Coordinator::new(
-        &CoordinatorConfig {
-            listen: "127.0.0.1:0".into(),
-            db_path: ":memory:".into(),
-            ..Default::default()
-        },
-        &[warden::config::CheckConfig {
-            name: "test-check".into(),
-            target: "https://test-check.invalid".into(),
-            ..Default::default()
-        }],
-    )
+    let coord = Coordinator::new(&CoordinatorConfig {
+        listen: "127.0.0.1:0".into(),
+        db_path: ":memory:".into(),
+        ..Default::default()
+    })
     .unwrap();
+    coord.create_check_for_test(CheckConfig {
+        id: cid("test-check"),
+        name: "test-check".into(),
+        target: "https://test-check.invalid".into(),
+        ..Default::default()
+    });
     coord
         .provision_agent_credential(AGENT_TOKEN, "ws-zone", "ws-region")
         .unwrap();
@@ -108,7 +113,11 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
     let r = http
         .post(format!("http://{addr}/api/v1/results"))
         .bearer_auth(AGENT_TOKEN)
-        .json(&result_body("test-check", "2026-07-11T00:00:00Z", 200))
+        .json(&result_body(
+            &cid("test-check").to_string(),
+            "2026-07-11T00:00:00Z",
+            200,
+        ))
         .send()
         .await
         .unwrap();
@@ -118,7 +127,11 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
     let r = http
         .post(format!("http://{addr}/api/v1/results"))
         .bearer_auth(AGENT_TOKEN)
-        .json(&result_body("test-check", "2026-07-11T00:00:01Z", 500))
+        .json(&result_body(
+            &cid("test-check").to_string(),
+            "2026-07-11T00:00:01Z",
+            500,
+        ))
         .send()
         .await
         .unwrap();
@@ -145,7 +158,11 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
     .expect("timed out waiting for a state_change broadcast");
 
     assert_eq!(event["type"], "state_change", "event type");
-    assert_eq!(event["check_id"], "test-check", "event check_id");
+    assert_eq!(
+        event["check_id"],
+        cid("test-check").to_string(),
+        "event check_id"
+    );
     assert_eq!(event["from"], "up", "transition starts at up");
     assert_eq!(event["to"], "down", "transition lands on down");
 
@@ -170,7 +187,8 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
     .expect("timed out waiting for incident_opened");
     assert_eq!(opened["type"], "incident_opened", "event type");
     assert_eq!(
-        opened["incident"]["origin_check"], "test-check",
+        opened["incident"]["origin_check"],
+        cid("test-check").to_string(),
         "the check that fell is the origin"
     );
     assert_eq!(
@@ -182,7 +200,8 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
         "nobody has looked at it yet"
     );
     assert_eq!(
-        opened["incident"]["checks"][0]["check_id"], "test-check",
+        opened["incident"]["checks"][0]["check_id"],
+        cid("test-check").to_string(),
         "the origin is attached as an affected check"
     );
     assert_eq!(opened["incident"]["checks"][0]["source"], "origin");
@@ -212,7 +231,7 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
         .as_array()
         .expect("alerts is an array")
         .iter()
-        .filter(|a| a["node_id"] == "test-check")
+        .filter(|a| a["node_id"] == cid("test-check").to_string())
         .collect();
     assert_eq!(
         mine.len(),
@@ -243,7 +262,7 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
         .as_array()
         .expect("incidents is an array")
         .iter()
-        .filter(|i| i["origin_check"] == "test-check")
+        .filter(|i| i["origin_check"] == cid("test-check").to_string())
         .collect();
     assert_eq!(mine_inc.len(), 1, "exactly one incident for test-check");
     assert_eq!(mine_inc[0]["state"], "detected", "incident is open");
@@ -290,7 +309,7 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
         .as_array()
         .expect("checks is an array")
         .iter()
-        .find(|c| c["check_id"] == "test-check")
+        .find(|c| c["check_id"] == cid("test-check").to_string())
         .expect("test-check present in status");
     assert_eq!(entry["status"], "down", "latest status is down");
 
@@ -299,7 +318,11 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
     let r = http
         .post(format!("http://{addr}/api/v1/results"))
         .bearer_auth(AGENT_TOKEN)
-        .json(&result_body("test-check", "2026-07-11T00:00:02Z", 200))
+        .json(&result_body(
+            &cid("test-check").to_string(),
+            "2026-07-11T00:00:02Z",
+            200,
+        ))
         .send()
         .await
         .unwrap();
@@ -341,7 +364,8 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
     .expect("timed out waiting for incident_resolved");
     assert_eq!(resolved["type"], "incident_updated", "event type");
     assert_eq!(
-        resolved["incident"]["origin_check"], "test-check",
+        resolved["incident"]["origin_check"],
+        cid("test-check").to_string(),
         "incident check"
     );
     assert_eq!(resolved["incident"]["state"], "resolved", "incident closes");
@@ -370,7 +394,7 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
         .as_array()
         .expect("incidents is an array")
         .iter()
-        .filter(|i| i["origin_check"] == "test-check")
+        .filter(|i| i["origin_check"] == cid("test-check").to_string())
         .collect();
     assert_eq!(mine_inc.len(), 1, "the resolved incident is listed");
     assert_eq!(
@@ -397,7 +421,7 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
         .as_array()
         .expect("incidents is an array")
         .iter()
-        .filter(|i| i["origin_check"] == "test-check")
+        .filter(|i| i["origin_check"] == cid("test-check").to_string())
         .collect();
     assert!(still_open.is_empty(), "no open incident after recovery");
 
@@ -413,7 +437,7 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
         .as_array()
         .expect("alerts is an array")
         .iter()
-        .filter(|a| a["node_id"] == "test-check")
+        .filter(|a| a["node_id"] == cid("test-check").to_string())
         .collect();
     assert_eq!(mine.len(), 2, "recovery is a second alert, down->up");
     assert_eq!(mine[0]["previous_state"], "down", "newest alert from state");
@@ -439,7 +463,7 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
         .as_array()
         .expect("checks is an array")
         .iter()
-        .find(|c| c["check_id"] == "test-check")
+        .find(|c| c["check_id"] == cid("test-check").to_string())
         .expect("test-check present in status");
     assert_eq!(entry["status"], "up", "latest status is up");
 }

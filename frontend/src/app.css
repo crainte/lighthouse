@@ -31,6 +31,12 @@
   /* Card/modal surface used by DayDetailModal and LoginModal. */
   --bg-card: var(--ad-panel);
   font-size: 16px;
+
+  /* Tells the browser to draw its own widgets — select popups, the text caret,
+     scrollbars, date pickers — from the dark theme. Without it they arrive
+     light-on-light over a #0a0c0e page. This is a whole-app declaration: it
+     applies to the public status page as much as to the admin area. */
+  color-scheme: dark;
 }
 
 * {
@@ -127,6 +133,7 @@ header.bar {
   background: rgba(63, 185, 80, 0.12);
   border-color: rgba(63, 185, 80, 0.4);
 }
+.banner.degraded,
 .banner.partial {
   background: rgba(210, 153, 34, 0.12);
   border-color: rgba(210, 153, 34, 0.4);
@@ -149,6 +156,7 @@ header.bar {
 .banner.operational .banner-icon {
   background: var(--up);
 }
+.banner.degraded .banner-icon,
 .banner.partial .banner-icon {
   background: var(--amber);
 }
@@ -320,6 +328,9 @@ header.bar {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.component-reason.degraded {
+  color: var(--amber);
+}
 /* The open incident a monitor is caught in — the human story above the raw
    failure text below it. Not a link: the row is already a button, and a nested
    one is invalid markup. */
@@ -387,6 +398,9 @@ header.bar {
 }
 .group-status.down {
   color: var(--down);
+}
+.group-status.degraded {
+  color: var(--amber);
 }
 .group .chevron {
   color: var(--text-dim);
@@ -1073,6 +1087,77 @@ button.link:hover {
 .admin-panel input[type='checkbox'] {
   width: auto;
   accent-color: var(--accent);
+}
+
+/* ---- Number fields ----
+   The browser's own spinners are drawn from the platform theme and land as a
+   bright smudge on a near-black panel, so they are removed outright and
+   NumberField.svelte draws the arrows instead. Both rules are needed: the
+   standard property for Firefox, the pseudo-elements for WebKit and Blink. */
+.admin-panel input[type='number'] {
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+.admin-panel input[type='number']::-webkit-outer-spin-button,
+.admin-panel input[type='number']::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.num {
+  position: relative;
+  display: flex;
+  min-width: 0;
+}
+/* Room for the arrows, so a four-digit value never slides under them. */
+.num input {
+  padding-right: 1.5rem;
+}
+.num-steps {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  bottom: 1px;
+  display: flex;
+  flex-direction: column;
+  width: 1.15rem;
+  border-left: 1px solid var(--border);
+  border-radius: 0 5px 5px 0;
+  overflow: hidden;
+}
+.num-step {
+  flex: 1 1 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: none;
+  border: 0;
+  color: var(--text-dim);
+  cursor: pointer;
+  min-height: 0;
+}
+.num-step + .num-step {
+  border-top: 1px solid var(--border);
+}
+.num-step:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--accent);
+}
+.num-step:active:not(:disabled) {
+  background: #1f6feb22;
+}
+/* Still occupying its half, just visibly inert: arrows that vanished at a
+   bound would make the control jump as you approached the limit. */
+.num-step:disabled {
+  color: #3a4149;
+  cursor: default;
+}
+.num:focus-within .num-steps {
+  border-left-color: var(--accent);
+}
+.num.readonly .num-steps {
+  display: none;
 }
 
 .field {

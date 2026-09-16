@@ -43,9 +43,10 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 
+use uuid::Uuid;
 use warden::config::{CheckConfig, CoordinatorConfig};
 use warden::coordinator::Coordinator;
-use warden::models::{CheckKind, CheckResult};
+use warden::models::{CheckId, CheckKind, CheckResult};
 use warden::notify::{Notifier, NotifierKind};
 
 /// Peers authenticate with their own secret, never an agent's — see
@@ -94,39 +95,46 @@ struct Node {
 /// listener bound before the coordinator is constructed, because a peer has
 /// to be told a real, dialable address — there is no way to know the
 /// ephemeral port in advance the way a fixed deployment would.
+fn cid(name: &str) -> CheckId {
+    Uuid::new_v5(&Uuid::NAMESPACE_DNS, name.as_bytes())
+}
+
+fn cid_str(name: &str) -> String {
+    cid(name).to_string()
+}
+
 async fn spawn_node(node_id: &str, peers: Vec<String>, peer_timeout_secs: u64) -> Node {
     let (sink, addr_sink) = alert_sink().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let coord = Coordinator::new(
-        &CoordinatorConfig {
-            listen: "127.0.0.1:0".into(),
-            db_path: ":memory:".into(),
-            admin_password: Some(ADMIN_PASSWORD.into()),
-            notifiers: vec![Notifier {
-                name: "alerts".into(),
-                default: true,
-                kind: NotifierKind::Webhook {
-                    url: format!("http://{addr_sink}/"),
-                },
-            }],
-            peer_token: Some(PEER_TOKEN.into()),
-            node_id: Some(node_id.into()),
-            advertise_url: Some(format!("http://{addr}")),
-            peers,
-            peer_timeout_secs,
-            ..Default::default()
-        },
-        &[CheckConfig {
-            name: CHECK.into(),
-            kind: CheckKind::Http,
-            target: "https://example.invalid".into(),
-            cron: "0 * * * * *".into(),
-            timeout_secs: 5,
-            ..Default::default()
+    let coord = Coordinator::new(&CoordinatorConfig {
+        listen: "127.0.0.1:0".into(),
+        db_path: ":memory:".into(),
+        admin_password: Some(ADMIN_PASSWORD.into()),
+        notifiers: vec![Notifier {
+            name: "alerts".into(),
+            default: true,
+            kind: NotifierKind::Webhook {
+                url: format!("http://{addr_sink}/"),
+            },
         }],
-    )
+        peer_token: Some(PEER_TOKEN.into()),
+        node_id: Some(node_id.into()),
+        advertise_url: Some(format!("http://{addr}")),
+        peers,
+        peer_timeout_secs,
+        ..Default::default()
+    })
     .unwrap();
+    coord.create_check_for_test(CheckConfig {
+        id: cid(CHECK),
+        name: CHECK.into(),
+        kind: CheckKind::Http,
+        target: "https://example.invalid".into(),
+        cron: "0 * * * * *".into(),
+        timeout_secs: 5,
+        ..Default::default()
+    });
     let app = coord
         .clone()
         .router()
@@ -146,7 +154,7 @@ const NO_TIMEOUT: u64 = 7_200;
 /// 500 -> DOWN. Copied from `tests/gossip.rs`.
 fn result(status_code: u16, ts_millis: i64) -> CheckResult {
     CheckResult {
-        check_id: CHECK.into(),
+        check_id: cid(CHECK),
         agent_id: "agent-test".into(),
         zone: "z".into(),
         region: "r".into(),
@@ -382,6 +390,9 @@ async fn a_node_with_no_seeds_stays_alone() {
         "an unseeded, never-contacted node must have no members: {view}"
     );
     assert_eq!(view["self"]["node_id"], "solo");
+    assert_eq!(view["mode"], "coordinator");
+    assert!(view["links"].as_array().unwrap().is_empty());
+    assert_eq!(view["link_stale_after_ms"], (NO_TIMEOUT * 1000) as i64);
 }
 
 // ---------------------------------------------------------------------------
@@ -513,7 +524,7 @@ async fn results_ingested_on_one_node_are_visible_on_its_peer() {
         Duration::from_secs(5),
         Duration::from_millis(20),
         || async {
-            let rows = history(b.addr, CHECK).await;
+            let rows = history(b.addr, &cid_str(CHECK)).await;
             (!rows.is_empty()).then_some(rows)
         },
     )
@@ -543,7 +554,7 @@ async fn replaying_a_replicate_batch_does_not_duplicate_history() {
         replicate(b.addr, &batch_at(1_000)).await,
         reqwest::StatusCode::NO_CONTENT
     );
-    assert_eq!(history(b.addr, CHECK).await.len(), 1);
+    assert_eq!(history(b.addr, &cid_str(CHECK)).await.len(), 1);
 
     // Exact replay of the same batch: nothing new should land.
     assert_eq!(
@@ -551,7 +562,7 @@ async fn replaying_a_replicate_batch_does_not_duplicate_history() {
         reqwest::StatusCode::NO_CONTENT
     );
     assert_eq!(
-        history(b.addr, CHECK).await.len(),
+        history(b.addr, &cid_str(CHECK)).await.len(),
         1,
         "replaying an identical batch must not duplicate the row"
     );
@@ -562,7 +573,7 @@ async fn replaying_a_replicate_batch_does_not_duplicate_history() {
         reqwest::StatusCode::NO_CONTENT
     );
     assert_eq!(
-        history(b.addr, CHECK).await.len(),
+        history(b.addr, &cid_str(CHECK)).await.len(),
         2,
         "a batch with one new observation should add exactly one row"
     );
@@ -619,7 +630,7 @@ async fn only_the_observing_node_pages_for_a_replicated_transition() {
             let c = v["checks"]
                 .as_array()?
                 .iter()
-                .find(|c| c["check_id"] == CHECK)?
+                .find(|c| c["check_id"] == cid_str(CHECK))?
                 .clone();
             (c["status"] == "down").then_some(c)
         },
@@ -669,7 +680,7 @@ async fn a_late_joiner_backfills_history_via_digest_and_backfill() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|c| c["check_id"] == CHECK)
+        .find(|c| c["check_id"] == cid_str(CHECK))
         .cloned()
         .expect("A's digest should list the check it has history for");
     assert_eq!(
@@ -678,7 +689,7 @@ async fn a_late_joiner_backfills_history_via_digest_and_backfill() {
     );
 
     let until = entry["max_ts"].as_i64().unwrap() + 1;
-    let batch = backfill(a.addr, CHECK, 0, until, 100).await;
+    let batch = backfill(a.addr, &cid_str(CHECK), 0, until, 100).await;
     assert_eq!(
         batch["results"].as_array().unwrap().len(),
         3,
@@ -690,7 +701,7 @@ async fn a_late_joiner_backfills_history_via_digest_and_backfill() {
         reqwest::StatusCode::NO_CONTENT
     );
 
-    let b_history = history(b.addr, CHECK).await;
+    let b_history = history(b.addr, &cid_str(CHECK)).await;
     assert_eq!(
         b_history.len(),
         3,
@@ -704,7 +715,7 @@ async fn a_late_joiner_backfills_history_via_digest_and_backfill() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|c| c["check_id"] == CHECK)
+        .find(|c| c["check_id"] == cid_str(CHECK))
         .cloned()
         .expect("B's digest should list the check now that it has caught up");
     assert_eq!(
@@ -773,7 +784,7 @@ async fn a_replicated_incident_keeps_its_originating_id() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|al| al["node_id"] == CHECK)
+        .find(|al| al["node_id"] == cid_str(CHECK))
         .expect("B should have recorded the replicated alert");
     assert_eq!(
         replicated_alert["incident_id"], incident_id,
@@ -884,7 +895,7 @@ async fn a_deleted_incident_stays_deleted_when_a_peer_pushes_it_back() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|al| al["node_id"] == CHECK)
+        .find(|al| al["node_id"] == cid_str(CHECK))
         .expect("deleting the incident must not delete the transition it described");
     assert!(
         alert["incident_id"].is_null(),
@@ -1054,7 +1065,10 @@ async fn internal_endpoints_refuse_anonymous_and_agent_callers() {
         ),
         (
             "GET",
-            format!("/internal/backfill?check_id={CHECK}&since=0&until=9999999999999&limit=10"),
+            format!(
+                "/internal/backfill?check_id={}&since=0&until=9999999999999&limit=10",
+                cid_str(CHECK)
+            ),
             None,
             reqwest::StatusCode::OK,
         ),
@@ -1103,35 +1117,21 @@ async fn internal_endpoints_refuse_anonymous_and_agent_callers() {
 }
 
 // ---------------------------------------------------------------------------
-// The demo seed is a single-node affordance
+// Empty stores remain empty
 // ---------------------------------------------------------------------------
 
-/// An empty store means two different things, and the difference is `peers`.
-///
-/// On a single node it means "nobody has configured anything yet", and demo
-/// data is friendlier than a blank dashboard. On a node that has just joined a
-/// cluster it means "the config is on its way" — and the demo rows do not stay
-/// local. Results replicate, so one joining node seeds a fake `seed` agent onto
-/// every node in the cluster, including the ones that were configured properly.
-/// Removing it afterwards does not work either: a result delete has no
-/// tombstone, so the next anti-entropy sweep pulls the rows back from a peer
-/// that still has them.
 #[tokio::test]
-async fn a_joining_node_does_not_seed_demo_data_over_the_whole_cluster() {
+async fn empty_nodes_do_not_seed_demo_data() {
     async fn status_agents(peers: Vec<String>) -> Vec<serde_json::Value> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let coord = Coordinator::new(
-            &CoordinatorConfig {
-                db_path: ":memory:".into(),
-                peer_token: Some(PEER_TOKEN.into()),
-                advertise_url: Some(format!("http://{addr}")),
-                peers,
-                ..Default::default()
-            },
-            // No checks: the state that triggers the seed.
-            &[],
-        )
+        let coord = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            peer_token: Some(PEER_TOKEN.into()),
+            advertise_url: Some(format!("http://{addr}")),
+            peers,
+            ..Default::default()
+        })
         .unwrap();
         let app = coord
             .router()
@@ -1152,9 +1152,8 @@ async fn a_joining_node_does_not_seed_demo_data_over_the_whole_cluster() {
 
     let standalone = status_agents(vec![]).await;
     assert!(
-        standalone.iter().any(|a| a["name"] == "seed"),
-        "a standalone node with no checks should still seed demo data, or this \
-         test proves nothing about the clustered case: {standalone:?}"
+        standalone.is_empty(),
+        "a standalone node must not invent checks or fleet data: {standalone:?}"
     );
 
     let joining = status_agents(vec!["http://127.0.0.1:9/".into()]).await;

@@ -8,7 +8,9 @@
     DefaultStatus,
     EvalResult,
     MatchMode,
+    RollupPolicy,
     Section,
+    Threshold,
   } from '../lib/admin';
   import {
     AdminError,
@@ -22,19 +24,26 @@
     testEval,
     updateCheck,
   } from '../lib/admin';
+  import NumberField from './NumberField.svelte';
 
   let {
-    name,
+    id,
     onsaved,
     onclose,
-  }: { name: string | null; onsaved: () => void; onclose: () => void } = $props();
+  }: { id: string | null; onsaved: () => void; onclose: () => void } = $props();
 
   // Number inputs go empty rather than to zero when cleared, so the draft holds
   // nulls and the guards below refuse them; AdminCheck itself stays honest.
   // `group` and the optional strings are non-optional here because `bind:value`
   // needs a string, and `position` is absent because the server owns ordering.
+  type ThresholdKind = 'any' | 'majority' | 'all' | 'quorum';
+  type ThresholdDraft = { kind: ThresholdKind; quorum: number | null };
+  type PolicyDraft = { degraded_when: ThresholdDraft; down_when: ThresholdDraft };
+  type OptionalBoolean = '' | 'true' | 'false';
+
   type Draft = Omit<
     AdminCheck,
+    | 'id'
     | 'timeout_secs'
     | 'expect'
     | 'group'
@@ -47,7 +56,14 @@
     | 'ping'
     | 'cert_warning_days'
     | 'grace_secs'
+    | 'retry_interval_secs'
+    | 'down_interval_secs'
     | 'placement'
+    | 'rollup'
+    | 'min_incident_secs'
+    | 'min_recovery_secs'
+    | 'notify_degraded'
+    | 'degraded_is_downtime'
   > & {
     timeout_secs: number | null;
     expect_status: number | null;
@@ -62,11 +78,21 @@
     cert_warning_days: number | null;
     grace_secs: number | null;
     failures_before_down: number | null;
+    // Blank means omitted — the server derives a value from the schedule and
+    // timeout — while heartbeat checks never read either, since nothing is
+    // retried between pings.
+    retry_interval_secs: number | null;
+    down_interval_secs: number | null;
+    rollup: { zone: PolicyDraft | null; region: PolicyDraft | null; global: PolicyDraft | null };
+    min_incident_secs: number | null;
+    min_recovery_secs: number | null;
+    notify_degraded: OptionalBoolean;
+    degraded_is_downtime: OptionalBoolean;
     /** Upstream checks. A DOWN here joins the upstream's open incident rather
      *  than opening a second one for the same root cause. */
     depends_on: string[];
     // Same reason as every other number here: cleared reads as empty, not zero.
-    placement: { zones: string[]; regions: string[]; per_zone: number | null };
+    placement: { mode: 'zone' | 'region'; zones: string[]; regions: string[]; count: number | null };
   };
 
   const KINDS: CheckKind[] = ['http', 'tcp', 'dns', 'icmp', 'ssl', 'heartbeat', 'openmetrics'];
@@ -74,7 +100,40 @@
   const DEFAULT_STATUSES: DefaultStatus[] = ['up', 'down', 'unknown'];
   const DNS_RECORDS = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS'];
   const IP_TYPES = ['any', 'ipv4', 'ipv6'];
+  const THRESHOLD_KINDS: ThresholdKind[] = ['any', 'majority', 'all', 'quorum'];
+  const POLICY_EDGES: { key: keyof PolicyDraft; label: string }[] = [
+    { key: 'degraded_when', label: 'Degraded' },
+    { key: 'down_when', label: 'DOWN' },
+  ];
   const LOG_LIMIT = 50;
+
+  function thresholdDraft(value: Threshold): ThresholdDraft {
+    return typeof value === 'string'
+      ? { kind: value, quorum: 1 }
+      : { kind: 'quorum', quorum: value.quorum };
+  }
+
+  function policyDraft(value: RollupPolicy): PolicyDraft {
+    return {
+      degraded_when: thresholdDraft(value.degraded_when),
+      down_when: thresholdDraft(value.down_when),
+    };
+  }
+
+  function thresholdValue(value: ThresholdDraft): Threshold {
+    return value.kind === 'quorum' ? { quorum: value.quorum ?? 1 } : value.kind;
+  }
+
+  function policyValue(value: PolicyDraft): RollupPolicy {
+    return {
+      degraded_when: thresholdValue(value.degraded_when),
+      down_when: thresholdValue(value.down_when),
+    };
+  }
+
+  function optionalBoolean(value: boolean | undefined): OptionalBoolean {
+    return value === undefined ? '' : String(value) as OptionalBoolean;
+  }
 
   function blank(): Draft {
     return {
@@ -108,7 +167,14 @@
       cert_warning_days: 14,
       grace_secs: 300,
       failures_before_down: 1,
-      placement: { zones: [], regions: [], per_zone: 1 },
+      retry_interval_secs: null,
+      down_interval_secs: null,
+      rollup: { zone: null, region: null, global: null },
+      min_incident_secs: null,
+      min_recovery_secs: null,
+      notify_degraded: '',
+      degraded_is_downtime: '',
+      placement: { mode: 'zone', zones: [], regions: [], count: 1 },
     };
   }
 
@@ -156,11 +222,23 @@
       cert_warning_days: c.cert_warning_days ?? d.cert_warning_days,
       grace_secs: c.grace_secs ?? d.grace_secs,
       failures_before_down: c.failures_before_down ?? d.failures_before_down,
-      placement: {
-        zones: [...(c.placement?.zones ?? [])],
-        regions: [...(c.placement?.regions ?? [])],
-        per_zone: c.placement?.per_zone ?? 1,
+      retry_interval_secs: c.retry_interval_secs ?? null,
+      down_interval_secs: c.down_interval_secs ?? null,
+      rollup: {
+        zone: c.rollup?.zone ? policyDraft(c.rollup.zone) : null,
+        region: c.rollup?.region ? policyDraft(c.rollup.region) : null,
+        global: c.rollup?.global ? policyDraft(c.rollup.global) : null,
       },
+      min_incident_secs: c.min_incident_secs ?? null,
+      min_recovery_secs: c.min_recovery_secs ?? null,
+      notify_degraded: optionalBoolean(c.notify_degraded),
+      degraded_is_downtime: optionalBoolean(c.degraded_is_downtime),
+placement: {
+mode: c.placement?.mode ?? 'zone',
+zones: [...(c.placement?.zones ?? [])],
+regions: [...(c.placement?.regions ?? [])],
+count: c.placement?.count ?? c.placement?.per_zone ?? 1,
+},
     };
   }
 
@@ -175,10 +253,10 @@
    *  the picker has to say what "none selected" actually means. */
   let notifierNames = $state<string[]>([]);
   let defaultNotifiers = $state<string[]>([]);
-  /** Every other check, for the `depends_on` picker. Excludes this one: a
-   *  check depending on itself would look up its own open incident and join
-   *  it, which is a no-op dressed up as configuration. */
-  let allCheckNames = $state<string[]>([]);
+  /** Every other check's id and name, for the `depends_on` picker. Excludes
+   *  this one: a check depending on itself would look up its own open
+   *  incident and join it, which is a no-op dressed up as configuration. */
+  let allChecks = $state<{ id: string; name: string }[]>([]);
   let loading = $state(true);
   let loadError = $state<string | null>(null);
   let saving = $state(false);
@@ -213,14 +291,18 @@
 
   let copied = $state(false);
   let copyError = $state<string | null>(null);
+  // This is deliberately initialized, rather than derived: after a new check
+  // is saved, closing Probe remains the editor's own persistent choice.
+  // svelte-ignore state_referenced_locally
+  let probeOpen = $state(id === null);
 
   const kind = $derived(draft.type);
-  const creating = $derived(name === null);
+  const creating = $derived(id === null);
 
-  // The URL is the credential, so it only exists once the check does; for an
-  // unsaved check we say so rather than printing a 404.
+  let savedName = $state<string | null>(null);
+
   const heartbeatUrl = $derived(
-    name === null ? null : `${location.origin}/api/v1/heartbeat/${encodeURIComponent(name)}`,
+    id === null ? null : `${location.origin}/api/v1/heartbeat/${encodeURIComponent(id)}`,
   );
 
   // A check may sit in a section the list doesn't know about (renamed
@@ -240,10 +322,15 @@
 
   /** Dependency candidates: every other check, plus anything already named on
    *  this one so a stale entry stays visible instead of vanishing silently.
-   *  Set-deduped, since the picker below is keyed on these strings. */
-  const otherChecks = $derived([
-    ...new Set([...allCheckNames, ...draft.depends_on].filter((n) => n !== name)),
-  ]);
+   *  Deduped by id, since the picker below is keyed on it. A dependency whose
+   *  check has since been deleted has no name to show, so it falls back to
+   *  its raw id rather than disappearing from the list unexplained. */
+  const otherChecks = $derived.by(() => {
+    const byId = new Map(allChecks.map((c) => [c.id, c.name]));
+    const ids = new Set([...allChecks.map((c) => c.id), ...draft.depends_on]);
+    ids.delete(id ?? '');
+    return [...ids].map((depId) => ({ id: depId, name: byId.get(depId) ?? depId }));
+  });
 
   // An id absent here is either silent or has never reported at all. Both mean
   // the same thing to someone ticking the box: nothing would probe this check.
@@ -273,22 +360,24 @@
   const pinned = $derived(draft.agents.length > 0);
 
   /** The number that stops a 20x fan-out. Same rule the coordinator applies:
-   *  eligible live agents grouped by zone, `per_zone` taken from each zone —
-   *  so it is per zone, never a total. Which specific agents win is rendezvous
-   *  hashing and irrelevant here; how many, and where, is the whole question. */
+   *  eligible live agents grouped by the chosen zone or region, with `count`
+   *  taken in each domain — never as a fleet-wide total. Which specific agents
+   *  win is rendezvous hashing and irrelevant here; how many and where is the
+   *  whole question. */
   const effect = $derived.by(() => {
     const p = draft.placement;
-    const per = Math.max(1, p.per_zone ?? 1);
+    const count = Math.max(1, p.count ?? 1);
     const counts = new Map<string, number>();
     for (const a of live) {
       if (p.zones.length > 0 && !p.zones.includes(a.zone)) continue;
       if (p.regions.length > 0 && !p.regions.includes(a.region)) continue;
-      counts.set(a.zone, (counts.get(a.zone) ?? 0) + 1);
+      const domain = p.mode === 'region' ? a.region : a.zone;
+      counts.set(domain, (counts.get(domain) ?? 0) + 1);
     }
-    const zones = [...counts]
-      .map(([zone, available]) => ({ zone, probes: Math.min(available, per), available }))
-      .sort((x, y) => x.zone.localeCompare(y.zone));
-    return { zones, total: zones.reduce((n, z) => n + z.probes, 0), per };
+    const domains = [...counts]
+      .map(([domain, available]) => ({ domain, probes: Math.min(available, count), available }))
+      .sort((x, y) => x.domain.localeCompare(y.domain));
+    return { domains, total: domains.reduce((n, d) => n + d.probes, 0), count };
   });
 
   /** Free-text buffer per axis, so a zone can be named before any agent in it
@@ -297,6 +386,95 @@
   let adding = $state<{ zones: string; regions: string }>({ zones: '', regions: '' });
 
   const cronHint = $derived(describeCron(draft.cron));
+  const retryIntervalHint = $derived(describeInterval(draft.retry_interval_secs));
+  const downIntervalHint = $derived(describeInterval(draft.down_interval_secs));
+
+  /* ---- Section summaries ----
+     A shut panel still has to answer its own question, or collapsing the form
+     has only hidden the crowding rather than fixed it. Each note is the one
+     line that would otherwise make you open the section to check. */
+
+  const identityNote = $derived(
+    [draft.name.trim() || 'unnamed', draft.tag.trim()].filter(Boolean).join(' · '),
+  );
+
+  /** Scheme and trailing slash carry no information in a one-line summary. */
+  const shortTarget = $derived(draft.target.trim().replace(/^[a-z]+:\/\//, '').replace(/\/$/, ''));
+
+  /** Heartbeat ignores both, so it never appears there — only on the kinds
+   *  the retry/down cadence actually governs. */
+  const cadenceNote = $derived(
+    kind === 'heartbeat'
+      ? ''
+      : [
+          draft.retry_interval_secs !== null ? `retry ${draft.retry_interval_secs}s` : '',
+          draft.down_interval_secs !== null ? `down ${draft.down_interval_secs}s` : '',
+        ]
+          .filter(Boolean)
+          .join(', '),
+  );
+
+  const probeNote = $derived(
+    [
+      kind,
+      shortTarget || (kind === 'heartbeat' ? 'inbound ping' : 'no target'),
+      cronHint,
+      cadenceNote,
+    ]
+      .filter(Boolean)
+      .join(' · '),
+  );
+
+  const placementNote = $derived.by(() => {
+    if (pinned)
+      return `pinned to ${draft.agents.length} ${draft.agents.length === 1 ? 'agent' : 'agents'}`;
+    if (effect.total === 0) return 'nothing probes this';
+    const domains = effect.domains.length;
+    return `${effect.total} ${effect.total === 1 ? 'probe' : 'probes'} across ${domains} ${draft.placement.mode}${domains === 1 ? '' : 's'}`;
+  });
+
+  /** Counts only what departs from the coordinator's own defaults, so the badge
+   *  reads as "things you changed", not "fields that exist". */
+  const verdictOverrides = $derived(
+    (draft.rollup.zone ? 1 : 0) +
+      (draft.rollup.region ? 1 : 0) +
+      (draft.rollup.global ? 1 : 0) +
+      (draft.min_incident_secs !== null ? 1 : 0) +
+      (draft.min_recovery_secs !== null ? 1 : 0),
+  );
+
+  const verdictNote = $derived(
+    [
+      `DOWN after ${draft.failures_before_down ?? '?'}`,
+      draft.depends_on.length > 0 ? `${draft.depends_on.length} upstream` : '',
+      verdictOverrides > 0
+        ? `${verdictOverrides} ${verdictOverrides === 1 ? 'override' : 'overrides'}`
+        : '',
+    ]
+      .filter(Boolean)
+      .join(' · '),
+  );
+
+  const alertNote = $derived.by(() => {
+    if (!draft.notify) return 'silent';
+    if (draft.notifiers.length > 0) return `→ ${draft.notifiers.join(', ')}`;
+    return defaultNotifiers.length > 0 ? `→ defaults (${defaultNotifiers.join(', ')})` : '→ nobody';
+  });
+
+  const statusPageNote = $derived(
+    [
+      draft.visible ? 'visible' : 'hidden',
+      draft.group ? `in ${draft.group}` : '',
+      draft.latency_graph ? 'latency graph' : '',
+    ]
+      .filter(Boolean)
+      .join(' · '),
+  );
+
+  /* Advanced disclosures. Set from the loaded check in load(), then owned by
+     whoever is typing. */
+  let verdictAdvanced = $state(false);
+  let probeAdvanced = $state(false);
 
   /** Plain-language gloss for the shapes people actually type. Anything else
    *  says it cannot read the expression rather than guessing — a wrong reading
@@ -330,6 +508,27 @@
     return 'Warden reads this schedule; this hint cannot put it in words.';
   }
 
+  function describeInterval(seconds: number | null): string {
+    if (seconds === null) return 'Automatic — derived from the cron schedule.';
+    if (!Number.isInteger(seconds) || seconds < 1) return 'Enter a whole number of seconds.';
+
+    const parts: string[] = [];
+    const units: [number, string][] = [
+      [86_400, 'day'],
+      [3_600, 'hour'],
+      [60, 'minute'],
+      [1, 'second'],
+    ];
+    let remaining = seconds;
+    for (const [size, name] of units) {
+      const count = Math.floor(remaining / size);
+      if (count === 0) continue;
+      parts.push(`${count} ${name}${count === 1 ? '' : 's'}`);
+      remaining %= size;
+    }
+    return `every ${parts.join(', ')}`;
+  }
+
   function fail(e: unknown): string {
     return e instanceof Error ? e.message : String(e);
   }
@@ -348,17 +547,23 @@
       ]);
       sections = secs;
       agentRows = ag.agents;
-      allCheckNames = checks.map((c) => c.name);
+      allChecks = checks.map((c) => ({ id: c.id, name: c.name }));
       notifierNames = notifiers.notifiers.map((n) => n.name).filter(Boolean);
       defaultNotifiers = notifiers.notifiers
         .filter((n) => n.default)
         .map((n) => n.name)
         .filter(Boolean);
-      if (name !== null) {
-        const found = checks.find((c) => c.name === name);
-        if (!found) throw new Error(`No check named “${name}”. It may have been deleted.`);
+      if (id !== null) {
+        const found = checks.find((c) => c.id === id);
+        if (!found) throw new Error('This check could not be found. It may have been deleted.');
         draft = fromCheck(found);
         position = found.position;
+        savedName = found.name;
+        // Read once, here, rather than reactively: a saved check that already
+        // carries overrides must arrive with them on screen, but clearing the
+        // last one must not then slam the panel shut under the cursor.
+        verdictAdvanced = verdictOverrides > 0;
+        probeAdvanced = draft.eval.trim().length > 0;
       }
     } catch (e) {
       loadError =
@@ -371,11 +576,11 @@
   }
 
   async function loadLogs() {
-    if (name === null) return;
+    if (id === null) return;
     logsLoading = true;
     logsError = null;
     try {
-      const r = await fetchHistory(name, LOG_LIMIT);
+      const r = await fetchHistory(id, LOG_LIMIT);
       logs = r.history;
     } catch (e) {
       logsError = fail(e);
@@ -421,6 +626,23 @@
     if (!on && at !== -1) list.splice(at, 1);
   }
 
+  function defaultPolicy(level: 'zone' | 'region' | 'global'): PolicyDraft {
+    if (level === 'zone') return policyDraft({ degraded_when: 'all', down_when: 'all' });
+    if (level === 'region') return policyDraft({ degraded_when: 'any', down_when: 'all' });
+    return policyDraft({ degraded_when: 'any', down_when: 'majority' });
+  }
+
+  function togglePolicy(level: 'zone' | 'region' | 'global', enabled: boolean) {
+    draft.rollup[level] = enabled ? defaultPolicy(level) : null;
+  }
+
+  function validPolicy(policy: PolicyDraft | null): boolean {
+    if (!policy) return true;
+    return [policy.degraded_when, policy.down_when].every(
+      (threshold) => threshold.kind !== 'quorum' || whole(threshold.quorum, 1),
+    );
+  }
+
   async function save() {
     if (saving) return;
     savedNote = null;
@@ -438,10 +660,31 @@
       return (saveError = 'Metric name is required.');
       if (k === 'heartbeat' && !whole(draft.grace_secs, 10))
         return (saveError = 'Grace must be a whole number of seconds, at least 10.');
-      if (!whole(draft.failures_before_down, 1))
-        return (saveError = 'Confirmation must be a whole number of probes, at least 1.');
-      if (!whole(draft.placement.per_zone, 1))
-      return (saveError = 'Agents per zone must be a whole number, at least 1.');
+    if (!whole(draft.failures_before_down, 1))
+      return (saveError = 'Confirmation must be a whole number of probes, at least 1.');
+    // Heartbeat never reads either: nothing is retried between pings, so the
+    // fields are off-screen for it and the draft's stale value (from an
+    // earlier kind) is simply never validated or sent.
+    if (
+      k !== 'heartbeat' &&
+      draft.retry_interval_secs !== null &&
+      !whole(draft.retry_interval_secs, draft.timeout_secs ?? 1)
+    )
+      return (saveError = 'Retry interval must be a whole number of seconds, at least the timeout.');
+    if (
+      k !== 'heartbeat' &&
+      draft.down_interval_secs !== null &&
+      !whole(draft.down_interval_secs, draft.timeout_secs ?? 1)
+    )
+      return (saveError = 'Down interval must be a whole number of seconds, at least the timeout.');
+    if (draft.min_incident_secs !== null && !whole(draft.min_incident_secs, 0))
+      return (saveError = 'Incident hold-down must be a whole number of seconds, at least 0.');
+    if (draft.min_recovery_secs !== null && !whole(draft.min_recovery_secs, 0))
+      return (saveError = 'Recovery hold-down must be a whole number of seconds, at least 0.');
+    if (!validPolicy(draft.rollup.zone) || !validPolicy(draft.rollup.region) || !validPolicy(draft.rollup.global))
+      return (saveError = 'Rollup quorum values must be whole numbers, at least 1.');
+    if (!whole(draft.placement.count, 1))
+      return (saveError = 'Placement count must be a whole number, at least 1.');
 
     const trimmed = (v: string[]) => v.map((s) => s.trim()).filter(Boolean);
     const multiHost = k === 'tcp' || k === 'icmp';
@@ -464,6 +707,8 @@
       visible: draft.visible,
       notify: draft.notify,
       notifiers: [...draft.notifiers],
+      // Ids selected via checkbox, not free text, but trimmed for consistency
+      // with every other list on this payload.
       depends_on: trimmed(draft.depends_on),
       agents: [...draft.agents],
       default_status: draft.default_status,
@@ -489,16 +734,37 @@
           : { name: '', labels: [] },
       cert_warning_days: draft.cert_warning_days ?? 14,
       grace_secs: draft.grace_secs ?? 300,
-      failures_before_down: draft.failures_before_down ?? 1,
-      placement: {
-        zones: trimmed(draft.placement.zones),
-        regions: trimmed(draft.placement.regions),
-        per_zone: draft.placement.per_zone ?? 1,
-      },
+      failures_before_down: draft.failures_before_down ?? 2,
+      rollup: {},
+placement: {
+zones: trimmed(draft.placement.zones),
+regions: trimmed(draft.placement.regions),
+mode: draft.placement.mode,
+count: draft.placement.count ?? 1,
+// Send the legacy field too: an older coordinator preserves the historic
+// per-zone value, while a current one reads mode/count.
+per_zone: draft.placement.count ?? 1,
+},
     };
     // Ordering is the server's: an edit round-trips the position it handed us,
     // a create has none until the server assigns one.
     if (position !== undefined) payload.position = position;
+    for (const level of ['zone', 'region', 'global'] as const) {
+      const policy = draft.rollup[level];
+      if (policy) payload.rollup[level] = policyValue(policy);
+    }
+    // Preserve inheritance: blank means omitted, while zero and false are sent.
+    // Heartbeat ignores both, so a stale value left over from a previous kind
+    // never reaches the wire for one.
+    if (k !== 'heartbeat' && draft.retry_interval_secs !== null)
+      payload.retry_interval_secs = draft.retry_interval_secs;
+    if (k !== 'heartbeat' && draft.down_interval_secs !== null)
+      payload.down_interval_secs = draft.down_interval_secs;
+    if (draft.min_incident_secs !== null) payload.min_incident_secs = draft.min_incident_secs;
+    if (draft.min_recovery_secs !== null) payload.min_recovery_secs = draft.min_recovery_secs;
+    if (draft.notify_degraded !== '') payload.notify_degraded = draft.notify_degraded === 'true';
+    if (draft.degraded_is_downtime !== '')
+      payload.degraded_is_downtime = draft.degraded_is_downtime === 'true';
     // An untouched optional field means "unset", not a tag literally named "".
     if (draft.group.trim()) payload.group = draft.group.trim();
     if (draft.eval.trim()) payload.eval = draft.eval.trim();
@@ -515,7 +781,7 @@
     saving = true;
     saveError = null;
     try {
-      if (name === null) {
+      if (id === null) {
         await createCheck(payload);
         onsaved();
         // A created check's identity is now fixed; the table is where you pick
@@ -523,11 +789,12 @@
         onclose();
         return;
       }
-      const updated = await updateCheck(name, payload);
+      const updated = await updateCheck(id, payload);
       // Round-trip what the server stored, so trimmed and defaulted values are
       // what you are looking at rather than what you typed.
       draft = fromCheck(updated);
       position = updated.position;
+      savedName = updated.name;
       savedNote = 'Saved.';
       onsaved();
     } catch (e) {
@@ -558,12 +825,12 @@
   }
 
   async function confirmPurge() {
-    if (name === null || dangerBusy) return;
+    if (id === null || dangerBusy) return;
     dangerBusy = true;
     dangerError = null;
     dangerNote = null;
     try {
-      const rows = await purgeCheckData(name);
+      const rows = await purgeCheckData(id);
       pending = null;
       dangerNote = `Deleted ${rows} recorded ${rows === 1 ? 'attempt' : 'attempts'}. The check is still configured and still probing.`;
       logs = [];
@@ -577,11 +844,11 @@
   }
 
   async function confirmDelete() {
-    if (name === null || dangerBusy) return;
+    if (id === null || dangerBusy) return;
     dangerBusy = true;
     dangerError = null;
     try {
-      await deleteCheck(name);
+      await deleteCheck(id);
       onsaved();
       onclose();
     } catch (e) {
@@ -591,14 +858,15 @@
   }
 
   // The only one of the three that also takes the recorded history and the
-  // incidents with it — plain delete leaves those orphaned behind the name.
+  // incidents with it — plain delete leaves those orphaned behind the id.
   async function confirmErase() {
-    if (name === null || dangerBusy) return;
+    if (id === null || dangerBusy) return;
     dangerBusy = true;
     dangerError = null;
     try {
-      const { results, incidents } = await purgeCheckEverything(name);
-      dangerNote = `Erased ${name}: ${results} recorded ${results === 1 ? 'attempt' : 'attempts'} and ${incidents} ${incidents === 1 ? 'incident' : 'incidents'} removed, along with the check itself.`;
+      const eraseName = savedName ?? (draft.name || id);
+      const { results, incidents } = await purgeCheckEverything(id);
+      dangerNote = `Erased ${eraseName}: ${results} recorded ${results === 1 ? 'attempt' : 'attempts'} and ${incidents} ${incidents === 1 ? 'incident' : 'incidents'} removed, along with the check itself.`;
       onsaved();
       onclose();
     } catch (e) {
@@ -632,34 +900,43 @@
     </div>
   </div>
 {:else}
-  <div class="area-bar">
+  <!-- Enabled lives up here rather than inside a section: it governs the whole
+       check, and a switch you have to go looking for is one you forget is off.
+       With every panel shut, the header still says so. -->
+  <div class="area-bar" class:off={!draft.enabled}>
     <div class="title-line">
-      <span class="panel-title no-gap mono">{creating ? 'New check' : name}</span>
+      <span class="panel-title no-gap mono">{creating ? 'New check' : draft.name || 'unnamed'}</span>
       <span class="kind-pill">{kind}</span>
+      {#if !draft.enabled}<span class="off-pill">not probing</span>{/if}
     </div>
-    <div class="range-switch">
+    <div class="range-switch head-acts">
+      <label class="toggle enable-toggle">
+        <input type="checkbox" bind:checked={draft.enabled} />
+        <span>Enabled</span>
+      </label>
       <button class="range-btn" onclick={onclose}>← All checks</button>
     </div>
   </div>
 
+  <!-- Sections are ordered as the decisions are actually made: what it is, how
+       it is probed, where from, what counts as down, who hears about it, and
+       how it looks. Only the first two open on arrival, and the summaries carry
+       enough that the rest usually stay shut. -->
+
   <details class="admin-panel editor-section" open>
     <summary class="editor-summary">
-      <span class="chev" aria-hidden="true">▸</span> General settings
+      <span class="chev" aria-hidden="true">▸</span> Identity
+      <span class="admin-muted sum-note mono">{identityNote}</span>
     </summary>
     <div class="editor-body">
       <div class="form-grid">
         <label class="field">
           <span class="field-label">Name</span>
-          <input
-            class="mono"
-            bind:value={draft.name}
-            readonly={!creating}
-            placeholder="api-gateway"
-          />
+          <input class="mono" bind:value={draft.name} placeholder="api-gateway" />
           <span class="field-note">
-            {creating
-              ? 'Letters, digits, dash, underscore and dot.'
-              : 'Identity — rename by creating a new check.'}
+            The mutable display label — rename freely. Anything but a slash or a control
+            character; this is not the check's identity, so renaming never orphans its history,
+            alerts or incidents.
           </span>
         </label>
 
@@ -670,172 +947,18 @@
         </label>
 
         <label class="field">
-          <span class="field-label">Image</span>
-          <input bind:value={draft.image} placeholder="🛰️ or https://…/icon.png" />
-          <span class="field-note">An emoji or an image URL.</span>
-        </label>
-
-        <label class="field wide">
           <span class="field-label">Description</span>
           <input bind:value={draft.description} placeholder="(none)" />
+          <span class="field-note">One line, shown under the name on the status page.</span>
         </label>
-
-        <label class="field">
-          <span class="field-label">Section</span>
-          <select bind:value={draft.group}>
-            <option value="">(none — listed loose)</option>
-            {#each sectionOptions as s (s)}
-              <option value={s}>{s}</option>
-            {/each}
-          </select>
-          <span class="field-note">Sections are created on the Status page panel.</span>
-        </label>
-
-        <label class="field wide">
-          <span class="field-label">Cron</span>
-          <input class="mono" bind:value={draft.cron} placeholder="*/30 * * * * *" />
-          <span class="field-note"><code>{draft.cron.trim() || '(empty)'}</code> — {cronHint}</span>
-        </label>
-
-        <label class="field">
-          <span class="field-label">Default status</span>
-          <select bind:value={draft.default_status}>
-            {#each DEFAULT_STATUSES as s (s)}
-              <option value={s}>{s}</option>
-            {/each}
-          </select>
-          <span class="field-note">How it reads before its first result lands.</span>
-        </label>
-
-        <label class="field">
-          <span class="field-label">Confirm DOWN after</span>
-          <input type="number" min="1" bind:value={draft.failures_before_down} />
-          <span class="field-note">
-            Consecutive failed probes before the check reads DOWN. 1 flips
-            immediately; 3 tolerates a flaky hop. Recovery is never delayed.
-          </span>
-        </label>
-
-        <div class="field wide">
-          <span class="field-label">Depends on</span>
-          {#if otherChecks.length === 0}
-            <span class="field-note">No other checks to depend on yet.</span>
-          {:else}
-            <div class="agent-picks">
-              {#each otherChecks as name (name)}
-                <label class="toggle">
-                  <input type="checkbox" value={name} bind:group={draft.depends_on} />
-                  <span class="agent-pill">{name}</span>
-                </label>
-              {/each}
-            </div>
-          {/if}
-          <span class="field-note">
-            {#if draft.depends_on.length === 0}
-              Nothing upstream. A failure here opens its own incident.
-            {:else}
-              When this check fails while one of these already has an open incident, it
-              joins that incident instead of opening a second one for the same root cause.
-              It still alerts and still notifies — grouping is not silence. One hop only:
-              it does not follow an upstream's own dependencies.
-            {/if}
-          </span>
-        </div>
-
-        <div class="field wide switches">
-          <span class="field-label">Switches</span>
-          <label class="toggle">
-            <input type="checkbox" bind:checked={draft.enabled} />
-            <span>Enabled <em>— probe it. Off keeps the config and history.</em></span>
-          </label>
-          <label class="toggle">
-            <input type="checkbox" checked={!draft.visible} onchange={() => (draft.visible = !draft.visible)} />
-            <span>Hidden <em>— keep it off the public status page. It is still probed.</em></span>
-          </label>
-          <label class="toggle">
-            <input type="checkbox" bind:checked={draft.notify} />
-            <span
-              >Notify <em
-                >— send this check's state changes to the notifiers. Off still records the
-                incident; it just doesn't page anyone.</em
-              ></span
-            >
-          </label>
-          <label class="toggle">
-            <input type="checkbox" bind:checked={draft.latency_graph} />
-            <span>Latency graph <em>— draw the sparkline under it.</em></span>
-          </label>
-        </div>
-
-        {#if draft.notify}
-          <div class="field wide">
-            <span class="field-label">Send alerts to</span>
-            {#if notifierNames.length === 0}
-              <span class="field-note">
-                No notifiers configured. Add one on the Notifications panel; until then every
-                alert is recorded and sent nowhere.
-              </span>
-            {:else}
-              <div class="agent-picker">
-                {#each notifierNames as n (n)}
-                  <label class="toggle">
-                    <input type="checkbox" value={n} bind:group={draft.notifiers} />
-                    <span class="agent-pill">{n}</span>
-                  </label>
-                {/each}
-              </div>
-              <span class="field-note">
-                {#if draft.notifiers.length === 0}
-                  None picked, so this check goes to the defaults:
-                  <strong>{defaultNotifiers.join(', ') || 'nothing is marked default, so nobody'}</strong>.
-                {:else}
-                  Exactly these, whether or not they are defaults.
-                {/if}
-              </span>
-            {/if}
-          </div>
-        {/if}
-
-        <div class="field wide">
-          <span class="field-label">Pin to agents</span>
-          {#if agentOptions.length === 0}
-            <span class="field-note">
-              No agent has reported yet. Placement, in Configuration, decides who probes this check
-              once some do.
-            </span>
-          {:else}
-            <div class="agent-picker">
-              {#each agentOptions as id (id)}
-                <label class="toggle">
-                  <input type="checkbox" value={id} bind:group={draft.agents} />
-                  <span class="agent-pill">{id}</span>
-                  {#if !reporting.has(id)}
-                    <em
-                      class="stale"
-                      title="This agent has not reported recently. A check pinned only to silent agents is never probed."
-                      >not reporting</em
-                    >
-                  {/if}
-                </label>
-              {/each}
-            </div>
-            <span class="field-note">
-              None ticked is the normal case: Placement, in Configuration, decides who probes this
-              check. Ticking agents pins it to exactly those and overrides placement entirely —
-              for a probe that genuinely belongs to one box, such as a machine's own loopback port.
-            </span>
-          {/if}
-        </div>
       </div>
     </div>
   </details>
 
-  <!-- General is the only section open on arrival; the rest are one click, and
-       a form that opens as four screens of fields is the crowding this page
-       exists to undo. -->
-  <details class="admin-panel editor-section">
+  <details class="admin-panel editor-section" bind:open={probeOpen}>
     <summary class="editor-summary">
-      <span class="chev" aria-hidden="true">▸</span> Configuration
+      <span class="chev" aria-hidden="true">▸</span> Probe
+      <span class="admin-muted sum-note mono">{probeNote}</span>
     </summary>
     <div class="editor-body">
       <div class="form-grid">
@@ -846,6 +969,7 @@
               <option value={k}>{k}</option>
             {/each}
           </select>
+          <span class="field-note">Decides every field below.</span>
         </label>
 
         {#if kind === 'http'}
@@ -856,12 +980,17 @@
 
           <label class="field">
             <span class="field-label">Timeout (s)</span>
-            <input type="number" min="1" bind:value={draft.timeout_secs} />
+            <NumberField min={1} bind:value={draft.timeout_secs} />
           </label>
 
           <label class="field">
             <span class="field-label">Expect status</span>
-            <input type="number" min="100" max="599" bind:value={draft.expect_status} placeholder="(any 2xx–3xx)" />
+            <NumberField
+              min={100}
+              max={599}
+              bind:value={draft.expect_status}
+              placeholder="(any 2xx–3xx)"
+            />
           </label>
 
           <label class="field wide">
@@ -908,7 +1037,7 @@
 
           <label class="field">
             <span class="field-label">Timeout (s)</span>
-            <input type="number" min="1" bind:value={draft.timeout_secs} />
+            <NumberField min={1} bind:value={draft.timeout_secs} />
           </label>
 
           <div class="field wide">
@@ -948,7 +1077,7 @@
 
           <label class="field">
             <span class="field-label">Timeout (s)</span>
-            <input type="number" min="1" bind:value={draft.timeout_secs} />
+            <NumberField min={1} bind:value={draft.timeout_secs} />
           </label>
 
           <div class="field wide">
@@ -990,7 +1119,7 @@
 
           <label class="field">
             <span class="field-label">Ping count</span>
-            <input type="number" min="1" bind:value={draft.ping.count} />
+            <NumberField min={1} bind:value={draft.ping.count} />
             <span class="field-note">Echoes sent per attempt.</span>
           </label>
         {:else if kind === 'dns'}
@@ -1002,7 +1131,7 @@
 
           <label class="field">
             <span class="field-label">Timeout (s)</span>
-            <input type="number" min="1" bind:value={draft.timeout_secs} />
+            <NumberField min={1} bind:value={draft.timeout_secs} />
           </label>
 
           <label class="field">
@@ -1056,12 +1185,12 @@
 
           <label class="field">
             <span class="field-label">Timeout (s)</span>
-            <input type="number" min="1" bind:value={draft.timeout_secs} />
+            <NumberField min={1} bind:value={draft.timeout_secs} />
           </label>
 
           <label class="field">
             <span class="field-label">Warn before expiry (days)</span>
-            <input type="number" min="0" bind:value={draft.cert_warning_days} />
+            <NumberField min={0} bind:value={draft.cert_warning_days} />
             <span class="field-note">DOWN once the certificate is this close to expiring.</span>
           </label>
         {:else if kind === 'openmetrics'}
@@ -1073,7 +1202,7 @@
 
           <label class="field">
             <span class="field-label">Timeout (s)</span>
-            <input type="number" min="1" bind:value={draft.timeout_secs} />
+            <NumberField min={1} bind:value={draft.timeout_secs} />
           </label>
 
           <label class="field wide">
@@ -1115,7 +1244,7 @@
         {:else}
           <label class="field">
             <span class="field-label">Grace (s)</span>
-            <input type="number" min="10" bind:value={draft.grace_secs} />
+            <NumberField min={10} bind:value={draft.grace_secs} />
             <span class="field-note">No ping within this window and the check goes DOWN.</span>
           </label>
 
@@ -1128,7 +1257,9 @@
               </div>
               <span class="field-note">
                 Have the job call this URL (GET or POST) when it finishes. It needs no
-                authentication — the URL itself is the credential, so treat it like one.
+                authentication — the URL itself is the credential, so treat it like one. It is
+                built from the check's current name, so renaming and saving moves it — update the
+                job before you save a rename.
               </span>
               {#if copyError}<span class="admin-error">{copyError}</span>{/if}
             {:else}
@@ -1140,167 +1271,506 @@
           </div>
         {/if}
 
-        <div class="field wide placement">
-          <span class="field-label">Placement</span>
-          {#if pinned}
-            <p class="field-note override">
-              Not in effect. This check pins {draft.agents.length}
-              {draft.agents.length === 1 ? 'agent' : 'agents'} in General settings, and an explicit
-              pin wins outright — placement is ignored entirely while that list is non-empty. Clear
-              it to place this check by location instead.
-            </p>
-          {/if}
-          <p class="field-note">
-            Where this check runs, described by location rather than by machine, so growing the
-            fleet does not mean revisiting every check. Leave both lists empty and it runs
-            everywhere — once per zone, not once per agent.
-          </p>
+        <!-- The schedule belongs with the probe: how often it runs is part of
+             how it is probed, not a separate concern. -->
+        <label class="field wide">
+          <span class="field-label">Cron</span>
+          <input class="mono" bind:value={draft.cron} placeholder="*/30 * * * * *" />
+          <span class="field-note"><code>{draft.cron.trim() || '(empty)'}</code> — {cronHint}</span>
+        </label>
 
-          <!-- Declared here, rendered twice below: regions and zones are the
-               same picker over a different axis. -->
-          {#snippet locations(axis: 'zones' | 'regions', noun: string, options: string[])}
-            <div class="field">
-              <span class="field-label">{noun}s</span>
-              {#if options.length > 0}
-                <div class="agent-picker">
-                  <!-- Set-deduped above, so no value can repeat. -->
-                  {#each options as v (v)}
-                    <label class="toggle">
-                      <input
-                        type="checkbox"
-                        checked={draft.placement[axis].includes(v)}
-                        onchange={(e) => toggleLocation(axis, v, e.currentTarget.checked)}
-                      />
-                      <span class="agent-pill">{v}</span>
-                      {#if v === UNKNOWN_LOCATION}
-                        <em
-                          class="stale"
-                          title="Agents that declare no zone or region of their own. Set them in the agent's config."
-                          >undeclared</em
-                        >
-                      {/if}
-                    </label>
-                  {/each}
-                </div>
+        {#if kind !== 'heartbeat'}
+          <!-- Nothing to retry between pings on a heartbeat, so these are
+               absent for that kind rather than shown and ignored. -->
+          <label class="field">
+            <span class="field-label">Retry interval (s)</span>
+            <NumberField min={draft.timeout_secs ?? 1} bind:value={draft.retry_interval_secs} placeholder="auto" />
+            <span class="field-note interval-example">{retryIntervalHint}</span>
+            <span class="field-note">
+              How often it re-probes after a single failure, while confirming DOWN. Blank derives
+              a value from the schedule; at least the timeout either way.
+            </span>
+          </label>
+
+          <label class="field">
+            <span class="field-label">Down interval (s)</span>
+            <NumberField min={draft.timeout_secs ?? 1} bind:value={draft.down_interval_secs} placeholder="auto" />
+            <span class="field-note interval-example">{downIntervalHint}</span>
+            <span class="field-note">
+              How often it re-probes once DOWN is confirmed. A success returns it to the cron
+              schedule immediately. Blank derives a value from the schedule; at least the timeout
+              either way.
+            </span>
+          </label>
+        {/if}
+      </div>
+
+      <details class="advanced" bind:open={probeAdvanced}>
+        <summary class="advanced-summary">
+          <span class="chev" aria-hidden="true">▸</span> Advanced — custom verdict script
+          {#if draft.eval.trim()}<span class="badge-count">Lua in use</span>{/if}
+        </summary>
+        <div class="advanced-body">
+          <div class="eval-block">
+            <div class="field-label">Custom eval (Lua)</div>
+            <textarea
+              class="mono"
+              rows="10"
+              spellcheck="false"
+              bind:value={draft.eval}
+              placeholder={'local code = math.floor(status / 100)\nif status == 429 or (code >= 2 and code <= 3) then\n  return "UP", latency\nend\nreturn "DOWN"'}
+            ></textarea>
+            <p class="field-note">
+              In scope: <code>status</code> (number, 0 when the probe never connected),
+              <code>latency</code>
+              (ms), <code>body</code> (string, truncated), <code>headers</code> (table, lowercased
+              keys). Return <code>"UP"</code> or <code>"DOWN"</code>, optionally a latency override as a
+              second value. Returning nothing — or leaving this empty — uses the built-in 2xx–3xx logic.
+              {#if kind === 'openmetrics'}
+                For OpenMetrics, <code>metric</code> is the selected sample's value (number), and
+                <code>metrics</code> is an array of every sample from the same scrape.
               {/if}
-              <div class="pair-row">
-                <input class="mono" bind:value={adding[axis]} placeholder="{noun} not in the fleet yet" />
-                <button
-                  class="btn"
-                  onclick={() => {
-                    addLocation(axis, adding[axis]);
-                    adding[axis] = '';
-                  }}
-                >
-                  + Add
-                </button>
-              </div>
-              <span class="field-note">
-                {draft.placement[axis].length === 0
-                  ? `None ticked — every ${noun} is allowed.`
-                  : `Restricted to ${draft.placement[axis].length} ${noun}${draft.placement[axis].length === 1 ? '' : 's'}.`}
-                Offered {noun}s come from the live fleet; add one by hand for a {noun} whose agents
-                have not booted yet.
-              </span>
+            </p>
+
+            <div class="try-row">
+              {#if kind === 'openmetrics'}
+                <label class="field try-num">
+                  <span class="field-label">metric</span>
+                  <NumberField bind:value={sample.metric} />
+                </label>
+              {:else}
+                <label class="field try-num">
+                  <span class="field-label">status</span>
+                  <NumberField bind:value={sample.status} />
+                </label>
+                <label class="field try-num">
+                  <span class="field-label">latency (ms)</span>
+                  <NumberField bind:value={sample.latency} />
+                </label>
+                <label class="field try-body">
+                  <span class="field-label">body</span>
+                  <input class="mono" bind:value={sample.body} />
+                </label>
+              {/if}
+              <button class="btn" onclick={runTest} disabled={testing}>
+                {testing ? 'Testing…' : 'Test script'}
+              </button>
             </div>
-          {/snippet}
 
-          <div class="placement-axes">
-            {@render locations('regions', 'region', regionOptions)}
-            {@render locations('zones', 'zone', zoneOptions)}
-            <label class="field">
-              <span class="field-label">Agents per zone</span>
-              <input type="number" min="1" bind:value={draft.placement.per_zone} />
-              <span class="field-note">
-                How many agents inside <em>each</em> matched zone probe this — not a total. Raising
-                it to 2 buys a second opinion before a service is called down, at the price of a
-                duplicate probe and a duplicate row every time it runs.
-              </span>
-            </label>
+            {#if evalError}
+              <p class="admin-error mono">{evalError}</p>
+            {:else if evalResult}
+              <p class="verdict">
+                <span class="verdict-pill {evalResult.verdict}">{evalResult.verdict.toUpperCase()}</span>
+                <span class="admin-muted">reported latency {evalResult.latency_ms} ms</span>
+              </p>
+            {/if}
           </div>
+        </div>
+      </details>
+    </div>
+  </details>
 
-          <!-- The number that stops a 20x fan-out: what this spec does to the
-               fleet as it stands right now, not what it means in the abstract. -->
-          {#if pinned}
-            <p class="effect muted">
-              With pinning on, {draft.agents.length}
-              {draft.agents.length === 1 ? 'agent probes' : 'agents probe'} this check — the spec above
-              changes nothing until the pin is cleared.
-            </p>
-          {:else if effect.total === 0}
-            <p class="effect none">
-              No live agent matches this placement, so nothing probes this check. It will report
-              nothing rather than fail — silence, not an error.
-            </p>
+  <!-- Pinning and placement answer the same question — who probes this — so
+       they are one panel. Split across two, as they used to be, each had to
+       apologise for the other in prose. -->
+  <details class="admin-panel editor-section">
+    <summary class="editor-summary">
+      <span class="chev" aria-hidden="true">▸</span> Placement
+      <span class="admin-muted sum-note mono" class:bad={!pinned && effect.total === 0}>
+        {placementNote}
+      </span>
+    </summary>
+    <div class="editor-body">
+      <p class="field-note lede">
+        Where this check runs, described by location rather than by machine, so growing the
+        fleet does not mean revisiting every check. Choose whether the count applies once per
+        zone or once per region; leave both lists empty to include every location.
+      </p>
+
+      {#if pinned}
+        <p class="field-note override">
+          This check is pinned to {draft.agents.length}
+          {draft.agents.length === 1 ? 'agent' : 'agents'} below, and an explicit pin wins
+          outright — the regions and zones here are ignored entirely while that list is
+          non-empty. Clear it to place this check by location instead.
+        </p>
+      {/if}
+
+      <div class="placement-axes">
+        <!-- Declared here, rendered twice below: regions and zones are the
+             same picker over a different axis. -->
+        {#snippet locations(axis: 'zones' | 'regions', noun: string, options: string[])}
+          <div class="field">
+            <span class="field-label">{noun}s</span>
+            {#if options.length > 0}
+              <div class="agent-picker">
+                <!-- Set-deduped above, so no value can repeat. -->
+                {#each options as v (v)}
+                  <label class="toggle">
+                    <input
+                      type="checkbox"
+                      checked={draft.placement[axis].includes(v)}
+                      onchange={(e) => toggleLocation(axis, v, e.currentTarget.checked)}
+                    />
+                    <span class="agent-pill">{v}</span>
+                    {#if v === UNKNOWN_LOCATION}
+                      <em
+                        class="stale"
+                        title="Agents that declare no zone or region of their own. Set them in the agent's config."
+                        >undeclared</em
+                      >
+                    {/if}
+                  </label>
+                {/each}
+              </div>
+            {/if}
+            <div class="pair-row">
+              <input class="mono" bind:value={adding[axis]} placeholder="{noun} not in the fleet yet" />
+              <button
+                class="btn"
+                onclick={() => {
+                  addLocation(axis, adding[axis]);
+                  adding[axis] = '';
+                }}
+              >
+                + Add
+              </button>
+            </div>
+            <span class="field-note">
+              {draft.placement[axis].length === 0
+                ? `None ticked — every ${noun} is allowed.`
+                : `Restricted to ${draft.placement[axis].length} ${noun}${draft.placement[axis].length === 1 ? '' : 's'}.`}
+              Offered {noun}s come from the live fleet; add one by hand for a {noun} whose agents
+              have not booted yet.
+            </span>
+          </div>
+        {/snippet}
+
+        {@render locations('regions', 'region', regionOptions)}
+        {@render locations('zones', 'zone', zoneOptions)}
+        <label class="field">
+          <span class="field-label">Placement mode</span>
+          <select bind:value={draft.placement.mode}>
+            <option value="zone">Per zone</option>
+            <option value="region">Per region</option>
+          </select>
+          <span class="field-note">The selected domain gets its own independent observer count.</span>
+        </label>
+        <label class="field">
+          <span class="field-label">Agents per {draft.placement.mode}</span>
+          <NumberField min={1} bind:value={draft.placement.count} />
+          <span class="field-note">
+            How many agents inside <em>each</em> matched {draft.placement.mode} probe this — not
+            a fleet-wide total. Raising it buys corroboration at the cost of duplicate probes.
+          </span>
+        </label>
+      </div>
+
+      <!-- The number that stops a 20x fan-out: what this spec does to the
+           fleet as it stands right now, not what it means in the abstract. -->
+      {#if pinned}
+        <p class="effect muted">
+          With pinning on, {draft.agents.length}
+          {draft.agents.length === 1 ? 'agent probes' : 'agents probe'} this check — the spec above
+          changes nothing until the pin is cleared.
+        </p>
+      {:else if effect.total === 0}
+        <p class="effect none">
+          No live agent matches this placement, so nothing probes this check. It will report
+          nothing rather than fail — silence, not an error.
+        </p>
+      {:else}
+        <p class="effect">
+          Right now this places <strong>{effect.total}</strong>
+          {effect.total === 1 ? 'probe' : 'probes'} across {effect.domains.length}
+          {draft.placement.mode}{effect.domains.length === 1 ? '' : 's'}:
+          {#each effect.domains as domain (domain.domain)}
+            <span class="effect-zone" class:short={domain.available < effect.count}>
+              {domain.domain} ×{domain.probes}{domain.available < effect.count ? ` (only ${domain.available} live)` : ''}
+            </span>
+          {/each}
+        </p>
+      {/if}
+
+      <div class="field pin-block">
+        <span class="field-label">Pin to agents</span>
+        {#if agentOptions.length === 0}
+          <span class="field-note">
+            No agent has reported yet. The placement above decides who probes this check once
+            some do.
+          </span>
+        {:else}
+          <div class="agent-picker">
+            {#each agentOptions as id (id)}
+              <label class="toggle">
+                <input type="checkbox" value={id} bind:group={draft.agents} />
+                <span class="agent-pill">{id}</span>
+                {#if !reporting.has(id)}
+                  <em
+                    class="stale"
+                    title="This agent has not reported recently. A check pinned only to silent agents is never probed."
+                    >not reporting</em
+                  >
+                {/if}
+              </label>
+            {/each}
+          </div>
+          <span class="field-note">
+            None ticked is the normal case: the placement above decides who probes this check.
+            Ticking agents pins it to exactly those and overrides placement entirely — for a
+            probe that genuinely belongs to one box, such as a machine's own loopback port.
+          </span>
+        {/if}
+      </div>
+    </div>
+  </details>
+
+  <details class="admin-panel editor-section">
+    <summary class="editor-summary">
+      <span class="chev" aria-hidden="true">▸</span> Verdict
+      <span class="admin-muted sum-note mono">{verdictNote}</span>
+    </summary>
+    <div class="editor-body">
+      <p class="field-note lede">
+        How probe results become a status. Everything here is about reading the evidence, not
+        about telling anyone — that is the Alerting section.
+      </p>
+
+      <div class="form-grid">
+        <label class="field">
+          <span class="field-label">Confirm DOWN after</span>
+          <NumberField min={1} bind:value={draft.failures_before_down} />
+          <span class="field-note">
+            Consecutive failed probes before the check reads DOWN. 1 flips immediately; 3 tolerates
+            a flaky hop. The time-based hold-down under Advanced applies after rollup.
+          </span>
+        </label>
+
+        <label class="field">
+          <span class="field-label">Default status</span>
+          <select bind:value={draft.default_status}>
+            {#each DEFAULT_STATUSES as s (s)}
+              <option value={s}>{s}</option>
+            {/each}
+          </select>
+          <span class="field-note">How it reads before its first result lands.</span>
+        </label>
+
+        <label class="field">
+          <span class="field-label">Count DEGRADED as downtime</span>
+          <select bind:value={draft.degraded_is_downtime}>
+            <option value="">inherit (default: off)</option>
+            <option value="true">on</option>
+            <option value="false">off</option>
+          </select>
+          <span class="field-note">
+            Whether a degraded period counts against uptime. Inherit follows the coordinator
+            default; choosing off is an explicit override.
+          </span>
+        </label>
+
+        <div class="field wide">
+          <span class="field-label">Depends on</span>
+          {#if otherChecks.length === 0}
+            <span class="field-note">No other checks to depend on yet.</span>
           {:else}
-            <p class="effect">
-              Right now this places <strong>{effect.total}</strong>
-              {effect.total === 1 ? 'probe' : 'probes'} across {effect.zones.length}
-              {effect.zones.length === 1 ? 'zone' : 'zones'}:
-              {#each effect.zones as z (z.zone)}
-                <span class="effect-zone" class:short={z.available < effect.per}>
-                  {z.zone} ×{z.probes}{z.available < effect.per ? ` (only ${z.available} live)` : ''}
-                </span>
+            <div class="agent-picker">
+              {#each otherChecks as dep (dep.id)}
+                <label class="toggle">
+                  <input type="checkbox" value={dep.id} bind:group={draft.depends_on} />
+                  <span class="agent-pill">{dep.name}</span>
+                </label>
               {/each}
-            </p>
+            </div>
           {/if}
+          <span class="field-note">
+            {#if draft.depends_on.length === 0}
+              Nothing upstream. A failure here opens its own incident.
+            {:else}
+              When this check fails while one of these already has an open incident, it
+              joins that incident instead of opening a second one for the same root cause.
+              It still alerts and still notifies — grouping is not silence. One hop only:
+              it does not follow an upstream's own dependencies.
+            {/if}
+          </span>
         </div>
       </div>
 
-      <div class="eval-block">
-        <div class="field-label">Custom eval (Lua)</div>
-        <textarea
-          class="mono"
-          rows="10"
-          spellcheck="false"
-          bind:value={draft.eval}
-          placeholder={'local code = math.floor(status / 100)\nif status == 429 or (code >= 2 and code <= 3) then\n  return "UP", latency\nend\nreturn "DOWN"'}
-        ></textarea>
-        <p class="field-note">
-          In scope: <code>status</code> (number, 0 when the probe never connected),
-          <code>latency</code>
-          (ms), <code>body</code> (string, truncated), <code>headers</code> (table, lowercased
-          keys). Return <code>"UP"</code> or <code>"DOWN"</code>, optionally a latency override as a
-          second value. Returning nothing — or leaving this empty — uses the built-in 2xx–3xx logic.
-          {#if kind === 'openmetrics'}
-            For OpenMetrics, <code>metric</code> is the selected sample's value (number), and
-            <code>metrics</code> is an array of every sample from the same scrape.
+      <details class="advanced" bind:open={verdictAdvanced}>
+        <summary class="advanced-summary">
+          <span class="chev" aria-hidden="true">▸</span> Advanced — hold-downs and rollup
+          {#if verdictOverrides > 0}
+            <span class="badge-count">
+              {verdictOverrides}
+              {verdictOverrides === 1 ? 'override' : 'overrides'}
+            </span>
           {/if}
-        </p>
+        </summary>
+        <div class="advanced-body">
+          <div class="form-grid">
+            <label class="field">
+              <span class="field-label">Incident hold-down (s)</span>
+              <NumberField min={0} bind:value={draft.min_incident_secs} placeholder="inherit" />
+              <span class="field-note">Blank inherits the coordinator default. Explicit 0 publishes failures immediately.</span>
+            </label>
 
-        <div class="try-row">
-          {#if kind === 'openmetrics'}
-            <label class="field try-num">
-              <span class="field-label">metric</span>
-              <input type="number" bind:value={sample.metric} />
+            <label class="field">
+              <span class="field-label">Recovery hold-down (s)</span>
+              <NumberField min={0} bind:value={draft.min_recovery_secs} placeholder="inherit" />
+              <span class="field-note">Blank inherits. Explicit 0 publishes recovery immediately.</span>
             </label>
-          {:else}
-            <label class="field try-num">
-              <span class="field-label">status</span>
-              <input type="number" bind:value={sample.status} />
-            </label>
-            <label class="field try-num">
-              <span class="field-label">latency (ms)</span>
-              <input type="number" bind:value={sample.latency} />
-            </label>
-            <label class="field try-body">
-              <span class="field-label">body</span>
-              <input class="mono" bind:value={sample.body} />
-            </label>
-          {/if}
-          <button class="btn" onclick={runTest} disabled={testing}>
-            {testing ? 'Testing…' : 'Test script'}
-          </button>
+
+            <div class="field rollup-editor">
+              <span class="field-label">Rollup policy overrides</span>
+              <span class="field-note">
+                Blank levels inherit stored coordinator policy, then built-ins. “Degraded” counts failing
+                children; “DOWN” counts hard-down children.
+              </span>
+              {#snippet policyLevel(level: 'zone' | 'region' | 'global', title: string, children: string)}
+                <div class="policy-level">
+                  <label class="toggle">
+                    <input
+                      type="checkbox"
+                      checked={draft.rollup[level] !== null}
+                      onchange={(e) => togglePolicy(level, e.currentTarget.checked)}
+                    />
+                    <span><strong>{title}</strong> <em>— {children}</em></span>
+                  </label>
+                  {#if draft.rollup[level]}
+                    <div class="policy-thresholds">
+                      {#each POLICY_EDGES as edge (edge.key)}
+                        <label class="field">
+                          <span class="field-label">{edge.label}</span>
+                          <select bind:value={draft.rollup[level]![edge.key].kind}>
+                            {#each THRESHOLD_KINDS as kind (kind)}
+                              <option value={kind}>{kind}</option>
+                            {/each}
+                          </select>
+                          {#if draft.rollup[level]![edge.key].kind === 'quorum'}
+                            <NumberField
+                              min={1}
+                              ariaLabel={`${edge.label} quorum`}
+                              bind:value={draft.rollup[level]![edge.key].quorum}
+                            />
+                          {/if}
+                        </label>
+                      {/each}
+                    </div>
+                  {/if}
+                </div>
+              {/snippet}
+              <div class="policy-levels">
+                {@render policyLevel('zone', 'Zone', 'agents → zone; built-in all / all')}
+                {@render policyLevel('region', 'Region', 'zones → region; built-in any / all')}
+                {@render policyLevel('global', 'Check', 'regions → check; built-in any / majority')}
+              </div>
+            </div>
+          </div>
+        </div>
+      </details>
+    </div>
+  </details>
+
+  <details class="admin-panel editor-section">
+    <summary class="editor-summary">
+      <span class="chev" aria-hidden="true">▸</span> Alerting
+      <span class="admin-muted sum-note mono">{alertNote}</span>
+    </summary>
+    <div class="editor-body">
+      <div class="form-grid">
+        <div class="field wide switches">
+          <span class="field-label">Notify</span>
+          <label class="toggle">
+            <input type="checkbox" bind:checked={draft.notify} />
+            <span
+              >Send state changes to the notifiers <em
+                >— off still records the incident; it just doesn't page anyone.</em
+              ></span
+            >
+          </label>
         </div>
 
-        {#if evalError}
-          <p class="admin-error mono">{evalError}</p>
-        {:else if evalResult}
-          <p class="verdict">
-            <span class="verdict-pill {evalResult.verdict}">{evalResult.verdict.toUpperCase()}</span>
-            <span class="admin-muted">reported latency {evalResult.latency_ms} ms</span>
-          </p>
+        {#if draft.notify}
+          <div class="field wide">
+            <span class="field-label">Send alerts to</span>
+            {#if notifierNames.length === 0}
+              <span class="field-note">
+                No notifiers configured. Add one on the Notifications panel; until then every
+                alert is recorded and sent nowhere.
+              </span>
+            {:else}
+              <div class="agent-picker">
+                {#each notifierNames as n (n)}
+                  <label class="toggle">
+                    <input type="checkbox" value={n} bind:group={draft.notifiers} />
+                    <span class="agent-pill">{n}</span>
+                  </label>
+                {/each}
+              </div>
+              <span class="field-note">
+                {#if draft.notifiers.length === 0}
+                  None picked, so this check goes to the defaults:
+                  <strong>{defaultNotifiers.join(', ') || 'nothing is marked default, so nobody'}</strong>.
+                {:else}
+                  Exactly these, whether or not they are defaults.
+                {/if}
+              </span>
+            {/if}
+          </div>
+
+          <label class="field">
+            <span class="field-label">Notify on DEGRADED</span>
+            <select bind:value={draft.notify_degraded}>
+              <option value="">inherit (default: on)</option>
+              <option value="true">on</option>
+              <option value="false">off</option>
+            </select>
+            <span class="field-note">
+              Whether a partial outage pages as well as a full one. Off means only DOWN and
+              recovery are sent.
+            </span>
+          </label>
         {/if}
+      </div>
+    </div>
+  </details>
+
+  <details class="admin-panel editor-section">
+    <summary class="editor-summary">
+      <span class="chev" aria-hidden="true">▸</span> Status page
+      <span class="admin-muted sum-note mono">{statusPageNote}</span>
+    </summary>
+    <div class="editor-body">
+      <div class="form-grid">
+        <label class="field">
+          <span class="field-label">Section</span>
+          <select bind:value={draft.group}>
+            <option value="">(none — listed loose)</option>
+            {#each sectionOptions as s (s)}
+              <option value={s}>{s}</option>
+            {/each}
+          </select>
+          <span class="field-note">Sections are created on the Status page panel.</span>
+        </label>
+
+        <label class="field">
+          <span class="field-label">Image</span>
+          <input bind:value={draft.image} placeholder="🛰️ or https://…/icon.png" />
+          <span class="field-note">An emoji or an image URL.</span>
+        </label>
+
+        <div class="field wide switches">
+          <span class="field-label">Display</span>
+          <label class="toggle">
+            <input type="checkbox" checked={!draft.visible} onchange={() => (draft.visible = !draft.visible)} />
+            <span>Hidden <em>— keep it off the public status page. It is still probed.</em></span>
+          </label>
+          <label class="toggle">
+            <input type="checkbox" bind:checked={draft.latency_graph} />
+            <span>Latency graph <em>— draw the sparkline under it.</em></span>
+          </label>
+        </div>
       </div>
     </div>
   </details>
@@ -1324,21 +1794,29 @@
         {:else if logs.length === 0}
           <p class="admin-muted">No attempts recorded for this check.</p>
         {:else}
-          <div class="admin-rows">
-            <!-- Keyed by index: several agents can report the same millisecond,
-                 so (timestamp, agent) is not guaranteed unique and a duplicate
-                 key aborts the render of the whole page. -->
-            {#each logs as h, i (i)}
-              <div class="log-row">
-                <span class="dim">{formatRelativeTime(h.timestamp)}</span>
-                <span class="agent-pill">{h.agent_id}</span>
-                <span class="mono">{formatLatency(h.latency_ms)}</span>
-                <span class="badge" style="background:{statusColor(h.status)}">{h.status}</span>
-                <span class="log-reason" title={failureReason(h) ?? ''}
-                  >{failureReason(h) ?? ''}</span
-                >
-              </div>
-            {/each}
+          <div class="log-table-wrap">
+            <table class="log-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Agent</th>
+                  <th>Latency</th>
+                  <th>Status</th>
+                  <th>Reason</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each logs as h, i (i)}
+                  <tr>
+                    <td class="dim">{formatRelativeTime(h.timestamp)}</td>
+                    <td><span class="agent-pill">{h.agent_id}</span></td>
+                    <td class="mono">{formatLatency(h.latency_ms)}</td>
+                    <td><span class="badge" style="background:{statusColor(h.status)}">{h.status}</span></td>
+                    <td class="log-reason" title={failureReason(h) ?? ''}>{failureReason(h) ?? ''}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
           </div>
         {/if}
       </div>
@@ -1355,9 +1833,9 @@
         <div class="danger-act">
           <div class="danger-title">Purge data</div>
           <p class="admin-muted">
-            Deletes every recorded attempt for <span class="mono">{name}</span> — history, uptime
-            bars and latency graphs all reset to empty. The check itself stays exactly as
-            configured and keeps probing. This cannot be undone.
+            Deletes every recorded attempt for <span class="mono">{draft.name || 'this check'}</span> —
+            history, uptime bars and latency graphs all reset to empty. The check itself stays
+            exactly as configured and keeps probing. This cannot be undone.
           </p>
           <div class="form-actions">
             {#if pending === 'purge'}
@@ -1377,11 +1855,11 @@
         <div class="danger-act">
           <div class="danger-title">Delete check</div>
           <p class="admin-muted">
-            Removes <span class="mono">{name}</span>'s configuration and its place on the status
-            page. Nothing will probe it again and the name becomes free to reuse. Its recorded
-            history — results, alerts, incidents — is <em>not</em> touched by this; it survives, orphaned
-            under the old name. Use "erase everything" below if that history should go too. This
-            cannot be undone.
+            Removes <span class="mono">{draft.name || 'this check'}</span>'s configuration and its
+            place on the status page. Nothing will probe it again and the name becomes free to
+            reuse. Its recorded history — results, alerts, incidents — is <em>not</em> touched by
+            this; it stays keyed on this check's id, just with no configuration left to name it.
+            Use "erase everything" below if that history should go too. This cannot be undone.
           </p>
           <div class="form-actions">
             {#if pending === 'delete'}
@@ -1401,10 +1879,10 @@
         <div class="danger-act">
           <div class="danger-title">Delete check and erase everything</div>
           <p class="admin-muted">
-            Removes <span class="mono">{name}</span> and every trace it left behind: its
-            configuration, every recorded result and alert, and every incident it ever opened or
-            joined. Nothing is left orphaned. This is the option for a check that should never
-            have existed — not one you might reuse the name for later. This cannot be undone.
+            Removes <span class="mono">{draft.name || 'this check'}</span> and every trace it left
+            behind: its configuration, every recorded result and alert, and every incident it ever
+            opened or joined. Nothing is left orphaned. This is the option for a check that should
+            never have existed — not one you might reuse the name for later. This cannot be undone.
           </p>
           <div class="form-actions">
             {#if pending === 'erase'}
@@ -1454,6 +1932,93 @@
     color: var(--text);
   }
 
+  .head-acts {
+    align-items: center;
+    gap: 0.9rem;
+  }
+  .enable-toggle {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-dim);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  /* A disabled check is not a broken one, so the header dims rather than
+     reddens — but it must not read as normal either, with every panel shut. */
+  .area-bar.off .no-gap {
+    color: var(--text-dim);
+  }
+  .off-pill {
+    font-size: 0.6rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 0.1rem 0.4rem;
+    border-radius: 999px;
+    border: 1px solid var(--amber);
+    color: var(--amber);
+  }
+
+  /* One line of orientation at the top of a section, before the controls. */
+  .lede {
+    display: block;
+    margin: 0 0 0.8rem;
+    line-height: 1.5;
+    max-width: 68ch;
+  }
+
+  /* Nested disclosure for the fields most checks never touch. Quieter than the
+     section summaries above it: this is a second-order fold, not a peer. */
+  .advanced {
+    margin-top: 0.9rem;
+    border-top: 1px solid var(--border);
+  }
+  .advanced-summary {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.55rem 0;
+    cursor: pointer;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-dim);
+    user-select: none;
+    list-style: none;
+  }
+  .advanced-summary::-webkit-details-marker {
+    display: none;
+  }
+  .advanced-summary:hover {
+    color: var(--text);
+  }
+  .advanced-summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .advanced-summary .chev {
+    transition: transform 0.12s ease;
+  }
+  .advanced[open] > .advanced-summary .chev {
+    transform: rotate(90deg);
+  }
+  .advanced-body {
+    padding-bottom: 0.3rem;
+  }
+  /* Counts what departs from the defaults. Lit rather than grey: a fold that
+     hides a changed value must say so on its own lid. */
+  .badge-count {
+    font-size: 0.62rem;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    padding: 0.05rem 0.4rem;
+    border-radius: 999px;
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    text-transform: none;
+  }
+
   .form-grid {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1468,6 +2033,28 @@
   .field.switches {
     grid-column: 1 / -1;
     gap: 0.35rem;
+  }
+  .rollup-editor {
+    grid-column: 1 / -1;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.6rem 0.7rem;
+  }
+  .policy-levels {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+    gap: 0.7rem;
+    margin-top: 0.5rem;
+  }
+  .policy-level {
+    border-top: 1px solid var(--border);
+    padding-top: 0.45rem;
+  }
+  .policy-thresholds {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.5rem;
+    margin-top: 0.45rem;
   }
   .agent-picker {
     display: flex;
@@ -1495,14 +2082,12 @@
     margin-top: 0.4rem;
   }
 
-  /* Full width and boxed: placement is one decision made of four controls, and
-     scattering them across the three-column grid reads as four unrelated ones. */
-  .field.placement {
-    grid-column: 1 / -1;
-    gap: 0.45rem;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 0.6rem 0.7rem;
+  /* The pin is the escape hatch from everything above it, so it sits below the
+     effect line with a rule between: read the placement, then the override. */
+  .pin-block {
+    margin-top: 0.9rem;
+    padding-top: 0.8rem;
+    border-top: 1px solid var(--border);
   }
   .placement-axes {
     display: grid;
@@ -1511,8 +2096,16 @@
     align-items: start;
   }
   .override {
+    display: block;
     color: var(--amber);
     line-height: 1.5;
+    margin: 0 0 0.8rem;
+    max-width: 68ch;
+  }
+
+  /* A check nothing probes must not read as fine when the panel is shut. */
+  .sum-note.bad {
+    color: var(--down);
   }
   .effect {
     margin: 0.2rem 0 0;
@@ -1603,16 +2196,36 @@
     color: var(--down);
   }
 
-  .log-row {
-    display: grid;
-    grid-template-columns: 7rem auto 5rem 4.5rem minmax(0, 1fr);
-    gap: 0.6rem;
-    align-items: center;
+  .interval-example {
+    color: var(--text);
+  }
+
+  .log-table-wrap {
+    overflow-x: auto;
+  }
+  .log-table {
+    width: 100%;
+    min-width: 40rem;
+    table-layout: fixed;
+    border-collapse: collapse;
     font-size: 0.8rem;
-    padding: 0.3rem 0;
+  }
+  .log-table th,
+  .log-table td {
+    width: 20%;
+    padding: 0.4rem 0.75rem;
+    text-align: left;
+    vertical-align: middle;
     border-bottom: 1px solid rgba(48, 54, 61, 0.5);
   }
-  .log-row:last-child {
+  .log-table th {
+    color: var(--text-dim);
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .log-table tbody tr:last-child td {
     border-bottom: none;
   }
   .log-reason {

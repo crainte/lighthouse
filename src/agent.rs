@@ -1,5 +1,5 @@
 use crate::config::{AgentConfig, CheckConfig};
-use crate::models::{CheckKind, CheckResult, ResultBatch};
+use crate::models::{CheckKind, CheckResult, ResultBatch, Status};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
@@ -127,7 +127,7 @@ pub async fn execute_check(probes: &Probes, who: &Origin<'_>, check: &CheckConfi
     };
 
     CheckResult {
-        check_id: check.name.clone(),
+        check_id: check.id,
         agent_id: who.agent_id.to_string(),
         zone: who.zone.to_string(),
         region: who.region.to_string(),
@@ -718,6 +718,51 @@ impl Probes {
 /// Spawn one loop per check, each on its own interval so a slow check never
 /// delays a sibling. Results flow into `tx`. Handles are returned so a caller
 /// that re-syncs its check list can replace the whole set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeCadence {
+    Scheduled,
+    Retry,
+    Down,
+}
+
+fn scheduling_status(check: &CheckConfig, result: &CheckResult) -> Status {
+    let Some(source) = check.eval.as_deref().filter(|s| !s.trim().is_empty()) else {
+        return crate::models::eval(result, check.expect.status);
+    };
+    let input = crate::script::EvalInput {
+        status: result.status_code.unwrap_or(0),
+        latency_ms: result.latency_ms,
+        body: result.body.clone(),
+        headers: result.headers.clone().unwrap_or_default(),
+        metric: result.metric,
+        metrics: result.metrics.clone().unwrap_or_default(),
+    };
+    match crate::script::evaluate(source, &input) {
+        Ok(outcome) if outcome.up => Status::Up,
+        Ok(_) => Status::Down,
+        Err(_) => Status::Unknown,
+    }
+}
+
+fn next_cadence(status: Status, failures: &mut u32, threshold: u32) -> ProbeCadence {
+    match status {
+        Status::Down => {
+            *failures = failures.saturating_add(1);
+            if *failures >= threshold.max(1) {
+                ProbeCadence::Down
+            } else {
+                ProbeCadence::Retry
+            }
+        }
+        Status::Up => {
+            *failures = 0;
+            ProbeCadence::Scheduled
+        }
+        Status::Unknown if *failures > 0 => ProbeCadence::Retry,
+        Status::Unknown => ProbeCadence::Scheduled,
+    }
+}
+
 pub fn spawn_check_loops(
     cfg: &AgentConfig,
     checks: Vec<CheckConfig>,
@@ -736,23 +781,38 @@ pub fn spawn_check_loops(
                 continue;
             }
         };
+        let retry_interval = check.retry_interval().map_err(anyhow::Error::msg)?;
+        let down_interval = check.down_interval().map_err(anyhow::Error::msg)?;
         let probes = probes.clone();
         let origin = OwnedOrigin::from(cfg);
         let tx = tx.clone();
         handles.push(tokio::spawn(async move {
+            let mut cadence = ProbeCadence::Scheduled;
+            let mut failures = 0;
             loop {
-                // Sleep until the next scheduled instant rather than ticking a
-                // fixed interval, so "every hour on the hour" lands on the hour
-                // instead of an hour after the agent happened to start.
-                let Some(next) = schedule.upcoming(chrono::Utc).next() else {
-                    warn!(check = %check.name, "schedule has no future runs, stopping");
-                    return;
+                let wait = match cadence {
+                    ProbeCadence::Scheduled => {
+                        // Sleep until the next scheduled instant rather than ticking a
+                        // fixed interval, so "every hour on the hour" lands on the hour
+                        // instead of an hour after the agent happened to start.
+                        let Some(next) = schedule.upcoming(chrono::Utc).next() else {
+                            warn!(check = %check.name, "schedule has no future runs, stopping");
+                            return;
+                        };
+                        (next - Utc::now()).to_std().unwrap_or(Duration::ZERO)
+                    }
+                    ProbeCadence::Retry => retry_interval,
+                    ProbeCadence::Down => down_interval,
                 };
-                let wait = (next - Utc::now()).to_std().unwrap_or(Duration::ZERO);
                 tokio::time::sleep(wait).await;
 
                 let result = execute_check(&probes, &origin.borrow(), &check).await;
-                debug!(check = %check.name, latency = result.latency_ms, "check done");
+                cadence = next_cadence(
+                    scheduling_status(&check, &result),
+                    &mut failures,
+                    check.failures_before_down,
+                );
+                debug!(check = %check.name, latency = result.latency_ms, ?cadence, "check done");
                 if tx.send(result).await.is_err() {
                     break; // receiver gone, coordinator shutting down
                 }
@@ -808,9 +868,11 @@ pub async fn sync_loop(cfg: AgentConfig, tx: mpsc::Sender<CheckResult>, initial:
     // running, but the check still counts as covered and never gets probed;
     // saying up front which kinds it can run is what lets the coordinator give
     // the work to an agent that can, or report that nobody can.
-    let base = format!(
-        "{}/api/v1/agent/checks?agent_id={}&poll_secs={}&kinds={}&version={}",
-        cfg.coordinator_url.trim_end_matches('/'),
+    //
+    // Rebuilt per tick rather than hoisted, because the coordinator in use can
+    // change under failover.
+    let query = format!(
+        "agent_id={}&poll_secs={}&kinds={}&version={}",
         urlencode(&cfg.agent_id),
         cfg.poll_secs.max(1),
         urlencode(&probeable_kinds().join(",")),
@@ -833,9 +895,10 @@ pub async fn sync_loop(cfg: AgentConfig, tx: mpsc::Sender<CheckResult>, initial:
     let mut last_rtt_ms: Option<u128> = None;
     loop {
         poll.tick().await;
+        let coordinator = cfg.coordinator().to_string();
         let url = match last_rtt_ms {
-            Some(rtt) => format!("{base}&rtt_ms={rtt}"),
-            None => base.clone(),
+            Some(rtt) => format!("{coordinator}/api/v1/agent/checks?{query}&rtt_ms={rtt}"),
+            None => format!("{coordinator}/api/v1/agent/checks?{query}"),
         };
         let mut req = client.get(&url);
         if let Some(t) = &token {
@@ -871,7 +934,8 @@ pub async fn sync_loop(cfg: AgentConfig, tx: mpsc::Sender<CheckResult>, initial:
             // A coordinator that is down or unreachable must not stop the checks
             // already running: keep probing with the set we have.
             Err(e) => {
-                debug!(error = %e, "could not refresh check list, keeping current set");
+                debug!(error = %e, coordinator = %coordinator, "could not refresh check list, keeping current set");
+                cfg.rotate_coordinator();
                 continue;
             }
         };
@@ -984,7 +1048,6 @@ fn usable_checks(raw: Vec<serde_json::Value>) -> (Vec<CheckConfig>, Vec<String>)
 /// Standalone mode skips this and consumes the channel directly.
 pub async fn poster_loop(cfg: AgentConfig, mut rx: mpsc::Receiver<CheckResult>) {
     let client = reqwest::Client::new();
-    let url = format!("{}/api/v1/results", cfg.coordinator_url);
     let token = cfg.resolved_token();
     let mut current = Vec::new();
     // Batches whose POST failed, oldest first. A failed POST keeps its batch
@@ -1020,7 +1083,12 @@ pub async fn poster_loop(cfg: AgentConfig, mut rx: mpsc::Receiver<CheckResult>) 
                 // order and a recovered queue never reorders around a gap.
                 while let Some(front) = pending.pop_front() {
                     let body = ResultBatch { results: front };
-                    let mut req = client.post(&url).json(&body);
+                    // Read per batch: the sync loop shares this cursor, so a
+                    // failover it decided applies to results already queued.
+                    let coordinator = cfg.coordinator().to_string();
+                    let mut req = client
+                        .post(format!("{coordinator}/api/v1/results"))
+                        .json(&body);
                     if let Some(t) = &token {
                         req = req.bearer_auth(t);
                     }
@@ -1040,7 +1108,13 @@ pub async fn poster_loop(cfg: AgentConfig, mut rx: mpsc::Receiver<CheckResult>) 
                             break;
                         }
                         Err(e) => {
-                            warn!(error = %e, "failed to post results, keeping batch for retry");
+                            warn!(error = %e, coordinator = %coordinator, "failed to post results, keeping batch for retry");
+                            // The batch is kept, so failing over costs nothing:
+                            // the next flush replays it at the next coordinator
+                            // and `insert_results_dedup` makes a double
+                            // delivery a no-op if the first one landed after
+                            // all.
+                            cfg.rotate_coordinator();
                             pending.push_front(body.results);
                             break;
                         }
@@ -1053,8 +1127,9 @@ pub async fn poster_loop(cfg: AgentConfig, mut rx: mpsc::Receiver<CheckResult>) 
 
 #[cfg(test)]
 mod sync_tests {
-    use super::{same_checks, usable_checks};
+    use super::{next_cadence, same_checks, usable_checks, ProbeCadence};
     use crate::config::CheckConfig;
+    use crate::models::Status;
 
     fn dns_check() -> CheckConfig {
         CheckConfig {
@@ -1063,6 +1138,33 @@ mod sync_tests {
             target: "home.example.com".into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn failures_retry_then_use_down_cadence_until_recovery() {
+        let mut failures = 0;
+        assert_eq!(
+            next_cadence(Status::Down, &mut failures, 2),
+            ProbeCadence::Retry
+        );
+        assert_eq!(
+            next_cadence(Status::Unknown, &mut failures, 2),
+            ProbeCadence::Retry,
+            "an unknown retry must not silently cancel confirmation"
+        );
+        assert_eq!(
+            next_cadence(Status::Down, &mut failures, 2),
+            ProbeCadence::Down
+        );
+        assert_eq!(
+            next_cadence(Status::Down, &mut failures, 2),
+            ProbeCadence::Down
+        );
+        assert_eq!(
+            next_cadence(Status::Up, &mut failures, 2),
+            ProbeCadence::Scheduled
+        );
+        assert_eq!(failures, 0);
     }
 
     #[test]

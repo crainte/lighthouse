@@ -54,6 +54,13 @@ const KEY_DOMAIN: &[u8] = b"warden-session-v1";
 
 pub const SESSION_COOKIE: &str = "warden_session";
 
+/// The global node names its session cookie distinctly so an operator can be
+/// signed into both a regional coordinator and the global dashboard at once.
+/// Cookies are not port-scoped, so on a shared host (localhost demo, or a
+/// reverse proxy fronting both) a single `warden_session` name would let each
+/// login clobber the other's cookie.
+pub const GLOBAL_SESSION_COOKIE: &str = "warden_global_session";
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum LoginError {
     /// No admin password is configured, so there is no way to authenticate.

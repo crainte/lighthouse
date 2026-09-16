@@ -30,7 +30,11 @@ export function alertForStateChange(msg: StateChange): Alert {
     scope: "check",
     node_id: msg.check_id,
     alert_type:
-      msg.to === "up" && msg.from === "down" ? "recovery" : "state_change",
+      msg.to === "degraded"
+        ? "degradation"
+        : msg.to === "up" && (msg.from === "down" || msg.from === "degraded")
+          ? "recovery"
+          : "state_change",
     previous_state: msg.from,
     current_state: msg.to,
     timestamp: msg.timestamp,

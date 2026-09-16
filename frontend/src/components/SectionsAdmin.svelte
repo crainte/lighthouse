@@ -213,11 +213,11 @@
     commitSections(reorder(ordered.map((s) => s.name), d.from, index));
   }
 
-  async function commitChecks(names: string[]) {
+  async function commitChecks(ids: string[]) {
     busyOrder = true;
     orderError = null;
     try {
-      checks = await reorderChecks(names);
+      checks = await reorderChecks(ids);
       onchanged();
     } catch (e) {
       orderError = fail(e);
@@ -226,13 +226,13 @@
     }
   }
 
-  /** The server takes one flat list, so a move inside a single group still ships
-   *  the whole display order. */
+  /** The server takes one flat list of ids, so a move inside a single group
+   *  still ships the whole display order. */
   function checkOrderWith(groupIndex: number, from: number, to: number): string[] {
     return orderGroups
       .map((g, i) => {
-        const names = g.rows.map((c) => c.name);
-        return i === groupIndex ? reorder(names, from, to) : names;
+        const ids = g.rows.map((c) => c.id);
+        return i === groupIndex ? reorder(ids, from, to) : ids;
       })
       .flat();
   }
@@ -259,8 +259,8 @@
     busyCell = cell;
     orderError = null;
     try {
-      const saved = await updateCheck(c.name, next);
-      checks = checks.map((x) => (x.name === c.name ? saved : x));
+      const saved = await updateCheck(c.id, next);
+      checks = checks.map((x) => (x.id === c.id ? saved : x));
       onchanged();
     } catch (e) {
       orderError = fail(e);
@@ -425,7 +425,7 @@
           <div class="ogroup">
             <div class="olabel">{g.label}</div>
             <div role="list">
-            {#each g.rows as c, i (c.name)}
+            {#each g.rows as c, i (c.id)}
               <div
                 class="orow"
                 role="listitem"
@@ -474,7 +474,7 @@
                     const next: AdminCheck = { ...c };
                     if (group) next.group = group;
                     else delete next.group;
-                    patch(c, next, `${c.name}|group`);
+                    patch(c, next, `${c.id}|group`);
                   }}
                 >
                   <option value="">(none — listed loose)</option>

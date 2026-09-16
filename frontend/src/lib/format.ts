@@ -4,8 +4,8 @@ import type { Status, Health, Check, UptimeBucket } from './api';
 export type SortKey = 'name' | 'status' | 'uptime';
 export type SortDir = 'asc' | 'desc';
 
-// `degraded` is not a check state — it is an agent-health row that is neither
-// fully healthy nor wholly down. Same amber the partial-outage bars use.
+// Degraded checks and partially healthy fleet rows share the same amber used
+// by partial-outage history bars.
 const STATUS_COLORS: Record<Status | Health, string> = {
   up: '#3fb950',
   down: '#f85149',
@@ -27,20 +27,22 @@ export function formatUptime(fraction: number | null | undefined): string {
 }
 
 // Overall system state from all checks, for the status banner.
-export type Overall = 'operational' | 'partial' | 'major';
+export type Overall = 'operational' | 'degraded' | 'partial' | 'major';
 
 export function overallStatus(checks: Pick<Check, 'status'>[]): Overall {
   if (checks.length === 0) return 'operational';
   const down = checks.filter((c) => c.status === 'down').length;
-  if (down === 0) return 'operational';
   if (down === checks.length) return 'major';
-  return 'partial';
+  if (down > 0) return 'partial';
+  if (checks.some((c) => c.status === 'degraded')) return 'degraded';
+  return 'operational';
 }
 
-// Worst status across a set of checks, for a group header: any DOWN wins, then
-// UNKNOWN, else UP. An empty set reads as UP.
+// Worst status across a set of checks, for a group header: DOWN wins, then
+// DEGRADED, then UNKNOWN, else UP. An empty set reads as UP.
 export function worstStatus(checks: Pick<Check, 'status'>[]): Status {
   if (checks.some((c) => c.status === 'down')) return 'down';
+  if (checks.some((c) => c.status === 'degraded')) return 'degraded';
   if (checks.some((c) => c.status === 'unknown')) return 'unknown';
   return 'up';
 }
@@ -102,13 +104,18 @@ export function formatDuration(ms: number): string {
 }
 
 // Lower rank sorts first ascending: healthy first, problems last.
-const STATUS_RANK: Record<Status, number> = { up: 0, unknown: 1, down: 2 };
+const STATUS_RANK: Record<Status, number> = {
+  up: 0,
+  unknown: 1,
+  degraded: 2,
+  down: 3,
+};
 
 export function sortChecks(list: Check[], key: SortKey, dir: SortDir): Check[] {
   const sign = dir === 'desc' ? -1 : 1;
   return [...list].sort((a, b) => {
     let cmp: number;
-    if (key === 'name') cmp = a.check_id.localeCompare(b.check_id);
+    if (key === 'name') cmp = a.name.localeCompare(b.name);
     else if (key === 'status') cmp = STATUS_RANK[a.status] - STATUS_RANK[b.status];
     else cmp = a.uptime_24h - b.uptime_24h;
     return cmp * sign;

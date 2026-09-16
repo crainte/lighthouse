@@ -5,7 +5,7 @@
 //! transitions independently.
 
 use crate::coordinator::state::Transition;
-use crate::models::Status;
+use crate::models::NodeState;
 use lettre::message::Mailbox;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
@@ -240,24 +240,37 @@ const NTFY_DEFAULT: &str = "https://ntfy.sh";
 /// error is returned rather than swallowed, because the admin page's test-send
 /// has nothing else to show. A wrong ntfy topic used to be silent: the request
 /// succeeded, the status code said 404, and nothing looked at it.
-pub async fn send(client: &Client, notifier: &Notifier, t: &Transition) -> Result<(), String> {
+pub async fn send(
+    client: &Client,
+    notifier: &Notifier,
+    t: &Transition,
+    name: &str,
+) -> Result<(), String> {
     match &notifier.kind {
-        NotifierKind::Webhook { url } => send_webhook(client, url, t).await,
+        NotifierKind::Webhook { url } => send_webhook(client, url, t, name).await,
         NotifierKind::Ntfy { topic, base_url } => {
-            send_ntfy(client, base_url.as_deref(), topic, t).await
+            send_ntfy(client, base_url.as_deref(), topic, t, name).await
         }
-        NotifierKind::Slack { webhook_url } => send_slack(client, webhook_url, t).await,
-        NotifierKind::Pagerduty { routing_key } => send_pagerduty(client, routing_key, t).await,
-        NotifierKind::Email(m) => send_email(m, t).await,
+        NotifierKind::Slack { webhook_url } => send_slack(client, webhook_url, t, name).await,
+        NotifierKind::Pagerduty { routing_key } => {
+            send_pagerduty(client, routing_key, t, name).await
+        }
+        NotifierKind::Email(m) => send_email(m, t, name).await,
     }
 }
 
 const DISPATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// POST a simple JSON alert payload to a webhook.
-async fn send_webhook(client: &Client, url: &str, t: &Transition) -> Result<(), String> {
+async fn send_webhook(
+    client: &Client,
+    url: &str,
+    t: &Transition,
+    name: &str,
+) -> Result<(), String> {
     let payload = serde_json::json!({
         "check_id": t.check_id,
+        "name": name,
         "from": t.from.as_str(),
         "to": t.to.as_str(),
     });
@@ -278,8 +291,9 @@ async fn send_ntfy(
     base_url: Option<&str>,
     topic: &str,
     t: &Transition,
+    name: &str,
 ) -> Result<(), String> {
-    let title = format!("Check {} → {}", t.check_id, t.to.as_str());
+    let title = format!("Check {name} → {}", t.to.as_str());
     let body = format!(
         "Status changed from {} to {}",
         t.from.as_str(),
@@ -295,8 +309,8 @@ async fn send_ntfy(
 }
 
 /// Slack incoming webhooks want `text`; everything else is optional.
-async fn send_slack(client: &Client, url: &str, t: &Transition) -> Result<(), String> {
-    let text = format!("*{}* {} → {}", t.check_id, t.from.as_str(), t.to.as_str());
+async fn send_slack(client: &Client, url: &str, t: &Transition, name: &str) -> Result<(), String> {
+    let text = format!("*{name}* {} → {}", t.from.as_str(), t.to.as_str());
     delivered(client.post(url).json(&serde_json::json!({ "text": text }))).await
 }
 
@@ -306,17 +320,25 @@ const PAGERDUTY_EVENTS: &str = "https://events.pagerduty.com/v2/enqueue";
 /// PagerDuty closes the incident the DOWN opened rather than leaving a human to
 /// close it by hand — and a flapping check reuses one incident instead of
 /// spraying twenty.
-async fn send_pagerduty(client: &Client, routing_key: &str, t: &Transition) -> Result<(), String> {
+async fn send_pagerduty(
+    client: &Client,
+    routing_key: &str,
+    t: &Transition,
+    name: &str,
+) -> Result<(), String> {
     delivered(
         client
             .post(PAGERDUTY_EVENTS)
-            .json(&pagerduty_event(routing_key, t)),
+            .json(&pagerduty_event(routing_key, t, name)),
     )
     .await
 }
 
-fn pagerduty_event(routing_key: &str, t: &Transition) -> serde_json::Value {
-    let up = t.to == Status::Up;
+/// `dedup_key`/`source` are the immutable check id, never the mutable name: a
+/// rename must not open a second PagerDuty incident for the same check, nor
+/// leave the old one dangling unresolved.
+fn pagerduty_event(routing_key: &str, t: &Transition, name: &str) -> serde_json::Value {
+    let up = t.to == NodeState::Up;
     let mut event = serde_json::json!({
         "routing_key": routing_key,
         "dedup_key": t.check_id,
@@ -326,9 +348,9 @@ fn pagerduty_event(routing_key: &str, t: &Transition) -> serde_json::Value {
     // probe could not say, which is not the same as a service being down.
     if !up {
         event["payload"] = serde_json::json!({
-            "summary": format!("{} is {}", t.check_id, t.to.as_str()),
+            "summary": format!("{name} is {}", t.to.as_str()),
             "source": t.check_id,
-            "severity": if t.to == Status::Down { "error" } else { "warning" },
+            "severity": if t.to == NodeState::Down { "error" } else { "warning" },
         });
     }
     event
@@ -339,12 +361,12 @@ fn pagerduty_event(routing_key: &str, t: &Transition) -> serde_json::Value {
 /// ponytail: a fresh connection per notification, no pool. An alert is rare and
 /// a pooled SMTP session held open for days is exactly the thing that goes
 /// stale unnoticed; pool it if a deployment ever pages in bursts.
-async fn send_email(m: &MailConfig, t: &Transition) -> Result<(), String> {
+async fn send_email(m: &MailConfig, t: &Transition, name: &str) -> Result<(), String> {
     let addr = |raw: &str| raw.parse::<Mailbox>().map_err(|e| format!("{raw:?}: {e}"));
     let message = Message::builder()
         .from(addr(&m.from)?)
         .to(addr(&m.to)?)
-        .subject(format!("{} is {}", t.check_id, t.to.as_str()))
+        .subject(format!("{name} is {}", t.to.as_str()))
         .body(format!(
             "Status changed from {} to {}.\n",
             t.from.as_str(),
@@ -428,9 +450,13 @@ mod tests {
         );
     }
 
-    fn transition(check: &str, from: Status, to: Status) -> Transition {
+    fn cid() -> crate::models::CheckId {
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, b"api")
+    }
+
+    fn transition(from: NodeState, to: NodeState) -> Transition {
         Transition {
-            check_id: check.into(),
+            check_id: cid(),
             from,
             to,
         }
@@ -439,14 +465,16 @@ mod tests {
     /// A recovery must resolve the incident the outage opened, not open a
     /// second one — which is what the shared dedup key buys, and the reason
     /// `event_action` is derived from the state rather than always `trigger`.
+    /// The dedup key is the immutable id, never the display name: a rename
+    /// must not open a second PagerDuty incident for the same check.
     #[test]
     fn pagerduty_triggers_on_down_and_resolves_the_same_incident() {
-        let down = pagerduty_event("rk", &transition("api", Status::Up, Status::Down));
+        let down = pagerduty_event("rk", &transition(NodeState::Up, NodeState::Down), "api");
         assert_eq!(down["event_action"], "trigger");
-        assert_eq!(down["dedup_key"], "api");
+        assert_eq!(down["dedup_key"], cid().to_string());
         assert_eq!(down["payload"]["severity"], "error");
 
-        let up = pagerduty_event("rk", &transition("api", Status::Down, Status::Up));
+        let up = pagerduty_event("rk", &transition(NodeState::Down, NodeState::Up), "api");
         assert_eq!(up["event_action"], "resolve");
         assert_eq!(up["dedup_key"], down["dedup_key"], "same incident");
         // Ignored by the API on a resolve, and PagerDuty rejects a trigger
@@ -454,7 +482,7 @@ mod tests {
         assert!(up.get("payload").is_none());
 
         // A probe that could not decide is not a hard outage.
-        let unknown = pagerduty_event("rk", &transition("api", Status::Up, Status::Unknown));
+        let unknown = pagerduty_event("rk", &transition(NodeState::Up, NodeState::Unknown), "api");
         assert_eq!(unknown["payload"]["severity"], "warning");
     }
 

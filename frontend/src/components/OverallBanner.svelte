@@ -8,9 +8,11 @@
   const label = $derived(
     state === 'operational'
       ? 'All Systems Operational'
-      : state === 'partial'
-        ? 'Partial System Outage'
-        : 'Major Outage',
+      : state === 'degraded'
+        ? 'Degraded System Performance'
+        : state === 'partial'
+          ? 'Partial System Outage'
+          : 'Major Outage',
   );
 </script>
 

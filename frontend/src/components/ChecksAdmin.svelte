@@ -7,7 +7,7 @@
   let {
     onopen,
     onexpired,
-  }: { onopen: (name: string | null) => void; onexpired: () => void } = $props();
+  }: { onopen: (id: string | null) => void; onexpired: () => void } = $props();
 
   let checks = $state<AdminCheck[]>([]);
   let loading = $state(true);
@@ -72,10 +72,10 @@
           <span>Cron</span>
           <span></span>
         </div>
-        {#each checks as c (c.name)}
+        {#each checks as c (c.id)}
           <div class="row" class:off={!c.enabled}>
             <span class="mono name" title={c.name}>{c.name}</span>
-            <span class="dim">{c.tag || '—'}</span>
+            <span>{#if c.tag}<span class="tag-pill">{c.tag}</span>{:else}<span class="dim">—</span>{/if}</span>
             <span><span class="kind-pill">{c.type}</span></span>
             <span class="state" class:on={c.enabled}>{c.enabled ? 'Enabled' : 'Disabled'}</span>
             <!-- The column asks "hidden?", so a published check reads No. The
@@ -83,7 +83,7 @@
             <span class="dim">{c.visible ? 'No' : 'Yes'}</span>
             <span class="mono dim">{c.cron}</span>
             <span class="actions">
-              <button class="btn" onclick={() => onopen(c.name)}>Configure</button>
+              <button class="btn" onclick={() => onopen(c.id)}>Configure</button>
             </span>
           </div>
         {/each}
@@ -148,6 +148,17 @@
   }
   /* Probing or not is the one thing in this table you act on, so it is stated
      in words and lit green rather than left as another grey cell. */
+  .tag-pill {
+    display: inline-block;
+    max-width: 100%;
+    padding: 0.08rem 0.45rem;
+    overflow: hidden;
+    color: var(--text-dim);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+  }
   .state {
     color: var(--text-dim);
   }

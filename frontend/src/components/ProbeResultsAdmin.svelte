@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import type { DefaultStatus } from '../lib/admin';
+  import type { ProbeStatus } from '../lib/admin';
   import {
     AdminError,
     fetchAdminChecks,
@@ -11,12 +11,13 @@
   import { formatAbsolute } from '../lib/incident';
 
   // `onopen` jumps to the check editor, like AgentsAdmin: a row names a check,
-  // and the operator reading a failure often wants to go edit it. `onexpired`
-  // drives the same re-login flow every panel uses.
+  // and the operator reading a failure often wants to go edit it. Takes the
+  // check's immutable id, which `ProbeResult.check_id` already is.
+  // `onexpired` drives the same re-login flow every panel uses.
   let {
     onopen,
     onexpired,
-  }: { onopen: (name: string) => void; onexpired: () => void } = $props();
+  }: { onopen: (id: string) => void; onexpired: () => void } = $props();
 
   /** How many rows to ask the server for. The server clamps to 1000. */
   const LIMITS = [100, 200, 500] as const;
@@ -25,10 +26,11 @@
   let loading = $state(true);
   let loadError = $state<string | null>(null);
 
-  // Server-side filters: a change to any of these re-fetches.
+  // Server-side filters: a change to any of these re-fetches. `check` is a
+  // check id \u2014 the server rejects anything that does not parse as one.
   let check = $state('');
   let agent = $state('');
-  let status = $state<'' | DefaultStatus>('');
+  let status = $state<'' | ProbeStatus>('');
   let region = $state('');
   let zone = $state('');
   let limit = $state<number>(200);
@@ -37,10 +39,10 @@
   // keystroke only re-filters the list in memory.
   let query = $state('');
 
-  /** Every configured check, fetched once on mount so the dropdown is complete
-   *  even for a check that has no recent results. Falls back to the distinct
-   *  ids in the batch if this call fails. */
-  let allCheckNames = $state<string[]>([]);
+  /** Every configured check's id and name, fetched once on mount so the
+   *  dropdown is complete even for a check that has no recent results. Falls
+   *  back to the distinct ids in the batch if this call fails. */
+  let allChecks = $state<{ id: string; name: string }[]>([]);
 
   /** Fetch with the current server-side filters. Called on mount and whenever a
    *  server-side filter changes; typing in `query` does NOT call this. */
@@ -69,7 +71,9 @@
 
   onMount(async () => {
     try {
-      allCheckNames = (await fetchAdminChecks()).map((c) => c.name).sort();
+      allChecks = (await fetchAdminChecks())
+        .map((c) => ({ id: c.id, name: c.name }))
+        .sort((a, b) => a.name.localeCompare(b.name));
     } catch (e) {
       if (e instanceof AdminError && e.unauthorized) {
         onexpired();
@@ -86,19 +90,23 @@
     [...new Set(results.map(pick).filter((v): v is string => !!v))].sort();
 
   const checkOptions = $derived(
-    allCheckNames.length ? allCheckNames : distinct((r) => r.check_id),
+    allChecks.length
+      ? allChecks
+      : [...new Map(results.map((r) => [r.check_id, r.name])).entries()]
+          .map(([id, name]) => ({ id, name }))
+          .sort((a, b) => a.name.localeCompare(b.name)),
   );
   const agentOptions = $derived(distinct((r) => r.agent_id));
   const regionOptions = $derived(distinct((r) => r.region));
   const zoneOptions = $derived(distinct((r) => r.zone));
 
   /** The free-text search: a substring match across the fields an operator
-   *  types into it — the raw error, the check, and the agent. */
+   *  types into it — the raw error, the check's name, and the agent. */
   const visible = $derived.by(() => {
     const q = query.trim().toLowerCase();
     if (!q) return results;
     return results.filter((r) =>
-      [r.error, r.check_id, r.agent_id].some((f) => f?.toLowerCase().includes(q)),
+      [r.error, r.name, r.agent_id].some((f) => f?.toLowerCase().includes(q)),
     );
   });
 
@@ -118,7 +126,7 @@
   }
 
   /** Severity tone from the result's status, matching AlertsList's palette. */
-  function tone(s: DefaultStatus): { pill: string; bar: string; label: string } {
+  function tone(s: ProbeStatus): { pill: string; bar: string; label: string } {
     if (s === 'down') return { pill: 'red', bar: 'bad', label: 'down' };
     if (s === 'unknown') return { pill: 'amber', bar: 'warn', label: 'unknown' };
     return { pill: 'green', bar: 'ok', label: 'up' };
@@ -146,8 +154,8 @@
     <span class="pick-label">Check</span>
     <select bind:value={check} onchange={load}>
       <option value="">All checks</option>
-      {#each checkOptions as c (c)}
-        <option value={c}>{c}</option>
+      {#each checkOptions as c (c.id)}
+        <option value={c.id}>{c.name}</option>
       {/each}
     </select>
   </label>
@@ -166,7 +174,7 @@
         class="range-btn"
         class:active={status === val}
         onclick={() => {
-          status = val as '' | DefaultStatus;
+          status = val as '' | ProbeStatus;
           load();
         }}>{label}</button
       >
@@ -234,7 +242,7 @@
         <div class="rc-top">
           <span class="opill {t.pill}">{t.label}</span>
           <button class="rc-check" onclick={() => onopen(r.check_id)} title="Edit this check">
-            {r.check_id}
+            {r.name}
           </button>
           <span class="rc-agent">{r.agent_id}</span>
           <span class="rc-when field-note" title={formatAbsolute(r.timestamp)}>

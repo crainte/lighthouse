@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Notifier, NotifiersResponse, Undelivered } from '../lib/admin';
   import { AdminError, fetchNotifiers, saveNotifiers, testNotifier } from '../lib/admin';
+  import NumberField from './NumberField.svelte';
 
   let { onexpired }: { onexpired: () => void } = $props();
 
@@ -202,7 +203,7 @@
       <ul class="undel">
         {#each undelivered as u (u.notifier + u.check_id + u.queued_at)}
           <li>
-            <strong>{u.check_id} → {u.to}</strong> via {u.notifier || '(unnamed)'} —
+            <strong>{u.name} → {u.to}</strong> via {u.notifier || '(unnamed)'} —
             {u.error}
             <span class="admin-muted">
               {u.given_up
@@ -255,19 +256,23 @@
                 bind:value={row.notifier.host}
                 oninput={() => touched(row.key)}
               />
-              <input
-                class="port"
-                type="number"
+              <!-- A function binding rather than `bind:value`: `port` lives on
+                   the email variant alone, and the union does not narrow inside
+                   a binding expression the way it does inside this branch. -->
+              <span class="port">
+              <NumberField
+                min={1}
+                max={65535}
                 placeholder="port"
-                value={row.notifier.port ?? ''}
-                oninput={(e) => {
-                  if (row.notifier.type === 'email')
-                    row.notifier.port = e.currentTarget.value
-                      ? Number(e.currentTarget.value)
-                      : null;
-                  touched(row.key);
-                }}
+                bind:value={
+                  () => (row.notifier.type === 'email' ? (row.notifier.port ?? null) : null),
+                  (v) => {
+                    if (row.notifier.type === 'email') row.notifier.port = v;
+                  }
+                }
+                onchanged={() => touched(row.key)}
               />
+              </span>
               <select
                 class="tls"
                 bind:value={row.notifier.tls}
@@ -414,6 +419,7 @@
   }
   .port {
     flex: 0 1 5rem;
+    min-width: 0;
   }
   .tls {
     flex: 0 1 8rem;

@@ -6,6 +6,7 @@ import {
   formatRelativeTime,
   sortChecks,
   overallStatus,
+  worstStatus,
   barColor,
   dayStatusText,
 } from './format';
@@ -16,6 +17,7 @@ describe('statusColor', () => {
     expect(statusColor('up')).toBe('#3fb950');
     expect(statusColor('down')).toBe('#f85149');
     expect(statusColor('unknown')).toBe('#8b949e');
+    expect(statusColor('degraded')).toBe('#d29922');
   });
 });
 
@@ -44,8 +46,21 @@ describe('overallStatus', () => {
   it('is partial when some but not all are down', () => {
     expect(overallStatus([{ status: 'up' }, { status: 'down' }])).toBe('partial');
   });
+  it('is degraded when any check is degraded and none are down', () => {
+    expect(overallStatus([{ status: 'up' }, { status: 'degraded' }])).toBe('degraded');
+    expect(overallStatus([{ status: 'degraded' }, { status: 'degraded' }])).toBe('degraded');
+  });
   it('is major when all are down', () => {
     expect(overallStatus([{ status: 'down' }, { status: 'down' }])).toBe('major');
+  });
+});
+
+describe('worstStatus', () => {
+  it('ranks down above degraded above unknown above up', () => {
+    expect(worstStatus([])).toBe('up');
+    expect(worstStatus([{ status: 'up' }, { status: 'unknown' }])).toBe('unknown');
+    expect(worstStatus([{ status: 'unknown' }, { status: 'degraded' }])).toBe('degraded');
+    expect(worstStatus([{ status: 'degraded' }, { status: 'down' }])).toBe('down');
   });
 });
 
@@ -114,32 +129,35 @@ describe('formatRelativeTime', () => {
 });
 
 describe('sortChecks', () => {
+  // check_id is the immutable identity (opaque, unrelated to display order);
+  // `name` is the mutable label sorting actually reads.
   const checks: Check[] = [
-    { check_id: 'beta', status: 'up', latency_ms: 10, last_check: 3, uptime_24h: 0.9 },
-    { check_id: 'alpha', status: 'down', latency_ms: 20, last_check: 1, uptime_24h: 0.5 },
-    { check_id: 'gamma', status: 'unknown', latency_ms: 30, last_check: 2, uptime_24h: 0.99 },
+    { check_id: 'id-2', name: 'beta', status: 'up', latency_ms: 10, last_check: 3, uptime_24h: 0.9 },
+    { check_id: 'id-4', name: 'alpha', status: 'down', latency_ms: 20, last_check: 1, uptime_24h: 0.5 },
+    { check_id: 'id-1', name: 'gamma', status: 'unknown', latency_ms: 30, last_check: 2, uptime_24h: 0.99 },
+    { check_id: 'id-3', name: 'delta', status: 'degraded', latency_ms: 15, last_check: 4, uptime_24h: 0.8 },
   ];
 
   it('sorts by name ascending and descending without mutating input', () => {
     const asc = sortChecks(checks, 'name', 'asc');
-    expect(asc.map((c) => c.check_id)).toEqual(['alpha', 'beta', 'gamma']);
+    expect(asc.map((c) => c.name)).toEqual(['alpha', 'beta', 'delta', 'gamma']);
     const desc = sortChecks(checks, 'name', 'desc');
-    expect(desc.map((c) => c.check_id)).toEqual(['gamma', 'beta', 'alpha']);
+    expect(desc.map((c) => c.name)).toEqual(['gamma', 'delta', 'beta', 'alpha']);
     // input untouched
-    expect(checks.map((c) => c.check_id)).toEqual(['beta', 'alpha', 'gamma']);
+    expect(checks.map((c) => c.name)).toEqual(['beta', 'alpha', 'gamma', 'delta']);
   });
 
-  it('sorts by status rank up < unknown < down ascending', () => {
+  it('sorts by status rank up < unknown < degraded < down ascending', () => {
     const asc = sortChecks(checks, 'status', 'asc');
-    expect(asc.map((c) => c.status)).toEqual(['up', 'unknown', 'down']);
+    expect(asc.map((c) => c.status)).toEqual(['up', 'unknown', 'degraded', 'down']);
     const desc = sortChecks(checks, 'status', 'desc');
-    expect(desc.map((c) => c.status)).toEqual(['down', 'unknown', 'up']);
+    expect(desc.map((c) => c.status)).toEqual(['down', 'degraded', 'unknown', 'up']);
   });
 
   it('sorts by uptime numerically', () => {
     const asc = sortChecks(checks, 'uptime', 'asc');
-    expect(asc.map((c) => c.uptime_24h)).toEqual([0.5, 0.9, 0.99]);
+    expect(asc.map((c) => c.uptime_24h)).toEqual([0.5, 0.8, 0.9, 0.99]);
     const desc = sortChecks(checks, 'uptime', 'desc');
-    expect(desc.map((c) => c.uptime_24h)).toEqual([0.99, 0.9, 0.5]);
+    expect(desc.map((c) => c.uptime_24h)).toEqual([0.99, 0.9, 0.8, 0.5]);
   });
 });

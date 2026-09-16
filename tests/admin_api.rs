@@ -9,9 +9,11 @@
 use std::net::SocketAddr;
 
 use serde_json::{json, Value};
+use uuid::Uuid;
 
-use warden::config::CoordinatorConfig;
+use warden::config::{CheckConfig, CoordinatorConfig};
 use warden::coordinator::Coordinator;
+use warden::models::{CheckId, NodeState};
 use warden::notify::{Notifier, NotifierKind};
 
 const PASSWORD: &str = "correct horse battery staple";
@@ -19,6 +21,10 @@ const PASSWORD: &str = "correct horse battery staple";
 /// there is no fleet-wide token — so the fixture mints one up front and every
 /// agent-facing call below presents it.
 const AGENT_TOKEN: &str = "wac_test.agent-shared-secret";
+
+fn cid(name: &str) -> CheckId {
+    Uuid::new_v5(&Uuid::NAMESPACE_DNS, name.as_bytes())
+}
 
 fn spawn_server(coord: Coordinator) -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -58,15 +64,12 @@ fn zone_tokens(
 }
 
 fn coordinator() -> Coordinator {
-    let coord = Coordinator::new(
-        &CoordinatorConfig {
-            listen: "127.0.0.1:0".into(),
-            db_path: ":memory:".into(),
-            admin_password: Some(PASSWORD.into()),
-            ..Default::default()
-        },
-        &[],
-    )
+    let coord = Coordinator::new(&CoordinatorConfig {
+        listen: "127.0.0.1:0".into(),
+        db_path: ":memory:".into(),
+        admin_password: Some(PASSWORD.into()),
+        ..Default::default()
+    })
     .unwrap();
     coord
         .provision_agent_credential(AGENT_TOKEN, "test-zone", "test-region")
@@ -84,6 +87,7 @@ fn check_body(name: &str, target: &str) -> Value {
         "group": "Probes",
         "latency_graph": true,
         "enabled": true,
+        "failures_before_down": 1,
     })
 }
 
@@ -187,10 +191,9 @@ async fn an_authenticated_admin_can_round_trip_a_check() {
         .await
         .unwrap();
     assert_eq!(res.status(), 200);
-    assert_eq!(
-        res.json::<Value>().await.unwrap()["check"]["target"],
-        "https://docs.test/health"
-    );
+    let created: Value = res.json().await.unwrap();
+    assert_eq!(created["check"]["target"], "https://docs.test/health");
+    let check_id = created["check"]["id"].as_str().unwrap();
 
     // A duplicate name is a conflict, not a silent overwrite.
     let res = admin
@@ -206,7 +209,7 @@ async fn an_authenticated_admin_can_round_trip_a_check() {
     let mut edited = check_body("docs-site", "https://docs.test/healthz");
     edited["enabled"] = json!(false);
     let res = admin
-        .put(format!("{base}/api/v1/admin/checks/docs-site"))
+        .put(format!("{base}/api/v1/admin/checks/{check_id}"))
         .header(reqwest::header::COOKIE, &session)
         .json(&edited)
         .send()
@@ -257,14 +260,14 @@ async fn an_authenticated_admin_can_round_trip_a_check() {
 
     // --- Delete. ---
     let res = admin
-        .delete(format!("{base}/api/v1/admin/checks/docs-site"))
+        .delete(format!("{base}/api/v1/admin/checks/{check_id}"))
         .header(reqwest::header::COOKIE, &session)
         .send()
         .await
         .unwrap();
     assert_eq!(res.status(), 200);
     let res = admin
-        .delete(format!("{base}/api/v1/admin/checks/docs-site"))
+        .delete(format!("{base}/api/v1/admin/checks/{check_id}"))
         .header(reqwest::header::COOKIE, &session)
         .send()
         .await
@@ -300,8 +303,8 @@ async fn invalid_checks_are_refused_with_a_readable_reason() {
             "name",
         ),
         (
-            json!({"name": "bad name", "type": "http", "target": "https://a.test", "cron": "*/30 * * * * *", "timeout_secs": 5}),
-            "name",
+            json!({"name": "bad/name", "type": "http", "target": "https://a.test", "cron": "*/30 * * * * *", "timeout_secs": 5}),
+            "slash",
         ),
         (
             json!({"name": "a", "type": "http", "target": "", "cron": "*/30 * * * * *", "timeout_secs": 5}),
@@ -348,22 +351,30 @@ async fn invalid_checks_are_refused_with_a_readable_reason() {
         );
     }
 
-    // Renaming through PUT would orphan the check's history.
-    admin
+    // Names are mutable labels; the UUID route preserves the check's history.
+    let keeper: Value = admin
         .post(format!("{base}/api/v1/admin/checks"))
         .header(reqwest::header::COOKIE, &session)
         .json(&check_body("keeper", "https://keeper.test"))
         .send()
         .await
+        .unwrap()
+        .json()
+        .await
         .unwrap();
+    let keeper_id = keeper["check"]["id"].as_str().unwrap();
     let res = admin
-        .put(format!("{base}/api/v1/admin/checks/keeper"))
+        .put(format!("{base}/api/v1/admin/checks/{keeper_id}"))
         .header(reqwest::header::COOKIE, &session)
         .json(&check_body("renamed", "https://keeper.test"))
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 400);
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        res.json::<Value>().await.unwrap()["check"]["name"],
+        "renamed"
+    );
 }
 
 #[tokio::test]
@@ -372,7 +383,7 @@ async fn probe_targets_never_reach_the_public_api() {
     let base = format!("http://{addr}");
     let admin = reqwest::Client::new();
     let session = login(&base).await;
-    admin
+    let created: Value = admin
         .post(format!("{base}/api/v1/admin/checks"))
         .header(reqwest::header::COOKIE, &session)
         .json(&check_body(
@@ -381,14 +392,18 @@ async fn probe_targets_never_reach_the_public_api() {
         ))
         .send()
         .await
+        .unwrap()
+        .json()
+        .await
         .unwrap();
+    let internal_id = &created["check"]["id"];
 
     // Report a result so the check appears on the status page at all.
     reqwest::Client::new()
         .post(format!("{base}/api/v1/results"))
         .bearer_auth(AGENT_TOKEN)
         .json(&json!({"results": [{
-            "check_id": "internal",
+            "check_id": internal_id,
             "agent_id": "agent-test",
             "timestamp": "2026-01-01T00:00:00Z",
             "latency_ms": 12,
@@ -439,7 +454,7 @@ async fn agents_must_present_the_token_for_targets_and_ingest() {
 
     // Unauthenticated ingest would let anyone forge uptime.
     let forged = json!({"results": [{
-        "check_id": "anything",
+        "check_id": Uuid::now_v7(),
         "agent_id": "impostor",
         "timestamp": "2026-01-01T00:00:00Z",
         "latency_ms": 1,
@@ -596,16 +611,21 @@ async fn a_lua_script_decides_the_verdict_end_to_end() {
         .await
         .unwrap();
     assert_eq!(res.status(), 200);
+    let check_id = res.json::<Value>().await.unwrap()["check"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let agent = reqwest::Client::new();
     let report = |status: u16| {
+        let check_id = check_id.clone();
         let (agent, base) = (agent.clone(), base.clone());
         async move {
             agent
                 .post(format!("{base}/api/v1/results"))
                 .bearer_auth(AGENT_TOKEN)
                 .json(&json!({"results": [{
-                    "check_id": "scripted",
+                    "check_id": check_id,
                     "agent_id": "agent-test",
                     "type": "http",
                     "timestamp": "2026-01-01T00:00:00Z",
@@ -621,7 +641,7 @@ async fn a_lua_script_decides_the_verdict_end_to_end() {
     report(200).await;
 
     let history: Value = reqwest::Client::new()
-        .get(format!("{base}/api/v1/checks/scripted/history?limit=10"))
+        .get(format!("{base}/api/v1/checks/{check_id}/history?limit=10"))
         .send()
         .await
         .unwrap()
@@ -726,14 +746,19 @@ async fn checks_keep_an_explicit_display_order() {
     let admin = reqwest::Client::new();
     let session = login(&base).await;
 
+    let mut ids = std::collections::HashMap::new();
     for name in ["alpha", "bravo", "charlie"] {
-        admin
+        let created: Value = admin
             .post(format!("{base}/api/v1/admin/checks"))
             .header(reqwest::header::COOKIE, &session)
             .json(&check_body(name, &format!("https://{name}.test")))
             .send()
             .await
+            .unwrap()
+            .json()
+            .await
             .unwrap();
+        ids.insert(name, created["check"]["id"].as_str().unwrap().to_string());
     }
 
     let names = |v: &Value| {
@@ -761,7 +786,7 @@ async fn checks_keep_an_explicit_display_order() {
     let res = admin
         .put(format!("{base}/api/v1/admin/checks/order"))
         .header(reqwest::header::COOKIE, &session)
-        .json(&json!({ "order": ["charlie", "alpha"] }))
+        .json(&json!({ "order": [ids["charlie"], ids["alpha"]] }))
         .send()
         .await
         .unwrap();
@@ -779,7 +804,7 @@ async fn checks_keep_an_explicit_display_order() {
             .post(format!("{base}/api/v1/results"))
             .bearer_auth(AGENT_TOKEN)
             .json(&json!({"results": [{
-                "check_id": name,
+                "check_id": ids[name],
                 "agent_id": "agent-test",
                 "timestamp": "2026-01-01T00:00:00Z",
                 "latency_ms": 5,
@@ -802,10 +827,11 @@ async fn checks_keep_an_explicit_display_order() {
         .unwrap()
         .iter()
         .filter_map(|c| {
-            let n = c["check_id"].as_str().unwrap().to_string();
+            let id = c["check_id"].as_str().unwrap();
             ["alpha", "bravo", "charlie"]
-                .contains(&n.as_str())
-                .then(|| (c["position"].as_i64().unwrap(), n))
+                .into_iter()
+                .find(|name| ids[*name] == id)
+                .map(|name| (c["position"].as_i64().unwrap(), name.to_string()))
         })
         .collect();
     ours.sort();
@@ -865,9 +891,14 @@ async fn a_check_can_be_restricted_to_particular_agents() {
     // change is what stops a 20-agent fleet probing everything twenty times.
     // Coverage is not lost: if the holder falls silent the other takes over at
     // its next poll, redundancy by failover rather than by duplication.
+    // The first pair registers both agents; poll again after membership has
+    // converged before asserting placement.
+    feed_for(Some("agent-a")).await;
+    feed_for(Some("agent-b")).await;
     let a = feed_for(Some("agent-a")).await;
     let b = feed_for(Some("agent-b")).await;
 
+    // Exactly one agent owns the unplaced check in the zone.
     let holders = [&a, &b]
         .iter()
         .filter(|f| f.contains(&"everywhere".to_string()))
@@ -938,6 +969,10 @@ async fn a_heartbeat_goes_up_when_pinged_and_is_not_handed_to_agents() {
         .await
         .unwrap();
     assert_eq!(res.status(), 200, "a heartbeat needs no target");
+    let heartbeat_id = res.json::<Value>().await.unwrap()["check"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // Nothing probes a heartbeat; handing it to an agent would have it probe
     // an empty target forever.
@@ -962,7 +997,7 @@ async fn a_heartbeat_goes_up_when_pinged_and_is_not_handed_to_agents() {
     // The URL is the credential and needs no session — that is the point of a
     // deadman switch that cron or a backup script can curl.
     let res = reqwest::Client::new()
-        .post(format!("{base}/api/v1/heartbeat/nightly-backup"))
+        .post(format!("{base}/api/v1/heartbeat/{heartbeat_id}"))
         .send()
         .await
         .unwrap();
@@ -970,7 +1005,7 @@ async fn a_heartbeat_goes_up_when_pinged_and_is_not_handed_to_agents() {
 
     let history: Value = reqwest::Client::new()
         .get(format!(
-            "{base}/api/v1/checks/nightly-backup/history?limit=5"
+            "{base}/api/v1/checks/{heartbeat_id}/history?limit=5"
         ))
         .send()
         .await
@@ -991,15 +1026,18 @@ async fn a_heartbeat_goes_up_when_pinged_and_is_not_handed_to_agents() {
     assert_eq!(res.status(), 404);
 
     // A normal check must not be pingable — that would let anyone forge uptime.
-    admin
+    let normal: Value = admin
         .post(format!("{base}/api/v1/admin/checks"))
         .header(reqwest::header::COOKIE, &session)
         .json(&check_body("normal", "https://normal.test"))
         .send()
         .await
+        .unwrap()
+        .json()
+        .await
         .unwrap();
     let res = reqwest::Client::new()
-        .post(format!("{base}/api/v1/heartbeat/normal"))
+        .post(format!("{base}/api/v1/heartbeat/{}", normal["check"]["id"]))
         .send()
         .await
         .unwrap();
@@ -1013,18 +1051,22 @@ async fn purging_data_keeps_the_check() {
     let admin = reqwest::Client::new();
     let session = login(&base).await;
 
-    admin
+    let noisy: Value = admin
         .post(format!("{base}/api/v1/admin/checks"))
         .header(reqwest::header::COOKIE, &session)
         .json(&check_body("noisy", "https://noisy.test"))
         .send()
         .await
+        .unwrap()
+        .json()
+        .await
         .unwrap();
+    let noisy_id = noisy["check"]["id"].as_str().unwrap().to_string();
     reqwest::Client::new()
         .post(format!("{base}/api/v1/results"))
         .bearer_auth(AGENT_TOKEN)
         .json(&json!({"results": [{
-            "check_id": "noisy",
+            "check_id": noisy_id,
             "agent_id": "agent-test",
             "timestamp": "2026-01-01T00:00:00Z",
             "latency_ms": 3,
@@ -1035,7 +1077,7 @@ async fn purging_data_keeps_the_check() {
         .unwrap();
 
     let res = admin
-        .delete(format!("{base}/api/v1/admin/checks/noisy/data"))
+        .delete(format!("{base}/api/v1/admin/checks/{noisy_id}/data"))
         .header(reqwest::header::COOKIE, &session)
         .send()
         .await
@@ -1046,7 +1088,7 @@ async fn purging_data_keeps_the_check() {
     // History is gone but the check itself survives — the two are different
     // intentions and must not be conflated.
     let history: Value = reqwest::Client::new()
-        .get(format!("{base}/api/v1/checks/noisy/history?limit=5"))
+        .get(format!("{base}/api/v1/checks/{noisy_id}/history?limit=5"))
         .send()
         .await
         .unwrap()
@@ -1094,8 +1136,9 @@ async fn a_configured_check_appears_before_it_has_ever_reported() {
         .await
         .unwrap();
     let code = created.status();
-    let body = created.text().await.unwrap();
+    let body: Value = created.json().await.unwrap();
     assert_eq!(code, 200, "create failed: {body}");
+    let slow_id = body["check"]["id"].clone();
 
     let public: Value = reqwest::Client::new()
         .get(format!("{base}/api/v1/status"))
@@ -1109,7 +1152,7 @@ async fn a_configured_check_appears_before_it_has_ever_reported() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|c| c["check_id"] == "slow-dns")
+        .find(|c| c["check_id"] == slow_id)
         .expect("a configured check belongs on the page before its first result");
     assert_eq!(row["status"], "unknown", "no result yet is not an outage");
     assert_eq!(row["uptime_24h"], 0.0);
@@ -1118,13 +1161,17 @@ async fn a_configured_check_appears_before_it_has_ever_reported() {
     // A hidden check still stays off the page.
     let mut hidden = check_body("hidden-one", "https://hidden.test");
     hidden["visible"] = json!(false);
-    admin
+    let hidden: Value = admin
         .post(format!("{base}/api/v1/admin/checks"))
         .header(reqwest::header::COOKIE, &session)
         .json(&hidden)
         .send()
         .await
+        .unwrap()
+        .json()
+        .await
         .unwrap();
+    let hidden_id = hidden["check"]["id"].clone();
     let public: Value = reqwest::Client::new()
         .get(format!("{base}/api/v1/status"))
         .send()
@@ -1138,7 +1185,7 @@ async fn a_configured_check_appears_before_it_has_ever_reported() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|c| c["check_id"] == "hidden-one"),
+            .any(|c| c["check_id"] == hidden_id),
         "listing pending checks must not leak hidden ones"
     );
 }
@@ -1150,7 +1197,7 @@ async fn heartbeat_pings_do_not_invent_a_monitoring_agent() {
     let admin = reqwest::Client::new();
     let session = login(&base).await;
 
-    admin
+    let cronjob: Value = admin
         .post(format!("{base}/api/v1/admin/checks"))
         .header(reqwest::header::COOKIE, &session)
         .json(&json!({
@@ -1159,9 +1206,15 @@ async fn heartbeat_pings_do_not_invent_a_monitoring_agent() {
         }))
         .send()
         .await
+        .unwrap()
+        .json()
+        .await
         .unwrap();
     reqwest::Client::new()
-        .post(format!("{base}/api/v1/heartbeat/cronjob"))
+        .post(format!(
+            "{base}/api/v1/heartbeat/{}",
+            cronjob["check"]["id"]
+        ))
         .send()
         .await
         .unwrap();
@@ -1195,11 +1248,22 @@ async fn a_check_pinned_to_a_dead_agent_is_reported_not_silent() {
     let session = login(&base).await;
 
     // An agent that reported once and then stopped.
+    let seed: Value = admin
+        .post(format!("{base}/api/v1/admin/checks"))
+        .header(reqwest::header::COOKIE, &session)
+        .json(&check_body("seed", "https://seed.test"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let seed_id = seed["check"]["id"].as_str().unwrap().to_string();
     reqwest::Client::new()
         .post(format!("{base}/api/v1/results"))
         .bearer_auth(AGENT_TOKEN)
         .json(&json!({"results": [{
-            "check_id": "seed", "agent_id": "agent-ghost",
+            "check_id": seed_id, "agent_id": "agent-ghost",
             "timestamp": "2020-01-01T00:00:00Z", "latency_ms": 1, "status_code": 200,
         }]}))
         .send()
@@ -1208,13 +1272,17 @@ async fn a_check_pinned_to_a_dead_agent_is_reported_not_silent() {
 
     let mut pinned = check_body("pinned-to-ghost", "https://ghost.test");
     pinned["agents"] = json!(["agent-ghost"]);
-    admin
+    let pinned: Value = admin
         .post(format!("{base}/api/v1/admin/checks"))
         .header(reqwest::header::COOKIE, &session)
         .json(&pinned)
         .send()
         .await
+        .unwrap()
+        .json()
+        .await
         .unwrap();
+    let pinned_id = pinned["check"]["id"].as_str().unwrap().to_string();
 
     let agents: Value = reqwest::Client::new()
         .get(format!("{base}/api/v1/agents"))
@@ -1264,13 +1332,14 @@ async fn a_check_pinned_to_a_dead_agent_is_reported_not_silent() {
     // Unassign, then purging is allowed and the agent disappears.
     let mut freed = check_body("pinned-to-ghost", "https://ghost.test");
     freed["agents"] = json!([]);
-    admin
-        .put(format!("{base}/api/v1/admin/checks/pinned-to-ghost"))
+    let res = admin
+        .put(format!("{base}/api/v1/admin/checks/{pinned_id}"))
         .header(reqwest::header::COOKIE, &session)
         .json(&freed)
         .send()
         .await
         .unwrap();
+    assert_eq!(res.status(), 200);
     let res = admin
         .delete(format!("{base}/api/v1/admin/agents/agent-ghost"))
         .header(reqwest::header::COOKIE, &session)
@@ -1319,7 +1388,7 @@ async fn public_pages_never_republish_what_a_probe_observed() {
     let session = login(&base).await;
     let client = reqwest::Client::new();
 
-    client
+    let created: Value = client
         .post(format!("{base}/api/v1/admin/checks"))
         .header(reqwest::header::COOKIE, &session)
         .json(&json!({
@@ -1331,12 +1400,16 @@ async fn public_pages_never_republish_what_a_probe_observed() {
         .await
         .unwrap()
         .error_for_status()
-        .expect("check created");
+        .expect("check created")
+        .json()
+        .await
+        .unwrap();
+    let ddns_id: CheckId = created["check"]["id"].as_str().unwrap().parse().unwrap();
 
     let secret = "198.51.100.77";
     coord
         .ingest(vec![warden::models::CheckResult {
-            check_id: "ddns".into(),
+            check_id: ddns_id,
             agent_id: "agent-a".into(),
             zone: "us-east-a".into(),
             region: "us-east".into(),
@@ -1357,7 +1430,10 @@ async fn public_pages_never_republish_what_a_probe_observed() {
         .await;
 
     // Both public endpoints the status page and the check page read from.
-    for path in ["/api/v1/status", "/api/v1/checks/ddns/history?limit=10"] {
+    for path in [
+        "/api/v1/status".to_string(),
+        format!("/api/v1/checks/{ddns_id}/history?limit=10"),
+    ] {
         let anon = client
             .get(format!("{base}{path}"))
             .send()
@@ -1628,29 +1704,32 @@ async fn a_hanging_notification_endpoint_cannot_stall_ingest() {
         }
     });
 
-    let coord = Coordinator::new(
-        &CoordinatorConfig {
-            listen: "127.0.0.1:0".into(),
-            db_path: ":memory:".into(),
-            notifiers: vec![Notifier {
-                name: "alerts".into(),
-                default: true,
-                kind: NotifierKind::Webhook {
-                    url: format!("http://{sink_addr}/"),
-                },
-            }],
-            admin_password: Some(PASSWORD.into()),
-            ..Default::default()
-        },
-        &[],
-    )
+    let coord = Coordinator::new(&CoordinatorConfig {
+        listen: "127.0.0.1:0".into(),
+        db_path: ":memory:".into(),
+        notifiers: vec![Notifier {
+            name: "alerts".into(),
+            default: true,
+            kind: NotifierKind::Webhook {
+                url: format!("http://{sink_addr}/"),
+            },
+        }],
+        admin_password: Some(PASSWORD.into()),
+        ..Default::default()
+    })
     .unwrap();
+    coord.create_check_for_test(CheckConfig {
+        id: cid("svc"),
+        name: "svc".into(),
+        target: "https://svc.test/".into(),
+        ..Default::default()
+    });
 
     let result = |status: u16, ts: i64| warden::models::CheckResult {
-        check_id: "svc".into(),
+        check_id: cid("svc"),
         agent_id: "agent-a".into(),
-        zone: "us-east-a".into(),
-        region: "us-east".into(),
+        zone: "test-zone".into(),
+        region: "test-region".into(),
         kind: warden::models::CheckKind::Http,
         timestamp: chrono::DateTime::from_timestamp_millis(ts).unwrap(),
         latency_ms: 1,
@@ -1682,7 +1761,7 @@ async fn a_hanging_notification_endpoint_cannot_stall_ingest() {
     let mine: Vec<_> = coord
         .alerts_for_test(100)
         .into_iter()
-        .filter(|a| a.node_id == "svc")
+        .filter(|a| a.node_id == cid("svc").to_string())
         .collect();
     assert_eq!(mine.len(), 1, "the transition is still persisted");
 }
@@ -1698,17 +1777,17 @@ async fn a_hanging_notification_endpoint_cannot_stall_ingest() {
 #[tokio::test]
 async fn incidents_open_on_down_and_resolve_on_up() {
     use warden::coordinator::storage::IncidentState;
-    let coord = coordinator();
-    let now = 1_783_728_000_000i64; // 2026-07-11T00:00:00Z
+    let coord = coordinator_with(vec![http_check("api")]);
+    let now = chrono::Utc::now().timestamp_millis();
 
     // `status_code: None` makes the default eval read the probe as Unknown;
     // `Some(code)` drives Up (2xx-3xx) or Down otherwise.
     let result =
         |ts: i64, status_code: Option<u16>, error: Option<String>| warden::models::CheckResult {
-            check_id: "api".into(),
+            check_id: cid("api"),
             agent_id: "agent-1".into(),
-            zone: "us-east-a".into(),
-            region: "us-east".into(),
+            zone: "test-zone".into(),
+            region: "test-region".into(),
             kind: warden::models::CheckKind::Http,
             timestamp: chrono::DateTime::from_timestamp_millis(ts).unwrap(),
             latency_ms: 1,
@@ -1727,7 +1806,7 @@ async fn incidents_open_on_down_and_resolve_on_up() {
     let mine = |c: &warden::coordinator::Coordinator| {
         c.incidents_for_test(100)
             .into_iter()
-            .filter(|i| i.origin_check.as_deref() == Some("api"))
+            .filter(|i| i.origin_check == Some(cid("api")))
             .collect::<Vec<_>>()
     };
 
@@ -1748,17 +1827,20 @@ async fn incidents_open_on_down_and_resolve_on_up() {
         "a probe noticing is not a human investigating"
     );
     assert_eq!(
-        incidents[0].origin_check.as_deref(),
-        Some("api"),
+        incidents[0].origin_check,
+        Some(cid("api")),
         "the check that fell is the origin"
     );
     assert_eq!(
         incidents[0]
             .checks
             .iter()
-            .map(|c| (c.check_id.as_str(), c.source))
+            .map(|c| (c.check_id, c.source))
             .collect::<Vec<_>>(),
-        vec![("api", warden::coordinator::storage::AffectSource::Origin)],
+        vec![(
+            cid("api"),
+            warden::coordinator::storage::AffectSource::Origin
+        )],
         "the origin is attached as an affected check"
     );
     // The cause is the first entry in the narrative, not a column beside it.
@@ -1774,7 +1856,7 @@ async fn incidents_open_on_down_and_resolve_on_up() {
         coord
             .alerts_for_test(100)
             .into_iter()
-            .filter(|a| a.node_id == "api")
+            .filter(|a| a.node_id == cid("api").to_string())
             .collect::<Vec<_>>()
             .is_empty(),
         "baseline still does not alert"
@@ -1817,7 +1899,7 @@ async fn incidents_open_on_down_and_resolve_on_up() {
     let recovery = coord
         .alerts_for_test(100)
         .into_iter()
-        .find(|a| a.node_id == "api" && a.current_state == warden::models::Status::Up)
+        .find(|a| a.node_id == cid("api").to_string() && a.current_state == NodeState::Up)
         .expect("recovery alert recorded");
     assert_eq!(
         recovery.incident_id.as_deref(),
@@ -1879,16 +1961,16 @@ async fn the_fleet_listing_is_not_public() {
 /// Build a coordinator whose checks carry `depends_on` / `failures_before_down`
 /// as configured, so the reconciler has a real graph to read.
 fn coordinator_with(checks: Vec<warden::config::CheckConfig>) -> Coordinator {
-    let coord = Coordinator::new(
-        &CoordinatorConfig {
-            listen: "127.0.0.1:0".into(),
-            db_path: ":memory:".into(),
-            admin_password: Some(PASSWORD.into()),
-            ..Default::default()
-        },
-        &checks,
-    )
+    let coord = Coordinator::new(&CoordinatorConfig {
+        listen: "127.0.0.1:0".into(),
+        db_path: ":memory:".into(),
+        admin_password: Some(PASSWORD.into()),
+        ..Default::default()
+    })
     .unwrap();
+    for check in checks {
+        coord.create_check_for_test(check);
+    }
     coord
         .provision_agent_credential(AGENT_TOKEN, "test-zone", "test-region")
         .unwrap();
@@ -1897,6 +1979,7 @@ fn coordinator_with(checks: Vec<warden::config::CheckConfig>) -> Coordinator {
 
 fn http_check(name: &str) -> warden::config::CheckConfig {
     warden::config::CheckConfig {
+        id: cid(name),
         name: name.into(),
         target: format!("http://{name}.test/"),
         ..Default::default()
@@ -1905,7 +1988,7 @@ fn http_check(name: &str) -> warden::config::CheckConfig {
 
 fn probe(check: &str, ts: i64, code: u16) -> warden::models::CheckResult {
     warden::models::CheckResult {
-        check_id: check.into(),
+        check_id: cid(check),
         agent_id: "agent-1".into(),
         zone: "test-zone".into(),
         region: "test-region".into(),
@@ -1934,9 +2017,9 @@ fn probe(check: &str, ts: i64, code: u16) -> warden::models::CheckResult {
 async fn a_dependent_check_joins_its_upstreams_incident() {
     use warden::coordinator::storage::AffectSource;
     let mut api = http_check("api");
-    api.depends_on = vec!["db".into()];
+    api.depends_on = vec![cid("db")];
     let coord = coordinator_with(vec![http_check("db"), api]);
-    let now = 1_783_728_000_000i64;
+    let now = chrono::Utc::now().timestamp_millis();
 
     // A baseline UP for the dependent: a first-ever observation never alerts,
     // so without this the "grouping is not suppression" assertion below would
@@ -1948,7 +2031,7 @@ async fn a_dependent_check_joins_its_upstreams_incident() {
     let opened: Vec<_> = coord
         .incidents_for_test(100)
         .into_iter()
-        .filter(|i| i.origin_check.as_deref() == Some("db"))
+        .filter(|i| i.origin_check == Some(cid("db")))
         .collect();
     assert_eq!(opened.len(), 1, "the upstream opened one incident");
     let incident_id = opened[0].id.clone();
@@ -1959,7 +2042,7 @@ async fn a_dependent_check_joins_its_upstreams_incident() {
         coord
             .incidents_for_test(100)
             .iter()
-            .all(|i| i.origin_check.as_deref() != Some("api")),
+            .all(|i| i.origin_check != Some(cid("api"))),
         "a dependent must not open its own incident while its upstream is down"
     );
 
@@ -1971,11 +2054,11 @@ async fn a_dependent_check_joins_its_upstreams_incident() {
     assert_eq!(
         inc.checks
             .iter()
-            .map(|c| (c.check_id.as_str(), c.source))
+            .map(|c| (c.check_id, c.source))
             .collect::<Vec<_>>(),
         vec![
-            ("api", AffectSource::Dependency),
-            ("db", AffectSource::Origin),
+            (cid("api"), AffectSource::Dependency),
+            (cid("db"), AffectSource::Origin),
         ],
         "the dependent joined the upstream's incident, marked as automatic"
     );
@@ -1985,7 +2068,7 @@ async fn a_dependent_check_joins_its_upstreams_incident() {
     let api_alert = coord
         .alerts_for_test(100)
         .into_iter()
-        .find(|a| a.node_id == "api")
+        .find(|a| a.node_id == cid("api").to_string())
         .expect("the dependent still records its own alert");
     assert_eq!(api_alert.incident_id.as_deref(), Some(incident_id.as_str()));
 }
@@ -1997,7 +2080,7 @@ async fn a_dependent_check_joins_its_upstreams_incident() {
 #[tokio::test]
 async fn unrelated_checks_falling_together_stay_separate_incidents() {
     let coord = coordinator_with(vec![http_check("db"), http_check("ping")]);
-    let now = 1_783_728_000_000i64;
+    let now = chrono::Utc::now().timestamp_millis();
 
     coord
         .ingest(vec![probe("db", now, 500), probe("ping", now, 500)])
@@ -2007,7 +2090,8 @@ async fn unrelated_checks_falling_together_stay_separate_incidents() {
         .incidents_for_test(100)
         .into_iter()
         .filter_map(|i| i.origin_check)
-        .filter(|c| c == "db" || c == "ping")
+        .filter(|c| *c == cid("db") || *c == cid("ping"))
+        .map(|c| c.to_string())
         .collect();
     assert_eq!(
         origins.len(),
@@ -2026,11 +2110,11 @@ async fn a_flapping_check_stays_inside_one_incident() {
     let mut flappy = http_check("flappy");
     flappy.failures_before_down = 3;
     let coord = coordinator_with(vec![flappy]);
-    let now = 1_783_728_000_000i64;
+    let now = chrono::Utc::now().timestamp_millis();
     let mine = |c: &Coordinator| {
         c.incidents_for_test(100)
             .into_iter()
-            .filter(|i| i.origin_check.as_deref() == Some("flappy"))
+            .filter(|i| i.origin_check == Some(cid("flappy")))
             .collect::<Vec<_>>()
     };
 
@@ -2063,26 +2147,20 @@ async fn a_flapping_check_stays_inside_one_incident() {
         );
     }
 
-    // Two clean UPs are still not enough.
+    // The two earlier UP observations remain part of the recovery confirmation
+    // run; a DOWN that is already confirmed does not reset it. Two more UPs
+    // therefore complete the required three successes and close the incident.
     for i in 0..2 {
         coord
             .ingest(vec![probe("flappy", now + 20_000 + i * 1_000, 200)])
             .await;
     }
-    assert_eq!(
-        mine(&coord)[0].state,
-        IncidentState::Detected,
-        "two of the three required successes must not resolve it"
-    );
-
-    // The third completes the run and closes it.
-    coord.ingest(vec![probe("flappy", now + 23_000, 200)]).await;
     let incidents = mine(&coord);
     assert_eq!(incidents.len(), 1, "still one incident");
     assert_eq!(
         incidents[0].state,
         IncidentState::Resolved,
-        "a full run of successes resolves it"
+        "the accumulated recovery run resolves it"
     );
 }
 
@@ -2093,7 +2171,7 @@ async fn a_flapping_check_stays_inside_one_incident() {
 async fn auto_resolve_fires_even_after_a_human_has_acknowledged() {
     use warden::coordinator::storage::IncidentState;
     let coord = coordinator_with(vec![http_check("svc")]);
-    let now = 1_783_728_000_000i64;
+    let now = chrono::Utc::now().timestamp_millis();
     let addr = spawn_server(coord.clone());
     let base = format!("http://{addr}");
     let session = login(&base).await;
@@ -2102,7 +2180,7 @@ async fn auto_resolve_fires_even_after_a_human_has_acknowledged() {
     let id = coord
         .incidents_for_test(100)
         .into_iter()
-        .find(|i| i.origin_check.as_deref() == Some("svc"))
+        .find(|i| i.origin_check == Some(cid("svc")))
         .expect("incident opened")
         .id;
 
@@ -2141,12 +2219,12 @@ async fn auto_resolve_fires_even_after_a_human_has_acknowledged() {
 #[tokio::test]
 async fn incident_writes_are_admin_only_while_reads_are_public() {
     let coord = coordinator_with(vec![http_check("svc")]);
-    let now = 1_783_728_000_000i64;
+    let now = chrono::Utc::now().timestamp_millis();
     coord.ingest(vec![probe("svc", now, 500)]).await;
     let id = coord
         .incidents_for_test(100)
         .into_iter()
-        .find(|i| i.origin_check.as_deref() == Some("svc"))
+        .find(|i| i.origin_check == Some(cid("svc")))
         .expect("incident opened")
         .id;
     let addr = spawn_server(coord.clone());
@@ -2167,7 +2245,7 @@ async fn incident_writes_are_admin_only_while_reads_are_public() {
         (
             reqwest::Method::PUT,
             format!("{base}/api/v1/admin/incidents/{id}/checks"),
-            json!({ "checks": ["svc"] }),
+            json!({ "checks": [cid("svc").to_string()] }),
         ),
         (
             reqwest::Method::POST,
@@ -2231,7 +2309,7 @@ async fn incident_writes_are_admin_only_while_reads_are_public() {
 async fn a_manual_incident_is_never_auto_resolved() {
     use warden::coordinator::storage::IncidentState;
     let coord = coordinator_with(vec![http_check("db")]);
-    let now = 1_783_728_000_000i64;
+    let now = chrono::Utc::now().timestamp_millis();
     let addr = spawn_server(coord.clone());
     let base = format!("http://{addr}");
     let session = login(&base).await;
@@ -2244,7 +2322,7 @@ async fn a_manual_incident_is_never_auto_resolved() {
             "title": "Scheduled database maintenance",
             "state": "monitoring",
             "global": true,
-            "checks": ["db"],
+            "checks": [cid("db").to_string()],
             "body": "Planned failover window.",
         }))
         .send()
@@ -2281,7 +2359,7 @@ async fn a_manual_incident_is_never_auto_resolved() {
     let own: Vec<_> = coord
         .incidents_for_test(100)
         .into_iter()
-        .filter(|i| i.origin_check.as_deref() == Some("db"))
+        .filter(|i| i.origin_check == Some(cid("db")))
         .collect();
     assert_eq!(
         own.len(),
@@ -2308,6 +2386,7 @@ async fn openmetrics_metric_and_metrics_drive_the_verdict() {
     // A metric check whose script compares two same-scrape series (used/size)
     // and treats an absent selection as DOWN.
     let check = CheckConfig {
+        id: cid("queue"),
         name: "queue".into(),
         kind: CheckKind::Openmetrics,
         target: "http://exporter.test:9100/metrics".into(),
@@ -2331,10 +2410,10 @@ async fn openmetrics_metric_and_metrics_drive_the_verdict() {
         ..Default::default()
     };
     let coord = coordinator_with(vec![check]);
-    let now = 1_783_728_000_000i64;
+    let now = chrono::Utc::now().timestamp_millis();
 
     let scrape = |ts: i64, metric: Option<f64>, metrics: Vec<MetricSample>| CheckResult {
-        check_id: "queue".into(),
+        check_id: cid("queue"),
         agent_id: "agent-1".into(),
         zone: "test-zone".into(),
         region: "test-region".into(),
@@ -2365,7 +2444,7 @@ async fn openmetrics_metric_and_metrics_drive_the_verdict() {
         coord
             .incidents_for_test(100)
             .iter()
-            .all(|i| i.origin_check.as_deref() != Some("queue")),
+            .all(|i| i.origin_check != Some(cid("queue"))),
         "a healthy metric check opens no incident"
     );
 
@@ -2382,7 +2461,7 @@ async fn openmetrics_metric_and_metrics_drive_the_verdict() {
     let down: Vec<_> = coord
         .incidents_for_test(100)
         .into_iter()
-        .filter(|i| i.origin_check.as_deref() == Some("queue"))
+        .filter(|i| i.origin_check == Some(cid("queue")))
         .collect();
     assert_eq!(
         down.len(),
@@ -2400,7 +2479,7 @@ async fn openmetrics_metric_and_metrics_drive_the_verdict() {
     let reopened: Vec<_> = coord
         .incidents_for_test(100)
         .into_iter()
-        .filter(|i| i.origin_check.as_deref() == Some("queue") && i.resolved_at.is_none())
+        .filter(|i| i.origin_check == Some(cid("queue")) && i.resolved_at.is_none())
         .collect();
     assert_eq!(
         reopened.len(),
@@ -2416,15 +2495,26 @@ async fn openmetrics_metric_and_metrics_drive_the_verdict() {
 #[tokio::test]
 async fn the_results_explorer_is_admin_only_and_returns_raw_errors() {
     let coord = coordinator();
+    coord.create_check_for_test(CheckConfig {
+        id: cid("web"),
+        name: "web".into(),
+        ..Default::default()
+    });
+    coord.create_check_for_test(CheckConfig {
+        id: cid("ddns-wa"),
+        name: "ddns-wa".into(),
+        kind: warden::models::CheckKind::Dns,
+        ..Default::default()
+    });
 
     // The exact leak the public path redacts: a resolved address and the
     // expected values, verbatim from the agent.
     let leaked = r#"resolved to 97.7.61.14, expected one of ["7.…"]"#;
-    let now = 1_783_728_000_000i64;
+    let now = chrono::Utc::now().timestamp_millis();
     let result =
         |check: &str, agent: &str, ts: i64, region: &str, zone: &str, error: Option<String>| {
             warden::models::CheckResult {
-                check_id: check.into(),
+                check_id: cid(check),
                 agent_id: agent.into(),
                 zone: zone.into(),
                 region: region.into(),
@@ -2473,7 +2563,10 @@ async fn the_results_explorer_is_admin_only_and_returns_raw_errors() {
     // Authed, filtered to the ddns check: the demo seed also lands rows, so the
     // server-side `check` filter is what isolates this test's data.
     let body: Value = admin
-        .get(format!("{base}/api/v1/admin/results?check=ddns-wa"))
+        .get(format!(
+            "{base}/api/v1/admin/results?check={}",
+            cid("ddns-wa")
+        ))
         .header(reqwest::header::COOKIE, &session)
         .send()
         .await
@@ -2483,7 +2576,7 @@ async fn the_results_explorer_is_admin_only_and_returns_raw_errors() {
         .unwrap();
     let rows = body["results"].as_array().unwrap();
     assert_eq!(rows.len(), 1, "the check filter isolates the ddns row");
-    assert_eq!(rows[0]["check_id"], "ddns-wa");
+    assert_eq!(rows[0]["check_id"], cid("ddns-wa").to_string());
     assert_eq!(
         rows[0]["error"], leaked,
         "the admin path returns the error verbatim, un-redacted"
@@ -2495,7 +2588,8 @@ async fn the_results_explorer_is_admin_only_and_returns_raw_errors() {
     // that never touched it, returns nothing.
     let empty: Value = admin
         .get(format!(
-            "{base}/api/v1/admin/results?check=ddns-wa&agent=agent-a"
+            "{base}/api/v1/admin/results?check={}&agent=agent-a",
+            cid("ddns-wa")
         ))
         .header(reqwest::header::COOKIE, &session)
         .send()
@@ -2512,7 +2606,7 @@ async fn the_results_explorer_is_admin_only_and_returns_raw_errors() {
 
     // The `web` result carried no error, so its row omits the field entirely.
     let web: Value = admin
-        .get(format!("{base}/api/v1/admin/results?check=web"))
+        .get(format!("{base}/api/v1/admin/results?check={}", cid("web")))
         .header(reqwest::header::COOKIE, &session)
         .send()
         .await
@@ -2533,7 +2627,7 @@ async fn the_results_explorer_is_admin_only_and_returns_raw_errors() {
 /// Open one incident by hand and hand back its id. Manual rather than
 /// probe-driven because the delete path does not care how it was opened, and
 /// driving it through ingest would make the test about reconciliation instead.
-async fn create_incident(base: &str, session: &str, title: &str, checks: &[&str]) -> String {
+async fn create_incident(base: &str, session: &str, title: &str, checks: &[String]) -> String {
     let res: Value = reqwest::Client::new()
         .post(format!("{base}/api/v1/admin/incidents"))
         .header(reqwest::header::COOKIE, session)
@@ -2629,13 +2723,17 @@ async fn deleting_an_incident_unlinks_its_alerts_instead_of_deleting_them() {
     let admin = reqwest::Client::new();
     let session = login(&base).await;
 
-    admin
+    let web: Value = admin
         .post(format!("{base}/api/v1/admin/checks"))
         .header(reqwest::header::COOKIE, &session)
         .json(&check_body("web", "https://web.test"))
         .send()
         .await
+        .unwrap()
+        .json()
+        .await
         .unwrap();
+    let web_id: CheckId = web["check"]["id"].as_str().unwrap().parse().unwrap();
     // An UP first, so the DOWN below is a *transition*: a check's first-ever
     // observation opens an incident but writes no alert, and this test is
     // about what happens to the alert.
@@ -2644,7 +2742,7 @@ async fn deleting_an_incident_unlinks_its_alerts_instead_of_deleting_them() {
             .post(format!("{base}/api/v1/results"))
             .bearer_auth(AGENT_TOKEN)
             .json(&json!({"results": [{
-                "check_id": "web",
+            "check_id": web_id,
                 "agent_id": "agent-test",
                 "timestamp": ts,
                 "latency_ms": 3,
@@ -2658,7 +2756,7 @@ async fn deleting_an_incident_unlinks_its_alerts_instead_of_deleting_them() {
     let opened = coord
         .incidents_for_test(100)
         .into_iter()
-        .find(|i| i.origin_check.as_deref() == Some("web"))
+        .find(|i| i.origin_check == Some(web_id))
         .expect("a confirmed DOWN opens an incident");
 
     admin
@@ -2678,7 +2776,7 @@ async fn deleting_an_incident_unlinks_its_alerts_instead_of_deleting_them() {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|a| a["node_id"] == "web")
+        .filter(|a| a["node_id"] == web_id.to_string())
         .collect();
     assert_eq!(mine.len(), 1, "the transition is still on the record");
     assert!(
@@ -2698,20 +2796,25 @@ async fn erasing_a_check_removes_everything_it_produced() {
     let admin = reqwest::Client::new();
     let session = login(&base).await;
 
+    let mut ids = std::collections::HashMap::new();
     for name in ["web", "api"] {
-        admin
+        let created: Value = admin
             .post(format!("{base}/api/v1/admin/checks"))
             .header(reqwest::header::COOKIE, &session)
             .json(&check_body(name, &format!("https://{name}.test")))
             .send()
             .await
+            .unwrap()
+            .json()
+            .await
             .unwrap();
+        ids.insert(name, created["check"]["id"].as_str().unwrap().to_string());
     }
     reqwest::Client::new()
         .post(format!("{base}/api/v1/results"))
         .bearer_auth(AGENT_TOKEN)
         .json(&json!({"results": [{
-            "check_id": "web",
+            "check_id": ids["web"],
             "agent_id": "agent-test",
             "timestamp": "2026-01-01T00:00:00Z",
             "latency_ms": 3,
@@ -2722,7 +2825,13 @@ async fn erasing_a_check_removes_everything_it_produced() {
         .unwrap();
     // An operator's incident about a different check, which `web` merely
     // appears on. It must outlive the erase.
-    let others = create_incident(&base, &session, "Datacentre work", &["api", "web"]).await;
+    let others = create_incident(
+        &base,
+        &session,
+        "Datacentre work",
+        &[ids["api"].clone(), ids["web"].clone()],
+    )
+    .await;
 
     let unknown = admin
         .delete(format!("{base}/api/v1/admin/checks/nope/everything"))
@@ -2733,14 +2842,17 @@ async fn erasing_a_check_removes_everything_it_produced() {
     assert_eq!(unknown.status(), 404);
 
     let res = admin
-        .delete(format!("{base}/api/v1/admin/checks/web/everything"))
+        .delete(format!(
+            "{base}/api/v1/admin/checks/{}/everything",
+            ids["web"]
+        ))
         .header(reqwest::header::COOKIE, &session)
         .send()
         .await
         .unwrap();
     assert_eq!(res.status(), 200);
     let body: Value = res.json().await.unwrap();
-    assert_eq!(body["deleted"], "web");
+    assert_eq!(body["deleted"], ids["web"]);
     assert_eq!(body["results"], 1);
     assert_eq!(body["incidents"], 1, "the incident web opened, and only it");
 
@@ -2769,7 +2881,7 @@ async fn erasing_a_check_removes_everything_it_produced() {
         coord
             .incidents_for_test(100)
             .into_iter()
-            .all(|i| i.origin_check.as_deref() != Some("web")),
+            .all(|i| i.origin_check != Some(cid("web"))),
         "every incident web opened is gone"
     );
     let surviving = public_incident_ids(&base).await;
@@ -2778,11 +2890,14 @@ async fn erasing_a_check_removes_everything_it_produced() {
         "an incident another check owns is not the erased check's to delete"
     );
 
-    let history: Value = reqwest::get(format!("{base}/api/v1/checks/web/history?limit=5"))
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let history: Value = reqwest::get(format!(
+        "{base}/api/v1/checks/{}/history?limit=5",
+        ids["web"]
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
     assert!(history["history"].as_array().unwrap().is_empty());
 }

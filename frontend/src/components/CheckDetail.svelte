@@ -191,7 +191,7 @@
 <div class="detail-head">
   <button class="link" onclick={onback}>← Back</button>
   <div class="title-line">
-    <h2 class="mono">{checkId}</h2>
+    <h2 class="mono">{check?.name ?? checkId}</h2>
     {#if check?.type}<span class="kind-pill">{check.type}</span>{/if}
     {#if check}
       <span class="status-chip" style="color:{statusColor(check.status)}">

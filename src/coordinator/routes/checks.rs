@@ -10,10 +10,12 @@
 //! itself: it is about what makes a submitted document fit to save, the same
 //! job `validate` does immediately after.
 //!
-//! **Renaming is refused, not merged.** `update_check_handler` rejects a body
-//! whose name disagrees with the path, because the name is the identity a
-//! check's history, alerts, and incidents are all keyed on — silently
-//! adopting a new one would orphan all three.
+//! **Identity is the path id, never the body.** `update_check_handler` always
+//! overwrites `body.id` with the path parameter, so a client cannot move an
+//! edit onto a different check by sending a different id. `name` is a mutable
+//! display value — not identity — so renaming through the same PUT is exactly
+//! what this allows; history, alerts and incidents are keyed on the immutable
+//! id and are unaffected by it.
 //!
 //! **Erasing is a different action from deleting.**
 //! `purge_check_everything_handler` removes a check's definition and every
@@ -26,18 +28,45 @@
 use super::super::{
     error_response, internal_error, storage, Coordinator, DeletedResponse, WsEvent,
 };
-use super::session::require_admin;
+use super::session::{bearer, require_admin};
 use crate::config::CheckConfig;
-use crate::models::CheckResult;
+use crate::models::{CheckId, CheckResult};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tracing::info;
 
 /// Trim the strings a form submits and drop the blanks, so an untouched field
 /// means "unset" rather than a group literally named "" or an agent id of "".
+fn is_peer_request(coord: &Coordinator, headers: &HeaderMap) -> bool {
+    use subtle::ConstantTimeEq;
+    let Some(got) = bearer(headers) else {
+        return false;
+    };
+    [
+        coord.inner.peer_token.as_deref(),
+        coord.inner.admin_trust_token.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|expected| bool::from(got.as_bytes().ct_eq(expected.as_bytes())))
+}
+
+/// Parse a path id after auth has already been checked, never before.
+/// `Path<CheckId>` would reject a non-UUID id at extraction time — before the
+/// handler body, and so before `require_admin` ever runs — which would let
+/// an anonymous caller learn "that wasn't even a valid id" (400) instead of
+/// the uniform "authentication required" (401) every other admin route gives
+/// them. Taking the id as a plain `String` and parsing it here keeps auth the
+/// first thing every admin-gated handler decides.
+fn parse_check_id(id: &str) -> Result<CheckId, Box<Response>> {
+    id.parse()
+        .map_err(|_| Box::new(error_response(StatusCode::NOT_FOUND, "no such check")))
+}
+
 fn normalise(mut c: CheckConfig) -> CheckConfig {
     let blank_to_none = |s: Option<String>| s.filter(|v: &String| !v.trim().is_empty());
     c.name = c.name.trim().to_string();
@@ -79,6 +108,15 @@ fn normalise(mut c: CheckConfig) -> CheckConfig {
 /// setting on save.
 ///
 /// It carries the target, so it must only ever be produced behind authentication.
+fn submitted_check(body: Value, new_default: bool) -> Result<CheckConfig, String> {
+    let has_failure_threshold = body.get("failures_before_down").is_some();
+    let mut check: CheckConfig = serde_json::from_value(body).map_err(|e| e.to_string())?;
+    if new_default && !has_failure_threshold {
+        check.failures_before_down = crate::config::NEW_CHECK_FAILURES_BEFORE_DOWN;
+    }
+    Ok(check)
+}
+
 #[derive(Serialize)]
 struct AdminChecksResponse {
     checks: Vec<CheckConfig>,
@@ -105,12 +143,22 @@ pub(in crate::coordinator) async fn list_checks_handler(
 pub(in crate::coordinator) async fn create_check_handler(
     State(coord): State<Coordinator>,
     headers: HeaderMap,
-    Json(body): Json<CheckConfig>,
+    Json(body): Json<Value>,
 ) -> Response {
     if let Some(denied) = require_admin(&coord, &headers) {
         return denied;
     }
-    let mut check = normalise(body);
+    let trusted_global = is_peer_request(&coord, &headers);
+    let mut check = match submitted_check(body, !trusted_global) {
+        Ok(check) => normalise(check),
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+    // Browser callers never choose identity. The global coordinator uses the
+    // cluster credential and has already minted exactly one UUIDv7 before its
+    // regional fan-out, so each region persists that same identity.
+    if !trusted_global {
+        check.id = crate::models::new_check_id();
+    }
     if let Err(reason) = check.validate() {
         return error_response(StatusCode::BAD_REQUEST, &reason);
     }
@@ -138,46 +186,75 @@ pub(in crate::coordinator) async fn create_check_handler(
 
 pub(in crate::coordinator) async fn update_check_handler(
     State(coord): State<Coordinator>,
-    Path(name): Path<String>,
+    Path(id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<CheckConfig>,
+    Json(body): Json<Value>,
 ) -> Response {
     if let Some(denied) = require_admin(&coord, &headers) {
         return denied;
     }
-    let check = normalise(body);
-    // The name is the identity. Renaming via PUT would orphan the check's
-    // history, so the path wins and a mismatched body is a mistake worth saying.
-    if check.name != name {
-        return error_response(StatusCode::BAD_REQUEST, "a check cannot be renamed");
-    }
+    let id = match parse_check_id(&id) {
+        Ok(id) => id,
+        Err(denied) => return *denied,
+    };
+    let mut check = match submitted_check(body, false) {
+        Ok(check) => normalise(check),
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+    // The id is the identity, never the body's. A client cannot move an edit
+    // onto a different check by sending a different id than the path names,
+    // and a rename is exactly what this allows: `name` is a mutable display
+    // value, so changing it here is not "a different check", unlike a
+    // mismatched id would be.
+    check.id = id;
     if let Err(reason) = check.validate() {
         return error_response(StatusCode::BAD_REQUEST, &reason);
+    }
+    {
+        let store = coord.inner.storage.lock();
+        let existing = match store.list_checks() {
+            Ok(existing) => existing,
+            Err(e) => return internal_error(e),
+        };
+        if !existing.iter().any(|c| c.id == id) {
+            return error_response(StatusCode::NOT_FOUND, "no such check");
+        }
+        if existing.iter().any(|c| c.id != id && c.name == check.name) {
+            return error_response(
+                StatusCode::CONFLICT,
+                &format!("a check named \"{}\" already exists", check.name),
+            );
+        }
     }
     coord.save_check(check)
 }
 
 pub(in crate::coordinator) async fn delete_check_handler(
     State(coord): State<Coordinator>,
-    Path(name): Path<String>,
+    Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
     if let Some(denied) = require_admin(&coord, &headers) {
         return denied;
     }
+    let id = match parse_check_id(&id) {
+        Ok(id) => id,
+        Err(denied) => return *denied,
+    };
     // A tombstone, not a bare row delete: see `Storage::apply_config_entry`
     // on why an absence alone is not enough for a peer to tell "deleted"
     // apart from "never heard of it".
-    if !coord.inner.checks.read().contains_key(&name) {
+    if !coord.inner.checks.read().contains_key(&id) {
         return error_response(StatusCode::NOT_FOUND, "no such check");
     }
-    let entry = match coord.write_config(storage::ConfigKind::Check, &name, None) {
+    let id_str = id.to_string();
+    let entry = match coord.write_config(storage::ConfigKind::Check, &id_str, None) {
         Ok(e) => e,
         Err(e) => return internal_error(e),
     };
     coord.replicate_config(vec![entry]);
-    info!(check = %name, "check deleted");
-    Json(DeletedResponse { deleted: name }).into_response()
+    info!(check = %id, "check deleted");
+    Json(DeletedResponse { deleted: id_str }).into_response()
 }
 
 // ---- Script try-it ----
@@ -235,7 +312,7 @@ pub(in crate::coordinator) async fn eval_test_handler(
 
 #[derive(Deserialize)]
 pub(in crate::coordinator) struct CheckOrderRequest {
-    order: Vec<String>,
+    order: Vec<CheckId>,
 }
 
 pub(in crate::coordinator) async fn reorder_checks_handler(
@@ -246,12 +323,12 @@ pub(in crate::coordinator) async fn reorder_checks_handler(
     if let Some(denied) = require_admin(&coord, &headers) {
         return denied;
     }
-    let before_pos: std::collections::HashMap<String, i32> = coord
+    let before_pos: std::collections::HashMap<CheckId, i32> = coord
         .inner
         .checks
         .read()
         .iter()
-        .map(|(name, m)| (name.clone(), m.position))
+        .map(|(id, m)| (*id, m.position))
         .collect();
     if let Err(e) = coord
         .inner
@@ -269,24 +346,28 @@ pub(in crate::coordinator) async fn reorder_checks_handler(
     // the ones the reorder rewrote are the ones a peer needs to hear about,
     // not the whole table.
     for c in &checks {
-        if before_pos.get(&c.name) != Some(&c.position) {
-            coord.restamp_and_push(storage::ConfigKind::Check, &c.name);
+        if before_pos.get(&c.id) != Some(&c.position) {
+            coord.restamp_and_push(storage::ConfigKind::Check, &c.id.to_string());
         }
     }
     Json(AdminChecksResponse { checks }).into_response()
 }
 
-/// Record a heartbeat ping. The URL is the credential, so a wrong name is a
-/// plain 404 rather than an error that confirms which names exist.
+/// Record a heartbeat ping. The immutable UUID keeps this URL stable when the
+/// operator renames the check; an unknown id — including one that was never
+/// even a valid UUID — remains a plain 404, not a hint that it was malformed.
 pub(in crate::coordinator) async fn heartbeat_handler(
     State(coord): State<Coordinator>,
-    Path(name): Path<String>,
+    Path(check_id): Path<String>,
 ) -> Response {
+    let Ok(check_id) = check_id.parse::<CheckId>() else {
+        return error_response(StatusCode::NOT_FOUND, "no such heartbeat");
+    };
     let is_heartbeat = coord
         .inner
         .checks
         .read()
-        .get(&name)
+        .get(&check_id)
         .is_some_and(|m| m.kind == crate::models::CheckKind::Heartbeat);
     if !is_heartbeat {
         return error_response(StatusCode::NOT_FOUND, "no such heartbeat");
@@ -295,7 +376,7 @@ pub(in crate::coordinator) async fn heartbeat_handler(
         .ingest(vec![CheckResult {
             zone: crate::config::UNKNOWN_LOCATION.into(),
             region: crate::config::UNKNOWN_LOCATION.into(),
-            check_id: name.clone(),
+            check_id,
             agent_id: crate::models::HEARTBEAT_AGENT.into(),
             kind: crate::models::CheckKind::Heartbeat,
             timestamp: chrono::Utc::now(),
@@ -323,44 +404,48 @@ pub(in crate::coordinator) async fn heartbeat_handler(
 /// its own tombstone for the same reason.
 pub(in crate::coordinator) async fn purge_check_everything_handler(
     State(coord): State<Coordinator>,
-    Path(name): Path<String>,
+    Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
     if let Some(denied) = require_admin(&coord, &headers) {
         return denied;
     }
-    if !coord.inner.checks.read().contains_key(&name) {
+    let id = match parse_check_id(&id) {
+        Ok(id) => id,
+        Err(denied) => return *denied,
+    };
+    if !coord.inner.checks.read().contains_key(&id) {
         return error_response(StatusCode::NOT_FOUND, "no such check");
     }
     let now = chrono::Utc::now().timestamp_millis();
     let node_id = coord.inner.node_id.clone();
     let summary = {
         let store = coord.inner.storage.lock();
-        match store.purge_check_everything(&name, now, &node_id) {
+        match store.purge_check_everything(id, now, &node_id) {
             Ok(s) => s,
             Err(e) => return internal_error(e),
         }
     };
-    let entry = match coord.write_config(storage::ConfigKind::Check, &name, None) {
+    let id_str = id.to_string();
+    let entry = match coord.write_config(storage::ConfigKind::Check, &id_str, None) {
         Ok(e) => e,
         Err(e) => return internal_error(e),
     };
     coord.replicate_config(vec![entry]);
     coord.replicate_incident_deletions(summary.deleted_incidents.clone());
-    for id in &summary.deleted_incidents {
-        let _ = coord
-            .inner
-            .events
-            .send(WsEvent::IncidentDeleted { id: id.clone() });
+    for incident_id in &summary.deleted_incidents {
+        let _ = coord.inner.events.send(WsEvent::IncidentDeleted {
+            id: incident_id.clone(),
+        });
     }
     info!(
-        check = %name,
+        check = %id,
         results = summary.results,
         incidents = summary.incidents,
         "check erased"
     );
     Json(ErasedResponse {
-        deleted: name,
+        deleted: id_str,
         results: summary.results,
         incidents: summary.incidents,
     })
@@ -379,15 +464,19 @@ struct ErasedResponse {
 /// are different intentions and a single button would conflate them.
 pub(in crate::coordinator) async fn purge_check_data_handler(
     State(coord): State<Coordinator>,
-    Path(name): Path<String>,
+    Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
     if let Some(denied) = require_admin(&coord, &headers) {
         return denied;
     }
-    match coord.inner.storage.lock().purge_check_data(&name) {
+    let id = match parse_check_id(&id) {
+        Ok(id) => id,
+        Err(denied) => return *denied,
+    };
+    match coord.inner.storage.lock().purge_check_data(id) {
         Ok(rows) => {
-            info!(check = %name, rows, "purged check history");
+            info!(check = %id, rows, "purged check history");
             Json(PurgedResponse { purged: rows }).into_response()
         }
         Err(e) => internal_error(e),

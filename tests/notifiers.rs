@@ -20,9 +20,10 @@ use axum::{extract::State, Json, Router};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 
+use uuid::Uuid;
 use warden::config::{CheckConfig, CoordinatorConfig};
 use warden::coordinator::Coordinator;
-use warden::models::{CheckKind, CheckResult};
+use warden::models::{CheckId, CheckKind, CheckResult};
 
 const PASSWORD: &str = "correct horse battery staple";
 const LOUD: &str = "payments-api";
@@ -80,8 +81,13 @@ fn coordinator() -> Coordinator {
     coordinator_at(":memory:")
 }
 
+fn cid(name: &str) -> CheckId {
+    Uuid::new_v5(&Uuid::NAMESPACE_DNS, name.as_bytes())
+}
+
 fn coordinator_at(db_path: &str) -> Coordinator {
     let check = |name: &str, notify: bool, notifiers: &[&str]| CheckConfig {
+        id: cid(name),
         name: name.into(),
         kind: CheckKind::Http,
         target: "https://example.invalid".into(),
@@ -91,21 +97,22 @@ fn coordinator_at(db_path: &str) -> Coordinator {
         notifiers: notifiers.iter().map(|s| (*s).to_string()).collect(),
         ..Default::default()
     };
-    Coordinator::new(
-        &CoordinatorConfig {
-            listen: "127.0.0.1:0".into(),
-            db_path: db_path.into(),
-            admin_password: Some(PASSWORD.into()),
-            ..Default::default()
-        },
-        &[
-            check(LOUD, true, &[]),
-            check(QUIET, false, &[]),
-            check(TO_A, true, &["team-a"]),
-            check(TO_B, true, &["team-b"]),
-        ],
-    )
-    .unwrap()
+    let coord = Coordinator::new(&CoordinatorConfig {
+        listen: "127.0.0.1:0".into(),
+        db_path: db_path.into(),
+        admin_password: Some(PASSWORD.into()),
+        ..Default::default()
+    })
+    .unwrap();
+    for check in [
+        check(LOUD, true, &[]),
+        check(QUIET, false, &[]),
+        check(TO_A, true, &["team-a"]),
+        check(TO_B, true, &["team-b"]),
+    ] {
+        coord.create_check_for_test(check);
+    }
+    coord
 }
 
 /// An endpoint that fails its first `fail_first` requests and accepts the rest,
@@ -179,7 +186,7 @@ fn webhook(name: &str, addr: SocketAddr, default: bool) -> Value {
 
 fn result(check: &str, status_code: u16, ts_millis: i64) -> CheckResult {
     CheckResult {
-        check_id: check.into(),
+        check_id: cid(check),
         agent_id: "agent-test".into(),
         zone: "z".into(),
         region: "r".into(),
@@ -277,7 +284,7 @@ async fn a_notifier_added_at_runtime_pages_without_a_restart() {
     let got = sink.lock().clone();
     let states: Vec<&str> = got.iter().map(|g| g["to"].as_str().unwrap()).collect();
     assert_eq!(states, ["up", "down"], "{got:?}");
-    assert!(got.iter().all(|g| g["check_id"] == LOUD));
+    assert!(got.iter().all(|g| g["name"] == LOUD));
 }
 
 /// "Some checks are just checks." The incident is still real; nobody is woken.
@@ -301,14 +308,17 @@ async fn a_check_with_notify_off_records_its_outage_without_paging() {
     );
     // But it is still an outage everywhere else in the product.
     assert!(
-        coord.alerts_for_test(10).iter().any(|a| a.node_id == QUIET),
+        coord
+            .alerts_for_test(10)
+            .iter()
+            .any(|a| a.node_id == cid(QUIET).to_string()),
         "the alert row is still written"
     );
     assert!(
         coord
             .incidents_for_test(10)
             .iter()
-            .any(|i| i.checks.iter().any(|c| c.check_id == QUIET)),
+            .any(|i| i.checks.iter().any(|c| c.check_id == cid(QUIET))),
         "the incident is still opened"
     );
 
@@ -355,8 +365,8 @@ async fn a_test_send_reports_a_refusal_instead_of_claiming_success() {
     assert_eq!(good["delivered"], true, "{good}");
     assert_eq!(sink.lock().len(), 1, "the test actually sent something");
     assert_eq!(
-        sink.lock()[0]["check_id"],
-        "warden-test",
+        sink.lock()[0]["name"],
+        "Warden test",
         "and it is recognisable as a test"
     );
 
@@ -512,7 +522,7 @@ async fn checks_reach_the_notifier_they_name_and_nothing_else() {
     let names = |s: &Sink| {
         s.lock()
             .iter()
-            .map(|v| v["check_id"].as_str().unwrap().to_string())
+            .map(|v| v["name"].as_str().unwrap().to_string())
             .collect::<Vec<_>>()
     };
     assert_eq!(names(&a), [TO_A], "team-a hears only its own check");
@@ -747,7 +757,7 @@ async fn a_notification_that_fails_is_queued_and_retried_until_it_lands() {
 
     let queued = undelivered(&base, &session).await;
     assert_eq!(queued.len(), 1, "the refusal is queued: {queued:?}");
-    assert_eq!(queued[0]["check_id"], LOUD);
+    assert_eq!(queued[0]["name"], LOUD);
     assert_eq!(queued[0]["notifier"], "oncall");
     assert_eq!(queued[0]["to"], "down");
     assert_eq!(queued[0]["attempts"], 1);
@@ -767,7 +777,7 @@ async fn a_notification_that_fails_is_queued_and_retried_until_it_lands() {
     assert_eq!(coord.retry_due(now + 60_000).await, 1);
     assert_eq!(*hits.lock(), 2);
     assert_eq!(sink.lock().len(), 1, "the alert finally reached the sink");
-    assert_eq!(sink.lock()[0]["check_id"], LOUD);
+    assert_eq!(sink.lock()[0]["name"], LOUD);
     assert!(
         undelivered(&base, &session).await.is_empty(),
         "delivered means gone: there is no 'sent' row to accumulate"
@@ -820,7 +830,7 @@ async fn a_queued_notification_outlives_a_restart_and_follows_the_edited_notifie
     let now = chrono::Utc::now().timestamp_millis();
     assert_eq!(coord.retry_due(now + 60_000).await, 1);
     assert_eq!(*hits.lock(), 1);
-    assert_eq!(sink.lock()[0]["check_id"], LOUD);
+    assert_eq!(sink.lock()[0]["name"], LOUD);
     assert!(undelivered(&base, &session).await.is_empty());
 
     std::fs::remove_file(&path).ok();
@@ -885,7 +895,7 @@ fn window(title: &str, starts_at: i64, ends_at: i64, checks: &[&str], announce: 
         "title": title,
         "starts_at": starts_at,
         "ends_at": ends_at,
-        "checks": checks,
+        "checks": checks.iter().map(|check| cid(check)).collect::<Vec<_>>(),
         "announce": announce,
     })
 }
@@ -942,14 +952,17 @@ async fn a_maintenance_window_suppresses_the_page_without_hiding_the_outage() {
         sink.lock().clone()
     );
     assert!(
-        coord.alerts_for_test(10).iter().any(|a| a.node_id == LOUD),
+        coord
+            .alerts_for_test(10)
+            .iter()
+            .any(|a| a.node_id == cid(LOUD).to_string()),
         "the alert row is still written"
     );
     assert!(
         coord
             .incidents_for_test(10)
             .iter()
-            .any(|i| i.checks.iter().any(|c| c.check_id == LOUD)),
+            .any(|i| i.checks.iter().any(|c| c.check_id == cid(LOUD))),
         "the incident is still opened"
     );
 
