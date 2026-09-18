@@ -77,15 +77,15 @@ async fn refusing_sink() -> SocketAddr {
 /// Four checks: one on the default route, one muted, and two routed to a
 /// notifier by name — which is the shape "some to A, some to B, some to a
 /// default" needs to be testable at all.
-fn coordinator() -> Coordinator {
-    coordinator_at(":memory:")
+async fn coordinator() -> Coordinator {
+    coordinator_at(":memory:").await
 }
 
 fn cid(name: &str) -> CheckId {
     Uuid::new_v5(&Uuid::NAMESPACE_DNS, name.as_bytes())
 }
 
-fn coordinator_at(db_path: &str) -> Coordinator {
+async fn coordinator_at(db_path: &str) -> Coordinator {
     let check = |name: &str, notify: bool, notifiers: &[&str]| CheckConfig {
         id: cid(name),
         name: name.into(),
@@ -103,6 +103,7 @@ fn coordinator_at(db_path: &str) -> Coordinator {
         admin_password: Some(PASSWORD.into()),
         ..Default::default()
     })
+    .await
     .unwrap();
     for check in [
         check(LOUD, true, &[]),
@@ -110,7 +111,7 @@ fn coordinator_at(db_path: &str) -> Coordinator {
         check(TO_A, true, &["team-a"]),
         check(TO_B, true, &["team-b"]),
     ] {
-        coord.create_check_for_test(check);
+        coord.create_check_for_test(check).await;
     }
     coord
 }
@@ -148,15 +149,9 @@ async fn flaky_sink(fail_first: usize) -> (Sink, Arc<Mutex<usize>>, SocketAddr) 
 
 /// Reopen the store the way `agent_health.rs` does: DuckDB is single-writer, so
 /// the dropped coordinator's file lock may outlive the drop by a moment.
-fn reopen(db_path: &str) -> Coordinator {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        match std::panic::catch_unwind(|| coordinator_at(db_path)) {
-            Ok(coord) => return coord,
-            Err(e) if std::time::Instant::now() >= deadline => std::panic::resume_unwind(e),
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
-        }
-    }
+async fn reopen(db_path: &str) -> Coordinator {
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    coordinator_at(db_path).await
 }
 
 async fn undelivered(base: &str, session: &str) -> Vec<Value> {
@@ -250,7 +245,7 @@ async fn put_notifiers(base: &str, session: &str, notifiers: Value) -> (u16, Val
 #[tokio::test]
 async fn a_notifier_added_at_runtime_pages_without_a_restart() {
     let (sink, sink_addr) = alert_sink().await;
-    let coord = coordinator();
+    let coord = coordinator().await;
     let addr = serve(coord.clone().router()).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
@@ -260,7 +255,7 @@ async fn a_notifier_added_at_runtime_pages_without_a_restart() {
     settle().await;
     assert!(sink.lock().is_empty(), "no notifier, no notification");
     assert!(
-        !coord.alerts_for_test(10).is_empty(),
+        !coord.alerts_for_test(10).await.is_empty(),
         "the alert itself is still recorded"
     );
 
@@ -291,7 +286,7 @@ async fn a_notifier_added_at_runtime_pages_without_a_restart() {
 #[tokio::test]
 async fn a_check_with_notify_off_records_its_outage_without_paging() {
     let (sink, sink_addr) = alert_sink().await;
-    let coord = coordinator();
+    let coord = coordinator().await;
     let addr = serve(coord.clone().router()).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
@@ -310,6 +305,7 @@ async fn a_check_with_notify_off_records_its_outage_without_paging() {
     assert!(
         coord
             .alerts_for_test(10)
+            .await
             .iter()
             .any(|a| a.node_id == cid(QUIET).to_string()),
         "the alert row is still written"
@@ -317,6 +313,7 @@ async fn a_check_with_notify_off_records_its_outage_without_paging() {
     assert!(
         coord
             .incidents_for_test(10)
+            .await
             .iter()
             .any(|i| i.checks.iter().any(|c| c.check_id == cid(QUIET))),
         "the incident is still opened"
@@ -334,7 +331,7 @@ async fn a_check_with_notify_off_records_its_outage_without_paging() {
 async fn a_test_send_reports_a_refusal_instead_of_claiming_success() {
     let refusing = refusing_sink().await;
     let (sink, working) = alert_sink().await;
-    let addr = serve(coordinator().router()).await;
+    let addr = serve(coordinator().await.router()).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
 
@@ -383,7 +380,7 @@ async fn a_test_send_reports_a_refusal_instead_of_claiming_success() {
 
 #[tokio::test]
 async fn the_notifier_list_is_admin_only() {
-    let addr = serve(coordinator().router()).await;
+    let addr = serve(coordinator().await.router()).await;
     let base = format!("http://{addr}");
     let anon = reqwest::Client::new();
     let body = json!({ "notifiers": [{ "name": "oncall", "type": "webhook", "url": "http://example.invalid/" }] });
@@ -421,7 +418,7 @@ async fn the_notifier_list_is_admin_only() {
 
 #[tokio::test]
 async fn a_notifier_that_cannot_work_is_refused() {
-    let addr = serve(coordinator().router()).await;
+    let addr = serve(coordinator().await.router()).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
 
@@ -464,7 +461,7 @@ async fn a_notifier_that_cannot_work_is_refused() {
 /// Whitespace in a URL is invisible in the form and fails at delivery time.
 #[tokio::test]
 async fn notifier_fields_are_trimmed_before_they_are_stored() {
-    let addr = serve(coordinator().router()).await;
+    let addr = serve(coordinator().await.router()).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
 
@@ -496,7 +493,7 @@ async fn checks_reach_the_notifier_they_name_and_nothing_else() {
     let (a, a_addr) = alert_sink().await;
     let (b, b_addr) = alert_sink().await;
     let (fallback, fallback_addr) = alert_sink().await;
-    let coord = coordinator();
+    let coord = coordinator().await;
     let addr = serve(coord.clone().router()).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
@@ -539,7 +536,7 @@ async fn checks_reach_the_notifier_they_name_and_nothing_else() {
 #[tokio::test]
 async fn checks_left_pointing_at_a_missing_notifier_are_reported() {
     let (_sink, sink_addr) = alert_sink().await;
-    let addr = serve(coordinator().router()).await;
+    let addr = serve(coordinator().await.router()).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
 
@@ -574,7 +571,7 @@ async fn checks_left_pointing_at_a_missing_notifier_are_reported() {
 #[tokio::test]
 async fn two_notifiers_cannot_share_a_name() {
     let (_sink, sink_addr) = alert_sink().await;
-    let addr = serve(coordinator().router()).await;
+    let addr = serve(coordinator().await.router()).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
 
@@ -654,7 +651,7 @@ async fn smtp_sink() -> (Arc<Mutex<Vec<String>>>, SocketAddr) {
 #[tokio::test]
 async fn an_email_notifier_delivers_over_smtp() {
     let (mailbox, smtp) = smtp_sink().await;
-    let coord = coordinator();
+    let coord = coordinator().await;
     let addr = serve(coord.clone().router()).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
@@ -700,7 +697,7 @@ async fn an_email_notifier_delivers_over_smtp() {
 #[tokio::test]
 async fn a_slack_notifier_sends_the_payload_slack_accepts() {
     let (sink, slack) = alert_sink().await;
-    let coord = coordinator();
+    let coord = coordinator().await;
     let addr = serve(coord.clone().router()).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
@@ -742,7 +739,7 @@ async fn a_slack_notifier_sends_the_payload_slack_accepts() {
 #[tokio::test]
 async fn a_notification_that_fails_is_queued_and_retried_until_it_lands() {
     let (sink, hits, flaky) = flaky_sink(1).await;
-    let coord = coordinator();
+    let coord = coordinator().await;
     let addr = serve(coord.clone().router()).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
@@ -799,7 +796,7 @@ async fn a_queued_notification_outlives_a_restart_and_follows_the_edited_notifie
     let (sink, hits, working) = flaky_sink(0).await;
 
     {
-        let coord = coordinator_at(&db);
+        let coord = coordinator_at(&db).await;
         let addr = serve(coord.clone().router()).await;
         let base = format!("http://{addr}");
         let session = login(&base).await;
@@ -815,7 +812,7 @@ async fn a_queued_notification_outlives_a_restart_and_follows_the_edited_notifie
         );
     }
 
-    let coord = reopen(&db);
+    let coord = reopen(&db).await;
     let addr = serve(coord.clone().router()).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
@@ -843,7 +840,7 @@ async fn a_queued_notification_outlives_a_restart_and_follows_the_edited_notifie
 #[tokio::test]
 async fn attempts_run_out_and_the_queue_records_that_nobody_was_paged() {
     let refusing = refusing_sink().await;
-    let coord = coordinator();
+    let coord = coordinator().await;
     let addr = serve(coord.clone().router()).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
@@ -929,7 +926,7 @@ async fn public_status(base: &str) -> Value {
 #[tokio::test]
 async fn a_maintenance_window_suppresses_the_page_without_hiding_the_outage() {
     let (sink, sink_addr) = alert_sink().await;
-    let coord = coordinator();
+    let coord = coordinator().await;
     let addr = serve(coord.clone().router()).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
@@ -954,6 +951,7 @@ async fn a_maintenance_window_suppresses_the_page_without_hiding_the_outage() {
     assert!(
         coord
             .alerts_for_test(10)
+            .await
             .iter()
             .any(|a| a.node_id == cid(LOUD).to_string()),
         "the alert row is still written"
@@ -961,6 +959,7 @@ async fn a_maintenance_window_suppresses_the_page_without_hiding_the_outage() {
     assert!(
         coord
             .incidents_for_test(10)
+            .await
             .iter()
             .any(|i| i.checks.iter().any(|c| c.check_id == cid(LOUD))),
         "the incident is still opened"
@@ -980,7 +979,7 @@ async fn a_maintenance_window_suppresses_the_page_without_hiding_the_outage() {
 #[tokio::test]
 async fn a_transition_outside_the_window_still_pages() {
     let (sink, sink_addr) = alert_sink().await;
-    let coord = coordinator();
+    let coord = coordinator().await;
     let addr = serve(coord.clone().router()).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
@@ -1006,7 +1005,7 @@ async fn a_transition_outside_the_window_still_pages() {
 /// visitors while it runs — and only while it runs.
 #[tokio::test]
 async fn an_announced_window_is_published_while_it_runs() {
-    let coord = coordinator();
+    let coord = coordinator().await;
     let addr = serve(coord.clone().router()).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
@@ -1041,7 +1040,7 @@ async fn an_announced_window_is_published_while_it_runs() {
 /// whole fleet with one PUT.
 #[tokio::test]
 async fn maintenance_windows_are_admin_only() {
-    let coord = coordinator();
+    let coord = coordinator().await;
     let addr = serve(coord.clone().router()).await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
@@ -1074,7 +1073,7 @@ async fn maintenance_windows_are_admin_only() {
 /// window that simply does not work.
 #[tokio::test]
 async fn a_window_that_ends_before_it_starts_is_refused() {
-    let coord = coordinator();
+    let coord = coordinator().await;
     let addr = serve(coord.clone().router()).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;

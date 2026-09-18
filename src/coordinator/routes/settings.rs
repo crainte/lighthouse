@@ -53,11 +53,9 @@ pub(in crate::coordinator) async fn agents_display_handler(
         return denied;
     }
     let now = chrono::Utc::now().timestamp_millis();
-    Json(AgentsDisplayResponse {
-        agents: coord.inner.status_agents.read().clone(),
-        fleet: fleet_members(&coord, now),
-    })
-    .into_response()
+    let agents = coord.inner.status_agents.read().clone();
+    let fleet = fleet_members(&coord, now).await;
+    Json(AgentsDisplayResponse { agents, fleet }).into_response()
 }
 
 /// Replace the fleet summary. Admin-only: it decides what an anonymous visitor
@@ -74,16 +72,14 @@ pub(in crate::coordinator) async fn update_agents_display_handler(
     if let Err(reason) = next.validate() {
         return error_response(StatusCode::BAD_REQUEST, &reason);
     }
-    if let Err(e) = coord.save_agents_display(next) {
+    if let Err(e) = coord.save_agents_display(next).await {
         return internal_error(e);
     }
     let now = chrono::Utc::now().timestamp_millis();
     info!("agent display settings saved");
-    Json(AgentsDisplayResponse {
-        agents: coord.inner.status_agents.read().clone(),
-        fleet: fleet_members(&coord, now),
-    })
-    .into_response()
+    let agents = coord.inner.status_agents.read().clone();
+    let fleet = fleet_members(&coord, now).await;
+    Json(AgentsDisplayResponse { agents, fleet }).into_response()
 }
 
 // ---- Notifiers ----
@@ -131,34 +127,48 @@ const UNDELIVERED_SHOWN: usize = 20;
 
 /// The saved list, the checks whose routing no longer resolves, and whatever
 /// could not be delivered.
-fn notifiers_response(coord: &Coordinator) -> Response {
+async fn notifiers_response(coord: &Coordinator) -> Response {
     let notifiers = coord.inner.notifiers.read().clone();
     let known: std::collections::HashSet<&str> =
         notifiers.iter().map(|n| n.name.as_str()).collect();
-    let checks = coord.inner.checks.read();
-    let mut unrouted: Vec<String> = checks
+    let checks: std::collections::HashMap<_, _> = coord
+        .inner
+        .checks
+        .read()
         .iter()
-        .filter(|(_, m)| {
-            m.enabled
-                && m.notify
-                && !m.notifiers.is_empty()
-                && !m.notifiers.iter().any(|n| known.contains(n.as_str()))
+        .map(|(id, meta)| {
+            (
+                *id,
+                (
+                    meta.name.clone(),
+                    meta.enabled,
+                    meta.notify,
+                    meta.notifiers.clone(),
+                ),
+            )
         })
-        .map(|(_, m)| m.name.clone())
+        .collect();
+    let mut unrouted: Vec<String> = checks
+        .values()
+        .filter(|(_, enabled, notify, routed)| {
+            *enabled
+                && *notify
+                && !routed.is_empty()
+                && !routed.iter().any(|n| known.contains(n.as_str()))
+        })
+        .map(|(name, _, _, _)| name.clone())
         .collect();
     unrouted.sort();
     let undelivered = coord
-        .inner
-        .storage
-        .lock()
-        .undelivered_notifications(UNDELIVERED_SHOWN)
+        .db(|storage| storage.undelivered_notifications(UNDELIVERED_SHOWN))
+        .await
         .unwrap_or_default()
         .into_iter()
         .map(|q| UndeliveredDto {
             notifier: q.notifier,
             name: checks
                 .get(&q.check_id)
-                .map_or_else(|| q.check_id.to_string(), |m| m.name.clone()),
+                .map_or_else(|| q.check_id.to_string(), |m| m.0.clone()),
             check_id: q.check_id,
             to: q.current_state.as_str(),
             attempts: q.attempts,
@@ -185,7 +195,7 @@ pub(in crate::coordinator) async fn notifiers_handler(
     if let Some(denied) = require_admin(&coord, &headers) {
         return denied;
     }
-    notifiers_response(&coord)
+    notifiers_response(&coord).await
 }
 
 /// Replace the whole list. The list is small and always edited as a whole in
@@ -221,14 +231,14 @@ pub(in crate::coordinator) async fn update_notifiers_handler(
             );
         }
     }
-    if let Err(e) = coord.save_notifiers(next) {
+    if let Err(e) = coord.save_notifiers(next).await {
         return internal_error(e);
     }
     info!(
         count = coord.inner.notifiers.read().len(),
         "notifiers saved"
     );
-    notifiers_response(&coord)
+    notifiers_response(&coord).await
 }
 
 // ---- Maintenance windows ----
@@ -335,7 +345,7 @@ pub(in crate::coordinator) async fn update_maintenance_handler(
             return error_response(StatusCode::BAD_REQUEST, &reason);
         }
     }
-    if let Err(e) = coord.save_maintenance(next) {
+    if let Err(e) = coord.save_maintenance(next).await {
         return internal_error(e);
     }
     info!(

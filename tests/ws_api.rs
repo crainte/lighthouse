@@ -70,15 +70,19 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
         db_path: ":memory:".into(),
         ..Default::default()
     })
+    .await
     .unwrap();
-    coord.create_check_for_test(CheckConfig {
-        id: cid("test-check"),
-        name: "test-check".into(),
-        target: "https://test-check.invalid".into(),
-        ..Default::default()
-    });
+    coord
+        .create_check_for_test(CheckConfig {
+            id: cid("test-check"),
+            name: "test-check".into(),
+            target: "https://test-check.invalid".into(),
+            ..Default::default()
+        })
+        .await;
     coord
         .provision_agent_credential(AGENT_TOKEN, "ws-zone", "ws-region")
+        .await
         .unwrap();
     let addr = spawn_server(coord);
 

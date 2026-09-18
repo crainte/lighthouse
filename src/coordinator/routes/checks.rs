@@ -134,7 +134,7 @@ pub(in crate::coordinator) async fn list_checks_handler(
     if let Some(denied) = require_admin(&coord, &headers) {
         return denied;
     }
-    match coord.inner.storage.lock().list_checks() {
+    match coord.db(|storage| storage.list_checks()).await {
         Ok(checks) => Json(AdminChecksResponse { checks }).into_response(),
         Err(e) => internal_error(e),
     }
@@ -163,9 +163,11 @@ pub(in crate::coordinator) async fn create_check_handler(
         return error_response(StatusCode::BAD_REQUEST, &reason);
     }
     {
-        let store = coord.inner.storage.lock();
-        let existing = match store.list_checks() {
-            Ok(existing) => existing,
+        let (existing, position) = match coord
+            .db(|storage| Ok((storage.list_checks()?, storage.next_check_position()?)))
+            .await
+        {
+            Ok(value) => value,
             Err(e) => return internal_error(e),
         };
         if existing.iter().any(|c| c.name == check.name) {
@@ -176,12 +178,9 @@ pub(in crate::coordinator) async fn create_check_handler(
         }
         // Land at the end rather than at 0, so adding a check never silently
         // reshuffles the status page.
-        match store.next_check_position() {
-            Ok(p) => check.position = p,
-            Err(e) => return internal_error(e),
-        }
+        check.position = position;
     }
-    coord.save_check(check)
+    coord.save_check(check).await
 }
 
 pub(in crate::coordinator) async fn update_check_handler(
@@ -211,8 +210,7 @@ pub(in crate::coordinator) async fn update_check_handler(
         return error_response(StatusCode::BAD_REQUEST, &reason);
     }
     {
-        let store = coord.inner.storage.lock();
-        let existing = match store.list_checks() {
+        let existing = match coord.db(|storage| storage.list_checks()).await {
             Ok(existing) => existing,
             Err(e) => return internal_error(e),
         };
@@ -226,7 +224,7 @@ pub(in crate::coordinator) async fn update_check_handler(
             );
         }
     }
-    coord.save_check(check)
+    coord.save_check(check).await
 }
 
 pub(in crate::coordinator) async fn delete_check_handler(
@@ -248,7 +246,10 @@ pub(in crate::coordinator) async fn delete_check_handler(
         return error_response(StatusCode::NOT_FOUND, "no such check");
     }
     let id_str = id.to_string();
-    let entry = match coord.write_config(storage::ConfigKind::Check, &id_str, None) {
+    let entry = match coord
+        .write_config(storage::ConfigKind::Check, &id_str, None)
+        .await
+    {
         Ok(e) => e,
         Err(e) => return internal_error(e),
     };
@@ -330,15 +331,14 @@ pub(in crate::coordinator) async fn reorder_checks_handler(
         .iter()
         .map(|(id, m)| (*id, m.position))
         .collect();
+    let order = body.order;
     if let Err(e) = coord
-        .inner
-        .storage
-        .lock()
-        .reorder_checks(&body.order, chrono::Utc::now().timestamp_millis())
+        .db(move |storage| storage.reorder_checks(&order, chrono::Utc::now().timestamp_millis()))
+        .await
     {
         return internal_error(e);
     }
-    let checks = match coord.reload_checks() {
+    let checks = match coord.reload_checks().await {
         Ok(checks) => checks,
         Err(e) => return internal_error(e),
     };
@@ -347,7 +347,9 @@ pub(in crate::coordinator) async fn reorder_checks_handler(
     // not the whole table.
     for c in &checks {
         if before_pos.get(&c.id) != Some(&c.position) {
-            coord.restamp_and_push(storage::ConfigKind::Check, &c.id.to_string());
+            coord
+                .restamp_and_push(storage::ConfigKind::Check, &c.id.to_string())
+                .await;
         }
     }
     Json(AdminChecksResponse { checks }).into_response()
@@ -419,15 +421,18 @@ pub(in crate::coordinator) async fn purge_check_everything_handler(
     }
     let now = chrono::Utc::now().timestamp_millis();
     let node_id = coord.inner.node_id.clone();
-    let summary = {
-        let store = coord.inner.storage.lock();
-        match store.purge_check_everything(id, now, &node_id) {
-            Ok(s) => s,
-            Err(e) => return internal_error(e),
-        }
+    let summary = match coord
+        .db(move |storage| storage.purge_check_everything(id, now, &node_id))
+        .await
+    {
+        Ok(summary) => summary,
+        Err(e) => return internal_error(e),
     };
     let id_str = id.to_string();
-    let entry = match coord.write_config(storage::ConfigKind::Check, &id_str, None) {
+    let entry = match coord
+        .write_config(storage::ConfigKind::Check, &id_str, None)
+        .await
+    {
         Ok(e) => e,
         Err(e) => return internal_error(e),
     };
@@ -474,7 +479,7 @@ pub(in crate::coordinator) async fn purge_check_data_handler(
         Ok(id) => id,
         Err(denied) => return *denied,
     };
-    match coord.inner.storage.lock().purge_check_data(id) {
+    match coord.db(move |storage| storage.purge_check_data(id)).await {
         Ok(rows) => {
             info!(check = %id, rows, "purged check history");
             Json(PurgedResponse { purged: rows }).into_response()

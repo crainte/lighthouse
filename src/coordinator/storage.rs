@@ -9,9 +9,10 @@ use sha2::{Digest as ShaDigest, Sha256};
 use std::collections::BTreeMap;
 
 /// DuckDB-backed store for check results and materialized current state.
-/// Single connection guarded by the caller; DuckDB is single-writer.
+/// The dedicated database worker exclusively owns this single DuckDB connection.
 pub struct Storage {
     conn: Connection,
+    incident_node_id: parking_lot::RwLock<String>,
 }
 
 /// One row of check history. Multiple agents probe the same check, so rows are
@@ -113,6 +114,16 @@ pub struct AgentCheckStateRow {
     pub region: String,
     pub status: Status,
     pub consecutive_failures: u32,
+    pub last_check: i64,
+}
+
+/// What the coordinator publishes for one check after a rollup: the state,
+/// any hold-down timer in flight, and when it was last observed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PublishedStateRow {
+    pub check_id: CheckId,
+    pub state: NodeState,
+    pub pending: Option<(NodeState, i64)>,
     pub last_check: i64,
 }
 
@@ -575,6 +586,7 @@ pub struct LatencySeries {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReplicatedIncident {
     pub id: String,
+    pub version: Hlc,
     pub title: String,
     pub state: IncidentState,
     pub started_at: i64,
@@ -592,6 +604,20 @@ pub struct ReplicatedIncident {
 pub struct CheckDigest {
     pub check_id: CheckId,
     pub max_ts: i64,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncidentTombstone {
+    pub id: String,
+    pub deleted_at: i64,
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamDigest {
+    pub max_millis: i64,
+    pub max_id: String,
     pub count: i64,
 }
 
@@ -678,8 +704,9 @@ pub struct ConfigDigest {
 pub struct Digest {
     pub checks: Vec<CheckDigest>,
     pub window_start: i64,
-    pub max_alert_ts: i64,
-    pub max_incident_started_at: i64,
+    pub alerts: StreamDigest,
+    pub incidents: StreamDigest,
+    pub incident_tombstones: StreamDigest,
     pub config: Vec<ConfigDigest>,
 }
 
@@ -1563,6 +1590,21 @@ impl Storage {
                 -- than the free text, which quotes whatever the probe saw.
                 failure    VARCHAR
             );
+            CREATE TABLE IF NOT EXISTS latest_check_results (
+                check_id    UUID PRIMARY KEY,
+                agent_id    VARCHAR NOT NULL,
+                ts_millis   BIGINT NOT NULL,
+                status      VARCHAR NOT NULL,
+                latency_ms  BIGINT NOT NULL,
+                status_code INTEGER,
+                error       VARCHAR,
+                failure     VARCHAR
+            );
+            CREATE TABLE IF NOT EXISTS result_replication_watermarks (
+                check_id     UUID PRIMARY KEY,
+                max_ts       BIGINT NOT NULL,
+                result_count BIGINT NOT NULL
+            );
             -- The event log: one row per confirmed state transition.
             -- `incident_id` is stamped as the row is written, because
             -- membership is a fact the coordinator knows at that moment and a
@@ -1571,6 +1613,12 @@ impl Storage {
             -- history the moment a check joined an incident's affects list.
             -- No `alert_type` column: StateChange/Degradation/Recovery is a
             -- function of the two state columns, so storing it invites drift.
+            CREATE TABLE IF NOT EXISTS replication_stream_watermarks (
+                stream      VARCHAR PRIMARY KEY,
+                max_millis  BIGINT NOT NULL,
+                max_id      VARCHAR NOT NULL,
+                item_count  BIGINT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS alerts (
                 id          VARCHAR PRIMARY KEY,
                 scope       VARCHAR NOT NULL,
@@ -1598,7 +1646,9 @@ impl Storage {
                 global      BOOLEAN NOT NULL DEFAULT FALSE,
                 -- NULL for a manually opened incident, which reconciliation
                 -- therefore never touches.
-                origin_check UUID
+                origin_check UUID,
+                version_millis BIGINT NOT NULL,
+                version_node VARCHAR NOT NULL
             );
             -- Which checks an incident affects. `source` (origin, dependency,
             -- manual) exists so reconciliation can retract what it added
@@ -1981,8 +2031,14 @@ impl Storage {
              UPDATE agent_check_state SET zone = 'unknown' WHERE zone IS NULL;
              UPDATE agent_check_state SET region = 'unknown' WHERE region IS NULL;",
         )?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            incident_node_id: parking_lot::RwLock::new("local".to_string()),
+        };
         store.backfill_configs()?;
+        store.backfill_latest_check_results()?;
+        store.backfill_result_replication_watermarks()?;
+        store.rebuild_stream_watermarks()?;
         Ok(store)
     }
 
@@ -2150,6 +2206,8 @@ impl Storage {
             "DELETE FROM check_results WHERE agent_id = ?",
             duckdb::params![agent_id],
         )?;
+        self.rebuild_result_watermarks()?;
+        self.rebuild_latest_check_results()?;
         // The fleet view is the union of results and poll rows, so leaving the
         // poll row behind would purge an agent that then reappeared, healthy.
         self.delete_agent_poll(agent_id)?;
@@ -2161,6 +2219,14 @@ impl Storage {
     pub fn purge_check_data(&self, check_id: CheckId) -> Result<u64> {
         let rows = self.conn.execute(
             "DELETE FROM check_results WHERE check_id = ?",
+            duckdb::params![check_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM result_replication_watermarks WHERE check_id = ?",
+            duckdb::params![check_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM latest_check_results WHERE check_id = ?",
             duckdb::params![check_id],
         )?;
         self.conn.execute(
@@ -2313,6 +2379,295 @@ impl Storage {
         Ok(())
     }
 
+    fn backfill_result_replication_watermarks(&self) -> Result<()> {
+        let watermark_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM result_replication_watermarks",
+            [],
+            |row| row.get(0),
+        )?;
+        if watermark_count == 0 {
+            self.conn.execute_batch(
+                "INSERT INTO result_replication_watermarks
+                     SELECT check_id, MAX(ts_millis), COUNT(*)
+                     FROM check_results GROUP BY check_id",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn record_result_watermarks<'a>(
+        &self,
+        rows: impl IntoIterator<Item = &'a CheckResult>,
+    ) -> Result<()> {
+        let mut updates = BTreeMap::<CheckId, (i64, i64)>::new();
+        for result in rows {
+            let timestamp = result.timestamp.timestamp_millis();
+            let entry = updates.entry(result.check_id).or_insert((timestamp, 0));
+            entry.0 = entry.0.max(timestamp);
+            entry.1 += 1;
+        }
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO result_replication_watermarks (check_id, max_ts, result_count)
+             VALUES (?, ?, ?)
+             ON CONFLICT (check_id) DO UPDATE SET
+                 max_ts = GREATEST(result_replication_watermarks.max_ts, excluded.max_ts),
+                 result_count = result_replication_watermarks.result_count + excluded.result_count",
+        )?;
+        for (check_id, (max_ts, count)) in updates {
+            stmt.execute(duckdb::params![check_id, max_ts, count])?;
+        }
+        Ok(())
+    }
+
+    fn rebuild_result_watermarks(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "DELETE FROM result_replication_watermarks;
+             INSERT INTO result_replication_watermarks
+                 SELECT check_id, MAX(ts_millis), COUNT(*)
+                 FROM check_results GROUP BY check_id;",
+        )?;
+        Ok(())
+    }
+
+    fn rebuild_stream_watermarks(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "DELETE FROM replication_stream_watermarks;
+             INSERT INTO replication_stream_watermarks
+             SELECT 'alerts', COALESCE(MAX(ts_millis), 0), COALESCE(MAX_BY(id, (ts_millis, id)), ''), COUNT(*) FROM alerts;
+             INSERT INTO replication_stream_watermarks
+             SELECT 'incidents', COALESCE(MAX(version_millis), 0),
+                    COALESCE(MAX_BY(version_node || chr(0) || id, (version_millis, version_node, id)), ''),
+                    COUNT(*) FROM incidents;
+             INSERT INTO replication_stream_watermarks
+                           SELECT 'incident_tombstones', COALESCE(MAX(deleted_at), 0),
+                     COALESCE(MAX_BY(node_id || chr(0) || id, (deleted_at, node_id, id)), ''),
+                     COUNT(*) FROM incident_tombstones;",
+        )?;
+        Ok(())
+    }
+
+    fn stream_digest(&self, stream: &str) -> Result<StreamDigest> {
+        self.conn.query_row(
+            "SELECT max_millis, max_id, item_count FROM replication_stream_watermarks WHERE stream = ?",
+            duckdb::params![stream],
+            |row| Ok(StreamDigest { max_millis: row.get(0)?, max_id: row.get(1)?, count: row.get(2)? }),
+        ).map_err(Into::into)
+    }
+
+    fn backfill_latest_check_results(&self) -> Result<()> {
+        self.rebuild_latest_check_results()
+    }
+
+    fn rebuild_latest_check_results(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "DELETE FROM latest_check_results;
+             INSERT INTO latest_check_results
+                 (check_id, agent_id, ts_millis, status, latency_ms, status_code, error, failure)
+             SELECT check_id, agent_id, ts_millis, status, latency_ms, status_code, error, failure
+             FROM (
+                 SELECT check_id, agent_id, ts_millis, status, latency_ms, status_code, error,
+                        failure,
+                        row_number() OVER (
+                            PARTITION BY check_id ORDER BY ts_millis DESC, agent_id DESC
+                        ) AS rn
+                 FROM check_results
+             ) ranked
+             WHERE rn = 1;",
+        )?;
+        Ok(())
+    }
+
+    fn record_latest_results<'a>(
+        &self,
+        rows: impl IntoIterator<Item = (&'a CheckResult, Status)>,
+    ) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO latest_check_results
+                 (check_id, agent_id, ts_millis, status, latency_ms, status_code, error, failure)
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM latest_check_results
+                 WHERE check_id = ?
+                   AND (ts_millis > ? OR (ts_millis = ? AND agent_id >= ?))
+             )
+             ON CONFLICT (check_id) DO UPDATE SET
+                 agent_id = excluded.agent_id,
+                 ts_millis = excluded.ts_millis,
+                 status = excluded.status,
+                 latency_ms = excluded.latency_ms,
+                 status_code = excluded.status_code,
+                 error = excluded.error,
+                 failure = excluded.failure",
+        )?;
+        for (result, status) in rows {
+            let ts = result.timestamp.timestamp_millis();
+            stmt.execute(duckdb::params![
+                result.check_id,
+                result.agent_id,
+                ts,
+                status.as_str(),
+                result.latency_ms as i64,
+                result.status_code.map(|code| code as i32),
+                result.error,
+                result
+                    .failure
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+                result.check_id,
+                ts,
+                ts,
+                result.agent_id,
+            ])?;
+        }
+        Ok(())
+    }
+
+    pub fn persist_ingest(
+        &self,
+        rows: &[(CheckResult, Status)],
+        agent_states: &[AgentCheckStateRow],
+        published_states: &[PublishedStateRow],
+    ) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS ingest_results_stage AS SELECT * FROM check_results WITH NO DATA;
+             CREATE TEMP TABLE IF NOT EXISTS ingest_agent_stage (
+                 ordinal BIGINT, check_id UUID, agent_id VARCHAR, status VARCHAR,
+                 consecutive_failures INTEGER, zone VARCHAR, region VARCHAR, last_check BIGINT
+             );
+             CREATE TEMP TABLE IF NOT EXISTS ingest_state_stage (
+                 check_id UUID, status VARCHAR, pending_state VARCHAR,
+                 pending_since BIGINT, last_check BIGINT
+             );
+             BEGIN;
+             DELETE FROM ingest_results_stage;
+             DELETE FROM ingest_agent_stage;
+             DELETE FROM ingest_state_stage;",
+        )?;
+        let persist = || -> Result<()> {
+            {
+                let mut appender = self.conn.appender("ingest_results_stage")?;
+                for (result, status) in rows {
+                    appender.append_row(duckdb::params![
+                        result.check_id,
+                        result.agent_id,
+                        result.timestamp.timestamp_millis(),
+                        status.as_str(),
+                        result.latency_ms as i64,
+                        result.status_code.map(|code| code as i32),
+                        result.error,
+                        non_empty(&result.zone),
+                        non_empty(&result.region),
+                        result
+                            .failure
+                            .as_ref()
+                            .map(serde_json::to_string)
+                            .transpose()?,
+                    ])?;
+                }
+                appender.flush()?;
+            }
+            {
+                let mut appender = self.conn.appender("ingest_agent_stage")?;
+                for (ordinal, state) in agent_states.iter().enumerate() {
+                    appender.append_row(duckdb::params![
+                        ordinal as i64,
+                        state.check_id,
+                        state.agent_id,
+                        state.status.as_str(),
+                        state.consecutive_failures as i32,
+                        state.zone,
+                        state.region,
+                        state.last_check,
+                    ])?;
+                }
+                appender.flush()?;
+            }
+            {
+                let mut appender = self.conn.appender("ingest_state_stage")?;
+                for state in published_states {
+                    appender.append_row(duckdb::params![
+                        state.check_id,
+                        state.state.as_str(),
+                        state.pending.map(|(pending, _)| pending.as_str()),
+                        state.pending.map(|(_, since)| since),
+                        state.last_check,
+                    ])?;
+                }
+                appender.flush()?;
+            }
+            self.conn.execute_batch(
+                "INSERT INTO check_results SELECT * FROM ingest_results_stage;
+                 INSERT INTO result_replication_watermarks
+                 SELECT check_id, MAX(ts_millis), COUNT(*) FROM ingest_results_stage GROUP BY check_id
+                 ON CONFLICT (check_id) DO UPDATE SET
+                     max_ts = GREATEST(result_replication_watermarks.max_ts, excluded.max_ts),
+                     result_count = result_replication_watermarks.result_count + excluded.result_count;
+                 INSERT INTO latest_check_results
+                 SELECT check_id, agent_id, ts_millis, status, latency_ms, status_code, error, failure
+                 FROM ingest_results_stage
+                 QUALIFY row_number() OVER (
+                     PARTITION BY check_id ORDER BY ts_millis DESC, agent_id DESC
+                 ) = 1
+                 ON CONFLICT (check_id) DO UPDATE SET
+                     agent_id = excluded.agent_id,
+                     ts_millis = excluded.ts_millis,
+                     status = excluded.status,
+                     latency_ms = excluded.latency_ms,
+                     status_code = excluded.status_code,
+                     error = excluded.error,
+                     failure = excluded.failure
+                 WHERE excluded.ts_millis > latest_check_results.ts_millis
+                    OR (excluded.ts_millis = latest_check_results.ts_millis
+                        AND excluded.agent_id > latest_check_results.agent_id);
+                 INSERT INTO agent_check_state
+                 SELECT check_id, agent_id, status, consecutive_failures, zone, region, last_check
+                 FROM ingest_agent_stage
+                 QUALIFY row_number() OVER (
+                     PARTITION BY check_id, agent_id ORDER BY last_check DESC, ordinal DESC
+                 ) = 1
+                 ON CONFLICT (check_id, agent_id) DO UPDATE SET
+                     status = excluded.status,
+                     consecutive_failures = excluded.consecutive_failures,
+                     zone = excluded.zone,
+                     region = excluded.region,
+                     last_check = excluded.last_check
+                 WHERE excluded.last_check >= agent_check_state.last_check;
+                 INSERT INTO current_state
+                     (check_id, status, last_check, consecutive_failures, pending_state, pending_since)
+                 SELECT check_id, status, last_check, 0, pending_state, pending_since
+                 FROM ingest_state_stage
+                 ON CONFLICT (check_id) DO UPDATE SET
+                     status = excluded.status,
+                     last_check = excluded.last_check,
+                     consecutive_failures = 0,
+                     pending_state = excluded.pending_state,
+                     pending_since = excluded.pending_since;
+                 INSERT INTO state_history
+                 SELECT staged.check_id, staged.status, staged.last_check
+                 FROM ingest_state_stage staged
+                 LEFT JOIN LATERAL (
+                     SELECT state FROM state_history history
+                     WHERE history.check_id = staged.check_id
+                     ORDER BY since DESC LIMIT 1
+                 ) newest ON true
+                 WHERE newest.state IS NULL OR newest.state <> staged.status
+                 ON CONFLICT DO NOTHING;",
+            )?;
+            Ok(())
+        };
+        match persist() {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
     /// Persist a batch of raw results with their evaluated status.
     pub fn insert_results(&self, rows: &[(CheckResult, Status)]) -> Result<()> {
         // One transaction for the whole batch: DuckDB otherwise commits per
@@ -2339,6 +2694,8 @@ impl Storage {
                     non_empty(&r.region),
                 ])?;
             }
+            self.record_result_watermarks(rows.iter().map(|(result, _)| result))?;
+            self.record_latest_results(rows.iter().map(|(result, status)| (result, *status)))?;
             Ok(())
         };
         match insert() {
@@ -2390,6 +2747,8 @@ impl Storage {
             ])?;
         }
         appender.flush()?;
+        self.record_result_watermarks(rows.iter().map(|(result, _)| result))?;
+        self.record_latest_results(rows.iter().map(|(result, status)| (result, *status)))?;
         Ok(())
     }
 
@@ -2539,6 +2898,52 @@ impl Storage {
     /// readable base; same-millisecond events receive a deterministic suffix.
     /// IDs are persisted and replicated as written, so replication retains the
     /// exact event identity rather than generating another one.
+    fn record_stream_item(&self, stream: &str, millis: i64, id: &str, delta: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO replication_stream_watermarks (stream, max_millis, max_id, item_count)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT (stream) DO UPDATE SET
+                 max_millis = CASE WHEN (excluded.max_millis, excluded.max_id) >
+                                        (replication_stream_watermarks.max_millis, replication_stream_watermarks.max_id)
+                                   THEN excluded.max_millis ELSE replication_stream_watermarks.max_millis END,
+                 max_id = CASE WHEN (excluded.max_millis, excluded.max_id) >
+                                    (replication_stream_watermarks.max_millis, replication_stream_watermarks.max_id)
+                               THEN excluded.max_id ELSE replication_stream_watermarks.max_id END,
+                 item_count = replication_stream_watermarks.item_count + excluded.item_count",
+            duckdb::params![stream, millis, id, delta],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_incident_node_id(&self, node_id: &str) {
+        *self.incident_node_id.write() = node_id.to_string();
+    }
+
+    fn incident_node_id(&self) -> String {
+        self.incident_node_id.read().clone()
+    }
+
+    fn touch_incident(&self, id: &str, millis: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE incidents SET version_millis = GREATEST(version_millis + 1, ?), version_node = ?
+             WHERE id = ?",
+            duckdb::params![millis, self.incident_node_id(), id],
+        )?;
+        let version: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT version_millis FROM incidents WHERE id = ?",
+                duckdb::params![id],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(version) = version {
+            let cursor_id = format!("{}\0{id}", self.incident_node_id());
+            self.record_stream_item("incidents", version, &cursor_id, 0)?;
+        }
+        Ok(())
+    }
+
     fn next_event_id(&self, table: &str, base: &str) -> Result<String> {
         for suffix in 0_u64.. {
             let id = if suffix == 0 {
@@ -2588,6 +2993,7 @@ impl Storage {
                 incident_id,
             ],
         )?;
+        self.record_stream_item("alerts", ts_millis, &id, 1)?;
         Ok(id)
     }
 
@@ -2774,16 +3180,32 @@ impl Storage {
         first_update: Option<(&str, Option<&str>)>,
     ) -> Result<IncidentRow> {
         self.conn.execute(
-            "INSERT INTO incidents (id, title, state, started_at, global, origin_check)
-             VALUES (?, ?, ?, ?, ?, ?)",
-            duckdb::params![id, title, state.as_str(), started_at, global, origin_check],
+            "INSERT INTO incidents
+                 (id, title, state, started_at, global, origin_check, version_millis, version_node)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            duckdb::params![
+                id,
+                title,
+                state.as_str(),
+                started_at,
+                global,
+                origin_check,
+                started_at,
+                self.incident_node_id()
+            ],
         )?;
         for c in checks {
-            self.attach_check(id, c.check_id, c.source)?;
+            self.conn.execute(
+                "INSERT INTO incident_checks (incident_id, check_id, source) VALUES (?, ?, ?)",
+                duckdb::params![id, c.check_id, c.source.as_str()],
+            )?;
         }
         if let Some((body, author)) = first_update {
             self.add_update(id, state, body, author, started_at)?;
         }
+        self.touch_incident(id, started_at)?;
+        let cursor_id = format!("{}\0{id}", self.incident_node_id());
+        self.record_stream_item("incidents", started_at, &cursor_id, 1)?;
         self.incident(id)?
             .ok_or_else(|| anyhow::anyhow!("incident {id} vanished immediately after insert"))
     }
@@ -2817,7 +3239,7 @@ impl Storage {
                      WHERE incident_id = ? AND check_id = ?",
                     duckdb::params![source.as_str(), incident_id, check_id],
                 )?;
-                Ok(())
+                self.touch_incident(incident_id, chrono::Utc::now().timestamp_millis())
             }
             None => {
                 self.conn.execute(
@@ -2825,7 +3247,7 @@ impl Storage {
                      VALUES (?, ?, ?)",
                     duckdb::params![incident_id, check_id, source.as_str()],
                 )?;
-                Ok(())
+                self.touch_incident(incident_id, chrono::Utc::now().timestamp_millis())
             }
         }
     }
@@ -2839,7 +3261,7 @@ impl Storage {
         check_id: CheckId,
         only_source: Option<AffectSource>,
     ) -> Result<()> {
-        match only_source {
+        let changed = match only_source {
             Some(s) => self.conn.execute(
                 "DELETE FROM incident_checks
                  WHERE incident_id = ? AND check_id = ? AND source = ?",
@@ -2850,20 +3272,37 @@ impl Storage {
                 duckdb::params![incident_id, check_id],
             )?,
         };
+        if changed != 0 {
+            self.touch_incident(incident_id, chrono::Utc::now().timestamp_millis())?;
+        }
         Ok(())
     }
 
     /// Replace exactly the manual attachments, leaving origin and dependency
     /// rows alone. The affects editor saves through this.
     pub fn set_manual_checks(&self, incident_id: &str, checks: &[CheckId]) -> Result<()> {
+        let current: std::collections::BTreeSet<CheckId> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT check_id FROM incident_checks WHERE incident_id = ? AND source = 'manual'",
+            )?;
+            stmt.query_map(duckdb::params![incident_id], |r| r.get(0))?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        let desired: std::collections::BTreeSet<CheckId> = checks.iter().copied().collect();
+        if current == desired {
+            return Ok(());
+        }
         self.conn.execute(
             "DELETE FROM incident_checks WHERE incident_id = ? AND source = 'manual'",
             duckdb::params![incident_id],
         )?;
-        for check_id in checks {
-            self.attach_check(incident_id, *check_id, AffectSource::Manual)?;
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO incident_checks (incident_id, check_id, source) VALUES (?, ?, 'manual')",
+        )?;
+        for check_id in desired {
+            stmt.execute(duckdb::params![incident_id, check_id])?;
         }
-        Ok(())
+        self.touch_incident(incident_id, chrono::Utc::now().timestamp_millis())
     }
 
     /// Add an update, moving the incident to the state it announces. This is
@@ -2901,6 +3340,7 @@ impl Storage {
                 duckdb::params![state.as_str(), incident_id],
             )?;
         }
+        self.touch_incident(incident_id, now_millis)?;
         Ok(IncidentUpdateRow {
             id,
             incident_id: incident_id.to_owned(),
@@ -2958,13 +3398,18 @@ impl Storage {
         started_at: i64,
         global: bool,
     ) -> Result<Option<IncidentRow>> {
-        let changed = self.conn.execute(
+        let Some(existing) = self.incident(id)? else {
+            return Ok(None);
+        };
+        if existing.title == title && existing.started_at == started_at && existing.global == global
+        {
+            return Ok(Some(existing));
+        }
+        self.conn.execute(
             "UPDATE incidents SET title = ?, started_at = ?, global = ? WHERE id = ?",
             duckdb::params![title, started_at, global, id],
         )?;
-        if changed == 0 {
-            return Ok(None);
-        }
+        self.touch_incident(id, chrono::Utc::now().timestamp_millis())?;
         self.incident(id)
     }
 
@@ -3086,9 +3531,9 @@ impl Storage {
             .map(|c| c.id)
             .collect();
 
-        // Every "latest" field is read from a single row, picked by row_number.
-        // Per-column `arg_max` is wrong here: it skips NULLs, so a recovered
-        // check would keep reporting the stale error of its last failure.
+        // Every "latest" field is read from one materialized row. Keeping the
+        // complete row avoids both a full-history window scan and the stale NULL
+        // behavior of per-column `arg_max`.
         //
         // The displayed status is the coordinator's PUBLISHED state
         // (`current_state`), not the raw last observation: it already accounts
@@ -3104,13 +3549,8 @@ impl Storage {
                  latest.status_code,
                  latest.error,
                  latest.failure
-             FROM (
-                 SELECT check_id, status, latency_ms, ts_millis, status_code, error, failure,
-                        row_number() OVER (PARTITION BY check_id ORDER BY ts_millis DESC) AS rn
-                 FROM check_results
-             ) AS latest
-             LEFT JOIN current_state cs ON cs.check_id = latest.check_id
-             WHERE latest.rn = 1",
+             FROM latest_check_results latest
+             LEFT JOIN current_state cs ON cs.check_id = latest.check_id",
         )?;
         let mut rows = stmt
             .query_map([], |row| {
@@ -3131,10 +3571,39 @@ impl Storage {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
+        let mut spans_by_check = BTreeMap::<CheckId, Vec<StateSpan>>::new();
+        let mut span_stmt = self.conn.prepare(
+            "SELECT check_id, state, since
+             FROM state_history
+             WHERE since >= ?
+               AND check_id IN (SELECT check_id FROM latest_check_results)
+             UNION ALL
+             SELECT check_id, arg_max(state, since) AS state, MAX(since) AS since
+             FROM state_history
+             WHERE since < ?
+               AND check_id IN (SELECT check_id FROM latest_check_results)
+             GROUP BY check_id
+             ORDER BY check_id, since",
+        )?;
+        let spans = span_stmt.query_map(duckdb::params![window_start, window_start], |row| {
+            Ok((
+                row.get::<_, CheckId>(0)?,
+                StateSpan {
+                    state: NodeState::from_db(&row.get::<_, String>(1)?),
+                    since: row.get::<_, i64>(2)?,
+                },
+            ))
+        })?;
+        for span in spans {
+            let (check_id, span) = span?;
+            spans_by_check.entry(check_id).or_default().push(span);
+        }
         for row in &mut rows {
             let degraded_counts = degraded_downtime.contains(&row.check_id);
-            row.uptime_24h = self
-                .uptime_between(row.check_id, window_start, now_millis, degraded_counts)?
+            row.uptime_24h = spans_by_check
+                .get(&row.check_id)
+                .and_then(|spans| uptime_counts(spans, window_start, now_millis, degraded_counts))
+                .map(|(up_ms, known_ms)| up_ms as f64 / known_ms as f64)
                 // No spans in the window at all — a check upgraded into this
                 // scheme moments ago, or one nobody was probing. Reads as fully
                 // up rather than fully down: an absence of recorded outage is
@@ -3495,10 +3964,15 @@ impl Storage {
         let results_before = now_millis - (results_days as i64) * 86_400_000;
         let alerts_before = now_millis - (alerts_days as i64) * 86_400_000;
         let mut removed = 0u64;
-        removed += self.conn.execute(
+        let removed_results = self.conn.execute(
             "DELETE FROM check_results WHERE ts_millis < ?",
             duckdb::params![results_before],
         )? as u64;
+        removed += removed_results;
+        if removed_results != 0 {
+            self.rebuild_result_watermarks()?;
+            self.rebuild_latest_check_results()?;
+        }
         removed += self.conn.execute(
             "DELETE FROM alerts WHERE ts_millis < ?",
             duckdb::params![alerts_before],
@@ -3543,6 +4017,7 @@ impl Storage {
         let tombstone_before = now_millis - (tombstone_days as i64) * 86_400_000;
         removed += self.prune_tombstones(tombstone_before)? as u64;
         removed += self.prune_incident_tombstones(tombstone_before)? as u64;
+        self.rebuild_stream_watermarks()?;
         Ok(removed)
     }
 
@@ -3579,6 +4054,9 @@ impl Storage {
                AND resolved_at - started_at < ?",
             duckdb::params![max_ms],
         )? as u64;
+        if removed != 0 {
+            self.rebuild_stream_watermarks()?;
+        }
         Ok(removed)
     }
 
@@ -3604,6 +4082,9 @@ impl Storage {
     /// record of what it published, which relabelling does not invalidate.
     pub fn purge_results(&self) -> Result<u64> {
         let mut removed = self.conn.execute("DELETE FROM check_results", [])? as u64;
+        self.conn
+            .execute("DELETE FROM result_replication_watermarks", [])?;
+        self.conn.execute("DELETE FROM latest_check_results", [])?;
         removed += self.conn.execute("DELETE FROM agent_check_state", [])? as u64;
         Ok(removed)
     }
@@ -4048,6 +4529,7 @@ impl Storage {
                  )",
             )?;
             let mut inserted = 0usize;
+            let mut inserted_results = Vec::new();
             for (r, status) in rows {
                 let ts = r.timestamp.timestamp_millis();
                 let n = stmt.execute(duckdb::params![
@@ -4065,8 +4547,13 @@ impl Storage {
                     r.agent_id,
                     ts,
                 ])?;
+                if n != 0 {
+                    inserted_results.push((r, *status));
+                }
                 inserted += n;
             }
+            self.record_result_watermarks(inserted_results.iter().map(|(result, _)| *result))?;
+            self.record_latest_results(inserted_results)?;
             Ok(inserted)
         };
         match insert() {
@@ -4114,6 +4601,7 @@ impl Storage {
                 a.incident_id,
             ],
         )?;
+        self.record_stream_item("alerts", a.timestamp, &a.id, 1)?;
         Ok(true)
     }
 
@@ -4121,15 +4609,32 @@ impl Storage {
     /// id may be reused only for its identical immutable payload, never to
     /// overwrite a different incident's narrative.
     pub fn upsert_incident(&self, i: &ReplicatedIncident) -> Result<bool> {
-        // A deleted incident stays deleted. Without this a peer's push, or the
-        // reconciler replaying an incident it still holds, walks it straight
-        // back in — and the operator who deleted it watches it reappear.
-        if self.incident_tombstoned(&i.id)? {
-            return Ok(false);
-        }
-        if self.replicated_incident(&i.id)?.as_ref() == Some(i) {
-            return Ok(false);
-        }
+        // Rows and tombstones share one total order. A newer incident may
+        // intentionally recreate a deleted id; an equal/newer tombstone wins,
+        // while a stale delete cannot erase a newer row.
+        let superseded_tombstone = match self.incident_tombstone(&i.id)? {
+            Some(t) => {
+                let tombstone_version = Hlc::new(t.deleted_at, t.node_id);
+                if tombstone_version >= i.version {
+                    return Ok(false);
+                }
+                true
+            }
+            None => false,
+        };
+        let existed = if let Some(existing) = self.replicated_incident(&i.id)? {
+            if existing.version > i.version || existing == *i {
+                return Ok(false);
+            }
+            if existing.version == i.version
+                && serde_json::to_vec(&existing)? >= serde_json::to_vec(i)?
+            {
+                return Ok(false);
+            }
+            true
+        } else {
+            false
+        };
         for update in &i.updates {
             if update.incident_id != i.id {
                 bail!(
@@ -4158,9 +4663,9 @@ impl Storage {
                 )
                 .ok();
             if let Some(existing) = existing {
-                if existing != *update {
+                if existing.incident_id != i.id {
                     bail!(
-                        "replicated incident update id {} conflicts with existing update",
+                        "replicated incident update id {} belongs to another incident",
                         update.id
                     );
                 }
@@ -4170,10 +4675,17 @@ impl Storage {
         let write = || -> Result<()> {
             self.conn
                 .execute("DELETE FROM incidents WHERE id = ?", duckdb::params![i.id])?;
+            if superseded_tombstone {
+                self.conn.execute(
+                    "DELETE FROM incident_tombstones WHERE id = ?",
+                    duckdb::params![i.id],
+                )?;
+            }
             self.conn.execute(
                 "INSERT INTO incidents
-                     (id, title, state, started_at, resolved_at, global, origin_check)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                     (id, title, state, started_at, resolved_at, global, origin_check,
+                      version_millis, version_node)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 duckdb::params![
                     i.id,
                     i.title,
@@ -4182,6 +4694,8 @@ impl Storage {
                     i.resolved_at,
                     i.global,
                     i.origin_check,
+                    i.version.millis,
+                    i.version.node_id,
                 ],
             )?;
             self.conn.execute(
@@ -4195,23 +4709,27 @@ impl Storage {
                     duckdb::params![i.id, check_id, source.as_str()],
                 )?;
             }
-            let existing_updates: std::collections::HashSet<String> = {
-                let mut stmt = self
-                    .conn
-                    .prepare("SELECT id FROM incident_updates WHERE incident_id = ?")?;
-                let rows = stmt.query_map(duckdb::params![i.id], |r| r.get::<_, String>(0))?;
-                rows.collect::<std::result::Result<_, _>>()?
-            };
+            self.conn.execute(
+                "DELETE FROM incident_updates WHERE incident_id = ?",
+                duckdb::params![i.id],
+            )?;
             for u in &i.updates {
-                if existing_updates.contains(&u.id) {
-                    continue;
-                }
                 self.conn.execute(
                     "INSERT INTO incident_updates
                          (id, incident_id, state, body, author, created_at)
-                     VALUES (?, ?, ?, ?, ?, ?)",
+                      VALUES (?, ?, ?, ?, ?, ?)",
                     duckdb::params![u.id, i.id, u.state.as_str(), u.body, u.author, u.created_at],
                 )?;
+            }
+            let cursor_id = format!("{}\0{}", i.version.node_id, i.id);
+            self.record_stream_item(
+                "incidents",
+                i.version.millis,
+                &cursor_id,
+                i64::from(!existed),
+            )?;
+            if superseded_tombstone {
+                self.rebuild_stream_watermarks()?;
             }
             Ok(())
         };
@@ -4236,6 +4754,11 @@ impl Storage {
         let updates = self.updates_for_incident(id)?;
         Ok(Some(ReplicatedIncident {
             id: row.id,
+            version: self.conn.query_row(
+                "SELECT version_millis, version_node FROM incidents WHERE id = ?",
+                duckdb::params![id],
+                |r| Ok(Hlc::new(r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )?,
             title: row.title,
             state: row.state,
             started_at: row.started_at,
@@ -4254,17 +4777,25 @@ impl Storage {
     // ---- Anti-entropy ----
 
     /// A fixed-cost summary of everything replicated, for a peer to compare
-    /// against its own. One query per component, each bounded so it stays
-    /// cheap on a large table: `window_start` excludes anything older than
-    /// the anti-entropy sweep cares about.
+    /// against its own. Full retained-history digests read compact metadata
+    /// maintained on write; explicitly windowed digests scan only that window.
     pub fn digest(&self, window_start: i64) -> Result<Digest> {
         let checks = {
-            let mut stmt = self.conn.prepare(
-                "SELECT check_id, MAX(ts_millis), COUNT(*) FROM check_results
-                 WHERE ts_millis >= ?
-                 GROUP BY check_id",
-            )?;
-            let rows = stmt.query_map(duckdb::params![window_start], |row| {
+            let (sql, params): (&str, Vec<i64>) = if window_start == 0 {
+                (
+                    "SELECT check_id, max_ts, result_count
+                     FROM result_replication_watermarks",
+                    Vec::new(),
+                )
+            } else {
+                (
+                    "SELECT check_id, MAX(ts_millis), COUNT(*) FROM check_results
+                     WHERE ts_millis >= ? GROUP BY check_id",
+                    vec![window_start],
+                )
+            };
+            let mut stmt = self.conn.prepare(sql)?;
+            let rows = stmt.query_map(duckdb::params_from_iter(params), |row| {
                 Ok(CheckDigest {
                     check_id: row.get(0)?,
                     max_ts: row.get(1)?,
@@ -4273,16 +4804,9 @@ impl Storage {
             })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
-        let max_alert_ts: i64 = self.conn.query_row(
-            "SELECT COALESCE(MAX(ts_millis), 0) FROM alerts WHERE ts_millis >= ?",
-            duckdb::params![window_start],
-            |r| r.get(0),
-        )?;
-        let max_incident_started_at: i64 = self.conn.query_row(
-            "SELECT COALESCE(MAX(started_at), 0) FROM incidents WHERE started_at >= ?",
-            duckdb::params![window_start],
-            |r| r.get(0),
-        )?;
+        let alerts = self.stream_digest("alerts")?;
+        let incidents = self.stream_digest("incidents")?;
+        let incident_tombstones = self.stream_digest("incident_tombstones")?;
         let config = ConfigKind::ALL
             .into_iter()
             .map(|k| self.config_digest_for(k))
@@ -4290,8 +4814,9 @@ impl Storage {
         Ok(Digest {
             checks,
             window_start,
-            max_alert_ts,
-            max_incident_started_at,
+            alerts,
+            incidents,
+            incident_tombstones,
             config,
         })
     }
@@ -4335,8 +4860,9 @@ impl Storage {
         })
     }
 
-    /// Paged raw rows for backfill. `since` is exclusive and acts as the
-    /// cursor; rows come back oldest-first so the caller can advance it.
+    /// Paged raw rows for backfill. `(since, since_agent_id)` is exclusive and
+    /// rows come back oldest-first so the caller can advance the stable cursor.
+    /// Without an agent id, all rows at `since` are excluded for the first page.
     ///
     /// `kind`, `body_matched`, `body`, `headers`, `metric` and `metrics` are
     /// never in `check_results` — the table keeps the coordinator's verdict,
@@ -4348,6 +4874,7 @@ impl Storage {
         &self,
         check_id: CheckId,
         since: i64,
+        since_agent_id: Option<&str>,
         until: i64,
         limit: usize,
     ) -> Result<Vec<(CheckResult, Status)>> {
@@ -4355,13 +4882,22 @@ impl Storage {
             "SELECT agent_id, ts_millis, status, latency_ms, status_code, error,
                     failure, zone, region
              FROM check_results
-             WHERE check_id = ? AND ts_millis > ? AND ts_millis <= ?
+             WHERE check_id = ? AND ts_millis <= ?
+               AND (ts_millis > ? OR (? IS NOT NULL AND ts_millis = ? AND agent_id > ?))
              ORDER BY ts_millis ASC, agent_id ASC
              LIMIT ?",
         )?;
         let rows = stmt
             .query_map(
-                duckdb::params![check_id, since, until, limit as i64],
+                duckdb::params![
+                    check_id,
+                    until,
+                    since,
+                    since_agent_id,
+                    since,
+                    since_agent_id,
+                    limit as i64
+                ],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -4402,38 +4938,56 @@ impl Storage {
         Ok(out)
     }
 
-    /// Alerts stamped after `since_ts`, oldest first — the paged backfill
-    /// counterpart to `results_since`.
-    pub fn alerts_since(&self, since_ts: i64, limit: usize) -> Result<Vec<AlertRow>> {
+    /// Alerts after the exclusive `(timestamp, id)` cursor, oldest first.
+    pub fn alerts_since(
+        &self,
+        since_ts: i64,
+        since_id: &str,
+        limit: usize,
+    ) -> Result<Vec<AlertRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, scope, node_id, previous_state, current_state, ts_millis, incident_id
              FROM alerts
-             WHERE ts_millis > ?
-             ORDER BY ts_millis ASC
+             WHERE ts_millis > ? OR (ts_millis = ? AND id > ?)
+             ORDER BY ts_millis ASC, id ASC
              LIMIT ?",
         )?;
         let rows = stmt
-            .query_map(duckdb::params![since_ts, limit as i64], Self::alert_row)?
+            .query_map(
+                duckdb::params![since_ts, since_ts, since_id, limit as i64],
+                Self::alert_row,
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    /// Incidents opened after `since_started_at`, oldest first, each with its
-    /// checks and updates — the paged backfill counterpart to
-    /// `results_since`.
+    /// Incidents changed after the exclusive stable mutation cursor.
     pub fn incidents_since(
         &self,
-        since_started_at: i64,
+        since_version: i64,
+        since_id: &str,
         limit: usize,
     ) -> Result<Vec<ReplicatedIncident>> {
+        let (since_node, since_incident_id) = since_id.split_once('\0').unwrap_or(("", since_id));
         let ids: Vec<String> = {
             let mut stmt = self.conn.prepare(
-                "SELECT id FROM incidents WHERE started_at > ?
-                 ORDER BY started_at ASC LIMIT ?",
+                "SELECT id FROM incidents
+                 WHERE version_millis > ?
+                    OR (version_millis = ? AND (version_node > ?
+                        OR (version_node = ? AND id > ?)))
+                 ORDER BY version_millis ASC, version_node ASC, id ASC LIMIT ?",
             )?;
-            stmt.query_map(duckdb::params![since_started_at, limit as i64], |r| {
-                r.get::<_, String>(0)
-            })?
+            stmt.query_map(
+                duckdb::params![
+                    since_version,
+                    since_version,
+                    since_node,
+                    since_node,
+                    since_incident_id,
+                    limit as i64
+                ],
+                |r| r.get::<_, String>(0),
+            )?
             .collect::<std::result::Result<_, _>>()?
         };
         let mut out = Vec::with_capacity(ids.len());
@@ -4443,6 +4997,42 @@ impl Storage {
             }
         }
         Ok(out)
+    }
+
+    pub fn incident_tombstones_since(
+        &self,
+        since_deleted_at: i64,
+        since_node_id: &str,
+        since_id: &str,
+        limit: usize,
+    ) -> Result<Vec<IncidentTombstone>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, deleted_at, node_id FROM incident_tombstones
+              WHERE deleted_at > ?
+                 OR (deleted_at = ? AND node_id > ?)
+                 OR (deleted_at = ? AND node_id = ? AND id > ?)
+              ORDER BY deleted_at ASC, node_id ASC, id ASC LIMIT ?",
+        )?;
+        stmt.query_map(
+            duckdb::params![
+                since_deleted_at,
+                since_deleted_at,
+                since_node_id,
+                since_deleted_at,
+                since_node_id,
+                since_id,
+                limit as i64
+            ],
+            |row| {
+                Ok(IncidentTombstone {
+                    id: row.get(0)?,
+                    deleted_at: row.get(1)?,
+                    node_id: row.get(2)?,
+                })
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
     }
 
     // ---- Config replication ----
@@ -4946,6 +5536,33 @@ impl Storage {
     /// rather than report success for an id that never existed. A repeat
     /// delete of an already-tombstoned id is still false, and still harmless.
     pub fn delete_incident(&self, id: &str, now_millis: i64, node_id: &str) -> Result<bool> {
+        let deleted_at = self
+            .replicated_incident(id)?
+            .map(|incident| now_millis.max(incident.version.millis + 1))
+            .unwrap_or(now_millis);
+        self.apply_incident_tombstone(&IncidentTombstone {
+            id: id.to_string(),
+            deleted_at,
+            node_id: node_id.to_string(),
+        })
+    }
+
+    pub fn apply_incident_tombstone(&self, tombstone: &IncidentTombstone) -> Result<bool> {
+        let id = &tombstone.id;
+        let incoming_version = Hlc::new(tombstone.deleted_at, tombstone.node_id.clone());
+        if let Some(incident) = self.replicated_incident(id)? {
+            if incident.version > incoming_version {
+                return Ok(false);
+            }
+        }
+        let tombstone_existed = if let Some(existing) = self.incident_tombstone(id)? {
+            if Hlc::new(existing.deleted_at, existing.node_id) >= incoming_version {
+                return Ok(false);
+            }
+            true
+        } else {
+            false
+        };
         self.conn.execute_batch("BEGIN")?;
         let write = || -> Result<bool> {
             self.conn.execute(
@@ -4969,8 +5586,19 @@ impl Storage {
             self.conn.execute(
                 "INSERT OR REPLACE INTO incident_tombstones (id, deleted_at, node_id)
                  VALUES (?, ?, ?)",
-                duckdb::params![id, now_millis, node_id],
+                duckdb::params![id, tombstone.deleted_at, tombstone.node_id],
             )?;
+            let cursor_id = format!("{}\0{id}", tombstone.node_id);
+            self.record_stream_item(
+                "incident_tombstones",
+                tombstone.deleted_at,
+                &cursor_id,
+                i64::from(!tombstone_existed),
+            )?;
+            // Replacement and deletion can invalidate a stream's previous max,
+            // not only its count. Rare deletes favor exact metadata over an
+            // incremental update that cannot know the next-highest row.
+            self.rebuild_stream_watermarks()?;
             Ok(removed > 0)
         };
         match write() {
@@ -4986,6 +5614,20 @@ impl Storage {
     }
 
     /// Whether an incident id has been deleted anywhere in the cluster.
+    pub fn incident_tombstone(&self, id: &str) -> Result<Option<IncidentTombstone>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, deleted_at, node_id FROM incident_tombstones WHERE id = ?")?;
+        let mut rows = stmt.query_map(duckdb::params![id], |row| {
+            Ok(IncidentTombstone {
+                id: row.get(0)?,
+                deleted_at: row.get(1)?,
+                node_id: row.get(2)?,
+            })
+        })?;
+        rows.next().transpose().map_err(Into::into)
+    }
+
     pub fn incident_tombstoned(&self, id: &str) -> Result<bool> {
         let found: i64 = self.conn.query_row(
             "SELECT count(*) FROM incident_tombstones WHERE id = ?",
@@ -5014,6 +5656,9 @@ impl Storage {
             "DELETE FROM incident_tombstones WHERE deleted_at < ?",
             duckdb::params![before_millis],
         )?;
+        if n != 0 {
+            self.rebuild_stream_watermarks()?;
+        }
         Ok(n)
     }
 
@@ -5046,11 +5691,18 @@ impl Storage {
             }
         }
         // Incidents this check merely joined belong to whoever opened them, so
-        // they survive; only this check's membership of them goes.
-        self.conn.execute(
-            "DELETE FROM incident_checks WHERE check_id = ?",
-            duckdb::params![check_id],
-        )?;
+        // they survive; only this check's membership of them goes. Route each
+        // removal through the normal mutator so its replication version moves.
+        let memberships: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT incident_id FROM incident_checks WHERE check_id = ?")?;
+            stmt.query_map(duckdb::params![check_id], |r| r.get(0))?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        for incident_id in memberships {
+            self.detach_check(&incident_id, check_id, None)?;
+        }
         Ok(PurgeSummary {
             results,
             incidents,
@@ -5103,6 +5755,171 @@ mod tests {
             metric: None,
             metrics: None,
         }
+    }
+
+    fn agent_state(check_id: &str, agent_id: &str, status: Status, ts: i64) -> AgentCheckStateRow {
+        AgentCheckStateRow {
+            check_id: cid(check_id),
+            agent_id: agent_id.into(),
+            zone: "test-zone".into(),
+            region: "test-region".into(),
+            status,
+            consecutive_failures: 0,
+            last_check: ts,
+        }
+    }
+
+    fn published(check_id: &str, state: NodeState, ts: i64) -> PublishedStateRow {
+        PublishedStateRow {
+            check_id: cid(check_id),
+            state,
+            pending: None,
+            last_check: ts,
+        }
+    }
+
+    /// One batched write must leave every projection exactly where the
+    /// row-at-a-time path left it: newest observation wins per check, equal
+    /// timestamps break ties on the greater agent, and per-agent beliefs
+    /// collapse to the newest row for that agent.
+    #[test]
+    fn persist_ingest_projects_the_newest_observation_per_check_and_agent() {
+        let s = Storage::open(":memory:").unwrap();
+        let mut older = result("a", 1_000, 5);
+        older.agent_id = "agent-b".into();
+        let mut tie = result("a", 2_000, 7);
+        tie.agent_id = "agent-a".into();
+        let mut newest = result("a", 2_000, 9);
+        newest.agent_id = "agent-c".into();
+
+        s.persist_ingest(
+            &[
+                (older, Status::Up),
+                (tie, Status::Down),
+                (newest, Status::Up),
+            ],
+            &[
+                agent_state("a", "agent-b", Status::Up, 1_000),
+                agent_state("a", "agent-a", Status::Down, 2_000),
+                agent_state("a", "agent-a", Status::Up, 2_500),
+            ],
+            &[published("a", NodeState::Up, 2_000)],
+        )
+        .unwrap();
+
+        assert_eq!(s.count_results().unwrap(), 3);
+        let digest = s.digest(0).unwrap();
+        assert_eq!(digest.checks[0].count, 3);
+        assert_eq!(digest.checks[0].max_ts, 2_000);
+        let latest = s.list_status(3_000).unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].latency_ms, 9, "greater agent wins an exact tie");
+
+        let mut beliefs = s.list_agent_check_state().unwrap();
+        beliefs.sort_by(|l, r| l.agent_id.cmp(&r.agent_id));
+        assert_eq!(beliefs.len(), 2);
+        assert_eq!(beliefs[0].last_check, 2_500);
+        assert_eq!(beliefs[0].status, Status::Up);
+        assert_eq!(beliefs[1].last_check, 1_000);
+        assert_eq!(
+            s.list_current_state().unwrap(),
+            vec![CurrentStateRow {
+                check_id: cid("a"),
+                state: NodeState::Up,
+                pending: None,
+            }]
+        );
+    }
+
+    /// A late batch must not rewind what is already published, and repeating a
+    /// state must not fragment history into a span per probe.
+    #[test]
+    fn persist_ingest_ignores_stale_rows_and_records_only_transitions() {
+        let s = Storage::open(":memory:").unwrap();
+        s.persist_ingest(
+            &[(result("a", 5_000, 11), Status::Up)],
+            &[agent_state("a", "agent", Status::Up, 5_000)],
+            &[published("a", NodeState::Up, 5_000)],
+        )
+        .unwrap();
+        s.persist_ingest(
+            &[(result("a", 1_000, 99), Status::Down)],
+            &[agent_state("a", "agent", Status::Down, 1_000)],
+            &[published("a", NodeState::Up, 5_100)],
+        )
+        .unwrap();
+
+        assert_eq!(s.count_results().unwrap(), 2, "raw history keeps both rows");
+        let digest = s.digest(0).unwrap();
+        assert_eq!(digest.checks[0].max_ts, 5_000);
+        assert_eq!(digest.checks[0].count, 2);
+        let latest = s.list_status(6_000).unwrap();
+        assert_eq!(latest[0].latency_ms, 11, "a stale row cannot rewind latest");
+        let beliefs = s.list_agent_check_state().unwrap();
+        assert_eq!(beliefs[0].status, Status::Up, "stale belief is ignored");
+        assert_eq!(
+            s.state_spans(cid("a")).unwrap(),
+            vec![StateSpan {
+                state: NodeState::Up,
+                since: 5_000,
+            }],
+            "an unchanged state opens no second span"
+        );
+
+        s.persist_ingest(
+            &[(result("a", 6_000, 12), Status::Down)],
+            &[agent_state("a", "agent", Status::Down, 6_000)],
+            &[published("a", NodeState::Down, 6_000)],
+        )
+        .unwrap();
+        assert_eq!(
+            s.state_spans(cid("a")).unwrap().len(),
+            2,
+            "a changed state opens exactly one new span"
+        );
+    }
+
+    /// Every projection commits together or not at all: a failing batch must
+    /// not leave raw rows behind, and the connection must stay usable.
+    #[test]
+    fn persist_ingest_rolls_back_every_projection_on_failure() {
+        let s = Storage::open(":memory:").unwrap();
+        s.persist_ingest(
+            &[(result("a", 1_000, 5), Status::Up)],
+            &[agent_state("a", "agent", Status::Up, 1_000)],
+            &[published("a", NodeState::Up, 1_000)],
+        )
+        .unwrap();
+        // Current state is written after the raw rows, watermarks, latest
+        // result, and agent belief of the same batch, so rejecting it proves
+        // those earlier writes are rolled back rather than half-kept.
+        s.conn
+            .execute_batch("CREATE UNIQUE INDEX one_check_per_ts ON current_state (last_check)")
+            .unwrap();
+
+        let failed = s.persist_ingest(
+            &[(result("b", 1_000, 6), Status::Down)],
+            &[agent_state("b", "agent", Status::Down, 1_000)],
+            &[published("b", NodeState::Down, 1_000)],
+        );
+        assert!(failed.is_err(), "a rejected projection fails the batch");
+        assert_eq!(s.count_results().unwrap(), 1, "raw rows rolled back");
+        let digest = s.digest(0).unwrap();
+        assert_eq!(digest.checks.len(), 1, "watermarks rolled back");
+        assert_eq!(digest.checks[0].check_id, cid("a"));
+        assert_eq!(s.list_status(3_000).unwrap().len(), 1);
+        assert_eq!(s.list_agent_check_state().unwrap().len(), 1);
+        assert_eq!(s.list_current_state().unwrap().len(), 1);
+        assert!(s.state_spans(cid("b")).unwrap().is_empty());
+
+        s.conn.execute_batch("DROP INDEX one_check_per_ts").unwrap();
+        s.persist_ingest(
+            &[(result("b", 1_000, 6), Status::Down)],
+            &[agent_state("b", "agent", Status::Down, 1_000)],
+            &[published("b", NodeState::Down, 1_000)],
+        )
+        .expect("the connection survives a failed batch");
+        assert_eq!(s.count_results().unwrap(), 2);
     }
 
     #[test]
@@ -5834,6 +6651,81 @@ mod tests {
             "stale row must be excluded, got {}",
             b.uptime_24h
         );
+    }
+
+    #[test]
+    fn list_status_projection_handles_out_of_order_equal_timestamp_and_nulls() {
+        let s = Storage::open(":memory:").unwrap();
+        let now = 1_000_000_000_000i64;
+        let mut failure = result("a", now, 50);
+        failure.agent_id = "agent-a".into();
+        failure.status_code = None;
+        failure.error = Some("failed".into());
+        failure.failure = Some(crate::models::FailureKind::ConnectionFailed);
+        let mut recovery = result("a", now, 12);
+        recovery.agent_id = "agent-z".into();
+        recovery.status_code = Some(204);
+        let stale = result("a", now - 1, 99);
+
+        s.insert_results(&[(failure, Status::Down), (recovery, Status::Up)])
+            .unwrap();
+        s.insert_results(&[(stale, Status::Down)]).unwrap();
+
+        let row = s.list_status(now).unwrap().remove(0);
+        assert_eq!(row.state, NodeState::Up);
+        assert_eq!(row.latency_ms, 12);
+        assert_eq!(row.status_code, Some(204));
+        assert_eq!(row.error, None);
+        assert_eq!(row.failure, None);
+    }
+
+    #[test]
+    fn opening_repairs_an_incomplete_latest_results_projection() {
+        let path = std::env::temp_dir().join(format!(
+            "warden-latest-results-repair-{}.duckdb",
+            uuid::Uuid::now_v7()
+        ));
+        let path_string = path.to_string_lossy().into_owned();
+        let now = 1_000_000_000_000i64;
+        {
+            let s = Storage::open(&path_string).unwrap();
+            s.insert_results(&[
+                (result("a", now, 10), Status::Up),
+                (result("b", now, 20), Status::Down),
+            ])
+            .unwrap();
+            s.conn
+                .execute(
+                    "DELETE FROM latest_check_results WHERE check_id = ?",
+                    duckdb::params![cid("b")],
+                )
+                .unwrap();
+            assert_eq!(s.list_status(now).unwrap().len(), 1);
+        }
+
+        let reopened = Storage::open(&path_string).unwrap();
+        assert_eq!(reopened.list_status(now).unwrap().len(), 2);
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn list_status_projection_is_rebuilt_after_agent_purge() {
+        let s = Storage::open(":memory:").unwrap();
+        let now = 1_000_000_000_000i64;
+        let mut older = result("a", now - 1, 10);
+        older.agent_id = "kept".into();
+        let mut latest = result("a", now, 20);
+        latest.agent_id = "purged".into();
+        s.insert_results(&[(older, Status::Up), (latest, Status::Down)])
+            .unwrap();
+
+        s.purge_agent("purged").unwrap();
+
+        let row = s.list_status(now).unwrap().remove(0);
+        assert_eq!(row.state, NodeState::Up);
+        assert_eq!(row.latency_ms, 10);
+        assert_eq!(row.last_check, now - 1);
     }
 
     #[test]
@@ -7010,6 +7902,7 @@ mod tests {
     fn sample_replicated_incident() -> ReplicatedIncident {
         ReplicatedIncident {
             id: "inc-1".into(),
+            version: Hlc::new(100, "a"),
             title: "Outage".into(),
             state: IncidentState::Detected,
             started_at: 100,
@@ -7044,6 +7937,7 @@ mod tests {
         );
 
         let mut renamed = i.clone();
+        renamed.version = Hlc::new(101, "a");
         renamed.title = "Major outage".into();
         s.upsert_incident(&renamed).unwrap();
         let stored = s.incident("inc-1").unwrap().unwrap();
@@ -7084,6 +7978,155 @@ mod tests {
         assert_eq!(s.replicated_incident("missing").unwrap(), None);
     }
 
+    #[test]
+    fn equal_version_incident_conflicts_converge_independent_of_delivery_order() {
+        let a = Storage::open(":memory:").unwrap();
+        let b = Storage::open(":memory:").unwrap();
+        let first = sample_replicated_incident();
+        let mut second = first.clone();
+        second.title = "Conflicting title".into();
+        let expected = if serde_json::to_vec(&first).unwrap() > serde_json::to_vec(&second).unwrap()
+        {
+            first.clone()
+        } else {
+            second.clone()
+        };
+
+        a.upsert_incident(&first).unwrap();
+        a.upsert_incident(&second).unwrap();
+        b.upsert_incident(&second).unwrap();
+        b.upsert_incident(&first).unwrap();
+
+        assert_eq!(
+            a.replicated_incident("inc-1").unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(b.replicated_incident("inc-1").unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn incident_tombstone_cursor_and_digest_include_node_id_before_id() {
+        let s = Storage::open(":memory:").unwrap();
+        for (id, node_id) in [("z", "a"), ("a", "z")] {
+            s.apply_incident_tombstone(&IncidentTombstone {
+                id: id.into(),
+                deleted_at: 101,
+                node_id: node_id.into(),
+            })
+            .unwrap();
+        }
+
+        let digest = s.digest(0).unwrap();
+        assert_eq!(digest.incident_tombstones.max_millis, 101);
+        assert_eq!(digest.incident_tombstones.max_id, "z\0a");
+        assert_eq!(
+            s.incident_tombstones_since(101, "a", "z", 10).unwrap(),
+            vec![IncidentTombstone {
+                id: "a".into(),
+                deleted_at: 101,
+                node_id: "z".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn incident_rows_and_tombstones_obey_one_lww_order_and_exact_digests() {
+        let s = Storage::open(":memory:").unwrap();
+        let mut incident = sample_replicated_incident();
+        assert!(s.upsert_incident(&incident).unwrap());
+        assert!(!s
+            .apply_incident_tombstone(&IncidentTombstone {
+                id: incident.id.clone(),
+                deleted_at: 99,
+                node_id: "z".into(),
+            })
+            .unwrap());
+        assert!(s.incident(&incident.id).unwrap().is_some());
+
+        assert!(s
+            .apply_incident_tombstone(&IncidentTombstone {
+                id: incident.id.clone(),
+                deleted_at: 101,
+                node_id: "a".into(),
+            })
+            .unwrap());
+        let digest = s.digest(0).unwrap();
+        assert_eq!(digest.incidents.count, 0);
+        assert_eq!(digest.incidents.max_millis, 0);
+        assert_eq!(digest.incident_tombstones.count, 1);
+
+        incident.version = Hlc::new(102, "a");
+        incident.title = "recreated".into();
+        assert!(s.upsert_incident(&incident).unwrap());
+        let digest = s.digest(0).unwrap();
+        assert_eq!(digest.incidents.count, 1);
+        assert_eq!(digest.incidents.max_millis, 102);
+        assert_eq!(digest.incident_tombstones.count, 0);
+        assert!(!s
+            .apply_incident_tombstone(&IncidentTombstone {
+                id: incident.id.clone(),
+                deleted_at: 101,
+                node_id: "z".into(),
+            })
+            .unwrap());
+        assert_eq!(
+            s.incident(&incident.id).unwrap().unwrap().title,
+            "recreated"
+        );
+    }
+
+    #[test]
+    fn incident_check_mutations_advance_versions_but_noops_do_not() {
+        let s = Storage::open(":memory:").unwrap();
+        s.set_incident_node_id("coordinator-a");
+        s.create_incident(
+            "inc",
+            "Outage",
+            IncidentState::Detected,
+            100,
+            false,
+            Some(cid("a")),
+            &[IncidentCheckRow {
+                check_id: cid("a"),
+                source: AffectSource::Origin,
+            }],
+            None,
+        )
+        .unwrap();
+        let version = || s.replicated_incident("inc").unwrap().unwrap().version;
+        let initial = version();
+        assert_eq!(initial.node_id, "coordinator-a");
+
+        s.attach_check("inc", cid("b"), AffectSource::Dependency)
+            .unwrap();
+        let attached = version();
+        assert!(attached > initial);
+        s.attach_check("inc", cid("b"), AffectSource::Dependency)
+            .unwrap();
+        assert_eq!(version(), attached);
+
+        s.detach_check("inc", cid("b"), Some(AffectSource::Dependency))
+            .unwrap();
+        let detached = version();
+        assert!(detached > attached);
+        s.detach_check("inc", cid("b"), Some(AffectSource::Dependency))
+            .unwrap();
+        assert_eq!(version(), detached);
+
+        s.set_manual_checks("inc", &[cid("c")]).unwrap();
+        let manual = version();
+        assert!(manual > detached);
+        s.set_manual_checks("inc", &[cid("c"), cid("c")]).unwrap();
+        assert_eq!(version(), manual);
+
+        s.purge_check_everything(cid("c"), 1_000, "coordinator-a")
+            .unwrap();
+        assert!(
+            version() > manual,
+            "purge membership removal must replicate"
+        );
+    }
+
     // ---- Clustering: paged backfill ----
 
     #[test]
@@ -7094,7 +8137,7 @@ mod tests {
             (result("a", 2000, 2), Status::Down),
         ])
         .unwrap();
-        let page = s.results_since(cid("a"), 1000, 5000, 10).unwrap();
+        let page = s.results_since(cid("a"), 1000, None, 5000, 10).unwrap();
         assert_eq!(page.len(), 1, "since is exclusive of the cursor");
         assert_eq!(page[0].0.timestamp.timestamp_millis(), 2000);
         assert_eq!(page[0].1, Status::Down);
@@ -7102,6 +8145,15 @@ mod tests {
         // rather than being invented.
         assert_eq!(page[0].0.body, None);
         assert_eq!(page[0].0.headers, None);
+
+        let mut same_ts = result("a", 2000, 3);
+        same_ts.agent_id = "z-agent".into();
+        s.insert_results(&[(same_ts, Status::Up)]).unwrap();
+        let page = s
+            .results_since(cid("a"), 2000, Some("agent"), 5000, 10)
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].0.agent_id, "z-agent");
 
         s.insert_alert(
             AlertScope::Check,
@@ -7112,7 +8164,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let alerts = s.alerts_since(1000, 10).unwrap();
+        let alerts = s.alerts_since(1000, "", 10).unwrap();
         assert_eq!(alerts.len(), 1);
 
         s.create_incident(
@@ -7129,12 +8181,287 @@ mod tests {
             None,
         )
         .unwrap();
-        let incidents = s.incidents_since(1000, 10).unwrap();
+        let incidents = s.incidents_since(1000, "", 10).unwrap();
         assert_eq!(incidents.len(), 1);
         assert_eq!(incidents[0].id, "inc-1");
     }
 
+    #[test]
+    fn result_backfill_pages_all_rows_sharing_a_timestamp() {
+        let s = Storage::open(":memory:").unwrap();
+        let rows = (0..501)
+            .map(|i| {
+                let mut row = result("a", 2000, i);
+                row.agent_id = format!("agent-{i:04}");
+                (row, Status::Up)
+            })
+            .collect::<Vec<_>>();
+        s.insert_results(&rows).unwrap();
+
+        let first = s.results_since(cid("a"), 1000, None, 2000, 500).unwrap();
+        assert_eq!(first.len(), 500);
+        let last = first.last().unwrap();
+        let second = s
+            .results_since(
+                cid("a"),
+                last.0.timestamp.timestamp_millis(),
+                Some(&last.0.agent_id),
+                2000,
+                500,
+            )
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].0.agent_id, "agent-0500");
+    }
+
     // ---- Clustering: digest ----
+
+    #[test]
+    fn full_digest_uses_write_time_watermarks() {
+        let s = Storage::open(":memory:").unwrap();
+        s.insert_results(&[
+            (result("a", 1000, 1), Status::Up),
+            (result("a", 2000, 2), Status::Down),
+            (result("b", 1500, 3), Status::Up),
+        ])
+        .unwrap();
+
+        s.conn.execute("DELETE FROM check_results", []).unwrap();
+
+        let digest = s.digest(0).unwrap();
+        let a = digest
+            .checks
+            .iter()
+            .find(|entry| entry.check_id == cid("a"))
+            .unwrap();
+        assert_eq!(a.max_ts, 2000);
+        assert_eq!(a.count, 2);
+        assert_eq!(digest.checks.len(), 2);
+    }
+
+    #[test]
+    #[ignore = "production-scale benchmark; requires substantial time and disk"]
+    fn benchmark_full_digest_with_production_retained_history() {
+        let check_count = std::env::var("WARDEN_BENCH_CHECKS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(10_000);
+        let observations_per_check = std::env::var("WARDEN_BENCH_OBSERVATIONS_PER_CHECK")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(30 * 24 * 60 * 2);
+        let max_digest_ms = std::env::var("WARDEN_BENCH_MAX_DIGEST_MS")
+            .ok()
+            .and_then(|value| value.parse::<u128>().ok())
+            .unwrap_or(2_000);
+        let sample_count = 20usize;
+        let path = std::env::temp_dir().join(format!(
+            "warden-anti-entropy-bench-{}-{}.duckdb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path_string = path.to_string_lossy().into_owned();
+        let store = Storage::open(&path_string).unwrap();
+
+        let seed_started = std::time::Instant::now();
+        store
+            .conn
+            .execute_batch(&format!(
+                "INSERT INTO check_results
+                 SELECT md5('check-' || check_number::VARCHAR)::UUID,
+                        'agent-' || (observation_number % 3)::VARCHAR,
+                        observation_number,
+                        'up', 1, 200, NULL, NULL, 'zone', 'region'
+                 FROM range({check_count}) checks(check_number)
+                 CROSS JOIN range({observations_per_check}) observations(observation_number);
+                 INSERT INTO result_replication_watermarks
+                 SELECT md5('check-' || check_number::VARCHAR)::UUID,
+                        {observations_per_check} - 1,
+                        {observations_per_check}
+                 FROM range({check_count}) checks(check_number);
+                 CHECKPOINT;"
+            ))
+            .unwrap();
+        let seed_elapsed = seed_started.elapsed();
+        let retained_rows = check_count * observations_per_check;
+        let database_bytes = std::fs::metadata(&path).unwrap().len();
+
+        let mut samples = Vec::with_capacity(sample_count);
+        for _ in 0..sample_count {
+            let started = std::time::Instant::now();
+            let digest = store.digest(0).unwrap();
+            samples.push(started.elapsed());
+            assert_eq!(digest.checks.len() as u64, check_count);
+        }
+        samples.sort_unstable();
+        let p50 = samples[sample_count / 2];
+        let p95 = samples[(sample_count * 95 / 100).min(sample_count - 1)];
+        let max = samples[sample_count - 1];
+
+        println!(
+            "checks={check_count} retained_rows={retained_rows} database_bytes={database_bytes} seed_ms={} digest_p50_ms={} digest_p95_ms={} digest_max_ms={}",
+            seed_elapsed.as_millis(),
+            p50.as_millis(),
+            p95.as_millis(),
+            max.as_millis()
+        );
+        assert!(
+            p95.as_millis() <= max_digest_ms,
+            "full digest p95 {p95:?} exceeded {max_digest_ms}ms with {retained_rows} retained rows"
+        );
+
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "capacity baseline; configure WARDEN_BENCH_* for the intended scale"]
+    fn benchmark_representative_storage_capacity_baseline() {
+        fn env_u64(name: &str, default: u64) -> u64 {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        }
+        fn env_u128(name: &str) -> Option<u128> {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+        }
+        fn percentile(samples: &mut [std::time::Duration], percentile: usize) -> u128 {
+            samples.sort_unstable();
+            samples[(samples.len() * percentile / 100).min(samples.len() - 1)].as_millis()
+        }
+        fn bytes(path: &std::path::Path) -> u64 {
+            std::fs::metadata(path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
+        }
+
+        let check_count = env_u64("WARDEN_BENCH_CHECKS", 100);
+        let days = env_u64("WARDEN_BENCH_DAYS", 2);
+        let observation_secs = env_u64("WARDEN_BENCH_OBSERVATION_SECS", 30);
+        let domains = env_u64("WARDEN_BENCH_DOMAINS", 1);
+        assert!(check_count > 0 && days > 0 && observation_secs > 0 && domains > 0);
+        let observations_per_check = days * 86_400 / observation_secs;
+        let rows = check_count * observations_per_check * domains;
+        let path = std::env::temp_dir().join(format!(
+            "warden-capacity-bench-{}-{}.duckdb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let wal_path = std::path::PathBuf::from(format!("{}.wal", path.display()));
+        let backup_path = path.with_extension("backup.duckdb");
+        let path_string = path.to_string_lossy().into_owned();
+        let store = Storage::open(&path_string).unwrap();
+        let now = days as i64 * 86_400_000;
+        let step_ms = observation_secs as i64 * 1_000;
+
+        let seed_started = std::time::Instant::now();
+        store
+            .conn
+            .execute_batch(&format!(
+                "INSERT INTO check_results
+                 SELECT md5('check-' || check_number::VARCHAR)::UUID,
+                        'agent-' || domain_number::VARCHAR || '-' || (check_number % 3)::VARCHAR,
+                        observation_number * {step_ms} + domain_number,
+                        CASE WHEN (observation_number + check_number * 17 + domain_number * 31) % 97 = 0 THEN 'down' ELSE 'up' END,
+                        15 + ((observation_number * 37 + check_number * 13 + domain_number * 19) % 2_000),
+                        CASE WHEN (observation_number + check_number * 17 + domain_number * 31) % 97 = 0 THEN 503 ELSE 200 + ((check_number + domain_number) % 5) END,
+                        CASE WHEN (observation_number + check_number * 17 + domain_number * 31) % 97 = 0 THEN 'timeout-' || check_number::VARCHAR || '-' || observation_number::VARCHAR ELSE NULL END,
+                        CASE WHEN (observation_number + check_number * 17 + domain_number * 31) % 97 = 0 THEN '\"timeout\"' ELSE NULL END,
+                        'zone-' || domain_number::VARCHAR,
+                        'region-' || domain_number::VARCHAR
+                 FROM range({check_count}) checks(check_number)
+                 CROSS JOIN range({observations_per_check}) observations(observation_number)
+                 CROSS JOIN range({domains}) domain(domain_number);"
+            ))
+            .unwrap();
+        store.rebuild_result_watermarks().unwrap();
+        store.rebuild_latest_check_results().unwrap();
+        store.conn.execute_batch("CHECKPOINT").unwrap();
+        let seed_ms = seed_started.elapsed().as_millis();
+        assert_eq!(store.count_results().unwrap(), rows);
+        let database_before_prune = bytes(&path);
+        let wal_before_prune = bytes(&wal_path);
+
+        drop(store);
+        let backup_started = std::time::Instant::now();
+        std::fs::copy(&path, &backup_path).unwrap();
+        let backup_ms = backup_started.elapsed().as_millis();
+        let backup_bytes = bytes(&backup_path);
+        let restore_started = std::time::Instant::now();
+        let restored = Storage::open(backup_path.to_str().unwrap()).unwrap();
+        assert_eq!(restored.count_results().unwrap(), rows);
+        let restore_ms = restore_started.elapsed().as_millis();
+        drop(restored);
+        let store = Storage::open(&path_string).unwrap();
+
+        let check_id: CheckId = store
+            .conn
+            .query_row("SELECT check_id FROM check_results LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let mut history_samples = Vec::new();
+        let mut latency_samples = Vec::new();
+        for _ in 0..10 {
+            let started = std::time::Instant::now();
+            let history = store
+                .history(check_id, 100, Some(0), Some(now), None)
+                .unwrap();
+            history_samples.push(started.elapsed());
+            assert_eq!(history.len(), 100);
+            let started = std::time::Instant::now();
+            let series = store.latency_series(check_id, 0, now, 120).unwrap();
+            latency_samples.push(started.elapsed());
+            assert!(series.overall.attempts > 0);
+        }
+
+        let prune_started = std::time::Instant::now();
+        let pruned = store.prune((days - 1).max(1), 90, now).unwrap();
+        let prune_ms = prune_started.elapsed().as_millis();
+        assert!(pruned > 0, "benchmark must exercise raw retention");
+        let checkpoint_started = std::time::Instant::now();
+        store.conn.execute_batch("CHECKPOINT").unwrap();
+        let checkpoint_ms = checkpoint_started.elapsed().as_millis();
+        let database_after_prune = bytes(&path);
+        let wal_after_prune = bytes(&wal_path);
+
+        let history_p95_ms = percentile(&mut history_samples, 95);
+        let latency_p95_ms = percentile(&mut latency_samples, 95);
+        println!(
+            "checks={check_count} domains={domains} retained_rows={rows} observation_secs={observation_secs} seed_ms={seed_ms} database_before_prune_bytes={database_before_prune} wal_before_prune_bytes={wal_before_prune} backup_bytes={backup_bytes} backup_ms={backup_ms} restore_ms={restore_ms} history_p95_ms={history_p95_ms} latency_p95_ms={latency_p95_ms} pruned_rows={pruned} prune_ms={prune_ms} checkpoint_ms={checkpoint_ms} database_after_prune_bytes={database_after_prune} wal_after_prune_bytes={wal_after_prune}"
+        );
+
+        for (name, value) in [
+            ("WARDEN_BENCH_MAX_HISTORY_P95_MS", history_p95_ms),
+            ("WARDEN_BENCH_MAX_LATENCY_P95_MS", latency_p95_ms),
+            ("WARDEN_BENCH_MAX_PRUNE_MS", prune_ms),
+            ("WARDEN_BENCH_MAX_CHECKPOINT_MS", checkpoint_ms),
+            ("WARDEN_BENCH_MAX_BACKUP_MS", backup_ms),
+            ("WARDEN_BENCH_MAX_RESTORE_MS", restore_ms),
+            (
+                "WARDEN_BENCH_MAX_DATABASE_BYTES",
+                database_before_prune as u128,
+            ),
+        ] {
+            if let Some(limit) = env_u128(name) {
+                assert!(value <= limit, "{name}: measured {value}, limit {limit}");
+            }
+        }
+
+        drop(store);
+        let _ = std::fs::remove_file(wal_path);
+        std::fs::remove_file(backup_path).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn digest_reports_max_and_count_and_excludes_rows_before_window_start() {
@@ -7205,13 +8532,13 @@ mod tests {
         );
 
         assert_eq!(
-            d.max_alert_ts,
+            d.alerts.max_millis,
             now - 1000,
             "the older alert is outside the window"
         );
         assert_eq!(
-            d.max_incident_started_at,
-            now - 2000,
+            d.incidents.max_millis,
+            now - 1999,
             "the older incident is outside the window"
         );
     }
@@ -7402,6 +8729,7 @@ mod tests {
 
         s.upsert_incident(&ReplicatedIncident {
             id: "inc-1".into(),
+            version: Hlc::new(1000, "a"),
             title: "Outage".into(),
             state: IncidentState::Detected,
             started_at: 1000,
@@ -7496,6 +8824,7 @@ mod tests {
         let web = cid("web");
         let i = ReplicatedIncident {
             id: "inc-1".into(),
+            version: Hlc::new(10, "a"),
             title: "Outage".into(),
             state: IncidentState::Investigating,
             started_at: 10,
@@ -7515,7 +8844,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&i).unwrap(),
             format!(
-                r#"{{"id":"inc-1","title":"Outage","state":"investigating","started_at":10,"resolved_at":null,"global":false,"origin_check":"{web}","checks":[["{web}","origin"]],"updates":[{{"id":"inc-1-u10","incident_id":"inc-1","state":"detected","body":"down","author":null,"created_at":10}}]}}"#
+                r#"{{"id":"inc-1","version":{{"millis":10,"node_id":"a"}},"title":"Outage","state":"investigating","started_at":10,"resolved_at":null,"global":false,"origin_check":"{web}","checks":[["{web}","origin"]],"updates":[{{"id":"inc-1-u10","incident_id":"inc-1","state":"detected","body":"down","author":null,"created_at":10}}]}}"#
             )
         );
     }

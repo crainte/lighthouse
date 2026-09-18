@@ -70,7 +70,7 @@ fn cid(name: &str) -> CheckId {
     Uuid::new_v5(&Uuid::NAMESPACE_DNS, name.as_bytes())
 }
 
-fn coordinator(alerts_to: SocketAddr, peers: Vec<String>) -> Coordinator {
+async fn coordinator(alerts_to: SocketAddr, peers: Vec<String>) -> Coordinator {
     let coord = Coordinator::new(&CoordinatorConfig {
         listen: "127.0.0.1:0".into(),
         db_path: ":memory:".into(),
@@ -85,16 +85,19 @@ fn coordinator(alerts_to: SocketAddr, peers: Vec<String>) -> Coordinator {
         peers,
         ..Default::default()
     })
+    .await
     .unwrap();
-    coord.create_check_for_test(CheckConfig {
-        id: cid(CHECK),
-        name: CHECK.into(),
-        kind: CheckKind::Http,
-        target: "https://example.invalid".into(),
-        cron: "0 * * * * *".into(),
-        timeout_secs: 5,
-        ..Default::default()
-    });
+    coord
+        .create_check_for_test(CheckConfig {
+            id: cid(CHECK),
+            name: CHECK.into(),
+            kind: CheckKind::Http,
+            target: "https://example.invalid".into(),
+            cron: "0 * * * * *".into(),
+            timeout_secs: 5,
+            ..Default::default()
+        })
+        .await;
     coord
 }
 
@@ -146,11 +149,11 @@ async fn a_transition_reaches_the_peer_without_paging_twice() {
     let (sink_b, addr_sink_b) = alert_sink().await;
 
     // Peer B is a plain coordinator with no peers of its own: it receives.
-    let coord_b = coordinator(addr_sink_b, vec![]);
+    let coord_b = coordinator(addr_sink_b, vec![]).await;
     let addr_b = serve(coord_b.clone().router()).await;
 
     // Node A replicates to B.
-    let coord_a = coordinator(addr_sink_a, vec![format!("http://{addr_b}")]);
+    let coord_a = coordinator(addr_sink_a, vec![format!("http://{addr_b}")]).await;
 
     // The first observation only establishes a baseline; the second flips it.
     coord_a.ingest(vec![result(200, 1_000)]).await;
@@ -209,7 +212,7 @@ async fn a_transition_reaches_the_peer_without_paging_twice() {
 #[tokio::test]
 async fn gossip_is_not_anonymously_writable() {
     let (_sink, addr_sink) = alert_sink().await;
-    let coord = coordinator(addr_sink, vec![]);
+    let coord = coordinator(addr_sink, vec![]).await;
     let addr = serve(coord.clone().router()).await;
 
     let forged = serde_json::json!({
@@ -261,9 +264,9 @@ async fn recovery_replicates_too() {
     let (_sink_a, addr_sink_a) = alert_sink().await;
     let (_sink_b, addr_sink_b) = alert_sink().await;
 
-    let coord_b = coordinator(addr_sink_b, vec![]);
+    let coord_b = coordinator(addr_sink_b, vec![]).await;
     let addr_b = serve(coord_b.clone().router()).await;
-    let coord_a = coordinator(addr_sink_a, vec![format!("http://{addr_b}")]);
+    let coord_a = coordinator(addr_sink_a, vec![format!("http://{addr_b}")]).await;
 
     coord_a.ingest(vec![result(200, 1_000)]).await;
     coord_a.ingest(vec![result(500, 2_000)]).await;
@@ -331,7 +334,7 @@ async fn peer_status(addr: SocketAddr) -> String {
 #[tokio::test]
 async fn unknown_is_carried_faithfully() {
     let (_sink, addr_sink) = alert_sink().await;
-    let coord = coordinator(addr_sink, vec![]);
+    let coord = coordinator(addr_sink, vec![]).await;
     let addr = serve(coord.clone().router()).await;
 
     // Move the check off its default first. UNKNOWN *is* the default, so
@@ -374,7 +377,7 @@ async fn broadcast_presents_the_agent_token() {
     let addr = serve(app).await;
 
     let (_sink, addr_sink) = alert_sink().await;
-    let coord = coordinator(addr_sink, vec![format!("http://{addr}")]);
+    let coord = coordinator(addr_sink, vec![format!("http://{addr}")]).await;
     coord.ingest(vec![result(200, 1_000)]).await;
     coord.ingest(vec![result(500, 2_000)]).await;
 

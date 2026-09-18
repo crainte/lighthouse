@@ -24,7 +24,7 @@ fn cid(name: &str) -> CheckId {
     Uuid::new_v5(&Uuid::NAMESPACE_DNS, name.as_bytes())
 }
 
-fn coordinator(peer_token: Option<&str>) -> Coordinator {
+async fn coordinator(peer_token: Option<&str>) -> Coordinator {
     let coord = Coordinator::new(&CoordinatorConfig {
         listen: "127.0.0.1:0".into(),
         db_path: ":memory:".into(),
@@ -32,16 +32,19 @@ fn coordinator(peer_token: Option<&str>) -> Coordinator {
         peer_token: peer_token.map(str::to_owned),
         ..Default::default()
     })
+    .await
     .unwrap();
-    coord.create_check_for_test(CheckConfig {
-        id: cid(CHECK),
-        name: CHECK.into(),
-        kind: CheckKind::Http,
-        target: "https://example.invalid".into(),
-        cron: "0 * * * * *".into(),
-        timeout_secs: 5,
-        ..Default::default()
-    });
+    coord
+        .create_check_for_test(CheckConfig {
+            id: cid(CHECK),
+            name: CHECK.into(),
+            kind: CheckKind::Http,
+            target: "https://example.invalid".into(),
+            cron: "0 * * * * *".into(),
+            timeout_secs: 5,
+            ..Default::default()
+        })
+        .await;
     coord
 }
 
@@ -140,7 +143,7 @@ async fn located(base: &str, session: &str, agent_id: &str) -> (String, String) 
 
 #[tokio::test]
 async fn a_credential_pins_location_over_whatever_the_agent_claims() {
-    let addr = serve(coordinator(None)).await;
+    let addr = serve(coordinator(None).await).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
     let token = mint(&base, &session, "eu-west-1a", "eu-west").await;
@@ -160,7 +163,7 @@ async fn a_credential_pins_location_over_whatever_the_agent_claims() {
 /// checks a caller is handed, and it reads the same self-declared location.
 #[tokio::test]
 async fn a_credential_pins_location_on_the_placement_path_too() {
-    let addr = serve(coordinator(None)).await;
+    let addr = serve(coordinator(None).await).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
     let token = mint(&base, &session, "eu-west-1a", "eu-west").await;
@@ -190,7 +193,7 @@ async fn a_credential_pins_location_on_the_placement_path_too() {
 /// state until an operator mints one.
 #[tokio::test]
 async fn nothing_is_accepted_until_a_credential_exists() {
-    let addr = serve(coordinator(None)).await;
+    let addr = serve(coordinator(None).await).await;
     let base = format!("http://{addr}");
 
     assert_eq!(
@@ -233,7 +236,7 @@ async fn nothing_is_accepted_until_a_credential_exists() {
 
 #[tokio::test]
 async fn revoking_a_credential_takes_effect_without_a_restart() {
-    let addr = serve(coordinator(None)).await;
+    let addr = serve(coordinator(None).await).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
     let token = mint(&base, &session, "eu-west-1a", "eu-west").await;
@@ -277,7 +280,7 @@ async fn revoking_a_credential_takes_effect_without_a_restart() {
 /// Minting must never hand back something that lets the caller read it again.
 #[tokio::test]
 async fn the_secret_is_returned_once_and_never_listed() {
-    let addr = serve(coordinator(None)).await;
+    let addr = serve(coordinator(None).await).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
     let token = mint(&base, &session, "eu-west-1a", "eu-west").await;
@@ -300,7 +303,7 @@ async fn the_secret_is_returned_once_and_never_listed() {
 
 #[tokio::test]
 async fn credentials_are_admin_only() {
-    let addr = serve(coordinator(None)).await;
+    let addr = serve(coordinator(None).await).await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
 
@@ -343,7 +346,7 @@ async fn credentials_are_admin_only() {
 
 #[tokio::test]
 async fn a_blank_location_is_refused() {
-    let addr = serve(coordinator(None)).await;
+    let addr = serve(coordinator(None).await).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
 
@@ -370,7 +373,7 @@ async fn a_blank_location_is_refused() {
 /// is no longer handed out, so gossip must not depend on it.
 #[tokio::test]
 async fn gossip_does_not_accept_an_agent_credential() {
-    let addr = serve(coordinator(Some(PEER_TOKEN))).await;
+    let addr = serve(coordinator(Some(PEER_TOKEN)).await).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
     let agent_token = mint(&base, &session, "eu-west-1a", "eu-west").await;
@@ -408,7 +411,7 @@ async fn gossip_does_not_accept_an_agent_credential() {
 /// per agent") changes how an operator provisions a fleet.
 #[tokio::test]
 async fn one_credential_is_shared_by_every_agent_in_its_zone() {
-    let addr = serve(coordinator(None)).await;
+    let addr = serve(coordinator(None).await).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
     let zone_token = mint(&base, &session, "eu-west-1a", "eu-west").await;
@@ -432,7 +435,7 @@ async fn one_credential_is_shared_by_every_agent_in_its_zone() {
 /// is allowed, and is how you get per-agent revocation if you want it.
 #[tokio::test]
 async fn a_zone_may_hold_several_credentials() {
-    let addr = serve(coordinator(None)).await;
+    let addr = serve(coordinator(None).await).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
 

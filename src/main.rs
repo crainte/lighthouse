@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
 /// the coordinator drains directly — no HTTP hop.
 async fn run_standalone(mut cfg: Config) -> Result<()> {
     cfg.coordinator.validate_cluster()?;
-    let coord = Coordinator::new(&cfg.coordinator)?;
+    let coord = Coordinator::new(&cfg.coordinator).await?;
     let (tx, mut rx) = mpsc::channel(1024);
 
     let ingest = coord.clone();
@@ -122,7 +122,7 @@ async fn run_agent(cfg: Config) -> Result<()> {
 
 async fn run_coordinator(cfg: Config) -> Result<()> {
     cfg.coordinator.validate_cluster()?;
-    let coord = Coordinator::new(&cfg.coordinator)?;
+    let coord = Coordinator::new(&cfg.coordinator).await?;
     serve(coord, &cfg.coordinator.listen).await
 }
 

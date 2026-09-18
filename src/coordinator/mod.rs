@@ -1,5 +1,6 @@
 pub mod alert;
 pub mod cluster;
+mod database;
 mod fleet;
 pub mod gossip;
 pub mod hlc;
@@ -18,6 +19,7 @@ use axum::http::{header, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use database::Database;
 use fleet::{fleet_rows, unreachable_after_ms, FleetMemberDto, FleetRowDto};
 use parking_lot::Mutex;
 use rand::seq::SliceRandom;
@@ -38,9 +40,10 @@ use routes::incidents::{
 };
 pub use routes::incidents::{IncidentCheckDto, IncidentDto, IncidentUpdateDto};
 use routes::peer::{
-    backfill_handler, cluster_ping_handler, cluster_view_handler, config_entries_handler,
-    config_handler, digest_handler, gossip_handler, read_config_entry_for_replication,
-    replicate_handler, ConfigBatch,
+    alerts_backfill_handler, backfill_handler, cluster_ping_handler, cluster_view_handler,
+    config_entries_handler, config_handler, digest_handler, gossip_handler,
+    incident_tombstones_backfill_handler, incidents_backfill_handler,
+    read_config_entry_for_replication, replicate_handler, ConfigBatch,
 };
 pub use routes::peer::{
     CheckDigestDto, ConfigDigestDto, DigestResponse, ReplicatedAlert, ReplicatedBelief,
@@ -340,8 +343,23 @@ struct IntermediateState {
     state: NodeState,
 }
 
+struct StartupData {
+    reported_fleet: Vec<storage::AgentRow>,
+    status_agents: crate::config::AgentsDisplay,
+    notifiers: Vec<crate::notify::Notifier>,
+    maintenance: Vec<crate::maintenance::MaintenanceWindow>,
+    checks: Vec<CheckConfig>,
+    node_id: String,
+    session_key: Vec<u8>,
+    cluster_members: Vec<cluster::Member>,
+    credentials: Vec<AgentCredential>,
+    agent_states: Vec<storage::AgentCheckStateRow>,
+    current_states: Vec<storage::CurrentStateRow>,
+    rollup_policies: Vec<storage::RollupPolicyRow>,
+}
+
 struct Inner {
-    storage: Mutex<Storage>,
+    database: Database,
     tracker: Mutex<StateTracker>,
     /// Last observed zone and region rollups. The first observation establishes
     /// a silent baseline; only subsequent changes become persisted alerts.
@@ -482,6 +500,14 @@ struct SeenAgent {
 }
 
 impl Coordinator {
+    async fn db<T, F>(&self, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Storage) -> Result<T> + Send + 'static,
+    {
+        self.inner.database.call(operation).await
+    }
+
     pub fn mark_embedded_agent_live(&self, agent: &crate::config::AgentConfig) {
         self.inner.seen.write().insert(
             agent.agent_id.clone(),
@@ -499,26 +525,55 @@ impl Coordinator {
 
     /// Check definitions are persisted and authoritative. Runtime edits survive
     /// restarts; process configuration never seeds application resources.
-    pub fn new(cfg: &CoordinatorConfig) -> Result<Self> {
-        let storage = Storage::open(&cfg.db_path)?;
+    pub async fn new(cfg: &CoordinatorConfig) -> Result<Self> {
+        let database = Database::open(cfg.db_path.clone()).await?;
         let now = chrono::Utc::now().timestamp_millis();
-        // Who was reporting before this process started, so a restart does not
-        // briefly forget the fleet and over-assign every check.
-        let reported_fleet = storage.list_agents(now).unwrap_or_default();
-
-        // Both seeded from the config file the first time only; after that the
-        // store is authoritative, or restarting would silently revert the admin
-        // page's edits. Same contract as checks.
-        let status_agents = load_or_seed(&storage, AGENTS_DISPLAY_KEY, &cfg.status_page.agents);
-        let notifiers = Arc::new(parking_lot::RwLock::new(load_or_seed(
-            &storage,
-            NOTIFIERS_KEY,
-            &cfg.notifiers,
-        )));
-        // Store-only, with no config-file counterpart: a window is booked at a
-        // moment, and nobody redeploys to schedule one.
-        let maintenance: Vec<crate::maintenance::MaintenanceWindow> =
-            load_or_seed(&storage, MAINTENANCE_KEY, &Vec::new());
+        let status_agents_seed = cfg.status_page.agents.clone();
+        let notifiers_seed = cfg.notifiers.clone();
+        let configured_node_id = cfg.resolved_node_id();
+        let startup_peer_token = cfg.resolved_peer_token();
+        let startup = database
+            .call(move |storage| {
+                let reported_fleet = storage.list_agents(now).unwrap_or_default();
+                let status_agents = load_or_seed(storage, AGENTS_DISPLAY_KEY, &status_agents_seed);
+                let notifiers = load_or_seed(storage, NOTIFIERS_KEY, &notifiers_seed);
+                let maintenance = load_or_seed(storage, MAINTENANCE_KEY, &Vec::new());
+                storage.seed_sections_from_checks()?;
+                let checks = storage.list_checks()?;
+                let node_id = configured_node_id
+                    .unwrap_or_else(|| load_or_generate(storage, NODE_ID_KEY, 16));
+                storage.set_incident_node_id(&node_id);
+                let session_key = match startup_peer_token {
+                    Some(token) => token.into_bytes(),
+                    None => load_or_generate(storage, SESSION_KEY_KEY, 32).into_bytes(),
+                };
+                let cluster_members = storage.list_cluster_members().unwrap_or_default();
+                let credentials = storage.list_agent_credentials().unwrap_or_default();
+                let agent_states = storage.list_agent_check_state().unwrap_or_default();
+                let current_states = storage.list_current_state().unwrap_or_default();
+                for row in &current_states {
+                    if let Err(error) = storage.record_state(row.check_id, row.state, now) {
+                        warn!(error = %error, check = %row.check_id, "could not seed state history baseline");
+                    }
+                }
+                let rollup_policies = storage.list_rollup_policies().unwrap_or_default();
+                Ok(StartupData {
+                    reported_fleet,
+                    status_agents,
+                    notifiers,
+                    maintenance,
+                    checks,
+                    node_id,
+                    session_key,
+                    cluster_members,
+                    credentials,
+                    agent_states,
+                    current_states,
+                    rollup_policies,
+                })
+            })
+            .await?;
+        let notifiers = Arc::new(parking_lot::RwLock::new(startup.notifiers));
 
         // The dispatcher runs beside ingest, not inside it. Bounded so a wedged
         // endpoint cannot grow an unbounded backlog in memory; overflow drops
@@ -527,26 +582,10 @@ impl Coordinator {
         // Spawned below, once `Self` exists: a failed send is persisted to the
         // retry queue, so the dispatcher needs the store.
         let (notify_tx, rx) = tokio::sync::mpsc::channel::<(alert::Transition, Vec<String>)>(1024);
-        // A deployment that predates the sections table has group names only on
-        // its checks; adopt them so the admin page isn't empty on first open.
-        storage.seed_sections_from_checks()?;
-        let stored = storage.list_checks()?;
-        // Stable across restarts either way: config-resolved when set, else
-        // generated once and persisted so a restart rejoins as itself instead
-        // of appearing as a new member.
-        let node_id = cfg
-            .resolved_node_id()
-            .unwrap_or_else(|| load_or_generate(&storage, NODE_ID_KEY, 16));
-        // The session signing key must be identical on every node so any node
-        // can validate a token any other node issued (see auth.rs). `peer_token`
-        // is already shared and stable, so it doubles as that material when
-        // clustering is on; standalone falls back to a persisted random key so
-        // a restart still does not force every admin to log back in.
-        let session_key = match cfg.resolved_peer_token() {
-            Some(token) => token.into_bytes(),
-            None => load_or_generate(&storage, SESSION_KEY_KEY, 32).into_bytes(),
-        };
-        let auth = crate::auth::Auth::with_signing_key(cfg.resolved_admin_password(), &session_key);
+        let auth = crate::auth::Auth::with_signing_key(
+            cfg.resolved_admin_password(),
+            &startup.session_key,
+        );
         if !auth.admin_enabled() {
             warn!("no admin password set (WARDEN_ADMIN_PASSWORD); the check editor is disabled");
         }
@@ -557,22 +596,19 @@ impl Coordinator {
         let cluster = match (cfg.resolved_peer_token(), cfg.resolved_advertise_url()) {
             (Some(token), Some(url)) => {
                 let c = cluster::Cluster::new(
-                    node_id.clone(),
+                    startup.node_id.clone(),
                     url,
                     now,
                     cfg.peers.clone(),
                     Some(token),
                     cfg.peer_timeout_secs,
                 );
-                match storage.list_cluster_members() {
-                    Ok(members) => c.restore(members),
-                    Err(e) => warn!(error = %e, "could not load persisted cluster members"),
-                }
+                c.restore(startup.cluster_members.clone());
                 Some(Arc::new(c))
             }
             _ => None,
         };
-        let clock = hlc::Clock::new(node_id.clone());
+        let clock = hlc::Clock::new(startup.node_id.clone());
         // Resolve the global-push target up front: a present-but-tokenless
         // block is a hard error, matching how a half-configured cluster
         // refuses to start rather than pushing into a 401.
@@ -580,7 +616,7 @@ impl Coordinator {
         if let Some((url, _, secs)) = &global_push {
             info!(url = %url, push_secs = secs, region = %cfg.region, "global push enabled");
         }
-        let credentials = storage.list_agent_credentials().unwrap_or_default();
+        let credentials = startup.credentials;
         let live = credentials.iter().filter(|c| !c.revoked()).count();
         if live == 0 {
             warn!(
@@ -594,9 +630,9 @@ impl Coordinator {
         // hold-down timer in flight. Seed a history baseline as well; record_state
         // is idempotent when a span already exists.
         let mut tracker = StateTracker::new();
-        if let Ok(leaves) = storage.list_agent_check_state() {
-            let n = leaves.len();
-            for row in leaves {
+        {
+            let n = startup.agent_states.len();
+            for row in startup.agent_states {
                 tracker.seed_agent(
                     row.check_id,
                     &row.agent_id,
@@ -611,37 +647,36 @@ impl Coordinator {
                 info!(leaves = n, "seeded agent beliefs");
             }
         }
-        let current = storage.list_current_state().unwrap_or_default();
-        for row in &current {
+        for row in &startup.current_states {
             tracker.seed_published(row.check_id, row.state, row.pending);
-            if let Err(e) = storage.record_state(row.check_id, row.state, now) {
-                warn!(error = %e, check = %row.check_id, "could not seed state history baseline");
-            }
         }
-        if !current.is_empty() {
-            info!(checks = current.len(), "seeded published state");
+        if !startup.current_states.is_empty() {
+            info!(
+                checks = startup.current_states.len(),
+                "seeded published state"
+            );
         }
-        let rollup_policies = storage
-            .list_rollup_policies()
-            .unwrap_or_default()
+        let rollup_policies = startup
+            .rollup_policies
             .into_iter()
             .map(|row| (row.node_id, row.policy))
             .collect();
         let (events, _) = broadcast::channel(256);
         let coord = Self {
             inner: Arc::new(Inner {
-                storage: Mutex::new(storage),
+                database,
                 tracker: Mutex::new(tracker),
                 intermediate_states: Mutex::new(std::collections::HashMap::new()),
                 retention: cfg.retention.clone(),
                 notify_tx,
                 notifiers,
                 events,
-                checks: parking_lot::RwLock::new(meta_by_id(&stored, cfg.rollup_defaults)),
+                checks: parking_lot::RwLock::new(meta_by_id(&startup.checks, cfg.rollup_defaults)),
                 rollup_defaults: cfg.rollup_defaults,
                 rollup_policies: parking_lot::RwLock::new(rollup_policies),
                 seen: parking_lot::RwLock::new(
-                    reported_fleet
+                    startup
+                        .reported_fleet
                         .into_iter()
                         .map(|a| {
                             (
@@ -671,9 +706,9 @@ impl Coordinator {
                 gossip: gossip::Peers::new(&cfg.peers, cfg.resolved_peer_token().as_deref())
                     .map(Arc::new),
                 missed_polls: cfg.missed_polls,
-                status_agents: parking_lot::RwLock::new(status_agents),
-                maintenance: parking_lot::RwLock::new(maintenance),
-                node_id,
+                status_agents: parking_lot::RwLock::new(startup.status_agents),
+                maintenance: parking_lot::RwLock::new(startup.maintenance),
+                node_id: startup.node_id,
                 clock,
                 cluster,
                 gossip_interval_secs: cfg.gossip_interval_secs,
@@ -685,7 +720,7 @@ impl Coordinator {
             }),
         };
         coord.spawn_dispatcher(rx);
-        coord.apply_provisioned_credentials(&cfg.provision)?;
+        coord.apply_provisioned_credentials(&cfg.provision).await?;
         Ok(coord)
     }
 
@@ -719,7 +754,7 @@ impl Coordinator {
     /// correct either way and converges after one anti-entropy sweep. Declaring
     /// the blocks on a single node sidesteps it entirely — the others receive
     /// the credentials over the config plane.
-    fn apply_provisioned_credentials(
+    async fn apply_provisioned_credentials(
         &self,
         blocks: &[crate::config::ProvisionedCredential],
     ) -> Result<()> {
@@ -749,7 +784,8 @@ impl Coordinator {
             if self.inner.credentials.read().contains_key(id) {
                 continue;
             }
-            self.provision_agent_credential(&token, zone, region)?;
+            self.provision_agent_credential(&token, zone, region)
+                .await?;
             info!(%id, zone, region, "provisioned agent credential from config");
         }
         Ok(())
@@ -785,7 +821,7 @@ impl Coordinator {
                 for notifier in targets {
                     if let Err(e) = crate::notify::send(&client, notifier, &t, &name).await {
                         warn!(error = %e, check = %t.check_id, notifier = %notifier.name, "notification failed, queued for retry");
-                        coord.enqueue_retry(&notifier.name, &t, &e);
+                        coord.enqueue_retry(&notifier.name, &t, &e).await;
                     }
                 }
             }
@@ -793,7 +829,7 @@ impl Coordinator {
     }
 
     /// Persist a failed notification for another attempt.
-    fn enqueue_retry(&self, notifier: &str, t: &alert::Transition, error: &str) {
+    async fn enqueue_retry(&self, notifier: &str, t: &alert::Transition, error: &str) {
         let now = chrono::Utc::now().timestamp_millis();
         let row = storage::QueuedRow {
             notifier: notifier.to_string(),
@@ -805,7 +841,10 @@ impl Coordinator {
             last_error: error.to_string(),
             queued_at: now,
         };
-        if let Err(e) = self.inner.storage.lock().enqueue_notification(&row) {
+        if let Err(e) = self
+            .db(move |storage| storage.enqueue_notification(&row))
+            .await
+        {
             // Nothing left to fall back to; say so rather than implying the
             // retry exists.
             tracing::error!(error = %e, check = %t.check_id, notifier = %notifier, "failed to queue notification for retry");
@@ -820,10 +859,8 @@ impl Coordinator {
     /// out the backoff.
     pub async fn retry_due(&self, now_millis: i64) -> usize {
         let due = match self
-            .inner
-            .storage
-            .lock()
-            .due_notifications(now_millis, RETRY_BATCH)
+            .db(move |storage| storage.due_notifications(now_millis, RETRY_BATCH))
+            .await
         {
             Ok(rows) => rows,
             Err(e) => {
@@ -854,7 +891,7 @@ impl Coordinator {
                     notifier = %row.notifier,
                     "dropping a queued notification: its notifier no longer exists"
                 );
-                self.drop_queued(&row);
+                self.drop_queued(&row).await;
                 continue;
             };
             let t = alert::Transition {
@@ -871,7 +908,7 @@ impl Coordinator {
                         attempts = row.attempts + 1,
                         "queued notification delivered"
                     );
-                    self.drop_queued(&row);
+                    self.drop_queued(&row).await;
                     delivered += 1;
                 }
                 Err(e) => {
@@ -895,7 +932,10 @@ impl Coordinator {
                         last_error: e,
                         ..row
                     };
-                    if let Err(e) = self.inner.storage.lock().enqueue_notification(&next_row) {
+                    if let Err(e) = self
+                        .db(move |storage| storage.enqueue_notification(&next_row))
+                        .await
+                    {
                         tracing::error!(error = %e, "failed to reschedule a notification");
                     }
                 }
@@ -904,12 +944,14 @@ impl Coordinator {
         delivered
     }
 
-    fn drop_queued(&self, row: &storage::QueuedRow) {
-        if let Err(e) = self.inner.storage.lock().delete_notification(
-            &row.notifier,
-            row.check_id,
-            row.queued_at,
-        ) {
+    async fn drop_queued(&self, row: &storage::QueuedRow) {
+        let notifier = row.notifier.clone();
+        let check_id = row.check_id;
+        let queued_at = row.queued_at;
+        if let Err(e) = self
+            .db(move |storage| storage.delete_notification(&notifier, check_id, queued_at))
+            .await
+        {
             tracing::error!(error = %e, "failed to clear a delivered notification");
         }
     }
@@ -994,7 +1036,7 @@ impl Coordinator {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(push_secs));
             loop {
                 tick.tick().await;
-                let push = coord.build_state_push();
+                let push = coord.build_state_push().await;
                 match client
                     .post(&endpoint)
                     .bearer_auth(&token)
@@ -1013,15 +1055,24 @@ impl Coordinator {
     /// Build the summary of every configured, visible check for a global push.
     /// Reuses the same status source the public `/api/v1/status` reads, so the
     /// global dashboard shows exactly what a regional dashboard would.
-    fn build_state_push(&self) -> crate::global::wire::RegionStatePush {
+    async fn build_state_push(&self) -> crate::global::wire::RegionStatePush {
         use crate::global::cache::worst;
         use crate::global::wire::{CheckSummary, RegionStatePush};
 
         let now = chrono::Utc::now().timestamp_millis();
-        let (rows, confirmed) = {
-            let store = self.inner.storage.lock();
-            (store.list_status(now), store.list_current_state())
-        };
+        let (rows, confirmed, polls) = self
+            .db(move |storage| {
+                Ok((
+                    storage.list_status(now),
+                    storage.list_current_state(),
+                    storage.list_agent_polls().unwrap_or_default(),
+                ))
+            })
+            .await
+            .unwrap_or_else(|error| {
+                warn!(%error, "global push database read failed");
+                (Ok(Vec::new()), Ok(Vec::new()), Vec::new())
+            });
         let confirmed: std::collections::HashMap<crate::models::CheckId, NodeState> = confirmed
             .unwrap_or_default()
             .into_iter()
@@ -1110,7 +1161,7 @@ impl Coordinator {
                         .or_insert(healthy);
                 }
             }
-            if let Ok(polls) = self.inner.storage.lock().list_agent_polls() {
+            {
                 for p in polls {
                     if p.region != region {
                         continue;
@@ -1138,14 +1189,52 @@ impl Coordinator {
         }
     }
 
+    async fn apply_config_entries(
+        &self,
+        entries: Vec<storage::ConfigEntry>,
+    ) -> Result<(bool, bool, bool, Vec<String>)> {
+        let entries: Vec<_> = entries
+            .into_iter()
+            .inspect(|entry| self.inner.clock.observe(&entry.hlc))
+            .collect();
+        self.db(move |store| {
+            let mut checks = false;
+            let mut credentials = false;
+            let mut policies = false;
+            let mut settings = Vec::new();
+            for raw in entries {
+                let mut entry = raw;
+                if entry.kind == storage::ConfigKind::Setting {
+                    if let Some(document) = entry.document.take() {
+                        entry.document = Some(serde_json::to_string(&document).unwrap_or(document));
+                    }
+                }
+                match store.apply_config_entry(&entry) {
+                    Ok(true) => match entry.kind {
+                        storage::ConfigKind::Check => checks = true,
+                        storage::ConfigKind::Credential => credentials = true,
+                        storage::ConfigKind::RollupPolicy => policies = true,
+                        storage::ConfigKind::Setting => settings.push(entry.id),
+                        storage::ConfigKind::Section => {}
+                    },
+                    Ok(false) => {}
+                    Err(error) => warn!(%error, kind = entry.kind.as_str(), id = %entry.id, "config: failed to apply an entry, skipping it"),
+                }
+            }
+            Ok((checks, credentials, policies, settings))
+        })
+        .await
+    }
+
     /// Replace the published fleet summary, through the config-replication
     /// path so a peer picks it up too. `write_config` persists before
     /// `apply_config_batch` swaps the live cache, so a failed write cannot
     /// leave a setting live that a restart would forget.
-    fn save_agents_display(&self, next: crate::config::AgentsDisplay) -> Result<()> {
+    async fn save_agents_display(&self, next: crate::config::AgentsDisplay) -> Result<()> {
         let json = serde_json::to_string(&next)?;
-        let entry =
-            self.write_config(storage::ConfigKind::Setting, AGENTS_DISPLAY_KEY, Some(json))?;
+        let entry = self
+            .write_config(storage::ConfigKind::Setting, AGENTS_DISPLAY_KEY, Some(json))
+            .await?;
         self.replicate_config(vec![entry]);
         Ok(())
     }
@@ -1153,9 +1242,11 @@ impl Coordinator {
     /// Replace the notifier list, through the config-replication path. A
     /// failed write cannot leave the dispatcher sending to something no
     /// restart would remember, for the same reason as any other config edit.
-    fn save_notifiers(&self, next: Vec<crate::notify::Notifier>) -> Result<()> {
+    async fn save_notifiers(&self, next: Vec<crate::notify::Notifier>) -> Result<()> {
         let json = serde_json::to_string(&next)?;
-        let entry = self.write_config(storage::ConfigKind::Setting, NOTIFIERS_KEY, Some(json))?;
+        let entry = self
+            .write_config(storage::ConfigKind::Setting, NOTIFIERS_KEY, Some(json))
+            .await?;
         self.replicate_config(vec![entry]);
         Ok(())
     }
@@ -1163,9 +1254,14 @@ impl Coordinator {
     /// Replace the maintenance windows, through the config-replication path:
     /// a window that only suppressed paging on the node it was created on
     /// would silently under-cover the rest of the fleet.
-    fn save_maintenance(&self, next: Vec<crate::maintenance::MaintenanceWindow>) -> Result<()> {
+    async fn save_maintenance(
+        &self,
+        next: Vec<crate::maintenance::MaintenanceWindow>,
+    ) -> Result<()> {
         let json = serde_json::to_string(&next)?;
-        let entry = self.write_config(storage::ConfigKind::Setting, MAINTENANCE_KEY, Some(json))?;
+        let entry = self
+            .write_config(storage::ConfigKind::Setting, MAINTENANCE_KEY, Some(json))
+            .await?;
         self.replicate_config(vec![entry]);
         Ok(())
     }
@@ -1206,32 +1302,40 @@ impl Coordinator {
     /// Persist a credential, make it live immediately, and push it to every
     /// peer so an operator mints once for the fleet rather than once per
     /// coordinator.
-    fn store_credential(&self, record: &AgentCredential) -> Result<()> {
-        self.inner.storage.lock().insert_agent_credential(record)?;
-        self.reload_credentials()?;
-        self.restamp_and_push(storage::ConfigKind::Credential, &record.id);
+    async fn store_credential(&self, record: &AgentCredential) -> Result<()> {
+        let persisted = record.clone();
+        self.db(move |storage| storage.insert_agent_credential(&persisted))
+            .await?;
+        self.reload_credentials().await?;
+        self.restamp_and_push(storage::ConfigKind::Credential, &record.id)
+            .await;
         Ok(())
     }
 
     /// Provision a credential whose token is already known — for a zone whose
     /// agents have to be configured before this coordinator first runs.
-    pub fn provision_agent_credential(&self, token: &str, zone: &str, region: &str) -> Result<()> {
+    pub async fn provision_agent_credential(
+        &self,
+        token: &str,
+        zone: &str,
+        region: &str,
+    ) -> Result<()> {
         let now = chrono::Utc::now().timestamp_millis();
         let record = crate::credential::provision(token, zone, region, now)
             .ok_or_else(|| anyhow::anyhow!("malformed agent credential token"))?;
-        self.store_credential(&record)
+        self.store_credential(&record).await
     }
 
     /// Re-read credentials after a mint or revoke, so a revocation takes effect
     /// on the next request instead of at the next restart.
-    fn reload_credentials(&self) -> Result<()> {
-        let rows = self.inner.storage.lock().list_agent_credentials()?;
+    async fn reload_credentials(&self) -> Result<()> {
+        let rows = self.db(|storage| storage.list_agent_credentials()).await?;
         *self.inner.credentials.write() = rows.into_iter().map(|c| (c.id.clone(), c)).collect();
         Ok(())
     }
 
-    fn reload_rollup_policies(&self) -> Result<()> {
-        let rows = self.inner.storage.lock().list_rollup_policies()?;
+    async fn reload_rollup_policies(&self) -> Result<()> {
+        let rows = self.db(|storage| storage.list_rollup_policies()).await?;
         *self.inner.rollup_policies.write() = rows
             .into_iter()
             .map(|row| (row.node_id, row.policy))
@@ -1241,8 +1345,8 @@ impl Coordinator {
 
     /// Re-read check definitions after an admin edit so ingest and the status
     /// page pick them up without a restart.
-    fn reload_checks(&self) -> Result<Vec<CheckConfig>> {
-        let stored = self.inner.storage.lock().list_checks()?;
+    async fn reload_checks(&self) -> Result<Vec<CheckConfig>> {
+        let stored = self.db(|storage| storage.list_checks()).await?;
         *self.inner.checks.write() = meta_by_id(&stored, self.inner.rollup_defaults);
         Ok(stored)
     }
@@ -1260,30 +1364,28 @@ impl Coordinator {
     ///
     /// Any other setting id applies to the table and stops there: there is
     /// nothing further in `Inner` to keep in step with it.
-    fn reload_setting_cache(&self, id: &str) {
-        fn read<T: serde::de::DeserializeOwned + Default>(store: &Storage, key: &str) -> T {
-            store
-                .get_setting(key)
-                .ok()
-                .flatten()
-                .and_then(|json| serde_json::from_str(&json).ok())
-                .unwrap_or_default()
-        }
+    async fn reload_setting_cache(&self, id: &str) -> Result<()> {
+        let key = id.to_string();
+        let value = self.db(move |storage| storage.get_setting(&key)).await?;
         match id {
             NOTIFIERS_KEY => {
-                let next = read(&self.inner.storage.lock(), NOTIFIERS_KEY);
-                *self.inner.notifiers.write() = next;
+                *self.inner.notifiers.write() = value
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .unwrap_or_default();
             }
             MAINTENANCE_KEY => {
-                let next = read(&self.inner.storage.lock(), MAINTENANCE_KEY);
-                *self.inner.maintenance.write() = next;
+                *self.inner.maintenance.write() = value
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .unwrap_or_default();
             }
             AGENTS_DISPLAY_KEY => {
-                let next = read(&self.inner.storage.lock(), AGENTS_DISPLAY_KEY);
-                *self.inner.status_agents.write() = next;
+                *self.inner.status_agents.write() = value
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .unwrap_or_default();
             }
             _ => {}
         }
+        Ok(())
     }
 
     /// Apply a batch of config entries through the one HLC-arbitrated write path
@@ -1307,61 +1409,20 @@ impl Coordinator {
     /// definition. A single malformed entry is logged and skipped rather
     /// than failing the whole batch, so one bad row cannot block every other
     /// edit riding along with it.
-    fn apply_config_batch(&self, entries: &[storage::ConfigEntry]) -> Result<()> {
-        let mut touched_checks = false;
-        let mut touched_credentials = false;
-        let mut touched_rollup_policies = false;
-        let mut touched_settings: Vec<String> = Vec::new();
-        {
-            let store = self.inner.storage.lock();
-            for raw in entries {
-                // Every stamp this node hears, local or remote, is observed —
-                // without it a node whose clock lags would keep losing every
-                // merge, local edits included, and could never overwrite what
-                // it is replacing.
-                self.inner.clock.observe(&raw.hlc);
-                let mut e = raw.clone();
-                if e.kind == storage::ConfigKind::Setting {
-                    if let Some(doc) = e.document.take() {
-                        e.document = Some(serde_json::to_string(&doc).unwrap_or(doc));
-                    }
-                }
-                match store.apply_config_entry(&e) {
-                    Ok(true) => match e.kind {
-                        storage::ConfigKind::Check => touched_checks = true,
-                        storage::ConfigKind::Credential => touched_credentials = true,
-                        storage::ConfigKind::Setting => touched_settings.push(e.id.clone()),
-                        storage::ConfigKind::RollupPolicy => touched_rollup_policies = true,
-                        // Sections have no in-memory cache of their own —
-                        // every reader queries the table directly.
-                        storage::ConfigKind::Section => {}
-                    },
-                    // Lost the merge: a local or peer stamp already at or
-                    // ahead of this one. Not an error — the row is exactly
-                    // as it should be.
-                    Ok(false) => {}
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            kind = e.kind.as_str(),
-                            id = %e.id,
-                            "config: failed to apply an entry, skipping it"
-                        );
-                    }
-                }
-            }
-        } // drop the storage guard before any reload below re-locks it
-        if touched_checks {
-            self.reload_checks()?;
+    async fn apply_config_batch(&self, entries: &[storage::ConfigEntry]) -> Result<()> {
+        let (checks, credentials, policies, settings) =
+            self.apply_config_entries(entries.to_vec()).await?;
+        if checks {
+            self.reload_checks().await?;
         }
-        if touched_credentials {
-            self.reload_credentials()?;
+        if credentials {
+            self.reload_credentials().await?;
         }
-        if touched_rollup_policies {
-            self.reload_rollup_policies()?;
+        if policies {
+            self.reload_rollup_policies().await?;
         }
-        for id in touched_settings {
-            self.reload_setting_cache(&id);
+        for id in settings {
+            self.reload_setting_cache(&id).await?;
         }
         Ok(())
     }
@@ -1373,7 +1434,7 @@ impl Coordinator {
     /// (see `apply_config_batch`'s doc); returned unchanged so the caller can
     /// hand the exact entry it just applied to `replicate_config` without
     /// re-deriving it.
-    fn write_config(
+    async fn write_config(
         &self,
         kind: storage::ConfigKind,
         id: &str,
@@ -1385,11 +1446,12 @@ impl Coordinator {
             hlc: self.inner.clock.now(),
             document,
         };
-        self.apply_config_batch(std::slice::from_ref(&entry))?;
+        self.apply_config_batch(std::slice::from_ref(&entry))
+            .await?;
         Ok(entry)
     }
 
-    pub(in crate::coordinator) fn save_rollup_policy(
+    pub(in crate::coordinator) async fn save_rollup_policy(
         &self,
         node_id: &str,
         node_type: storage::NodeType,
@@ -1397,14 +1459,17 @@ impl Coordinator {
     ) -> Result<()> {
         policy.validate().map_err(anyhow::Error::msg)?;
         let document = serde_json::to_string(&storage::RollupPolicyDoc { node_type, policy })?;
-        let entry =
-            self.write_config(storage::ConfigKind::RollupPolicy, node_id, Some(document))?;
+        let entry = self
+            .write_config(storage::ConfigKind::RollupPolicy, node_id, Some(document))
+            .await?;
         self.replicate_config(vec![entry]);
         Ok(())
     }
 
-    pub(in crate::coordinator) fn delete_rollup_policy(&self, node_id: &str) -> Result<()> {
-        let entry = self.write_config(storage::ConfigKind::RollupPolicy, node_id, None)?;
+    pub(in crate::coordinator) async fn delete_rollup_policy(&self, node_id: &str) -> Result<()> {
+        let entry = self
+            .write_config(storage::ConfigKind::RollupPolicy, node_id, None)
+            .await?;
         self.replicate_config(vec![entry]);
         Ok(())
     }
@@ -1451,15 +1516,17 @@ impl Coordinator {
     /// `apply_config_batch`'s doc), one layer more than `write_config`
     /// expects here, so a setting is always pushed by its own handler, which
     /// already holds the raw value it just wrote.
-    fn restamp_and_push(&self, kind: storage::ConfigKind, id: &str) {
-        let existing = {
-            let store = self.inner.storage.lock();
-            read_config_entry_for_replication(&store, kind, id)
-        };
+    async fn restamp_and_push(&self, kind: storage::ConfigKind, id: &str) {
+        let owned_id = id.to_string();
+        let existing = self
+            .db(move |storage| Ok(read_config_entry_for_replication(storage, kind, &owned_id)))
+            .await
+            .ok()
+            .flatten();
         let Some(existing) = existing else {
             return;
         };
-        match self.write_config(kind, id, existing.document) {
+        match self.write_config(kind, id, existing.document).await {
             Ok(entry) => self.replicate_config(vec![entry]),
             Err(e) => {
                 tracing::warn!(
@@ -1490,12 +1557,25 @@ impl Coordinator {
         if cluster.live_urls().is_empty() {
             return;
         }
-        let batch = ReplicationBatch {
-            origin: self.inner.node_id.clone(),
-            deleted_incidents: ids,
-            ..Default::default()
-        };
+        let coord = self.clone();
         tokio::spawn(async move {
+            let tombstones: Vec<storage::IncidentTombstone> = coord
+                .db(move |storage| {
+                    ids.into_iter()
+                        .map(|id| storage.incident_tombstone(&id))
+                        .collect::<Result<Vec<_>>>()
+                        .map(|rows| rows.into_iter().flatten().collect())
+                })
+                .await
+                .unwrap_or_default();
+            if tombstones.is_empty() {
+                return;
+            }
+            let batch = ReplicationBatch {
+                origin: coord.inner.node_id.clone(),
+                deleted_incidents: tombstones,
+                ..Default::default()
+            };
             cluster.broadcast_json("/internal/replicate", &batch).await;
         });
     }
@@ -1548,13 +1628,17 @@ impl Coordinator {
                 if snapshot.is_empty() {
                     continue;
                 }
-                {
-                    let store = coord.inner.storage.lock();
-                    for p in &snapshot {
-                        if let Err(e) = store.record_agent_poll(p) {
-                            tracing::warn!(error = %e, agent = %p.agent_id, "could not persist agent poll");
+                let persisted = snapshot.clone();
+                if let Err(error) = coord
+                    .db(move |storage| {
+                        for poll in &persisted {
+                            storage.record_agent_poll(poll)?;
                         }
-                    }
+                        Ok(())
+                    })
+                    .await
+                {
+                    tracing::warn!(%error, "could not persist agent polls");
                 }
                 let Some(cluster) = coord.inner.cluster.clone() else {
                     continue;
@@ -1583,11 +1667,12 @@ impl Coordinator {
             loop {
                 tick.tick().await;
                 let now = chrono::Utc::now().timestamp_millis();
-                match coord.inner.storage.lock().prune(
-                    retention.results_days,
-                    retention.alerts_days,
-                    now,
-                ) {
+                let results_days = retention.results_days;
+                let alerts_days = retention.alerts_days;
+                match coord
+                    .db(move |storage| storage.prune(results_days, alerts_days, now))
+                    .await
+                {
                     Ok(0) => {}
                     Ok(removed) => {
                         tracing::info!(removed, "retention prune removed old rows");
@@ -1966,15 +2051,15 @@ impl Coordinator {
                     meta.as_ref().map(|m| m.failures_before_down).unwrap_or(1),
                     ts,
                 );
-                leaf_updates.push((
-                    r.check_id,
-                    r.agent_id.clone(),
-                    r.zone.clone(),
-                    r.region.clone(),
-                    confirmed,
-                    tracker.failures(r.check_id, &r.agent_id),
-                    ts,
-                ));
+                leaf_updates.push(storage::AgentCheckStateRow {
+                    check_id: r.check_id,
+                    agent_id: r.agent_id.clone(),
+                    zone: r.zone.clone(),
+                    region: r.region.clone(),
+                    status: confirmed,
+                    consecutive_failures: tracker.failures(r.check_id, &r.agent_id),
+                    last_check: ts,
+                });
                 let replace = affected
                     .get(&r.check_id)
                     .map(|(_, prior)| ts >= *prior)
@@ -2074,40 +2159,31 @@ impl Coordinator {
             }
             // Persist every candidate, including pending hold-down state.
             published_states.insert(check_id, state);
-            state_updates.push((check_id, state, pending, *ts));
+            state_updates.push(storage::PublishedStateRow {
+                check_id,
+                state,
+                pending,
+                last_check: *ts,
+            });
         }
 
-        let mut incident_events = Vec::new();
-        let mut incident_for = std::collections::HashMap::<crate::models::CheckId, String>::new();
-        let mut replicated_alerts = Vec::<ReplicatedAlert>::new();
-        let mut replicated_incidents = Vec::<storage::ReplicatedIncident>::new();
-        {
-            let store = self.inner.storage.lock();
-            if let Err(e) = store.insert_results(&rows) {
-                tracing::error!(error = %e, "failed to persist results");
-            }
-            for (check_id, agent_id, zone, region, status, failures, ts) in &leaf_updates {
-                if let Err(e) = store.update_agent_check_state(
-                    *check_id, agent_id, zone, region, *status, *failures, *ts,
-                ) {
-                    tracing::error!(error = %e, check = %check_id, agent = %agent_id, "failed to persist agent belief");
-                }
-            }
-            for (check_id, state, pending, ts) in &state_updates {
-                if let Err(e) = store.update_current_state(*check_id, *state, *pending, *ts) {
-                    tracing::error!(error = %e, check = %check_id, "failed to persist current state");
-                }
-                if let Err(e) = store.record_state(*check_id, *state, *ts) {
-                    tracing::error!(error = %e, check = %check_id, "failed to persist state history");
-                }
-            }
+        let rows_for_replication = rows.clone();
+        let leaf_updates_for_replication = leaf_updates.clone();
+        let transitions_for_publish = transitions.clone();
+        let coord = self.clone();
+        let persisted = self.db(move |store| {
+            let mut incident_events = Vec::new();
+            let mut incident_for = std::collections::HashMap::<crate::models::CheckId, String>::new();
+            let mut replicated_alerts = Vec::<ReplicatedAlert>::new();
+            let mut replicated_incidents = Vec::<storage::ReplicatedIncident>::new();
+            store.persist_ingest(&rows, &leaf_updates, &state_updates)?;
 
             for (check_id, state, ts) in &baseline_failures {
                 let Some((result, _)) = affected.get(check_id) else {
                     continue;
                 };
                 let regions = root_regions.get(check_id).cloned().unwrap_or_default();
-                match self.attach_or_open(&store, result, *state, &regions, *ts) {
+                match coord.attach_or_open(store, result, *state, &regions, *ts) {
                     Ok((id, opened, changed)) => {
                         if opened || changed {
                             if let Ok(Some(i)) = store.incident(&id) {
@@ -2132,7 +2208,7 @@ impl Coordinator {
                 };
                 if t.to.is_failing() {
                     let regions = root_regions.get(&t.check_id).cloned().unwrap_or_default();
-                    match self.attach_or_open(&store, result, t.to, &regions, *ts) {
+                    match coord.attach_or_open(store, result, t.to, &regions, *ts) {
                         Ok((id, opened, changed)) => {
                             if opened || changed {
                                 if let Ok(Some(i)) = store.incident(&id) {
@@ -2154,7 +2230,7 @@ impl Coordinator {
                     match store.open_incident_for(t.check_id) {
                         Ok(Some(inc)) => {
                             incident_for.insert(t.check_id, inc.id.clone());
-                            match self.try_resolve(&store, &inc, *ts) {
+                            match coord.try_resolve(store, &inc, *ts) {
                                 Ok(true) => {
                                     if let Ok(Some(i)) = store.incident(&inc.id) {
                                         let ack = store.is_acknowledged(&inc.id).unwrap_or(false);
@@ -2182,7 +2258,7 @@ impl Coordinator {
                 .map(|(_, ts)| *ts)
                 .max()
                 .unwrap_or_default();
-            match self.reconcile_open_incidents(&store, reconcile_ts) {
+            match coord.reconcile_open_incidents(store, reconcile_ts) {
                 Ok(rows) => {
                     for row in rows {
                         let ack = store.is_acknowledged(&row.id).unwrap_or(false);
@@ -2214,7 +2290,7 @@ impl Coordinator {
                             continue;
                         }
                         let title = incident_title(
-                            &self.check_name(*check_id),
+                            &coord.check_name(*check_id),
                             NodeState::Degraded,
                             current,
                         );
@@ -2287,7 +2363,18 @@ impl Coordinator {
                     }
                 }
             }
-        }
+            Ok((incident_events, incident_for, replicated_alerts, replicated_incidents))
+        }).await;
+        let (incident_events, incident_for, replicated_alerts, replicated_incidents) =
+            match persisted {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::error!(%error, "failed to persist ingest batch");
+                    return;
+                }
+            };
+        let rows = rows_for_replication;
+        let transitions = transitions_for_publish;
 
         if let Some(peers) = &self.inner.gossip {
             if !transitions.is_empty() {
@@ -2319,18 +2406,16 @@ impl Coordinator {
                         // The same leaves just written to `agent_check_state`,
                         // so a peer that never saw these probes still folds the
                         // whole zone rather than the slice that reports to it.
-                        beliefs: leaf_updates
+                        beliefs: leaf_updates_for_replication
                             .iter()
-                            .map(|(check_id, agent_id, zone, region, status, failures, ts)| {
-                                ReplicatedBelief {
-                                    check_id: *check_id,
-                                    agent_id: agent_id.clone(),
-                                    zone: zone.clone(),
-                                    region: region.clone(),
-                                    status: *status,
-                                    consecutive_failures: *failures,
-                                    last_check: *ts,
-                                }
+                            .map(|state| ReplicatedBelief {
+                                check_id: state.check_id,
+                                agent_id: state.agent_id.clone(),
+                                zone: state.zone.clone(),
+                                region: state.region.clone(),
+                                status: state.status,
+                                consecutive_failures: state.consecutive_failures,
+                                last_check: state.last_check,
                             })
                             .collect(),
                         alerts: replicated_alerts,
@@ -2377,29 +2462,24 @@ impl Coordinator {
     /// nothing else it does — no `eval`, no `notify_tx`, no re-broadcast to
     /// the cluster or to `self.inner.gossip` — because the sender already
     /// decided all of that and owns paging for it.
-    fn apply_replicated(&self, batch: ReplicationBatch) {
-        let mut incident_events = Vec::new();
-        // (check_id, previous, current, timestamp), derived from the
-        // alerts in the batch — the same "only a confirmed flip moves the
-        // published state" rule `gossip_handler` applies, generalized to a
-        // whole batch instead of one transition.
-        let mut state_changes: Vec<(crate::models::CheckId, Option<NodeState>, NodeState, i64)> =
-            Vec::new();
-        {
-            let store = self.inner.storage.lock();
+    async fn apply_replicated(&self, batch: ReplicationBatch) {
+        let beliefs = batch.beliefs.clone();
+        let persisted = self.db(move |store| {
+            let mut incident_events = Vec::new();
+            let mut state_changes: Vec<(crate::models::CheckId, Option<NodeState>, NodeState, i64)> = Vec::new();
             let now = chrono::Utc::now().timestamp_millis();
             // Deletes are applied before upserts, so a batch that carries both
             // an incident and its deletion (a reconciler replaying a peer's
             // whole state) converges on deleted rather than on ordering luck.
-            for id in &batch.deleted_incidents {
-                match store.delete_incident(id, now, &batch.origin) {
+            for tombstone in &batch.deleted_incidents {
+                match store.apply_incident_tombstone(tombstone) {
                     // Only announce a delete that actually removed something:
                     // a tombstone for an incident this node never had is not
                     // news any dashboard can act on.
-                    Ok(true) => incident_events.push(WsEvent::IncidentDeleted { id: id.clone() }),
+                    Ok(true) => incident_events.push(WsEvent::IncidentDeleted { id: tombstone.id.clone() }),
                     Ok(false) => {}
                     Err(e) => {
-                        tracing::warn!(error = %e, incident = %id, "replicate: failed to delete incident")
+                        tracing::warn!(error = %e, incident = %tombstone.id, "replicate: failed to delete incident")
                     }
                 }
             }
@@ -2475,7 +2555,15 @@ impl Coordinator {
                     tracing::warn!(error = %e, check = %check_id, "replicate: failed to persist state history");
                 }
             }
-        } // drop storage guard before touching the tracker or broadcasting
+            Ok((incident_events, state_changes))
+        }).await;
+        let (incident_events, state_changes) = match persisted {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(%error, "replicate: database worker failed");
+                return;
+            }
+        };
         let merged_beliefs: Vec<ReplicatedBelief> = {
             // The failure count resets, same as `gossip_handler`: this node
             // is not mid-confirmation for something the observer already
@@ -2487,8 +2575,7 @@ impl Coordinator {
             // Leaves from a peer's tracker. `merge_agent` keeps the newer
             // observation, so an out-of-order or replayed batch cannot rewind a
             // live agent, and only what actually won is persisted below.
-            batch
-                .beliefs
+            beliefs
                 .into_iter()
                 .filter(|b| {
                     tracker.merge_agent(
@@ -2504,22 +2591,22 @@ impl Coordinator {
                 .collect()
         };
         if !merged_beliefs.is_empty() {
-            // Persisted so a restart resumes the whole regional fleet, not just
-            // the agents that happen to report to this node.
-            let store = self.inner.storage.lock();
-            for b in &merged_beliefs {
-                if let Err(e) = store.update_agent_check_state(
-                    b.check_id,
-                    &b.agent_id,
-                    &b.zone,
-                    &b.region,
-                    b.status,
-                    b.consecutive_failures,
-                    b.last_check,
-                ) {
-                    tracing::warn!(error = %e, check = %b.check_id, agent = %b.agent_id, "replicate: failed to persist agent belief");
-                }
-            }
+            let _ = self
+                .db(move |store| {
+                    for belief in &merged_beliefs {
+                        store.update_agent_check_state(
+                            belief.check_id,
+                            &belief.agent_id,
+                            &belief.zone,
+                            &belief.region,
+                            belief.status,
+                            belief.consecutive_failures,
+                            belief.last_check,
+                        )?;
+                    }
+                    Ok(())
+                })
+                .await;
         }
         for (check_id, from, to, timestamp) in state_changes {
             let _ = self.inner.events.send(WsEvent::StateChange {
@@ -2556,36 +2643,150 @@ impl Coordinator {
         let Some(their) = self.fetch_digest(&client, &peer).await else {
             return;
         };
-        let our = {
-            let store = self.inner.storage.lock();
-            match store.digest(0) {
-                Ok(d) => DigestResponse::new(&self.inner.node_id, d),
-                Err(e) => {
-                    tracing::warn!(error = %e, "anti-entropy: failed to read local digest");
-                    return;
-                }
+        let node_id = self.inner.node_id.clone();
+        let our = match self
+            .db(move |storage| {
+                storage
+                    .digest(0)
+                    .map(|digest| DigestResponse::new(&node_id, digest))
+            })
+            .await
+        {
+            Ok(digest) => digest,
+            Err(error) => {
+                tracing::warn!(%error, "anti-entropy: failed to read local digest");
+                return;
             }
         };
         for their_check in &their.checks {
-            let our_max_ts = our
+            let ours = our
                 .checks
                 .iter()
-                .find(|c| c.check_id == their_check.check_id)
-                .map(|c| c.max_ts)
-                .unwrap_or(0);
-            if their_check.max_ts <= our_max_ts {
+                .find(|c| c.check_id == their_check.check_id);
+            let our_max_ts = ours.map(|c| c.max_ts).unwrap_or(i64::MIN);
+            let our_count = ours.map(|c| c.count).unwrap_or(0);
+            if their_check.max_ts <= our_max_ts && their_check.count == our_count {
                 continue;
             }
+            // A count mismatch can be a hole below our high-water mark. Replay
+            // the retained stream from its beginning; dedup makes rows already
+            // present cheap no-ops while filling the historical gap.
+            let since = if their_check.count != our_count {
+                i64::MIN
+            } else {
+                our_max_ts
+            };
             self.backfill_check(
                 &client,
                 &peer,
                 &their_check.check_id,
-                our_max_ts,
+                since,
                 their_check.max_ts,
             )
             .await;
         }
+        self.reconcile_streams(&client, &peer, &their, &our).await;
         self.reconcile_config(&client, &peer, &their, &our).await;
+    }
+
+    async fn reconcile_streams(
+        &self,
+        client: &reqwest::Client,
+        peer: &str,
+        their: &DigestResponse,
+        our: &DigestResponse,
+    ) {
+        for (path, theirs, ours) in [
+            ("alerts", &their.alerts, &our.alerts),
+            ("incidents", &their.incidents, &our.incidents),
+            (
+                "incident-tombstones",
+                &their.incident_tombstones,
+                &our.incident_tombstones,
+            ),
+        ] {
+            if theirs.count == ours.count
+                && (theirs.max_millis, &theirs.max_id) <= (ours.max_millis, &ours.max_id)
+            {
+                continue;
+            }
+            // Equal/high local watermarks do not prove there is no older hole.
+            // On count disagreement, replay from the start and rely on each
+            // stream's idempotent merge to retain only missing/newer state.
+            let (since, since_id) = if theirs.count != ours.count {
+                (i64::MIN, "")
+            } else {
+                (ours.max_millis, ours.max_id.as_str())
+            };
+            self.backfill_stream(client, peer, path, since, since_id)
+                .await;
+        }
+    }
+
+    async fn backfill_stream(
+        &self,
+        client: &reqwest::Client,
+        peer: &str,
+        path: &str,
+        since: i64,
+        since_id: &str,
+    ) {
+        let url = cluster::Cluster::endpoint(peer, &format!("/internal/backfill/{path}"));
+        let mut cursor = (since, since_id.to_string());
+        loop {
+            let mut query = vec![
+                ("since", cursor.0.to_string()),
+                ("since_id", cursor.1.clone()),
+                ("limit", ANTI_ENTROPY_PAGE.to_string()),
+            ];
+            if path == "incident-tombstones" {
+                let (node_id, id) = cursor.1.split_once('\0').unwrap_or(("", &cursor.1));
+                query.push(("since_node_id", node_id.to_string()));
+                query[1].1 = id.to_string();
+            }
+            let mut req = client.get(&url).query(&query);
+            if let Some(t) = &self.inner.peer_token {
+                req = req.bearer_auth(t);
+            }
+            let batch: ReplicationBatch = match req.send().await {
+                Ok(r) if r.status().is_success() => match r.json().await {
+                    Ok(b) => b,
+                    Err(_) => return,
+                },
+                _ => return,
+            };
+            let next = match path {
+                "alerts" => batch.alerts.last().map(|r| (r.timestamp, r.id.clone())),
+                "incidents" => batch
+                    .incidents
+                    .last()
+                    .map(|r| (r.version.millis, format!("{}\0{}", r.version.node_id, r.id))),
+                _ => batch
+                    .deleted_incidents
+                    .last()
+                    .map(|r| (r.deleted_at, format!("{}\0{}", r.node_id, r.id))),
+            };
+            let len = match path {
+                "alerts" => batch.alerts.len(),
+                "incidents" => batch.incidents.len(),
+                _ => batch.deleted_incidents.len(),
+            };
+            if len == 0 {
+                return;
+            }
+            self.apply_replicated(batch).await;
+            if len < ANTI_ENTROPY_PAGE {
+                return;
+            }
+            let Some(next) = next else {
+                return;
+            };
+            if next <= cursor {
+                return;
+            }
+            cursor = next;
+            tokio::task::yield_now().await;
+        }
     }
 
     /// Pull any config kind where `peer` may hold something this node does
@@ -2663,7 +2864,7 @@ impl Coordinator {
             return;
         }
         let n = batch.entries.len();
-        if let Err(e) = self.apply_config_batch(&batch.entries) {
+        if let Err(e) = self.apply_config_batch(&batch.entries).await {
             tracing::warn!(%peer, kind = kind.as_str(), error = %e, "anti-entropy: failed to apply config");
             return;
         }
@@ -2693,7 +2894,7 @@ impl Coordinator {
     }
 
     /// Page `check_id`'s history from `peer` between `since` (exclusive on
-    /// the first page, then advanced to the last row applied) and `until`
+    /// the first page, then advanced with the last row's agent id) and `until`
     /// (inclusive), applying each page as it arrives and yielding between
     /// pages so a large catch-up cannot starve `ingest`.
     async fn backfill_check(
@@ -2705,14 +2906,18 @@ impl Coordinator {
         until: i64,
     ) {
         let url = cluster::Cluster::endpoint(peer, "/internal/backfill");
-        let mut cursor = since;
+        let mut cursor = (since, None::<String>);
         loop {
-            let mut req = client.get(&url).query(&[
+            let mut query = vec![
                 ("check_id", check_id.to_string()),
-                ("since", cursor.to_string()),
+                ("since", cursor.0.to_string()),
                 ("until", until.to_string()),
                 ("limit", ANTI_ENTROPY_PAGE.to_string()),
-            ]);
+            ];
+            if let Some(agent_id) = &cursor.1 {
+                query.push(("since_agent_id", agent_id.clone()));
+            }
+            let mut req = client.get(&url).query(&query);
             if let Some(t) = &self.inner.peer_token {
                 req = req.bearer_auth(t);
             }
@@ -2737,28 +2942,31 @@ impl Coordinator {
                 return;
             }
             let page_len = batch.results.len();
-            let max_ts = batch
-                .results
-                .iter()
-                .map(|r| r.result.timestamp.timestamp_millis())
-                .max()
-                .unwrap_or(cursor);
-            self.apply_replicated(batch);
-            // Either the page was not full (nothing left to fetch) or the
-            // cursor failed to advance (every row shares `max_ts`, which a
-            // strictly-exclusive `since` can never get past) — both mean
-            // stop rather than repeat the same request forever.
-            if page_len < ANTI_ENTROPY_PAGE || max_ts <= cursor {
+            let next_cursor = batch.results.last().map(|row| {
+                (
+                    row.result.timestamp.timestamp_millis(),
+                    Some(row.result.agent_id.clone()),
+                )
+            });
+            self.apply_replicated(batch).await;
+            if page_len < ANTI_ENTROPY_PAGE {
                 return;
             }
-            cursor = max_ts;
+            let Some(next_cursor) = next_cursor else {
+                return;
+            };
+            if next_cursor <= cursor {
+                tracing::warn!(%peer, %check_id, "anti-entropy: backfill cursor did not advance");
+                return;
+            }
+            cursor = next_cursor;
             tokio::task::yield_now().await;
         }
     }
 
     /// Read recent history for a check (newest first), optionally within a time
     /// range and optionally restricted to one evaluated status.
-    pub fn history(
+    pub async fn history(
         &self,
         check_id: crate::models::CheckId,
         limit: usize,
@@ -2766,10 +2974,8 @@ impl Coordinator {
         to: Option<i64>,
         status: Option<Status>,
     ) -> Result<Vec<storage::HistoryRow>> {
-        self.inner
-            .storage
-            .lock()
-            .history(check_id, limit, from, to, status)
+        self.db(move |storage| storage.history(check_id, limit, from, to, status))
+            .await
     }
 
     /// Effective SLA interpretation for a check. This comes from `CheckMeta`,
@@ -2786,27 +2992,31 @@ impl Coordinator {
     /// Recent raw probe results across all checks and agents (newest first),
     /// narrowed by `filter`. Admin-only at the HTTP layer: rows carry the raw
     /// error.
-    pub fn recent_results(
+    pub async fn recent_results(
         &self,
-        filter: &storage::ResultsFilter,
+        filter: storage::ResultsFilter,
         limit: usize,
     ) -> Result<Vec<storage::ResultRow>> {
-        self.inner.storage.lock().recent_results(filter, limit)
+        self.db(move |storage| storage.recent_results(&filter, limit))
+            .await
     }
 
     /// Persist one check, through the config-replication path so a peer picks
     /// it up too, and refresh the cached metadata. Shared by create and
     /// update so both paths reload identically.
-    fn save_check(&self, check: CheckConfig) -> Response {
+    async fn save_check(&self, check: CheckConfig) -> Response {
         let document = match serde_json::to_string(&check) {
             Ok(d) => d,
             Err(e) => return internal_error(e.into()),
         };
-        let entry = match self.write_config(
-            storage::ConfigKind::Check,
-            &check.id.to_string(),
-            Some(document),
-        ) {
+        let entry = match self
+            .write_config(
+                storage::ConfigKind::Check,
+                &check.id.to_string(),
+                Some(document),
+            )
+            .await
+        {
             Ok(e) => e,
             Err(e) => return internal_error(e),
         };
@@ -2824,43 +3034,41 @@ impl Coordinator {
     /// the same way the admin API would once a session existed. Returns the
     /// id it persisted under, which is always `check.id` — this never mints
     /// a fresh identity the way the unauthenticated create path does.
-    pub fn create_check_for_test(&self, check: CheckConfig) -> crate::models::CheckId {
+    pub async fn create_check_for_test(&self, check: CheckConfig) -> crate::models::CheckId {
         let id = check.id;
-        self.save_check(check);
+        self.save_check(check).await;
         id
     }
 
     /// Persisted alerts, for tests that assert dispatch did not lose one.
-    pub fn alerts_for_test(&self, limit: usize) -> Vec<crate::coordinator::storage::AlertRow> {
-        self.inner
-            .storage
-            .lock()
-            .recent_alerts(limit)
+    pub async fn alerts_for_test(
+        &self,
+        limit: usize,
+    ) -> Vec<crate::coordinator::storage::AlertRow> {
+        self.db(move |storage| storage.recent_alerts(limit))
+            .await
             .unwrap_or_default()
     }
 
     /// Persisted incidents, for tests that assert the open/resolve lifecycle.
-    pub fn incidents_for_test(
+    pub async fn incidents_for_test(
         &self,
         limit: usize,
     ) -> Vec<crate::coordinator::storage::IncidentRow> {
-        self.inner
-            .storage
-            .lock()
-            .list_incidents(limit, None)
+        self.db(move |storage| storage.list_incidents(limit, None))
+            .await
             .unwrap_or_default()
     }
 
     /// An incident's narrative, for tests that assert the timeline the
     /// coordinator wrote rather than only the state it left behind.
-    pub fn updates_for_test(
+    pub async fn updates_for_test(
         &self,
         incident_id: &str,
     ) -> Vec<crate::coordinator::storage::IncidentUpdateRow> {
-        self.inner
-            .storage
-            .lock()
-            .updates_for_incident(incident_id)
+        let incident_id = incident_id.to_string();
+        self.db(move |storage| storage.updates_for_incident(&incident_id))
+            .await
             .unwrap_or_default()
     }
 
@@ -3022,6 +3230,15 @@ impl Coordinator {
             // that backfills whatever it says this node is missing.
             .route("/internal/digest", get(digest_handler))
             .route("/internal/backfill", get(backfill_handler))
+            .route("/internal/backfill/alerts", get(alerts_backfill_handler))
+            .route(
+                "/internal/backfill/incidents",
+                get(incidents_backfill_handler),
+            )
+            .route(
+                "/internal/backfill/incident-tombstones",
+                get(incident_tombstones_backfill_handler),
+            )
             // Config-plane push: checks, sections, settings, credentials —
             // last-writer-wins by HLC, applied locally, never observer-owned
             // the way a result is. See `config_handler`.
@@ -3128,7 +3345,7 @@ where
 }
 
 /// Fleet liveness for the public status page.
-fn fleet_health(coord: &Coordinator, now: i64) -> Vec<FleetRowDto> {
+async fn fleet_health(coord: &Coordinator, now: i64) -> Vec<FleetRowDto> {
     let cfg = coord.inner.status_agents.read().clone();
     // Nothing placed by hand and nothing automatic: the section is off, and
     // the aggregate query can be skipped entirely. This rides the busiest
@@ -3138,19 +3355,16 @@ fn fleet_health(coord: &Coordinator, now: i64) -> Vec<FleetRowDto> {
     }
     // One lock for both reads: they are two halves of the same answer, and
     // taking it twice on the busiest public endpoint buys nothing.
-    let (reported, polls) = {
-        let store = coord.inner.storage.lock();
-        (
-            store.list_agents(now).unwrap_or_default(),
-            store.list_agent_polls().unwrap_or_default(),
-        )
-    };
+    let (reported, polls) = coord
+        .db(move |storage| Ok((storage.list_agents(now)?, storage.list_agent_polls()?)))
+        .await
+        .unwrap_or_default();
     fleet_rows(now, &coord.inner.seen.read(), &polls, &reported, &cfg)
 }
 
 /// Everyone the coordinator knows about, live pollers and past reporters alike,
 /// sorted so the picker does not reshuffle between loads.
-fn fleet_members(coord: &Coordinator, now: i64) -> Vec<FleetMemberDto> {
+async fn fleet_members(coord: &Coordinator, now: i64) -> Vec<FleetMemberDto> {
     let mut members: std::collections::HashMap<String, (String, bool)> = coord
         .inner
         .seen
@@ -3158,13 +3372,10 @@ fn fleet_members(coord: &Coordinator, now: i64) -> Vec<FleetMemberDto> {
         .iter()
         .map(|(id, s)| (id.clone(), (s.region.clone(), now - s.at <= s.window_ms)))
         .collect();
-    let (reported, polls) = {
-        let store = coord.inner.storage.lock();
-        (
-            store.list_agents(now).unwrap_or_default(),
-            store.list_agent_polls().unwrap_or_default(),
-        )
-    };
+    let (reported, polls) = coord
+        .db(move |storage| Ok((storage.list_agents(now)?, storage.list_agent_polls()?)))
+        .await
+        .unwrap_or_default();
     // Merged the same way the status page merges, so pinning a row on one node
     // offers the same fleet as pinning it on another.
     for p in polls {
@@ -3274,15 +3485,277 @@ fn error_response(code: StatusCode, message: &str) -> Response {
 mod tests {
     use super::{incident_title, region_change_narrative, Coordinator};
     use crate::{
-        config::CoordinatorConfig,
+        config::{CheckConfig, CoordinatorConfig, GlobalConfig},
         coordinator::storage::{AffectSource, IncidentCheckRow, IncidentState},
-        models::NodeState,
+        global::GlobalNode,
+        models::{CheckKind, CheckResult, NodeState},
     };
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, net::SocketAddr, time::Instant};
     use uuid::Uuid;
 
     fn regions(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    async fn serve(app: axum::Router) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    fn percentile(samples: &mut [u128], percentile: usize) -> u128 {
+        samples.sort_unstable();
+        samples[(samples.len() * percentile).div_ceil(100).saturating_sub(1)]
+    }
+
+    fn env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    }
+
+    fn assert_ceiling(name: &str, actual: u128) {
+        if let Ok(value) = std::env::var(name) {
+            let ceiling = value
+                .parse::<u128>()
+                .expect("benchmark ceiling must be an integer");
+            assert!(actual <= ceiling, "{name}: {actual} exceeded {ceiling}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "sustained-ingest benchmark; configure WARDEN_BENCH_* for the intended scale"]
+    async fn benchmark_sustained_coordinator_ingest() {
+        let check_count = env_usize("WARDEN_BENCH_CHECKS", 10_000);
+        let domain_count = env_usize("WARDEN_BENCH_DOMAINS", 1);
+        let batch_count = env_usize("WARDEN_BENCH_BATCHES", 20).max(1);
+        assert!(check_count > 0 && domain_count > 0);
+
+        let coord = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            region: "benchmark-region".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let checks: Vec<_> = (0..check_count)
+            .map(|index| CheckConfig {
+                id: Uuid::new_v5(&Uuid::NAMESPACE_OID, index.to_string().as_bytes()),
+                name: format!("check-{index}"),
+                target: "https://example.invalid".into(),
+                notify: false,
+                position: index as i32,
+                ..Default::default()
+            })
+            .collect();
+        let stored = checks.clone();
+        coord
+            .db(move |storage| {
+                for check in &stored {
+                    storage.upsert_check(check, 1)?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        coord.reload_checks().await.unwrap();
+
+        let rows_per_batch = check_count * domain_count;
+        let mut batch_ms = Vec::with_capacity(batch_count);
+        let benchmark_started = Instant::now();
+        for batch in 0..batch_count {
+            let timestamp = chrono::Utc::now() + chrono::Duration::milliseconds(batch as i64);
+            let mut results = Vec::with_capacity(rows_per_batch);
+            for domain in 0..domain_count {
+                for check in &checks {
+                    results.push(CheckResult {
+                        check_id: check.id,
+                        agent_id: format!("agent-{domain}-{}", check.position % 3),
+                        zone: format!("zone-{domain}"),
+                        region: format!("region-{domain}"),
+                        kind: CheckKind::Http,
+                        timestamp,
+                        latency_ms: 10 + (check.position as u64 % 200),
+                        status_code: Some(200),
+                        body_matched: None,
+                        error: None,
+                        failure: None,
+                        body: None,
+                        headers: None,
+                        metric: None,
+                        metrics: None,
+                    });
+                }
+            }
+            let started = Instant::now();
+            coord.ingest(results).await;
+            batch_ms.push(started.elapsed().as_millis());
+        }
+        let elapsed = benchmark_started.elapsed();
+        let total_rows = rows_per_batch * batch_count;
+        let rows_per_second = total_rows as f64 / elapsed.as_secs_f64();
+        let stored_rows = coord.db(|storage| storage.count_results()).await.unwrap() as usize;
+        assert_eq!(stored_rows, total_rows);
+
+        let batch_p50 = percentile(&mut batch_ms, 50);
+        let batch_p95 = percentile(&mut batch_ms, 95);
+        let batch_p99 = percentile(&mut batch_ms, 99);
+        let batch_max = *batch_ms.last().unwrap();
+        assert_ceiling("WARDEN_BENCH_MAX_INGEST_BATCH_P95_MS", batch_p95);
+        if let Ok(value) = std::env::var("WARDEN_BENCH_MIN_INGEST_ROWS_PER_SECOND") {
+            let minimum = value
+                .parse::<f64>()
+                .expect("benchmark floor must be a number");
+            assert!(
+                rows_per_second >= minimum,
+                "WARDEN_BENCH_MIN_INGEST_ROWS_PER_SECOND: {rows_per_second:.2} below {minimum:.2}"
+            );
+        }
+        println!(
+            "checks={check_count} domains={domain_count} batches={batch_count} rows_per_batch={rows_per_batch} total_rows={total_rows} ingest_rows_per_second={rows_per_second:.2} batch_p50_ms={batch_p50} batch_p95_ms={batch_p95} batch_p99_ms={batch_p99} batch_max_ms={batch_max}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "production-cardinality benchmark; configure WARDEN_BENCH_* for the intended scale"]
+    async fn benchmark_status_and_global_push_production_cardinality() {
+        let check_count = env_usize("WARDEN_BENCH_CHECKS", 10_000);
+        let region_count = env_usize("WARDEN_BENCH_REGIONS", 3);
+        let sample_count = env_usize("WARDEN_BENCH_SAMPLES", 20).max(1);
+        let token = "benchmark-global-token";
+        let coord = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            region: "region-0".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let checks: Vec<_> = (0..check_count)
+            .map(|index| CheckConfig {
+                id: Uuid::new_v5(&Uuid::NAMESPACE_OID, index.to_string().as_bytes()),
+                name: format!("check-{index}"),
+                target: "https://example.invalid".into(),
+                notify: false,
+                position: index as i32,
+                ..Default::default()
+            })
+            .collect();
+        let stored = checks.clone();
+        coord
+            .db(move |storage| {
+                for check in &stored {
+                    storage.upsert_check(check, 1)?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        coord.reload_checks().await.unwrap();
+        let now = chrono::Utc::now();
+        coord
+            .ingest(
+                checks
+                    .iter()
+                    .map(|check| CheckResult {
+                        check_id: check.id,
+                        agent_id: "benchmark-agent".into(),
+                        zone: "benchmark-zone".into(),
+                        region: "region-0".into(),
+                        kind: CheckKind::Http,
+                        timestamp: now,
+                        latency_ms: 10,
+                        status_code: Some(200),
+                        body_matched: None,
+                        error: None,
+                        failure: None,
+                        body: None,
+                        headers: None,
+                        metric: None,
+                        metrics: None,
+                    })
+                    .collect(),
+            )
+            .await;
+
+        let regional_addr = serve(coord.clone().router()).await;
+        let global_addr = serve(
+            GlobalNode::new(&GlobalConfig {
+                token: Some(token.into()),
+                ..Default::default()
+            })
+            .router(),
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let regional_url = format!("http://{regional_addr}/api/v1/status");
+        let global_url = format!("http://{global_addr}/api/v1/status");
+        let push_url = format!("http://{global_addr}/internal/global/state");
+
+        let warm = client.get(&regional_url).send().await.unwrap();
+        assert_eq!(warm.status(), reqwest::StatusCode::OK);
+        let mut regional_ms = Vec::with_capacity(sample_count);
+        let mut regional_bytes = 0;
+        for _ in 0..sample_count {
+            let started = Instant::now();
+            let response = client.get(&regional_url).send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let body = response.bytes().await.unwrap();
+            regional_ms.push(started.elapsed().as_millis());
+            regional_bytes = body.len();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["checks"].as_array().unwrap().len(), check_count);
+        }
+
+        let mut push_ms = Vec::with_capacity(sample_count * region_count);
+        let mut push_bytes = 0;
+        for sample in 0..sample_count {
+            for region in 0..region_count {
+                let started = Instant::now();
+                let mut push = coord.build_state_push().await;
+                push.region = format!("region-{region}");
+                push.origin = format!("node-{region}-{sample}");
+                push.pushed_at += sample as i64 + 1;
+                push_bytes = serde_json::to_vec(&push).unwrap().len();
+                let response = client
+                    .post(&push_url)
+                    .bearer_auth(token)
+                    .json(&push)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), reqwest::StatusCode::OK);
+                push_ms.push(started.elapsed().as_millis());
+            }
+        }
+
+        let warm = client.get(&global_url).send().await.unwrap();
+        assert_eq!(warm.status(), reqwest::StatusCode::OK);
+        let mut global_ms = Vec::with_capacity(sample_count);
+        let mut global_bytes = 0;
+        for _ in 0..sample_count {
+            let started = Instant::now();
+            let response = client.get(&global_url).send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let body = response.bytes().await.unwrap();
+            global_ms.push(started.elapsed().as_millis());
+            global_bytes = body.len();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["checks"].as_array().unwrap().len(), check_count);
+            assert_eq!(value["agents"].as_array().unwrap().len(), region_count);
+        }
+
+        let regional_p95 = percentile(&mut regional_ms, 95);
+        let push_p95 = percentile(&mut push_ms, 95);
+        let global_p95 = percentile(&mut global_ms, 95);
+        assert_ceiling("WARDEN_BENCH_MAX_REGIONAL_STATUS_P95_MS", regional_p95);
+        assert_ceiling("WARDEN_BENCH_MAX_GLOBAL_PUSH_P95_MS", push_p95);
+        assert_ceiling("WARDEN_BENCH_MAX_GLOBAL_STATUS_P95_MS", global_p95);
+        assert_ceiling("WARDEN_BENCH_MAX_PUSH_BYTES", push_bytes as u128);
+        println!(
+            "checks={check_count} regions={region_count} samples={sample_count} regional_status_p95_ms={regional_p95} regional_status_bytes={regional_bytes} global_push_p95_ms={push_p95} push_bytes={push_bytes} global_status_p95_ms={global_p95} global_status_bytes={global_bytes}"
+        );
     }
 
     #[test]
@@ -3319,35 +3792,38 @@ mod tests {
             db_path: ":memory:".into(),
             ..Default::default()
         })
+        .await
         .unwrap();
         let check_id = Uuid::new_v4();
-        let store = coord.inner.storage.lock();
-        store
-            .update_current_state(check_id, NodeState::Up, None, 2_000)
+        let test_coord = coord.clone();
+        let resolved = coord
+            .db(move |store| {
+                store.update_current_state(check_id, NodeState::Up, None, 2_000)?;
+                store.create_incident(
+                    "stale",
+                    "upstream is down",
+                    IncidentState::Detected,
+                    1_000,
+                    false,
+                    Some(check_id),
+                    &[IncidentCheckRow {
+                        check_id,
+                        source: AffectSource::Origin,
+                    }],
+                    Some(("timeout", None)),
+                )?;
+                test_coord.reconcile_open_incidents(store, 3_000)
+            })
+            .await
             .unwrap();
-        store
-            .create_incident(
-                "stale",
-                "upstream is down",
-                IncidentState::Detected,
-                1_000,
-                false,
-                Some(check_id),
-                &[IncidentCheckRow {
-                    check_id,
-                    source: AffectSource::Origin,
-                }],
-                Some(("timeout", None)),
-            )
-            .unwrap();
-
-        let resolved = coord.reconcile_open_incidents(&store, 3_000).unwrap();
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].state, IncidentState::Resolved);
         assert_eq!(resolved[0].resolved_at, Some(3_000));
+        let test_coord = coord.clone();
         assert!(coord
-            .reconcile_open_incidents(&store, 4_000)
+            .db(move |store| test_coord.reconcile_open_incidents(store, 4_000))
+            .await
             .unwrap()
             .is_empty());
     }

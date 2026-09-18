@@ -102,9 +102,10 @@ async fn spawn_node(node_id: &str, peers: Vec<String>, checks: Vec<CheckConfig>)
         peer_timeout_secs: 7_200,
         ..Default::default()
     })
+    .await
     .unwrap();
     for check in checks {
-        coord.create_check_for_test(check);
+        coord.create_check_for_test(check).await;
     }
     let app = coord
         .clone()
@@ -353,6 +354,7 @@ async fn a_check_created_on_one_node_appears_on_its_peer_including_the_agent_fee
     let agent_token = "wac_test.config-repl-secret";
     b.coord
         .provision_agent_credential(agent_token, "z", "r")
+        .await
         .unwrap();
 
     let res = reqwest::Client::new()

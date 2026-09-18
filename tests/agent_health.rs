@@ -21,13 +21,15 @@ use warden::models::{CheckId, CheckKind};
 
 const PASSWORD: &str = "correct horse battery staple";
 
-fn coordinator(agents: AgentsDisplay) -> Coordinator {
-    let coord = coordinator_at(":memory:", agents);
+async fn coordinator(agents: AgentsDisplay) -> Coordinator {
+    let coord = coordinator_at(":memory:", agents).await;
     coord
         .provision_agent_credential("wac_eu.secret", "eu-west-1a", "eu-west")
+        .await
         .unwrap();
     coord
         .provision_agent_credential("wac_us.secret", "us-east-1a", "us-east")
+        .await
         .unwrap();
     coord
 }
@@ -36,7 +38,7 @@ fn cid(name: &str) -> CheckId {
     Uuid::new_v5(&Uuid::NAMESPACE_DNS, name.as_bytes())
 }
 
-fn coordinator_at(db_path: &str, agents: AgentsDisplay) -> Coordinator {
+async fn coordinator_at(db_path: &str, agents: AgentsDisplay) -> Coordinator {
     let coord = Coordinator::new(&CoordinatorConfig {
         listen: "127.0.0.1:0".into(),
         db_path: db_path.into(),
@@ -44,16 +46,19 @@ fn coordinator_at(db_path: &str, agents: AgentsDisplay) -> Coordinator {
         status_page: StatusPageConfig { agents },
         ..Default::default()
     })
+    .await
     .unwrap();
-    coord.create_check_for_test(CheckConfig {
-        id: cid("payments-api"),
-        name: "payments-api".into(),
-        kind: CheckKind::Http,
-        target: "https://example.invalid".into(),
-        cron: "0 * * * * *".into(),
-        timeout_secs: 5,
-        ..Default::default()
-    });
+    coord
+        .create_check_for_test(CheckConfig {
+            id: cid("payments-api"),
+            name: "payments-api".into(),
+            kind: CheckKind::Http,
+            target: "https://example.invalid".into(),
+            cron: "0 * * * * *".into(),
+            timeout_secs: 5,
+            ..Default::default()
+        })
+        .await;
     coord
 }
 
@@ -61,15 +66,9 @@ fn coordinator_at(db_path: &str, agents: AgentsDisplay) -> Coordinator {
 /// down. DuckDB holds a file lock until its handle actually drops, and an
 /// aborted server task unwinds a moment after `abort()` returns, so this waits
 /// for the lock rather than racing it.
-fn reopen(db_path: &str) -> Coordinator {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        match std::panic::catch_unwind(|| coordinator_at(db_path, AgentsDisplay::default())) {
-            Ok(coord) => return coord,
-            Err(e) if std::time::Instant::now() >= deadline => std::panic::resume_unwind(e),
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
-        }
-    }
+async fn reopen(db_path: &str) -> Coordinator {
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    coordinator_at(db_path, AgentsDisplay::default()).await
 }
 
 async fn serve(coord: Coordinator) -> SocketAddr {
@@ -174,7 +173,7 @@ async fn anonymous_status(base: &str) -> Value {
 
 #[tokio::test]
 async fn the_public_page_reads_fleet_health_without_a_session() {
-    let coord = coordinator(AgentsDisplay::default());
+    let coord = coordinator(AgentsDisplay::default()).await;
     let addr = serve(coord).await;
     let base = format!("http://{addr}");
 
@@ -214,7 +213,8 @@ async fn off_publishes_no_fleet_at_all() {
     let coord = coordinator(AgentsDisplay {
         mode: AgentsMode::Off,
         ..Default::default()
-    });
+    })
+    .await;
     let addr = serve(coord).await;
     let base = format!("http://{addr}");
 
@@ -234,7 +234,7 @@ async fn off_publishes_no_fleet_at_all() {
 /// region, in that order, with nothing else on the page.
 #[tokio::test]
 async fn placed_rows_publish_an_agent_and_a_whole_region_in_order() {
-    let coord = coordinator(AgentsDisplay::default());
+    let coord = coordinator(AgentsDisplay::default()).await;
     let addr = serve(coord).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
@@ -303,7 +303,7 @@ async fn placed_rows_publish_an_agent_and_a_whole_region_in_order() {
 /// nobody. Asserted on the recorded window rather than by waiting minutes.
 #[tokio::test]
 async fn the_window_is_sized_from_the_cadence_the_agent_declares() {
-    let coord = coordinator(AgentsDisplay::default());
+    let coord = coordinator(AgentsDisplay::default()).await;
     let probe = coord.clone();
     let addr = serve(coord).await;
     let base = format!("http://{addr}");
@@ -330,7 +330,7 @@ async fn the_window_is_sized_from_the_cadence_the_agent_declares() {
 
 #[tokio::test]
 async fn the_display_settings_are_admin_only() {
-    let addr = serve(coordinator(AgentsDisplay::default())).await;
+    let addr = serve(coordinator(AgentsDisplay::default()).await).await;
     let base = format!("http://{addr}");
     let anon = reqwest::Client::new();
 
@@ -359,7 +359,7 @@ async fn the_display_settings_are_admin_only() {
 /// page follows, with no restart and no config file edit.
 #[tokio::test]
 async fn saving_a_mode_changes_the_public_page_at_once() {
-    let addr = serve(coordinator(AgentsDisplay::default())).await;
+    let addr = serve(coordinator(AgentsDisplay::default()).await).await;
     let base = format!("http://{addr}");
     assert_eq!(
         poll(&base, "wac_eu.secret", "eu-probe-1", Some(10)).await,
@@ -390,7 +390,7 @@ async fn saving_a_mode_changes_the_public_page_at_once() {
 
 #[tokio::test]
 async fn the_picker_offers_the_fleet_it_can_pin() {
-    let addr = serve(coordinator(AgentsDisplay::default())).await;
+    let addr = serve(coordinator(AgentsDisplay::default()).await).await;
     let base = format!("http://{addr}");
     assert_eq!(
         poll(&base, "wac_eu.secret", "eu-probe-1", Some(10)).await,
@@ -418,7 +418,7 @@ async fn the_picker_offers_the_fleet_it_can_pin() {
 /// not just before they are rendered.
 #[tokio::test]
 async fn duplicate_and_blank_rows_are_dropped() {
-    let addr = serve(coordinator(AgentsDisplay::default())).await;
+    let addr = serve(coordinator(AgentsDisplay::default()).await).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
 
@@ -450,7 +450,7 @@ async fn duplicate_and_blank_rows_are_dropped() {
 
 #[tokio::test]
 async fn thresholds_that_cannot_be_satisfied_are_refused() {
-    let addr = serve(coordinator(AgentsDisplay::default())).await;
+    let addr = serve(coordinator(AgentsDisplay::default()).await).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;
 
@@ -488,7 +488,8 @@ async fn a_saved_setting_outlives_a_restart_and_the_config_file_does_not_revert_
     let db = path.to_str().unwrap().to_string();
 
     {
-        let (addr, handle) = serve_abortable(coordinator_at(&db, AgentsDisplay::default())).await;
+        let (addr, handle) =
+            serve_abortable(coordinator_at(&db, AgentsDisplay::default()).await).await;
         let base = format!("http://{addr}");
         let session = login(&base).await;
         // A pinned id nobody has ever reported still gets a row, so the second
@@ -506,7 +507,7 @@ async fn a_saved_setting_outlives_a_restart_and_the_config_file_does_not_revert_
     }
 
     // Same file, same config file — which still says "no pinned agents".
-    let (addr, handle) = serve_abortable(reopen(&db)).await;
+    let (addr, handle) = serve_abortable(reopen(&db).await).await;
     let rows = anonymous_status(&format!("http://{addr}")).await;
     assert_eq!(
         rows["agents"][0]["name"], "ghost-box",
@@ -521,7 +522,7 @@ async fn a_saved_setting_outlives_a_restart_and_the_config_file_does_not_revert_
 /// only — a made-up value moves nothing but its own row.
 #[tokio::test]
 async fn poll_rtt_surfaces_on_the_admin_agent_list() {
-    let coord = coordinator(AgentsDisplay::default());
+    let coord = coordinator(AgentsDisplay::default()).await;
     let addr = serve(coord).await;
     let base = format!("http://{addr}");
     let session = login(&base).await;

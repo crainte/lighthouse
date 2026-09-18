@@ -151,7 +151,10 @@ pub(in crate::coordinator) async fn agents_handler(
         return denied;
     }
     let now = chrono::Utc::now().timestamp_millis();
-    let rows = match coord.inner.storage.lock().list_agents(now) {
+    let (rows, polls) = match coord
+        .db(move |storage| Ok((storage.list_agents(now)?, storage.list_agent_polls()?)))
+        .await
+    {
         Ok(rows) => rows,
         Err(e) => return internal_error(e),
     };
@@ -188,12 +191,7 @@ pub(in crate::coordinator) async fn agents_handler(
     // legitimately name a kind this node has never heard of, and narrowing to
     // the kinds this binary knows would make an agent look less capable here
     // than on the node it actually polls.
-    let mut declared: std::collections::HashMap<String, Declared> = coord
-        .inner
-        .storage
-        .lock()
-        .list_agent_polls()
-        .unwrap_or_default()
+    let mut declared: std::collections::HashMap<String, Declared> = polls
         .into_iter()
         .map(|p| {
             (
@@ -330,7 +328,11 @@ pub(in crate::coordinator) async fn purge_agent_handler(
             ),
         );
     }
-    match coord.inner.storage.lock().purge_agent(&agent_id) {
+    let purge_id = agent_id.clone();
+    match coord
+        .db(move |storage| storage.purge_agent(&purge_id))
+        .await
+    {
         Ok(rows) => {
             info!(agent = %agent_id, rows, "purged agent history");
             Json(PurgedResponse { purged: rows }).into_response()
@@ -406,7 +408,7 @@ pub(in crate::coordinator) async fn agent_checks_handler(
         // An agent that will not say who it is cannot be placed. Older agents
         // predate identity, so they still get everything rather than silently
         // going idle on upgrade.
-        return match coord.inner.storage.lock().list_checks() {
+        return match coord.db(|storage| storage.list_checks()).await {
             Ok(checks) => Json(AgentChecksResponse {
                 checks: checks
                     .into_iter()
@@ -453,8 +455,11 @@ pub(in crate::coordinator) async fn agent_checks_handler(
         seen.retain(|_, s| now - s.at <= s.window_ms);
     }
 
-    let checks = match coord.inner.storage.lock().list_checks() {
-        Ok(c) => c,
+    let (checks, polls) = match coord
+        .db(|storage| Ok((storage.list_checks()?, storage.list_agent_polls()?)))
+        .await
+    {
+        Ok(value) => value,
         Err(e) => return internal_error(e),
     };
 
@@ -463,12 +468,6 @@ pub(in crate::coordinator) async fn agent_checks_handler(
     // its assignment here. For each agent, select the newest live observation;
     // local `seen` wins only when timestamps tie. The selected observation
     // supplies location and capabilities together.
-    let polls = coord
-        .inner
-        .storage
-        .lock()
-        .list_agent_polls()
-        .unwrap_or_default();
     let fleet = placement_fleet(now, &coord.inner.seen.read(), &polls);
 
     let mine = checks
@@ -655,7 +654,7 @@ pub(in crate::coordinator) async fn list_agent_credentials_handler(
     if let Some(denied) = require_admin(&coord, &headers) {
         return denied;
     }
-    match coord.inner.storage.lock().list_agent_credentials() {
+    match coord.db(|storage| storage.list_agent_credentials()).await {
         Ok(rows) => Json(AgentCredentialsResponse {
             credentials: rows.iter().map(AgentCredentialDto::from).collect(),
         })
@@ -689,7 +688,7 @@ pub(in crate::coordinator) async fn mint_agent_credential_handler(
     }
     let now = chrono::Utc::now().timestamp_millis();
     let (record, token) = crate::credential::mint(zone, region, now);
-    if let Err(e) = coord.store_credential(&record) {
+    if let Err(e) = coord.store_credential(&record).await {
         return internal_error(e);
     }
     info!(id = %record.id, zone, region, "minted agent credential");
@@ -712,17 +711,22 @@ pub(in crate::coordinator) async fn revoke_agent_credential_handler(
         return denied;
     }
     let now = chrono::Utc::now().timestamp_millis();
-    let revoked = coord.inner.storage.lock().revoke_agent_credential(&id, now);
+    let revoke_id = id.clone();
+    let revoked = coord
+        .db(move |storage| storage.revoke_agent_credential(&revoke_id, now))
+        .await;
     match revoked {
         Ok(true) => {
-            if let Err(e) = coord.reload_credentials() {
+            if let Err(e) = coord.reload_credentials().await {
                 return internal_error(e);
             }
             // Revocation is security-relevant and time-sensitive — pushed
             // to peers immediately rather than waiting on anti-entropy, so
             // a credential stops working fleet-wide as close as possible to
             // the moment an operator revoked it.
-            coord.restamp_and_push(storage::ConfigKind::Credential, &id);
+            coord
+                .restamp_and_push(storage::ConfigKind::Credential, &id)
+                .await;
             warn!(id = %id, "revoked agent credential");
             Json(RevokedResponse { revoked: id }).into_response()
         }

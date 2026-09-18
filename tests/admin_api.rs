@@ -47,32 +47,34 @@ fn spawn_server(coord: Coordinator) -> SocketAddr {
 /// This is the real provisioning model — location is bound to the credential —
 /// so a test that wants a multi-zone fleet has to hold a token per zone rather
 /// than declaring `?zone=` on the request.
-fn zone_tokens(
+async fn zone_tokens(
     coord: &Coordinator,
     zones: &[(&str, &str)],
 ) -> std::collections::HashMap<String, String> {
-    zones
-        .iter()
-        .map(|(zone, region)| {
-            let token = format!("wac_{}.secret", zone.replace('-', "_"));
-            coord
-                .provision_agent_credential(&token, zone, region)
-                .unwrap();
-            ((*zone).to_string(), token)
-        })
-        .collect()
+    let mut tokens = std::collections::HashMap::new();
+    for (zone, region) in zones {
+        let token = format!("wac_{}.secret", zone.replace('-', "_"));
+        coord
+            .provision_agent_credential(&token, zone, region)
+            .await
+            .unwrap();
+        tokens.insert((*zone).to_string(), token);
+    }
+    tokens
 }
 
-fn coordinator() -> Coordinator {
+async fn coordinator() -> Coordinator {
     let coord = Coordinator::new(&CoordinatorConfig {
         listen: "127.0.0.1:0".into(),
         db_path: ":memory:".into(),
         admin_password: Some(PASSWORD.into()),
         ..Default::default()
     })
+    .await
     .unwrap();
     coord
         .provision_agent_credential(AGENT_TOKEN, "test-zone", "test-region")
+        .await
         .unwrap();
     coord
 }
@@ -122,7 +124,7 @@ async fn login(base: &str) -> String {
 
 #[tokio::test]
 async fn the_check_editor_is_unusable_without_a_session() {
-    let addr = spawn_server(coordinator());
+    let addr = spawn_server(coordinator().await);
     let base = format!("http://{addr}");
     let anon = reqwest::Client::new();
 
@@ -177,7 +179,7 @@ async fn the_check_editor_is_unusable_without_a_session() {
 
 #[tokio::test]
 async fn an_authenticated_admin_can_round_trip_a_check() {
-    let addr = spawn_server(coordinator());
+    let addr = spawn_server(coordinator().await);
     let base = format!("http://{addr}");
     let admin = reqwest::Client::new();
     let session = login(&base).await;
@@ -290,7 +292,7 @@ async fn an_authenticated_admin_can_round_trip_a_check() {
 
 #[tokio::test]
 async fn invalid_checks_are_refused_with_a_readable_reason() {
-    let addr = spawn_server(coordinator());
+    let addr = spawn_server(coordinator().await);
     let base = format!("http://{addr}");
     let admin = reqwest::Client::new();
     let session = login(&base).await;
@@ -379,7 +381,7 @@ async fn invalid_checks_are_refused_with_a_readable_reason() {
 
 #[tokio::test]
 async fn probe_targets_never_reach_the_public_api() {
-    let addr = spawn_server(coordinator());
+    let addr = spawn_server(coordinator().await);
     let base = format!("http://{addr}");
     let admin = reqwest::Client::new();
     let session = login(&base).await;
@@ -433,7 +435,7 @@ async fn probe_targets_never_reach_the_public_api() {
 
 #[tokio::test]
 async fn agents_must_present_the_token_for_targets_and_ingest() {
-    let addr = spawn_server(coordinator());
+    let addr = spawn_server(coordinator().await);
     let base = format!("http://{addr}");
     let anon = reqwest::Client::new();
 
@@ -480,7 +482,7 @@ async fn agents_must_present_the_token_for_targets_and_ingest() {
 
 #[tokio::test]
 async fn sections_are_ordered_renamed_and_deleted_without_losing_checks() {
-    let addr = spawn_server(coordinator());
+    let addr = spawn_server(coordinator().await);
     let base = format!("http://{addr}");
     let admin = reqwest::Client::new();
     let session = login(&base).await;
@@ -594,7 +596,7 @@ async fn sections_are_ordered_renamed_and_deleted_without_losing_checks() {
 
 #[tokio::test]
 async fn a_lua_script_decides_the_verdict_end_to_end() {
-    let addr = spawn_server(coordinator());
+    let addr = spawn_server(coordinator().await);
     let base = format!("http://{addr}");
     let admin = reqwest::Client::new();
     let session = login(&base).await;
@@ -671,7 +673,7 @@ async fn a_lua_script_decides_the_verdict_end_to_end() {
 
 #[tokio::test]
 async fn a_broken_script_is_refused_at_save_time() {
-    let addr = spawn_server(coordinator());
+    let addr = spawn_server(coordinator().await);
     let base = format!("http://{addr}");
     let admin = reqwest::Client::new();
     let session = login(&base).await;
@@ -696,7 +698,7 @@ async fn a_broken_script_is_refused_at_save_time() {
 
 #[tokio::test]
 async fn the_eval_test_endpoint_reports_verdicts_and_errors() {
-    let addr = spawn_server(coordinator());
+    let addr = spawn_server(coordinator().await);
     let base = format!("http://{addr}");
     let admin = reqwest::Client::new();
     let session = login(&base).await;
@@ -741,7 +743,7 @@ async fn the_eval_test_endpoint_reports_verdicts_and_errors() {
 
 #[tokio::test]
 async fn checks_keep_an_explicit_display_order() {
-    let addr = spawn_server(coordinator());
+    let addr = spawn_server(coordinator().await);
     let base = format!("http://{addr}");
     let admin = reqwest::Client::new();
     let session = login(&base).await;
@@ -844,7 +846,7 @@ async fn checks_keep_an_explicit_display_order() {
 
 #[tokio::test]
 async fn a_check_can_be_restricted_to_particular_agents() {
-    let addr = spawn_server(coordinator());
+    let addr = spawn_server(coordinator().await);
     let base = format!("http://{addr}");
     let admin = reqwest::Client::new();
     let session = login(&base).await;
@@ -949,7 +951,7 @@ async fn hosts_combine_by_any_or_all() {
 
 #[tokio::test]
 async fn a_heartbeat_goes_up_when_pinged_and_is_not_handed_to_agents() {
-    let addr = spawn_server(coordinator());
+    let addr = spawn_server(coordinator().await);
     let base = format!("http://{addr}");
     let admin = reqwest::Client::new();
     let session = login(&base).await;
@@ -1046,7 +1048,7 @@ async fn a_heartbeat_goes_up_when_pinged_and_is_not_handed_to_agents() {
 
 #[tokio::test]
 async fn purging_data_keeps_the_check() {
-    let addr = spawn_server(coordinator());
+    let addr = spawn_server(coordinator().await);
     let base = format!("http://{addr}");
     let admin = reqwest::Client::new();
     let session = login(&base).await;
@@ -1117,7 +1119,7 @@ async fn purging_data_keeps_the_check() {
 
 #[tokio::test]
 async fn a_configured_check_appears_before_it_has_ever_reported() {
-    let addr = spawn_server(coordinator());
+    let addr = spawn_server(coordinator().await);
     let base = format!("http://{addr}");
     let admin = reqwest::Client::new();
     let session = login(&base).await;
@@ -1192,7 +1194,7 @@ async fn a_configured_check_appears_before_it_has_ever_reported() {
 
 #[tokio::test]
 async fn heartbeat_pings_do_not_invent_a_monitoring_agent() {
-    let addr = spawn_server(coordinator());
+    let addr = spawn_server(coordinator().await);
     let base = format!("http://{addr}");
     let admin = reqwest::Client::new();
     let session = login(&base).await;
@@ -1242,7 +1244,7 @@ async fn heartbeat_pings_do_not_invent_a_monitoring_agent() {
 
 #[tokio::test]
 async fn a_check_pinned_to_a_dead_agent_is_reported_not_silent() {
-    let addr = spawn_server(coordinator());
+    let addr = spawn_server(coordinator().await);
     let base = format!("http://{addr}");
     let admin = reqwest::Client::new();
     let session = login(&base).await;
@@ -1382,7 +1384,7 @@ async fn public_pages_never_republish_what_a_probe_observed() {
     // address, published to anyone loading the status page. A status page says
     // whether a service is up; it must not narrate the infrastructure it
     // watches back to the internet.
-    let coord = coordinator();
+    let coord = coordinator().await;
     let addr = spawn_server(coord.clone());
     let base = format!("http://{addr}");
     let session = login(&base).await;
@@ -1513,7 +1515,7 @@ async fn a_twenty_agent_fleet_probes_each_check_once_per_zone() {
     // assigned to exactly one agent per zone. Left unplaced it would go to all
     // twenty — 100 checks at 30s is 67 probes/s and 5.8M rows a day, almost
     // all of it the same observation repeated.
-    let coord = coordinator();
+    let coord = coordinator().await;
     let addr = spawn_server(coord.clone());
     let base = format!("http://{addr}");
     let session = login(&base).await;
@@ -1546,7 +1548,7 @@ async fn a_twenty_agent_fleet_probes_each_check_once_per_zone() {
     }
     assert_eq!(fleet.len(), 18);
     let zone_refs: Vec<(&str, &str)> = zones.iter().map(|(z, r)| (z.as_str(), *r)).collect();
-    let tokens = zone_tokens(&coord, &zone_refs);
+    let tokens = zone_tokens(&coord, &zone_refs).await;
 
     // The fleet is discovered by contact, so the first agent to poll is briefly
     // the only one the coordinator knows about and takes everything. That is
@@ -1605,7 +1607,7 @@ async fn a_twenty_agent_fleet_probes_each_check_once_per_zone() {
 async fn scoping_a_check_to_a_region_keeps_it_out_of_the_others() {
     // A check on an internal EU service must not be probed from Singapore: it
     // would fail there for reasons that say nothing about the service.
-    let coord = coordinator();
+    let coord = coordinator().await;
     let addr = spawn_server(coord.clone());
     let base = format!("http://{addr}");
     let session = login(&base).await;
@@ -1626,7 +1628,8 @@ async fn scoping_a_check_to_a_region_keeps_it_out_of_the_others() {
     let tokens = zone_tokens(
         &coord,
         &[("eu-west-a", "eu-west"), ("ap-south-a", "ap-south")],
-    );
+    )
+    .await;
     let ask = |agent: &'static str, zone: &'static str, _region: &'static str| {
         let client = client.clone();
         let base = base.clone();
@@ -1717,13 +1720,16 @@ async fn a_hanging_notification_endpoint_cannot_stall_ingest() {
         admin_password: Some(PASSWORD.into()),
         ..Default::default()
     })
+    .await
     .unwrap();
-    coord.create_check_for_test(CheckConfig {
-        id: cid("svc"),
-        name: "svc".into(),
-        target: "https://svc.test/".into(),
-        ..Default::default()
-    });
+    coord
+        .create_check_for_test(CheckConfig {
+            id: cid("svc"),
+            name: "svc".into(),
+            target: "https://svc.test/".into(),
+            ..Default::default()
+        })
+        .await;
 
     let result = |status: u16, ts: i64| warden::models::CheckResult {
         check_id: cid("svc"),
@@ -1760,6 +1766,7 @@ async fn a_hanging_notification_endpoint_cannot_stall_ingest() {
     // Decoupling must not lose the alert: it is still recorded for the UI.
     let mine: Vec<_> = coord
         .alerts_for_test(100)
+        .await
         .into_iter()
         .filter(|a| a.node_id == cid("svc").to_string())
         .collect();
@@ -1777,7 +1784,7 @@ async fn a_hanging_notification_endpoint_cannot_stall_ingest() {
 #[tokio::test]
 async fn incidents_open_on_down_and_resolve_on_up() {
     use warden::coordinator::storage::IncidentState;
-    let coord = coordinator_with(vec![http_check("api")]);
+    let coord = coordinator_with(vec![http_check("api")]).await;
     let now = chrono::Utc::now().timestamp_millis();
 
     // `status_code: None` makes the default eval read the probe as Unknown;
@@ -1803,12 +1810,13 @@ async fn incidents_open_on_down_and_resolve_on_up() {
 
     // The demo seed opens its own incidents, so every assertion below counts
     // only this check's — a global count would be measuring the fixture.
-    let mine = |c: &warden::coordinator::Coordinator| {
+    async fn mine(c: &Coordinator) -> Vec<warden::coordinator::storage::IncidentRow> {
         c.incidents_for_test(100)
+            .await
             .into_iter()
             .filter(|i| i.origin_check == Some(cid("api")))
-            .collect::<Vec<_>>()
-    };
+            .collect()
+    }
 
     // First-ever observation is DOWN. No alert (baseline is silent), but the
     // outage is real: an incident must open.
@@ -1819,7 +1827,7 @@ async fn incidents_open_on_down_and_resolve_on_up() {
             Some("connection refused".into()),
         )])
         .await;
-    let incidents = mine(&coord);
+    let incidents = mine(&coord).await;
     assert_eq!(incidents.len(), 1, "first-ever DOWN opens an incident");
     assert_eq!(
         incidents[0].state,
@@ -1844,7 +1852,7 @@ async fn incidents_open_on_down_and_resolve_on_up() {
         "the origin is attached as an affected check"
     );
     // The cause is the first entry in the narrative, not a column beside it.
-    let updates = coord.updates_for_test(&incidents[0].id);
+    let updates = coord.updates_for_test(&incidents[0].id).await;
     assert_eq!(updates.len(), 1, "opening writes exactly one update");
     assert_eq!(updates[0].body, "connection refused");
     assert_eq!(updates[0].state, IncidentState::Detected);
@@ -1855,6 +1863,7 @@ async fn incidents_open_on_down_and_resolve_on_up() {
     assert!(
         coord
             .alerts_for_test(100)
+            .await
             .into_iter()
             .filter(|a| a.node_id == cid("api").to_string())
             .collect::<Vec<_>>()
@@ -1866,12 +1875,12 @@ async fn incidents_open_on_down_and_resolve_on_up() {
     coord
         .ingest(vec![result(now + 5_000, Some(500), None)])
         .await;
-    let incidents = mine(&coord);
+    let incidents = mine(&coord).await;
     assert_eq!(incidents.len(), 1, "no second incident while one is open");
 
     // UNKNOWN is not a confirmed recovery, so it must not close the incident.
     coord.ingest(vec![result(now + 10_000, None, None)]).await;
-    let incidents = mine(&coord);
+    let incidents = mine(&coord).await;
     assert_eq!(incidents.len(), 1, "UNKNOWN keeps the incident open");
     assert_eq!(incidents[0].state, IncidentState::Detected);
 
@@ -1880,12 +1889,12 @@ async fn incidents_open_on_down_and_resolve_on_up() {
     coord
         .ingest(vec![result(now + 20_000, Some(200), None)])
         .await;
-    let incidents = mine(&coord);
+    let incidents = mine(&coord).await;
     assert_eq!(incidents.len(), 1, "same incident, now resolved");
     assert_eq!(incidents[0].state, IncidentState::Resolved);
     assert_eq!(incidents[0].resolved_at, Some(now + 20_000));
     // Resolving writes its own entry, so the timeline explains the state.
-    let updates = coord.updates_for_test(&incidents[0].id);
+    let updates = coord.updates_for_test(&incidents[0].id).await;
     assert_eq!(updates.len(), 2, "open and resolve each wrote an update");
     assert_eq!(updates[1].state, IncidentState::Resolved);
     assert!(
@@ -1898,6 +1907,7 @@ async fn incidents_open_on_down_and_resolve_on_up() {
     // stays attached to the outage rather than floating loose.
     let recovery = coord
         .alerts_for_test(100)
+        .await
         .into_iter()
         .find(|a| a.node_id == cid("api").to_string() && a.current_state == NodeState::Up)
         .expect("recovery alert recorded");
@@ -1911,7 +1921,7 @@ async fn incidents_open_on_down_and_resolve_on_up() {
     coord
         .ingest(vec![result(now + 30_000, Some(500), None)])
         .await;
-    let incidents = mine(&coord);
+    let incidents = mine(&coord).await;
     assert_eq!(incidents.len(), 2, "a new outage opens a second incident");
     assert_eq!(
         incidents[0].state,
@@ -1929,7 +1939,7 @@ async fn incidents_open_on_down_and_resolve_on_up() {
 /// would keep rendering it with live data.
 #[tokio::test]
 async fn the_fleet_listing_is_not_public() {
-    let coord = coordinator();
+    let coord = coordinator().await;
     let addr = spawn_server(coord);
     let base = format!("http://{addr}");
 
@@ -1960,19 +1970,21 @@ async fn the_fleet_listing_is_not_public() {
 
 /// Build a coordinator whose checks carry `depends_on` / `failures_before_down`
 /// as configured, so the reconciler has a real graph to read.
-fn coordinator_with(checks: Vec<warden::config::CheckConfig>) -> Coordinator {
+async fn coordinator_with(checks: Vec<warden::config::CheckConfig>) -> Coordinator {
     let coord = Coordinator::new(&CoordinatorConfig {
         listen: "127.0.0.1:0".into(),
         db_path: ":memory:".into(),
         admin_password: Some(PASSWORD.into()),
         ..Default::default()
     })
+    .await
     .unwrap();
     for check in checks {
-        coord.create_check_for_test(check);
+        coord.create_check_for_test(check).await;
     }
     coord
         .provision_agent_credential(AGENT_TOKEN, "test-zone", "test-region")
+        .await
         .unwrap();
     coord
 }
@@ -2018,7 +2030,7 @@ async fn a_dependent_check_joins_its_upstreams_incident() {
     use warden::coordinator::storage::AffectSource;
     let mut api = http_check("api");
     api.depends_on = vec![cid("db")];
-    let coord = coordinator_with(vec![http_check("db"), api]);
+    let coord = coordinator_with(vec![http_check("db"), api]).await;
     let now = chrono::Utc::now().timestamp_millis();
 
     // A baseline UP for the dependent: a first-ever observation never alerts,
@@ -2030,6 +2042,7 @@ async fn a_dependent_check_joins_its_upstreams_incident() {
     coord.ingest(vec![probe("db", now, 500)]).await;
     let opened: Vec<_> = coord
         .incidents_for_test(100)
+        .await
         .into_iter()
         .filter(|i| i.origin_check == Some(cid("db")))
         .collect();
@@ -2041,6 +2054,7 @@ async fn a_dependent_check_joins_its_upstreams_incident() {
     assert!(
         coord
             .incidents_for_test(100)
+            .await
             .iter()
             .all(|i| i.origin_check != Some(cid("api"))),
         "a dependent must not open its own incident while its upstream is down"
@@ -2048,6 +2062,7 @@ async fn a_dependent_check_joins_its_upstreams_incident() {
 
     let inc = coord
         .incidents_for_test(100)
+        .await
         .into_iter()
         .find(|i| i.id == incident_id)
         .expect("the upstream incident is still there");
@@ -2067,6 +2082,7 @@ async fn a_dependent_check_joins_its_upstreams_incident() {
     // recorded, and stamped with the incident it belongs to.
     let api_alert = coord
         .alerts_for_test(100)
+        .await
         .into_iter()
         .find(|a| a.node_id == cid("api").to_string())
         .expect("the dependent still records its own alert");
@@ -2079,7 +2095,7 @@ async fn a_dependent_check_joins_its_upstreams_incident() {
 /// what a time-window correlation would have done.
 #[tokio::test]
 async fn unrelated_checks_falling_together_stay_separate_incidents() {
-    let coord = coordinator_with(vec![http_check("db"), http_check("ping")]);
+    let coord = coordinator_with(vec![http_check("db"), http_check("ping")]).await;
     let now = chrono::Utc::now().timestamp_millis();
 
     coord
@@ -2088,6 +2104,7 @@ async fn unrelated_checks_falling_together_stay_separate_incidents() {
 
     let origins: Vec<String> = coord
         .incidents_for_test(100)
+        .await
         .into_iter()
         .filter_map(|i| i.origin_check)
         .filter(|c| *c == cid("db") || *c == cid("ping"))
@@ -2109,14 +2126,15 @@ async fn a_flapping_check_stays_inside_one_incident() {
     use warden::coordinator::storage::IncidentState;
     let mut flappy = http_check("flappy");
     flappy.failures_before_down = 3;
-    let coord = coordinator_with(vec![flappy]);
+    let coord = coordinator_with(vec![flappy]).await;
     let now = chrono::Utc::now().timestamp_millis();
-    let mine = |c: &Coordinator| {
+    async fn mine(c: &Coordinator) -> Vec<warden::coordinator::storage::IncidentRow> {
         c.incidents_for_test(100)
+            .await
             .into_iter()
             .filter(|i| i.origin_check == Some(cid("flappy")))
-            .collect::<Vec<_>>()
-    };
+            .collect()
+    }
 
     // Three failures confirm the DOWN and open the incident.
     for i in 0..3 {
@@ -2124,7 +2142,7 @@ async fn a_flapping_check_stays_inside_one_incident() {
             .ingest(vec![probe("flappy", now + i * 1_000, 500)])
             .await;
     }
-    let incidents = mine(&coord);
+    let incidents = mine(&coord).await;
     assert_eq!(incidents.len(), 1, "confirmed DOWN opened one incident");
     let id = incidents[0].id.clone();
 
@@ -2134,7 +2152,7 @@ async fn a_flapping_check_stays_inside_one_incident() {
         coord
             .ingest(vec![probe("flappy", now + 10_000 + i as i64 * 1_000, code)])
             .await;
-        let incidents = mine(&coord);
+        let incidents = mine(&coord).await;
         assert_eq!(
             incidents.len(),
             1,
@@ -2155,7 +2173,7 @@ async fn a_flapping_check_stays_inside_one_incident() {
             .ingest(vec![probe("flappy", now + 20_000 + i * 1_000, 200)])
             .await;
     }
-    let incidents = mine(&coord);
+    let incidents = mine(&coord).await;
     assert_eq!(incidents.len(), 1, "still one incident");
     assert_eq!(
         incidents[0].state,
@@ -2170,7 +2188,7 @@ async fn a_flapping_check_stays_inside_one_incident() {
 #[tokio::test]
 async fn auto_resolve_fires_even_after_a_human_has_acknowledged() {
     use warden::coordinator::storage::IncidentState;
-    let coord = coordinator_with(vec![http_check("svc")]);
+    let coord = coordinator_with(vec![http_check("svc")]).await;
     let now = chrono::Utc::now().timestamp_millis();
     let addr = spawn_server(coord.clone());
     let base = format!("http://{addr}");
@@ -2179,6 +2197,7 @@ async fn auto_resolve_fires_even_after_a_human_has_acknowledged() {
     coord.ingest(vec![probe("svc", now, 500)]).await;
     let id = coord
         .incidents_for_test(100)
+        .await
         .into_iter()
         .find(|i| i.origin_check == Some(cid("svc")))
         .expect("incident opened")
@@ -2195,6 +2214,7 @@ async fn auto_resolve_fires_even_after_a_human_has_acknowledged() {
     assert_eq!(res.status(), reqwest::StatusCode::OK);
     let acked = coord
         .incidents_for_test(100)
+        .await
         .into_iter()
         .find(|i| i.id == id)
         .unwrap();
@@ -2203,6 +2223,7 @@ async fn auto_resolve_fires_even_after_a_human_has_acknowledged() {
     coord.ingest(vec![probe("svc", now + 5_000, 200)]).await;
     let resolved = coord
         .incidents_for_test(100)
+        .await
         .into_iter()
         .find(|i| i.id == id)
         .unwrap();
@@ -2218,11 +2239,12 @@ async fn auto_resolve_fires_even_after_a_human_has_acknowledged() {
 /// it — and an open create endpoint would let anyone invent an outage.
 #[tokio::test]
 async fn incident_writes_are_admin_only_while_reads_are_public() {
-    let coord = coordinator_with(vec![http_check("svc")]);
+    let coord = coordinator_with(vec![http_check("svc")]).await;
     let now = chrono::Utc::now().timestamp_millis();
     coord.ingest(vec![probe("svc", now, 500)]).await;
     let id = coord
         .incidents_for_test(100)
+        .await
         .into_iter()
         .find(|i| i.origin_check == Some(cid("svc")))
         .expect("incident opened")
@@ -2269,6 +2291,7 @@ async fn incident_writes_are_admin_only_while_reads_are_public() {
     // Nothing above took effect.
     let after = coord
         .incidents_for_test(100)
+        .await
         .into_iter()
         .find(|i| i.id == id)
         .unwrap();
@@ -2308,7 +2331,7 @@ async fn incident_writes_are_admin_only_while_reads_are_public() {
 #[tokio::test]
 async fn a_manual_incident_is_never_auto_resolved() {
     use warden::coordinator::storage::IncidentState;
-    let coord = coordinator_with(vec![http_check("db")]);
+    let coord = coordinator_with(vec![http_check("db")]).await;
     let now = chrono::Utc::now().timestamp_millis();
     let addr = spawn_server(coord.clone());
     let base = format!("http://{addr}");
@@ -2343,6 +2366,7 @@ async fn a_manual_incident_is_never_auto_resolved() {
         .await;
     let after = coord
         .incidents_for_test(100)
+        .await
         .into_iter()
         .find(|i| i.id == id)
         .expect("the manual incident still exists");
@@ -2358,6 +2382,7 @@ async fn a_manual_incident_is_never_auto_resolved() {
     coord.ingest(vec![probe("db", now + 2_000, 500)]).await;
     let own: Vec<_> = coord
         .incidents_for_test(100)
+        .await
         .into_iter()
         .filter(|i| i.origin_check == Some(cid("db")))
         .collect();
@@ -2409,7 +2434,7 @@ async fn openmetrics_metric_and_metrics_drive_the_verdict() {
         ),
         ..Default::default()
     };
-    let coord = coordinator_with(vec![check]);
+    let coord = coordinator_with(vec![check]).await;
     let now = chrono::Utc::now().timestamp_millis();
 
     let scrape = |ts: i64, metric: Option<f64>, metrics: Vec<MetricSample>| CheckResult {
@@ -2443,6 +2468,7 @@ async fn openmetrics_metric_and_metrics_drive_the_verdict() {
     assert!(
         coord
             .incidents_for_test(100)
+            .await
             .iter()
             .all(|i| i.origin_check != Some(cid("queue"))),
         "a healthy metric check opens no incident"
@@ -2460,6 +2486,7 @@ async fn openmetrics_metric_and_metrics_drive_the_verdict() {
         .await;
     let down: Vec<_> = coord
         .incidents_for_test(100)
+        .await
         .into_iter()
         .filter(|i| i.origin_check == Some(cid("queue")))
         .collect();
@@ -2478,6 +2505,7 @@ async fn openmetrics_metric_and_metrics_drive_the_verdict() {
     coord.ingest(vec![scrape(now + 3_000, None, vec![])]).await;
     let reopened: Vec<_> = coord
         .incidents_for_test(100)
+        .await
         .into_iter()
         .filter(|i| i.origin_check == Some(cid("queue")) && i.resolved_at.is_none())
         .collect();
@@ -2494,18 +2522,22 @@ async fn openmetrics_metric_and_metrics_drive_the_verdict() {
 /// summarises away.
 #[tokio::test]
 async fn the_results_explorer_is_admin_only_and_returns_raw_errors() {
-    let coord = coordinator();
-    coord.create_check_for_test(CheckConfig {
-        id: cid("web"),
-        name: "web".into(),
-        ..Default::default()
-    });
-    coord.create_check_for_test(CheckConfig {
-        id: cid("ddns-wa"),
-        name: "ddns-wa".into(),
-        kind: warden::models::CheckKind::Dns,
-        ..Default::default()
-    });
+    let coord = coordinator().await;
+    coord
+        .create_check_for_test(CheckConfig {
+            id: cid("web"),
+            name: "web".into(),
+            ..Default::default()
+        })
+        .await;
+    coord
+        .create_check_for_test(CheckConfig {
+            id: cid("ddns-wa"),
+            name: "ddns-wa".into(),
+            kind: warden::models::CheckKind::Dns,
+            ..Default::default()
+        })
+        .await;
 
     // The exact leak the public path redacts: a resolved address and the
     // expected values, verbatim from the agent.
@@ -2658,7 +2690,7 @@ async fn public_incident_ids(base: &str) -> Vec<String> {
 
 #[tokio::test]
 async fn deleting_an_incident_needs_a_session_and_a_real_id() {
-    let addr = spawn_server(coordinator());
+    let addr = spawn_server(coordinator().await);
     let base = format!("http://{addr}");
     let admin = reqwest::Client::new();
     let session = login(&base).await;
@@ -2717,7 +2749,7 @@ async fn deleting_an_incident_needs_a_session_and_a_real_id() {
 /// `incident_id` rather than going with the incident.
 #[tokio::test]
 async fn deleting_an_incident_unlinks_its_alerts_instead_of_deleting_them() {
-    let coord = coordinator();
+    let coord = coordinator().await;
     let addr = spawn_server(coord.clone());
     let base = format!("http://{addr}");
     let admin = reqwest::Client::new();
@@ -2755,6 +2787,7 @@ async fn deleting_an_incident_unlinks_its_alerts_instead_of_deleting_them() {
 
     let opened = coord
         .incidents_for_test(100)
+        .await
         .into_iter()
         .find(|i| i.origin_check == Some(web_id))
         .expect("a confirmed DOWN opens an incident");
@@ -2790,7 +2823,7 @@ async fn deleting_an_incident_unlinks_its_alerts_instead_of_deleting_them() {
 /// incident it opened, all gone. Incidents owned by *other* checks survive.
 #[tokio::test]
 async fn erasing_a_check_removes_everything_it_produced() {
-    let coord = coordinator();
+    let coord = coordinator().await;
     let addr = spawn_server(coord.clone());
     let base = format!("http://{addr}");
     let admin = reqwest::Client::new();
@@ -2880,6 +2913,7 @@ async fn erasing_a_check_removes_everything_it_produced() {
     assert!(
         coord
             .incidents_for_test(100)
+            .await
             .into_iter()
             .all(|i| i.origin_check != Some(cid("web"))),
         "every incident web opened is gone"

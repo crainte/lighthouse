@@ -62,41 +62,35 @@ pub(in crate::coordinator) async fn gossip_handler(
         .tracker
         .lock()
         .seed_published(t.check_id, t.to, None);
-    {
-        let store = coord.inner.storage.lock();
-        if let Err(e) = store.update_current_state(t.check_id, t.to, None, msg.timestamp) {
-            tracing::warn!(error = %e, check = %t.check_id, "gossip: failed to persist state");
-        }
-        // Same filter the local path applies, so the two alert feeds agree.
-        if alert::should_alert(&t) {
-            // The sender's real incident id, carried on the message since
-            // `gossip::Message` grew `incident_id`. Stamped verbatim even
-            // though the incident row itself has not arrived here yet — it
-            // lands separately, via `/internal/replicate` or an
-            // anti-entropy backfill, and `upsert_incident` is keyed by this
-            // same id, so the alert is already pointing at the right row the
-            // moment it does. Only a sender with no incident_id at all
-            // (never opened one, or an older binary) falls back to whatever
-            // this node happens to have open locally.
-            let incident_id = msg.incident_id.clone().or_else(|| {
-                store
-                    .open_incident_for(t.check_id)
-                    .ok()
-                    .flatten()
-                    .map(|i| i.id)
-            });
-            if let Err(e) = store.insert_alert(
-                storage::AlertScope::Check,
-                &t.check_id.to_string(),
-                Some(t.from),
-                t.to,
-                msg.timestamp,
-                incident_id.as_deref(),
-            ) {
-                tracing::warn!(error = %e, check = %t.check_id, "gossip: failed to persist alert");
+    let persisted = t.clone();
+    let timestamp = msg.timestamp;
+    let message_incident = msg.incident_id;
+    if let Err(error) = coord
+        .db(move |store| {
+            store.update_current_state(persisted.check_id, persisted.to, None, timestamp)?;
+            if alert::should_alert(&persisted) {
+                let incident_id = message_incident.or_else(|| {
+                    store
+                        .open_incident_for(persisted.check_id)
+                        .ok()
+                        .flatten()
+                        .map(|incident| incident.id)
+                });
+                store.insert_alert(
+                    storage::AlertScope::Check,
+                    &persisted.check_id.to_string(),
+                    Some(persisted.from),
+                    persisted.to,
+                    timestamp,
+                    incident_id.as_deref(),
+                )?;
             }
-        }
-    } // drop storage guard before the broadcast
+            Ok(())
+        })
+        .await
+    {
+        tracing::warn!(%error, check = %t.check_id, "gossip: failed to persist transition");
+    }
     let _ = coord.inner.events.send(WsEvent::StateChange {
         check_id: t.check_id,
         from: t.from,
@@ -214,7 +208,7 @@ pub struct ReplicationBatch {
     /// Incident ids deleted on the sender. Applied as a delete *plus a local
     /// tombstone*, so this node will not hand the incident back later either.
     #[serde(default)]
-    pub deleted_incidents: Vec<String>,
+    pub deleted_incidents: Vec<storage::IncidentTombstone>,
 }
 
 /// `POST /internal/replicate`: the data-plane analog of `/internal/gossip`,
@@ -230,7 +224,7 @@ pub(in crate::coordinator) async fn replicate_handler(
     if let Some(denied) = require_peer(&coord, &headers) {
         return denied;
     }
-    coord.apply_replicated(batch);
+    coord.apply_replicated(batch).await;
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -264,7 +258,7 @@ pub(in crate::coordinator) async fn config_handler(
     if let Some(denied) = require_peer(&coord, &headers) {
         return denied;
     }
-    match coord.apply_config_batch(&batch.entries) {
+    match coord.apply_config_batch(&batch.entries).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => internal_error(e),
     }
@@ -331,6 +325,23 @@ impl From<&storage::ConfigDigest> for ConfigDigestDto {
 /// One check's contribution to a digest, on the wire. Mirrors
 /// `storage::CheckDigest`, which has no `Serialize` of its own.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamDigestDto {
+    pub max_millis: i64,
+    pub max_id: String,
+    pub count: i64,
+}
+
+impl From<&storage::StreamDigest> for StreamDigestDto {
+    fn from(d: &storage::StreamDigest) -> Self {
+        Self {
+            max_millis: d.max_millis,
+            max_id: d.max_id.clone(),
+            count: d.count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckDigestDto {
     pub check_id: String,
     pub max_ts: i64,
@@ -357,8 +368,9 @@ pub struct DigestResponse {
     pub node_id: String,
     pub checks: Vec<CheckDigestDto>,
     pub window_start: i64,
-    pub max_alert_ts: i64,
-    pub max_incident_started_at: i64,
+    pub alerts: StreamDigestDto,
+    pub incidents: StreamDigestDto,
+    pub incident_tombstones: StreamDigestDto,
     /// The config plane's half. Without this a node that was down through an
     /// edit never learns about it: the immediate push already happened and
     /// nothing else would ever mention the row again.
@@ -371,8 +383,9 @@ impl DigestResponse {
             node_id: node_id.to_string(),
             checks: d.checks.iter().map(CheckDigestDto::from).collect(),
             window_start: d.window_start,
-            max_alert_ts: d.max_alert_ts,
-            max_incident_started_at: d.max_incident_started_at,
+            alerts: StreamDigestDto::from(&d.alerts),
+            incidents: StreamDigestDto::from(&d.incidents),
+            incident_tombstones: StreamDigestDto::from(&d.incident_tombstones),
             config: d.config.iter().map(ConfigDigestDto::from).collect(),
         }
     }
@@ -390,7 +403,7 @@ pub(in crate::coordinator) async fn digest_handler(
     if let Some(denied) = require_peer(&coord, &headers) {
         return denied;
     }
-    let digest = { coord.inner.storage.lock().digest(0) };
+    let digest = coord.db(|storage| storage.digest(0)).await;
     match digest {
         Ok(d) => Json(DigestResponse::new(&coord.inner.node_id, d)).into_response(),
         Err(e) => internal_error(e),
@@ -425,16 +438,18 @@ pub(in crate::coordinator) async fn config_entries_handler(
         Some(k) => vec![k],
         None => storage::ConfigKind::ALL.to_vec(),
     };
-    let entries = {
-        let store = coord.inner.storage.lock();
-        let mut out = Vec::new();
-        for kind in kinds {
-            match store.config_entries(kind) {
-                Ok(mut e) => out.append(&mut e),
-                Err(e) => return internal_error(e),
+    let entries = match coord
+        .db(move |storage| {
+            let mut out = Vec::new();
+            for kind in kinds {
+                out.append(&mut storage.config_entries(kind)?);
             }
-        }
-        out
+            Ok(out)
+        })
+        .await
+    {
+        Ok(entries) => entries,
+        Err(e) => return internal_error(e),
     };
     Json(ConfigBatch {
         origin: coord.inner.node_id.clone(),
@@ -443,17 +458,98 @@ pub(in crate::coordinator) async fn config_entries_handler(
     .into_response()
 }
 
+#[derive(Debug, Deserialize)]
+pub(in crate::coordinator) struct StreamBackfillQuery {
+    since: i64,
+    #[serde(default)]
+    since_node_id: String,
+    #[serde(default)]
+    since_id: String,
+    limit: usize,
+}
+
+pub(in crate::coordinator) async fn alerts_backfill_handler(
+    State(coord): State<Coordinator>,
+    headers: HeaderMap,
+    Query(q): Query<StreamBackfillQuery>,
+) -> Response {
+    if let Some(denied) = require_peer(&coord, &headers) {
+        return denied;
+    }
+    let limit = q.limit.min(super::super::ANTI_ENTROPY_PAGE);
+    match coord
+        .db(move |s| s.alerts_since(q.since, &q.since_id, limit))
+        .await
+    {
+        Ok(rows) => Json(ReplicationBatch {
+            origin: coord.inner.node_id.clone(),
+            alerts: rows.iter().map(ReplicatedAlert::from).collect(),
+            ..Default::default()
+        })
+        .into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+pub(in crate::coordinator) async fn incidents_backfill_handler(
+    State(coord): State<Coordinator>,
+    headers: HeaderMap,
+    Query(q): Query<StreamBackfillQuery>,
+) -> Response {
+    if let Some(denied) = require_peer(&coord, &headers) {
+        return denied;
+    }
+    let limit = q.limit.min(super::super::ANTI_ENTROPY_PAGE);
+    match coord
+        .db(move |s| s.incidents_since(q.since, &q.since_id, limit))
+        .await
+    {
+        Ok(rows) => Json(ReplicationBatch {
+            origin: coord.inner.node_id.clone(),
+            incidents: rows,
+            ..Default::default()
+        })
+        .into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+pub(in crate::coordinator) async fn incident_tombstones_backfill_handler(
+    State(coord): State<Coordinator>,
+    headers: HeaderMap,
+    Query(q): Query<StreamBackfillQuery>,
+) -> Response {
+    if let Some(denied) = require_peer(&coord, &headers) {
+        return denied;
+    }
+    let limit = q.limit.min(super::super::ANTI_ENTROPY_PAGE);
+    match coord
+        .db(move |s| s.incident_tombstones_since(q.since, &q.since_node_id, &q.since_id, limit))
+        .await
+    {
+        Ok(rows) => Json(ReplicationBatch {
+            origin: coord.inner.node_id.clone(),
+            deleted_incidents: rows,
+            ..Default::default()
+        })
+        .into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
 /// Query for `GET /internal/backfill`.
 #[derive(Debug, Deserialize)]
 pub(in crate::coordinator) struct BackfillQuery {
     check_id: String,
     since: i64,
+    since_agent_id: Option<String>,
     until: i64,
     limit: usize,
 }
 
-/// `GET /internal/backfill`: paged raw rows for one check, `since` exclusive
-/// — the pull counterpart to `/internal/replicate`'s push, and the same
+/// `GET /internal/backfill`: paged raw rows for one check, with the composite
+/// `(since, since_agent_id)` cursor exclusive — the pull counterpart to
+/// `/internal/replicate`'s push, and the same
 /// `ReplicationBatch` shape, so a caller can hand the response straight to a
 /// peer's `/internal/replicate` without reshaping it.
 pub(in crate::coordinator) async fn backfill_handler(
@@ -468,13 +564,15 @@ pub(in crate::coordinator) async fn backfill_handler(
         Ok(id) => id,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "check_id must be a valid UUID"),
     };
-    let rows = {
-        coord
-            .inner
-            .storage
-            .lock()
-            .results_since(check_id, q.since, q.until, q.limit)
-    };
+    let since = q.since;
+    let since_agent_id = q.since_agent_id;
+    let until = q.until;
+    let limit = q.limit.min(super::super::ANTI_ENTROPY_PAGE);
+    let rows = coord
+        .db(move |storage| {
+            storage.results_since(check_id, since, since_agent_id.as_deref(), until, limit)
+        })
+        .await;
     match rows {
         Ok(rows) => {
             let batch = ReplicationBatch {

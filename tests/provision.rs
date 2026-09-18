@@ -80,18 +80,18 @@ fn checks() -> Vec<CheckConfig> {
     }]
 }
 
-fn boot(db_path: &str, provision: Vec<ProvisionedCredential>) -> anyhow::Result<Coordinator> {
-    let coord = Coordinator::new(&config(db_path, provision))?;
+async fn boot(db_path: &str, provision: Vec<ProvisionedCredential>) -> anyhow::Result<Coordinator> {
+    let coord = Coordinator::new(&config(db_path, provision)).await?;
     for check in checks() {
-        coord.create_check_for_test(check);
+        coord.create_check_for_test(check).await;
     }
     Ok(coord)
 }
 
 /// The refusal message, or a failure naming what booted when it should not
 /// have. `Coordinator` is not `Debug`, so this stands in for `expect_err`.
-fn boot_error(provision: Vec<ProvisionedCredential>, why: &str) -> String {
-    match boot(":memory:", provision) {
+async fn boot_error(provision: Vec<ProvisionedCredential>, why: &str) -> String {
+    match boot(":memory:", provision).await {
         Ok(_) => panic!("{why}"),
         Err(e) => e.to_string(),
     }
@@ -218,6 +218,7 @@ async fn a_configured_credential_works_and_pins_the_zone_it_declares() {
         ":memory:",
         vec![block("us-east-1a", "us-east", Some(TOKEN), None)],
     )
+    .await
     .unwrap();
     let (addr, handle) = serve(coord).await;
     let base = format!("http://{addr}");
@@ -247,6 +248,7 @@ async fn the_token_may_come_from_the_environment() {
         ":memory:",
         vec![block("eu-west-1a", "eu-west", None, Some(VAR))],
     )
+    .await
     .unwrap();
     let (addr, handle) = serve(coord).await;
     let base = format!("http://{addr}");
@@ -275,9 +277,12 @@ async fn the_token_may_come_from_the_environment() {
 async fn a_second_boot_rewrites_nothing() {
     let db = db_file("second-boot");
     let first = {
-        let (addr, handle) =
-            serve(boot(&db, vec![block("us-east-1a", "us-east", Some(TOKEN), None)]).unwrap())
-                .await;
+        let (addr, handle) = serve(
+            boot(&db, vec![block("us-east-1a", "us-east", Some(TOKEN), None)])
+                .await
+                .unwrap(),
+        )
+        .await;
         let entries = credential_entries(addr).await;
         stop(handle).await;
         entries
@@ -288,8 +293,12 @@ async fn a_second_boot_rewrites_nothing() {
         "the first boot should provision one: {first:?}"
     );
 
-    let (addr, handle) =
-        serve(boot(&db, vec![block("us-east-1a", "us-east", Some(TOKEN), None)]).unwrap()).await;
+    let (addr, handle) = serve(
+        boot(&db, vec![block("us-east-1a", "us-east", Some(TOKEN), None)])
+            .await
+            .unwrap(),
+    )
+    .await;
     let second = credential_entries(addr).await;
     stop(handle).await;
 
@@ -313,6 +322,7 @@ async fn a_credential_already_replicated_in_is_left_alone() {
                 &db,
                 vec![block("ap-south-1a", "ap-south", Some(TOKEN), None)],
             )
+            .await
             .unwrap(),
         )
         .await;
@@ -329,6 +339,7 @@ async fn a_credential_already_replicated_in_is_left_alone() {
             &db,
             vec![block("elsewhere-1a", "elsewhere", Some(TOKEN), None)],
         )
+        .await
         .unwrap(),
     )
     .await;
@@ -354,9 +365,12 @@ async fn a_credential_already_replicated_in_is_left_alone() {
 async fn a_revoked_credential_is_not_resurrected_by_its_own_config_block() {
     let db = db_file("revoked");
     let id = {
-        let (addr, handle) =
-            serve(boot(&db, vec![block("us-east-1a", "us-east", Some(TOKEN), None)]).unwrap())
-                .await;
+        let (addr, handle) = serve(
+            boot(&db, vec![block("us-east-1a", "us-east", Some(TOKEN), None)])
+                .await
+                .unwrap(),
+        )
+        .await;
         let base = format!("http://{addr}");
         let session = login(&base).await;
         let listed: Value = reqwest::Client::new()
@@ -385,8 +399,12 @@ async fn a_revoked_credential_is_not_resurrected_by_its_own_config_block() {
         id
     };
 
-    let (addr, handle) =
-        serve(boot(&db, vec![block("us-east-1a", "us-east", Some(TOKEN), None)]).unwrap()).await;
+    let (addr, handle) = serve(
+        boot(&db, vec![block("us-east-1a", "us-east", Some(TOKEN), None)])
+            .await
+            .unwrap(),
+    )
+    .await;
     let base = format!("http://{addr}");
     assert_eq!(
         post_result(&base, TOKEN, "agent-a", "us-east-1a", "us-east").await,
@@ -407,7 +425,8 @@ async fn an_unresolvable_token_fails_startup_naming_the_zone_and_the_variable() 
     let err = boot_error(
         vec![block("us-east-1a", "us-east", None, Some(VAR))],
         "a block whose token resolves to nothing must not boot silently",
-    );
+    )
+    .await;
     assert!(err.contains("us-east-1a"), "should name the zone: {err}");
     assert!(err.contains(VAR), "should name the variable: {err}");
 }
@@ -422,7 +441,8 @@ async fn a_malformed_token_fails_startup() {
             None,
         )],
         "a token that is not shaped like a credential must not boot",
-    );
+    )
+    .await;
     assert!(err.contains("us-east-1a"), "should name the zone: {err}");
     assert!(
         err.contains("malformed"),
@@ -435,7 +455,8 @@ async fn a_blank_location_fails_startup() {
     let err = boot_error(
         vec![block("  ", "us-east", Some(TOKEN), None)],
         "a credential bound to no zone is the state credentials replace",
-    );
+    )
+    .await;
     assert!(err.contains("zone"), "should say what is missing: {err}");
 }
 
@@ -499,9 +520,10 @@ async fn spawn_peer(node_id: &str, provision: Vec<ProvisionedCredential>) -> Pee
         peer_timeout_secs: 7_200,
         ..config(":memory:", provision)
     })
+    .await
     .unwrap();
     for check in checks() {
-        coord.create_check_for_test(check);
+        coord.create_check_for_test(check).await;
     }
     let app = coord
         .clone()

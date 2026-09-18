@@ -296,12 +296,12 @@ pub(in crate::coordinator) async fn status_handler(
     // The status page is public; raw probe errors name resolved addresses and
     // expected values, so only an admin sees them verbatim.
     let detailed = is_admin(&coord, &headers);
-    let (rows, confirmed) = {
-        let store = coord.inner.storage.lock();
-        // Confirmed states are read under the same guard. A node that learned a
-        // check's state by gossip has no measurements of its own, so it has no
-        // `list_status` row to carry that state on.
-        (store.list_status(now), store.list_current_state())
+    let (rows, confirmed) = match coord
+        .db(move |storage| Ok((storage.list_status(now), storage.list_current_state())))
+        .await
+    {
+        Ok(value) => value,
+        Err(e) => return internal_error(e),
     };
     let confirmed: std::collections::HashMap<CheckId, NodeState> = confirmed
         .unwrap_or_default()
@@ -310,7 +310,7 @@ pub(in crate::coordinator) async fn status_handler(
         .collect();
     match rows {
         Ok(rows) => {
-            let by_id = coord.inner.checks.read();
+            let by_id = coord.inner.checks.read().clone();
             let mut checks: Vec<CheckStatusDto> = rows
                 .into_iter()
                 // Only currently-configured, published checks. A row with no
@@ -373,9 +373,10 @@ pub(in crate::coordinator) async fn status_handler(
                 })
                 .collect();
             checks.extend(pending);
+            let agents = fleet_health(&coord, now).await;
             Json(StatusResponse {
                 checks,
-                agents: fleet_health(&coord, now),
+                agents,
                 maintenance: announced_maintenance(&coord, now),
             })
             .into_response()
@@ -403,7 +404,7 @@ pub(in crate::coordinator) async fn history_handler(
     // addresses and expected values.
     let detailed = is_admin(&coord, &headers);
     let name = coord.check_name(id);
-    match coord.history(id, limit, q.from, q.to, status) {
+    match coord.history(id, limit, q.from, q.to, status).await {
         Ok(rows) => {
             let history = rows
                 .into_iter()
@@ -460,9 +461,9 @@ pub(in crate::coordinator) async fn results_handler(
         region: q.region,
         zone: q.zone,
     };
-    let names = coord.inner.checks.read();
-    match coord.recent_results(&filter, limit) {
+    match coord.recent_results(filter, limit).await {
         Ok(rows) => {
+            let names = coord.inner.checks.read();
             let results = rows
                 .into_iter()
                 .map(|r| ResultDto {
@@ -547,12 +548,13 @@ pub(in crate::coordinator) async fn uptime_handler(
     // inherits the coordinator default when its own setting is absent.
     let degraded_is_downtime = coord.degraded_is_downtime(id);
     let window_start = now - days as i64 * 86_400_000;
-    let result = (|| -> anyhow::Result<_> {
-        let storage = coord.inner.storage.lock();
-        let rows = storage.uptime_buckets(id, days, buckets, now, degraded_is_downtime)?;
-        let overall = storage.uptime_between(id, window_start, now, degraded_is_downtime)?;
-        Ok((rows, overall))
-    })();
+    let result = coord
+        .db(move |storage| {
+            let rows = storage.uptime_buckets(id, days, buckets, now, degraded_is_downtime)?;
+            let overall = storage.uptime_between(id, window_start, now, degraded_is_downtime)?;
+            Ok((rows, overall))
+        })
+        .await;
     match result {
         Ok((rows, overall_uptime)) => {
             let buckets = rows
@@ -596,10 +598,8 @@ pub(in crate::coordinator) async fn latency_sparkline_handler(
         }
     };
     match coord
-        .inner
-        .storage
-        .lock()
-        .latency_series(id, from, to, buckets)
+        .db(move |storage| storage.latency_series(id, from, to, buckets))
+        .await
     {
         Ok(series) => {
             let points = series
@@ -640,7 +640,7 @@ pub(in crate::coordinator) async fn alerts_handler(
     Query(q): Query<LimitQuery>,
 ) -> Response {
     let limit = q.limit.unwrap_or(50).min(1000);
-    let rows = coord.inner.storage.lock().recent_alerts(limit);
+    let rows = coord.db(move |storage| storage.recent_alerts(limit)).await;
     match rows {
         Ok(rows) => {
             let alerts = rows

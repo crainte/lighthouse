@@ -77,8 +77,8 @@ fn valid_section_name(name: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-fn sections_response(coord: &Coordinator) -> Response {
-    match coord.inner.storage.lock().list_sections() {
+async fn sections_response(coord: &Coordinator) -> Response {
+    match coord.db(|storage| storage.list_sections()).await {
         Ok(sections) => Json(SectionsResponse {
             sections: sections.into_iter().map(Into::into).collect(),
         })
@@ -92,7 +92,7 @@ fn sections_response(coord: &Coordinator) -> Response {
 pub(in crate::coordinator) async fn public_sections_handler(
     State(coord): State<Coordinator>,
 ) -> Response {
-    sections_response(&coord)
+    sections_response(&coord).await
 }
 
 pub(in crate::coordinator) async fn list_sections_handler(
@@ -102,7 +102,7 @@ pub(in crate::coordinator) async fn list_sections_handler(
     if let Some(denied) = require_admin(&coord, &headers) {
         return denied;
     }
-    sections_response(&coord)
+    sections_response(&coord).await
 }
 
 pub(in crate::coordinator) async fn create_section_handler(
@@ -117,11 +117,11 @@ pub(in crate::coordinator) async fn create_section_handler(
         Ok(n) => n,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
     };
+    let create_name = name.clone();
+    let collapsed = body.collapsed.unwrap_or(false);
     match coord
-        .inner
-        .storage
-        .lock()
-        .create_section(&name, body.collapsed.unwrap_or(false))
+        .db(move |storage| storage.create_section(&create_name, collapsed))
+        .await
     {
         Ok(true) => {}
         Ok(false) => {
@@ -132,7 +132,9 @@ pub(in crate::coordinator) async fn create_section_handler(
         }
         Err(e) => return internal_error(e),
     }
-    coord.restamp_and_push(storage::ConfigKind::Section, &name);
+    coord
+        .restamp_and_push(storage::ConfigKind::Section, &name)
+        .await;
     Json(SectionResponse {
         section: SectionDto {
             name,
@@ -157,7 +159,7 @@ pub(in crate::coordinator) async fn rename_section_handler(
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
     };
     if name != current {
-        let taken = match coord.inner.storage.lock().list_sections() {
+        let taken = match coord.db(|storage| storage.list_sections()).await {
             Ok(existing) => existing.iter().any(|s| s.name == name),
             Err(e) => return internal_error(e),
         };
@@ -168,33 +170,37 @@ pub(in crate::coordinator) async fn rename_section_handler(
             );
         }
     }
-    match coord.inner.storage.lock().rename_section(
-        &current,
-        &name,
-        chrono::Utc::now().timestamp_millis(),
-    ) {
+    let rename_from = current.clone();
+    let rename_to = name.clone();
+    let collapsed = body.collapsed;
+    match coord
+        .db(move |storage| {
+            let renamed = storage.rename_section(
+                &rename_from,
+                &rename_to,
+                chrono::Utc::now().timestamp_millis(),
+            )?;
+            if renamed {
+                if let Some(collapsed) = collapsed {
+                    storage.set_section_collapsed(&rename_to, collapsed)?;
+                }
+            }
+            Ok(renamed)
+        })
+        .await
+    {
         Ok(true) => {}
         Ok(false) => return error_response(StatusCode::NOT_FOUND, "no such section"),
         Err(e) => return internal_error(e),
     }
-    // Absent means "leave it alone"; the same endpoint is used to rename and to
-    // toggle how the public page first renders the section.
-    if let Some(collapsed) = body.collapsed {
-        if let Err(e) = coord
-            .inner
-            .storage
-            .lock()
-            .set_section_collapsed(&name, collapsed)
-        {
-            return internal_error(e);
-        }
-    }
     // Renaming moves every check in the section, so the cached metadata the
     // status page reads is now stale.
-    if let Err(e) = coord.reload_checks() {
+    if let Err(e) = coord.reload_checks().await {
         return internal_error(e);
     }
-    coord.restamp_and_push(storage::ConfigKind::Section, &name);
+    coord
+        .restamp_and_push(storage::ConfigKind::Section, &name)
+        .await;
     // Every check `rename_section` moved gets its own stamp and push — its
     // document changed too (its `group` now names the new section), and a
     // peer that only heard about the section itself would show those checks
@@ -215,14 +221,14 @@ pub(in crate::coordinator) async fn rename_section_handler(
         .map(|(id, _)| *id)
         .collect();
     for check_id in moved {
-        coord.restamp_and_push(storage::ConfigKind::Check, &check_id.to_string());
+        coord
+            .restamp_and_push(storage::ConfigKind::Check, &check_id.to_string())
+            .await;
     }
     info!(from = %current, to = %name, "section renamed");
     let collapsed = coord
-        .inner
-        .storage
-        .lock()
-        .list_sections()
+        .db(|storage| storage.list_sections())
+        .await
         .ok()
         .and_then(|all| all.into_iter().find(|s| s.name == name))
         .map(|s| s.collapsed)
@@ -256,29 +262,35 @@ pub(in crate::coordinator) async fn delete_section_handler(
         .filter(|(_, m)| m.group.as_deref() == Some(name.as_str()))
         .map(|(id, _)| *id)
         .collect();
+    let delete_name = name.clone();
     match coord
-        .inner
-        .storage
-        .lock()
-        .delete_section(&name, chrono::Utc::now().timestamp_millis())
+        .db(move |storage| {
+            storage.delete_section(&delete_name, chrono::Utc::now().timestamp_millis())
+        })
+        .await
     {
         Ok(true) => {}
         Ok(false) => return error_response(StatusCode::NOT_FOUND, "no such section"),
         Err(e) => return internal_error(e),
     }
-    if let Err(e) = coord.reload_checks() {
+    if let Err(e) = coord.reload_checks().await {
         return internal_error(e);
     }
     // A tombstone for the section itself, pushed the same way any other
     // delete is.
-    match coord.write_config(storage::ConfigKind::Section, &name, None) {
+    match coord
+        .write_config(storage::ConfigKind::Section, &name, None)
+        .await
+    {
         Ok(entry) => coord.replicate_config(vec![entry]),
         Err(e) => {
             tracing::warn!(error = %e, section = %name, "config: failed to push section tombstone")
         }
     }
     for check_id in &affected {
-        coord.restamp_and_push(storage::ConfigKind::Check, &check_id.to_string());
+        coord
+            .restamp_and_push(storage::ConfigKind::Check, &check_id.to_string())
+            .await;
     }
     info!(section = %name, "section deleted, its checks are now loose");
     Json(DeletedResponse { deleted: name }).into_response()
@@ -292,15 +304,17 @@ pub(in crate::coordinator) async fn reorder_sections_handler(
     if let Some(denied) = require_admin(&coord, &headers) {
         return denied;
     }
-    let before = match coord.inner.storage.lock().list_sections() {
-        Ok(s) => s,
-        Err(e) => return internal_error(e),
-    };
-    if let Err(e) = coord.inner.storage.lock().reorder_sections(&body.order) {
-        return internal_error(e);
-    }
-    let after = match coord.inner.storage.lock().list_sections() {
-        Ok(s) => s,
+    let order = body.order;
+    let (before, after) = match coord
+        .db(move |storage| {
+            let before = storage.list_sections()?;
+            storage.reorder_sections(&order)?;
+            let after = storage.list_sections()?;
+            Ok((before, after))
+        })
+        .await
+    {
+        Ok(value) => value,
         Err(e) => return internal_error(e),
     };
     // Only the sections whose position actually moved are stamped and
@@ -312,8 +326,10 @@ pub(in crate::coordinator) async fn reorder_sections_handler(
         .collect();
     for s in &after {
         if before_pos.get(s.name.as_str()) != Some(&s.position) {
-            coord.restamp_and_push(storage::ConfigKind::Section, &s.name);
+            coord
+                .restamp_and_push(storage::ConfigKind::Section, &s.name)
+                .await;
         }
     }
-    sections_response(&coord)
+    sections_response(&coord).await
 }

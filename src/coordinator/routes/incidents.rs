@@ -212,18 +212,20 @@ pub(in crate::coordinator) async fn incidents_handler(
     let limit = q.limit.unwrap_or(50).min(1000);
     let open_only = incident_open_filter(q.status.as_deref());
     let now = chrono::Utc::now().timestamp_millis();
-    let store = coord.inner.storage.lock();
-    match store.list_incidents(limit, open_only) {
-        Ok(rows) => {
-            let incidents = rows
-                .into_iter()
-                .map(|r| {
-                    let ack = store.is_acknowledged(&r.id).unwrap_or(false);
-                    IncidentDto::from_row(r, now, ack)
-                })
-                .collect();
-            Json(IncidentsResponse { incidents }).into_response()
-        }
+    match coord
+        .db(move |storage| {
+            storage.list_incidents(limit, open_only).map(|rows| {
+                rows.into_iter()
+                    .map(|row| {
+                        let ack = storage.is_acknowledged(&row.id).unwrap_or(false);
+                        IncidentDto::from_row(row, now, ack)
+                    })
+                    .collect()
+            })
+        })
+        .await
+    {
+        Ok(incidents) => Json(IncidentsResponse { incidents }).into_response(),
         Err(e) => internal_error(e),
     }
 }
@@ -236,15 +238,21 @@ pub(in crate::coordinator) async fn incident_handler(
     Path(id): Path<String>,
 ) -> Response {
     let now = chrono::Utc::now().timestamp_millis();
-    let store = coord.inner.storage.lock();
-    match store.incident(&id) {
-        Ok(Some(row)) => {
-            let ack = store.is_acknowledged(&row.id).unwrap_or(false);
-            let updates = store.updates_for_incident(&row.id).unwrap_or_default();
+    let lookup_id = id.clone();
+    match coord
+        .db(move |storage| {
+            let Some(row) = storage.incident(&lookup_id)? else {
+                return Ok(None);
+            };
+            let ack = storage.is_acknowledged(&row.id).unwrap_or(false);
+            let updates = storage.updates_for_incident(&row.id).unwrap_or_default();
             let mut dto = IncidentDto::from_row(row, now, ack);
             dto.updates = Some(updates.into_iter().map(IncidentUpdateDto::from).collect());
-            Json(serde_json::json!({ "incident": dto })).into_response()
-        }
+            Ok(Some(dto))
+        })
+        .await
+    {
+        Ok(Some(dto)) => Json(serde_json::json!({ "incident": dto })).into_response(),
         Ok(None) => error_response(StatusCode::NOT_FOUND, "no incident with that id"),
         Err(e) => internal_error(e),
     }
@@ -288,17 +296,23 @@ pub(in crate::coordinator) async fn create_incident_handler(
         })
         .collect();
     let body = req.body.unwrap_or_default();
-    let store = coord.inner.storage.lock();
-    match store.create_incident(
-        &id,
-        title,
-        state,
-        started_at,
-        req.global.unwrap_or(false),
-        None,
-        &checks,
-        Some((&body, Some("admin"))),
-    ) {
+    let title = title.to_string();
+    let create_id = id.clone();
+    match coord
+        .db(move |storage| {
+            storage.create_incident(
+                &create_id,
+                &title,
+                state,
+                started_at,
+                req.global.unwrap_or(false),
+                None,
+                &checks,
+                Some((&body, Some("admin"))),
+            )
+        })
+        .await
+    {
         Ok(row) => {
             let dto = IncidentDto::from_row(row, now, true);
             let _ = coord.inner.events.send(WsEvent::IncidentOpened {
@@ -310,8 +324,6 @@ pub(in crate::coordinator) async fn create_incident_handler(
     }
 }
 
-/// Edit the operator-owned fields. Deliberately cannot move `state`: that only
-/// happens by posting an update, so the timeline always explains the state.
 pub(in crate::coordinator) async fn edit_incident_handler(
     State(coord): State<Coordinator>,
     Path(id): Path<String>,
@@ -326,11 +338,19 @@ pub(in crate::coordinator) async fn edit_incident_handler(
         return error_response(StatusCode::BAD_REQUEST, "title is required");
     }
     let now = chrono::Utc::now().timestamp_millis();
-    let store = coord.inner.storage.lock();
-    match store.edit_incident(&id, title, req.started_at, req.global) {
-        Ok(Some(row)) => {
-            let ack = store.is_acknowledged(&row.id).unwrap_or(false);
-            let dto = IncidentDto::from_row(row, now, ack);
+    let title = title.to_string();
+    let edit_id = id.clone();
+    match coord
+        .db(move |storage| {
+            let row = storage.edit_incident(&edit_id, &title, req.started_at, req.global)?;
+            Ok(row.map(|row| {
+                let ack = storage.is_acknowledged(&row.id).unwrap_or(false);
+                IncidentDto::from_row(row, now, ack)
+            }))
+        })
+        .await
+    {
+        Ok(Some(dto)) => {
             let _ = coord.inner.events.send(WsEvent::IncidentUpdated {
                 incident: dto.clone(),
             });
@@ -361,12 +381,13 @@ pub(in crate::coordinator) async fn delete_incident_handler(
     }
     let now = chrono::Utc::now().timestamp_millis();
     let node_id = coord.inner.node_id.clone();
-    let deleted = {
-        let store = coord.inner.storage.lock();
-        match store.delete_incident(&id, now, &node_id) {
-            Ok(deleted) => deleted,
-            Err(e) => return internal_error(e),
-        }
+    let delete_id = id.clone();
+    let deleted = match coord
+        .db(move |storage| storage.delete_incident(&delete_id, now, &node_id))
+        .await
+    {
+        Ok(deleted) => deleted,
+        Err(e) => return internal_error(e),
     };
     if !deleted {
         return error_response(StatusCode::NOT_FOUND, "no incident with that id");
@@ -389,7 +410,7 @@ pub(in crate::coordinator) async fn results_count_handler(
     if let Some(rejection) = require_admin(&coord, &headers) {
         return rejection;
     }
-    match coord.inner.storage.lock().count_results() {
+    match coord.db(|storage| storage.count_results()).await {
         Ok(raw_results) => Json(ResultsCountResponse { raw_results }).into_response(),
         Err(e) => internal_error(e),
     }
@@ -404,7 +425,7 @@ pub(in crate::coordinator) async fn purge_results_handler(
     if let Some(rejection) = require_admin(&coord, &headers) {
         return rejection;
     }
-    let deleted = match coord.inner.storage.lock().purge_results() {
+    let deleted = match coord.db(|storage| storage.purge_results()).await {
         Ok(deleted) => deleted,
         Err(e) => return internal_error(e),
     };
@@ -432,7 +453,10 @@ pub(in crate::coordinator) async fn purge_short_incidents_handler(
             "max_secs must be between 1 and 3600",
         );
     }
-    match coord.inner.storage.lock().purge_short_incidents(max_secs) {
+    match coord
+        .db(move |storage| storage.purge_short_incidents(max_secs))
+        .await
+    {
         Ok(deleted) => {
             info!(max_secs, deleted, "purged short incidents");
             Json(ShortIncidentPurgeResponse { deleted }).into_response()
@@ -461,14 +485,19 @@ pub(in crate::coordinator) async fn incident_checks_handler(
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
     let now = chrono::Utc::now().timestamp_millis();
-    let store = coord.inner.storage.lock();
-    if let Err(e) = store.set_manual_checks(&id, &req.checks) {
-        return internal_error(e);
-    }
-    match store.incident(&id) {
-        Ok(Some(row)) => {
-            let ack = store.is_acknowledged(&row.id).unwrap_or(false);
-            let dto = IncidentDto::from_row(row, now, ack);
+    let update_id = id.clone();
+    match coord
+        .db(move |storage| {
+            storage.set_manual_checks(&update_id, &req.checks)?;
+            let row = storage.incident(&update_id)?;
+            Ok(row.map(|row| {
+                let ack = storage.is_acknowledged(&row.id).unwrap_or(false);
+                IncidentDto::from_row(row, now, ack)
+            }))
+        })
+        .await
+    {
+        Ok(Some(dto)) => {
             let _ = coord.inner.events.send(WsEvent::IncidentUpdated {
                 incident: dto.clone(),
             });
@@ -498,21 +527,25 @@ pub(in crate::coordinator) async fn incident_update_handler(
         );
     };
     let now = chrono::Utc::now().timestamp_millis();
-    let store = coord.inner.storage.lock();
-    if store.incident(&id).ok().flatten().is_none() {
-        return error_response(StatusCode::NOT_FOUND, "no incident with that id");
-    }
-    // Logins are password-only: there is no per-user identity to record, so the
-    // byline is the role. What matters is that it is non-NULL — that is what
-    // makes this an acknowledgement rather than a coordinator entry.
-    if let Err(e) = store.add_update(&id, state, req.body.trim(), Some("admin"), now) {
-        return internal_error(e);
-    }
-    match store.incident(&id) {
-        Ok(Some(row)) => {
-            let updates = store.updates_for_incident(&row.id).unwrap_or_default();
+    let update_id = id.clone();
+    let update_body = req.body.trim().to_string();
+    match coord
+        .db(move |storage| {
+            if storage.incident(&update_id)?.is_none() {
+                return Ok(None);
+            }
+            storage.add_update(&update_id, state, &update_body, Some("admin"), now)?;
+            let row = storage
+                .incident(&update_id)?
+                .expect("incident checked above");
+            let updates = storage.updates_for_incident(&row.id).unwrap_or_default();
             let mut dto = IncidentDto::from_row(row, now, true);
             dto.updates = Some(updates.into_iter().map(IncidentUpdateDto::from).collect());
+            Ok(Some(dto))
+        })
+        .await
+    {
+        Ok(Some(dto)) => {
             let _ = coord.inner.events.send(WsEvent::IncidentUpdated {
                 incident: dto.clone(),
             });
@@ -543,18 +576,20 @@ pub(in crate::coordinator) async fn check_incidents_handler(
 ) -> Response {
     let limit = q.limit.unwrap_or(20).min(1000);
     let now = chrono::Utc::now().timestamp_millis();
-    let store = coord.inner.storage.lock();
-    match store.incidents_for_check(id, limit) {
-        Ok(rows) => {
-            let incidents = rows
-                .into_iter()
-                .map(|r| {
-                    let ack = store.is_acknowledged(&r.id).unwrap_or(false);
-                    IncidentDto::from_row(r, now, ack)
-                })
-                .collect();
-            Json(IncidentsResponse { incidents }).into_response()
-        }
+    match coord
+        .db(move |storage| {
+            storage.incidents_for_check(id, limit).map(|rows| {
+                rows.into_iter()
+                    .map(|row| {
+                        let ack = storage.is_acknowledged(&row.id).unwrap_or(false);
+                        IncidentDto::from_row(row, now, ack)
+                    })
+                    .collect()
+            })
+        })
+        .await
+    {
+        Ok(incidents) => Json(IncidentsResponse { incidents }).into_response(),
         Err(e) => internal_error(e),
     }
 }

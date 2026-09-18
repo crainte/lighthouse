@@ -16,7 +16,7 @@ use crate::config::GlobalConfig;
 use crate::models::{CheckId, NodeState};
 use alert::GlobalAlerter;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, get, post};
@@ -119,7 +119,10 @@ impl GlobalNode {
             // status on each one, exactly as it does against a coordinator.
             .route("/api/v1/ws", get(ws_handler))
             // Push ingest from regional coordinators. Token-gated.
-            .route("/internal/global/state", post(push_handler))
+            .route(
+                "/internal/global/state",
+                post(push_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+            )
             // Everything else under /api/v1 that a coordinator answers is
             // relayed to regions: drill-down reads (history, uptime,
             // sparklines) to the owning region, and admin operations

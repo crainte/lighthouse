@@ -120,8 +120,11 @@ async fn agent_check_through_coordinator_fires_alert_on_up_to_down() {
         }],
         ..Default::default()
     })
+    .await
     .unwrap();
-    coord.create_check_for_test(check(format!("http://{target_addr}/ok")));
+    coord
+        .create_check_for_test(check(format!("http://{target_addr}/ok")))
+        .await;
 
     let probes = Probes::new().unwrap();
 
@@ -164,7 +167,10 @@ async fn agent_check_through_coordinator_fires_alert_on_up_to_down() {
     coord.ingest(vec![down]).await;
 
     // --- Contract 3: both results persisted, newest-first [Down, Up] ---
-    let hist = coord.history(cid("web"), 10, None, None, None).unwrap();
+    let hist = coord
+        .history(cid("web"), 10, None, None, None)
+        .await
+        .unwrap();
     assert_eq!(hist.len(), 2, "both ingested results must be persisted");
     assert_eq!(
         hist[0].status,

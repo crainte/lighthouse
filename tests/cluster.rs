@@ -125,16 +125,19 @@ async fn spawn_node(node_id: &str, peers: Vec<String>, peer_timeout_secs: u64) -
         peer_timeout_secs,
         ..Default::default()
     })
+    .await
     .unwrap();
-    coord.create_check_for_test(CheckConfig {
-        id: cid(CHECK),
-        name: CHECK.into(),
-        kind: CheckKind::Http,
-        target: "https://example.invalid".into(),
-        cron: "0 * * * * *".into(),
-        timeout_secs: 5,
-        ..Default::default()
-    });
+    coord
+        .create_check_for_test(CheckConfig {
+            id: cid(CHECK),
+            name: CHECK.into(),
+            kind: CheckKind::Http,
+            target: "https://example.invalid".into(),
+            cron: "0 * * * * *".into(),
+            timeout_secs: 5,
+            ..Default::default()
+        })
+        .await;
     let app = coord
         .clone()
         .router()
@@ -725,6 +728,135 @@ async fn a_late_joiner_backfills_history_via_digest_and_backfill() {
     assert_eq!(entry_b["max_ts"], entry["max_ts"]);
 }
 
+#[tokio::test]
+async fn anti_entropy_repairs_a_historical_result_hole_below_local_high_water() {
+    let a = spawn_node("a", vec![], NO_TIMEOUT).await;
+    a.coord
+        .ingest(vec![result(200, 1_000), result(200, 2_000)])
+        .await;
+
+    let b = spawn_node("b", vec![], NO_TIMEOUT).await;
+    let session_a = login(a.addr).await;
+    gossip_step(a.addr, &session_a, b.addr).await;
+    let newest_only = backfill(a.addr, &cid_str(CHECK), 1_000, 2_000, 100).await;
+    assert_eq!(
+        replicate(b.addr, &newest_only).await,
+        reqwest::StatusCode::NO_CONTENT
+    );
+
+    let before = digest(b.addr).await;
+    let check = before["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["check_id"] == cid_str(CHECK))
+        .unwrap();
+    assert_eq!(check["count"], 1);
+    assert_eq!(check["max_ts"], 2_000, "B already has A's high water");
+
+    b.coord.anti_entropy_sweep().await;
+    let history = history(b.addr, &cid_str(CHECK)).await;
+    assert_eq!(
+        history.len(),
+        2,
+        "count mismatch must replay below high water"
+    );
+}
+
+#[tokio::test]
+async fn anti_entropy_pages_rows_sharing_a_timestamp() {
+    let a = spawn_node("a", vec![], NO_TIMEOUT).await;
+    let rows = (0..501)
+        .map(|i| {
+            let mut row = result(200, 1_000);
+            row.agent_id = format!("agent-{i:04}");
+            row
+        })
+        .collect();
+    a.coord.ingest(rows).await;
+
+    let b = spawn_node("b", vec![], NO_TIMEOUT).await;
+    let session_a = login(a.addr).await;
+    gossip_step(a.addr, &session_a, b.addr).await;
+    b.coord.anti_entropy_sweep().await;
+
+    let dig_b = digest(b.addr).await;
+    let entry = dig_b["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["check_id"] == cid_str(CHECK))
+        .expect("B's digest should contain the backfilled check");
+    assert_eq!(entry["count"], 501);
+    assert_eq!(entry["max_ts"], 1_000);
+}
+
+#[tokio::test]
+async fn anti_entropy_repairs_an_alert_hole_below_local_high_water() {
+    let a = spawn_node("a", vec![], NO_TIMEOUT).await;
+    a.coord.ingest(vec![result(200, 1_000)]).await;
+    a.coord.ingest(vec![result(500, 2_000)]).await;
+    a.coord.ingest(vec![result(200, 3_000)]).await;
+    let all_alerts: Value = reqwest::Client::new()
+        .get(format!(
+            "http://{}/internal/backfill/alerts?since={}&since_id=&limit=100",
+            a.addr,
+            i64::MIN
+        ))
+        .bearer_auth(PEER_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut newest_only = all_alerts.clone();
+    let alerts = newest_only["alerts"].as_array_mut().unwrap();
+    assert!(alerts.len() >= 2);
+    let newest = alerts.pop().unwrap();
+    *alerts = vec![newest];
+
+    let b = spawn_node("b", vec![], NO_TIMEOUT).await;
+    let session_a = login(a.addr).await;
+    gossip_step(a.addr, &session_a, b.addr).await;
+    assert_eq!(
+        replicate(b.addr, &newest_only).await,
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert_eq!(b.coord.alerts_for_test(100).await.len(), 1);
+
+    b.coord.anti_entropy_sweep().await;
+    assert_eq!(
+        b.coord.alerts_for_test(100).await.len(),
+        a.coord.alerts_for_test(100).await.len(),
+        "stream count mismatch must replay below the local watermark"
+    );
+}
+
+#[tokio::test]
+async fn anti_entropy_recovers_a_complete_missed_incident_lifecycle() {
+    let a = spawn_node("a", vec![], NO_TIMEOUT).await;
+    a.coord.ingest(vec![result(200, 1_000)]).await;
+    a.coord.ingest(vec![result(500, 2_000)]).await;
+    a.coord.ingest(vec![result(200, 3_000)]).await;
+
+    let incident_id = a.coord.incidents_for_test(1).await[0].id.clone();
+    assert_eq!(a.coord.updates_for_test(&incident_id).await.len(), 2);
+    let alert_count = a.coord.alerts_for_test(100).await.len();
+
+    let b = spawn_node("b", vec![], NO_TIMEOUT).await;
+    let session_a = login(a.addr).await;
+    gossip_step(a.addr, &session_a, b.addr).await;
+    b.coord.anti_entropy_sweep().await;
+
+    assert_eq!(b.coord.alerts_for_test(100).await.len(), alert_count);
+    let recovered = b.coord.incidents_for_test(10).await;
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].id, incident_id);
+    assert_eq!(recovered[0].state.as_str(), "resolved");
+    assert_eq!(b.coord.updates_for_test(&incident_id).await.len(), 2);
+}
+
 // ---------------------------------------------------------------------------
 // 7. Incident replication
 // ---------------------------------------------------------------------------
@@ -752,6 +884,7 @@ async fn a_replicated_incident_keeps_its_originating_id() {
     let incident_id = a
         .coord
         .incidents_for_test(1)
+        .await
         .first()
         .expect("A should have opened an incident for the confirmed outage")
         .id
@@ -815,6 +948,7 @@ async fn a_deleted_incident_stays_deleted_when_a_peer_pushes_it_back() {
     let incident = a
         .coord
         .incidents_for_test(1)
+        .await
         .first()
         .expect("A should have opened an incident for the confirmed outage")
         .clone();
@@ -867,6 +1001,7 @@ async fn a_deleted_incident_stays_deleted_when_a_peer_pushes_it_back() {
         "origin": "a",
         "incidents": [{
             "id": incident_id,
+            "version": { "millis": incident.started_at, "node_id": "a" },
             "title": incident.title,
             "state": incident.state,
             "started_at": incident.started_at,
@@ -929,6 +1064,7 @@ async fn an_agent_polling_one_node_shows_up_in_its_peers_fleet() {
     let agent_token = "wac_fleet.poll-secret";
     a.coord
         .provision_agent_credential(agent_token, "ap-south-1a", REGION)
+        .await
         .unwrap();
 
     // The poll itself: asking for work is the contact that puts an agent in
@@ -1000,6 +1136,7 @@ async fn internal_endpoints_refuse_anonymous_and_agent_callers() {
     let agent_token = "wac_test.cluster-auth-secret";
     node.coord
         .provision_agent_credential(agent_token, "z", "r")
+        .await
         .unwrap();
 
     // Ping is checked on its own: the contract pins its request/response
@@ -1132,6 +1269,7 @@ async fn empty_nodes_do_not_seed_demo_data() {
             peers,
             ..Default::default()
         })
+        .await
         .unwrap();
         let app = coord
             .router()

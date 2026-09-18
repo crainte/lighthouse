@@ -181,7 +181,7 @@ pub(in crate::coordinator) async fn list_rollup_policies_handler(
         return denied;
     }
 
-    match coord.inner.storage.lock().list_rollup_policies() {
+    match coord.db(|storage| storage.list_rollup_policies()).await {
         Ok(rows) => Json(RollupPoliciesResponse {
             policies: rows.into_iter().map(Into::into).collect(),
         })
@@ -204,7 +204,10 @@ pub(in crate::coordinator) async fn upsert_rollup_policy_handler(
     if let Err(reason) = body.policy.validate() {
         return error_response(StatusCode::BAD_REQUEST, &reason);
     }
-    if let Err(e) = coord.save_rollup_policy(&body.node_id, body.node_type, body.policy) {
+    if let Err(e) = coord
+        .save_rollup_policy(&body.node_id, body.node_type, body.policy)
+        .await
+    {
         return internal_error(e);
     }
 
@@ -224,7 +227,7 @@ pub(in crate::coordinator) async fn delete_rollup_policy_handler(
         return error_response(StatusCode::BAD_REQUEST, reason);
     }
 
-    let stored_type = match coord.inner.storage.lock().list_rollup_policies() {
+    let stored_type = match coord.db(|storage| storage.list_rollup_policies()).await {
         Ok(rows) => rows
             .into_iter()
             .find(|row| row.node_id == body.node_id)
@@ -238,7 +241,7 @@ pub(in crate::coordinator) async fn delete_rollup_policy_handler(
         }
         Some(_) => {}
     }
-    if let Err(e) = coord.delete_rollup_policy(&body.node_id) {
+    if let Err(e) = coord.delete_rollup_policy(&body.node_id).await {
         return internal_error(e);
     }
 

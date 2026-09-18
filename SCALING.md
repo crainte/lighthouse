@@ -192,19 +192,76 @@ A future split may retain DuckDB for control/current-state analytics while movin
 
 ## Data retention tiers
 
-A likely large-deployment model is:
+The current implementation and the target policy are deliberately separate. Today the
+coordinator enforces:
+
+| Data | Current policy |
+|---|---|
+| Raw observations | 30 days by default (`retention.results_days`), pruned daily |
+| State transitions | The raw-results window; the latest/open span per check is retained |
+| Alerts and resolved incidents | 90 days by default (`retention.alerts_days`); open incidents are retained |
+| Current state | Retained while the check exists |
+| Minute/hour latency rollups | Not stored yet |
+| WAL | DuckDB recovery state; no independent age-based retention promise |
+| Backups | No built-in scheduler or retention; checkpointed offline copies are operator-managed |
+
+The target policy for a large deployment is:
+
+| Data | Target retention |
+|---|---|
+| Raw observations | 30 days initially; reduce only after rollup boundary semantics and peer recovery are implemented |
+| Minute latency rollups | 90 days |
+| Hourly latency rollups | 13 months |
+| State transitions | At least 90 days, independently configurable from raw observations |
+| Current state | Retained while the check exists |
+| WAL | Bound by measured checkpoint behavior and a monitored size budget, not by deleting WAL files |
+| Offline backups | Daily checkpointed snapshots managed externally; retain 7 daily, 4 weekly, and 12 monthly copies |
+
+Raw retention supports detailed diagnosis. State transitions support exact time-weighted
+uptime without retaining every successful probe. Rollups support bounded long-range
+latency queries. The backup schedule is an operational starting point, not a built-in
+Warden guarantee.
+
+Capacity is driven by independent observation domains, not colocated agent replicas:
 
 ```text
-Raw observations:       7–30 days
-Minute latency rollups: 30–90 days
-Hourly rollups:         optional longer retention
-State transitions:      at least 90 days
-Current state:          indefinitely while the check exists
+raw rows per database replica = checks × domains × 86,400 / cadence_seconds × raw_days
+physical row-copies in a region = raw rows per replica × coordinator replicas
 ```
 
-Raw retention supports detailed diagnosis. State transitions support exact time-weighted uptime without retaining every successful probe. Rollups support bounded long-range latency queries.
+At 10,000 checks, a 30-second cadence, 30 raw days, and three fully replicated
+coordinators:
 
-Retention policy must account for peer downtime: a peer offline longer than raw retention cannot recover complete raw history through ordinary anti-entropy and must be restored from a snapshot/backup or explicitly accept a gap.
+| Domains | Sustained ingest | Rows per database replica | Regional physical row-copies |
+|---:|---:|---:|---:|
+| 1 | 333/s | 864M | 2.592B |
+| 3 | 1,000/s | 2.592B | 7.776B |
+| 5 | 1,667/s | 4.320B | 12.960B |
+
+Disk and backup estimates must use measured representative data rather than an assumed
+bytes-per-row constant. For a baseline with `measured_rows`, scale its checkpointed
+file and backup sizes linearly for planning, then retain headroom for WAL and temporary
+checkpoint/prune space:
+
+```text
+estimated bytes per replica = measured bytes × target rows / measured_rows
+regional checkpointed bytes = estimated bytes per replica × coordinator replicas
+```
+
+This estimate is not a support claim: compression depends on probe metadata and data
+distribution, while checkpoints and large deletes can require transient space.
+
+Do not reduce raw retention until minute/hour rollups exist, latency queries select the
+correct resolution across raw/rollup boundaries, and a peer older than raw retention has
+an explicit snapshot-or-gap recovery path. Require time partitioning when a full-scale
+retention run cannot drop one expiry unit within the maintenance budget without blocking
+ingest or requiring excessive temporary disk. Require a separate raw-observation store
+when measured single-replica ingest, concurrent query latency, checkpoint/backup time, or
+storage growth exceeds the accepted production envelope after rollups and partitioning.
+
+A peer offline longer than raw retention cannot recover complete raw history through
+ordinary anti-entropy and must be restored from a snapshot/backup or explicitly accept a
+gap.
 
 ## UUIDv7 implementation plan
 
@@ -305,6 +362,121 @@ Record at minimum:
 - global state propagation latency and bytes;
 - DuckDB, WAL, and rollup growth;
 - retention, checkpoint, backup, restore, and peer catch-up durations.
+
+### Measured capacity envelope
+
+The numbers below were measured on 2026-09-18 with a release build on a 16-thread
+x86_64 workstation with NVMe storage, running the ignored benchmarks in this
+repository. They describe one coordinator replica, not a full regional cluster.
+
+Coordinator ingest, 10,000 checks × 3 observation domains (30,000 rows per batch,
+10 batches, `benchmark_sustained_coordinator_ingest`):
+
+| Measurement | Result |
+|---|---:|
+| Sustained ingest | 37,222 rows/s |
+| Batch p50 / p95 / max | 788 / 849 / 849 ms |
+
+The steady-state requirement at that shape is 1,000 rows/s, so measured single-replica
+ingest has roughly 37× headroom before evaluation, rollup, and persistence become the
+constraint. A debug build reaches only ~3,600 rows/s; benchmark from a release build.
+
+Storage, 10,000 checks × 3 domains × 2 days of retained raw data
+(172.8M rows, `benchmark_representative_storage_capacity_baseline`):
+
+| Measurement | Result |
+|---|---:|
+| Retained rows | 172,800,000 |
+| Checkpointed database | 1.54 GB (8.9 bytes/row) |
+| Single-check history p95 | 30 ms |
+| Latency series p95 | 91 ms |
+| Retention prune of 86.4M rows | 23.5 s |
+| Checkpoint after prune | 2.1 s |
+| Restore (open + full count) | 25.3 s |
+
+Scaling raw retention linearly from that measurement gives the planning envelope:
+
+| Domains | Raw days | Rows per replica | Estimated bytes per replica |
+|---:|---:|---:|---:|
+| 1 | 30 | 864M | ~7.7 GB |
+| 3 | 30 | 2.592B | ~23 GB |
+| 5 | 30 | 4.320B | ~39 GB |
+
+Multiply by three for a fully replicated region, and keep headroom for WAL and
+transient checkpoint/prune space. Daily retention removes roughly one day of raw rows;
+at three domains that is ~86M rows per run, measured at 23.5 s, which is why monolithic
+deletes remain acceptable at this scale and time partitioning is not yet required.
+
+Still unmeasured, and therefore outside any support claim: a full 30-day dataset,
+live probe traffic, network replication and peer catch-up, concurrent query load during
+retention, and online backup. The backup step copies a closed, checkpointed file and
+reported ~0 ms here because the filesystem performed a copy-on-write clone; treat
+backup duration as unmeasured on filesystems without reflink support.
+
+### Current single-table capacity baseline
+
+The ignored `benchmark_representative_storage_capacity_baseline` test characterizes the
+current DuckDB layout before retention tiers or partitioning are selected. Unlike the
+anti-entropy digest benchmark, it uses varied statuses, latency, locations, errors, and
+failure values so its compressed file size is a useful baseline rather than a storage
+forecast from repeated constants.
+
+Run a local baseline with:
+
+```bash
+WARDEN_BENCH_CHECKS=10000 WARDEN_BENCH_DAYS=30 WARDEN_BENCH_OBSERVATION_SECS=30 \
+WARDEN_BENCH_DOMAINS=1 \
+rtk cargo test benchmark_representative_storage_capacity_baseline -- --ignored --nocapture
+```
+
+Repeat for one, three, and five independent domains. The test reports logical rows;
+DuckDB, WAL, and backup bytes; p95 history and latency-query time; and seed, prune,
+checkpoint, backup, and restore duration. Backup is measured from a checkpointed,
+closed database, matching the required offline file-copy procedure. Optional
+`WARDEN_BENCH_MAX_*` variables turn these measurements into explicit acceptance
+ceilings, including `WARDEN_BENCH_MAX_BACKUP_MS` and
+`WARDEN_BENCH_MAX_RESTORE_MS`.
+
+This is baseline characterization only. It does not validate live probe traffic,
+network replication, online backups, rollup resolution switching, or partition expiry;
+those are required before a supported-envelope claim.
+
+### Sustained coordinator-ingest benchmark
+
+The ignored `benchmark_sustained_coordinator_ingest` test sends healthy observations
+through the real coordinator evaluation, rollup, and persistence path. It defaults to
+10,000 checks, one observation domain, and 20 batches. Repeat it for one, three, and
+five domains:
+
+```bash
+WARDEN_BENCH_CHECKS=10000 WARDEN_BENCH_DOMAINS=1 WARDEN_BENCH_BATCHES=20 \
+rtk cargo test benchmark_sustained_coordinator_ingest -- --ignored --nocapture
+```
+
+It reports total rows, sustained rows/s, and batch p50/p95/p99/max. Optional
+`WARDEN_BENCH_MIN_INGEST_ROWS_PER_SECOND` and
+`WARDEN_BENCH_MAX_INGEST_BATCH_P95_MS` variables enforce acceptance thresholds.
+This isolates coordinator ingest capacity; agent scheduling, network transfer, and
+concurrent query/retention load still require production-scale measurement.
+
+### Status and global-push benchmark
+
+The ignored `benchmark_status_and_global_push_production_cardinality` test exercises the
+real regional and global HTTP status routes plus authenticated full-state pushes. It
+uses 10,000 checks, three regions, and 20 samples by default. Run it with:
+
+```bash
+WARDEN_BENCH_CHECKS=10000 WARDEN_BENCH_REGIONS=3 WARDEN_BENCH_SAMPLES=20 \
+rtk cargo test benchmark_status_and_global_push_production_cardinality -- --ignored --nocapture
+```
+
+It reports regional/global status p95 and response bytes, plus global-push p95 and
+payload bytes. Optional `WARDEN_BENCH_MAX_REGIONAL_STATUS_P95_MS`,
+`WARDEN_BENCH_MAX_GLOBAL_PUSH_P95_MS`, `WARDEN_BENCH_MAX_GLOBAL_STATUS_P95_MS`, and
+`WARDEN_BENCH_MAX_PUSH_BYTES` variables enforce local acceptance ceilings. The global
+push route has an explicit 16 MiB limit so supported 10,000-check snapshots are not
+rejected by Axum's 2 MiB default. This validates cardinality, not sustained concurrent
+load or the full production capacity envelope.
 
 ## Scaling milestones
 

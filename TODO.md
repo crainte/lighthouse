@@ -6,32 +6,39 @@ Prioritized action items from the production-readiness review. Existing items fr
 
 ### Storage and runtime scalability
 
-- [ ] Move all synchronous DuckDB work off Tokio worker threads.
-  - [ ] Introduce a dedicated blocking database executor or worker.
-  - [ ] Remove direct `parking_lot::Mutex<Storage>` contention from async handlers and background tasks.
-  - [ ] Add load tests proving slow queries do not stall probes, gossip, WebSockets, or unrelated API requests.
-- [ ] Replace the full-history anti-entropy digest scan.
-  - [ ] Stop calling `digest(0)` every anti-entropy interval.
-  - [ ] Maintain compact per-check replication high-water metadata, or use a bounded recent window plus infrequent full reconciliation.
-  - [ ] Benchmark anti-entropy with production-scale retained history.
-- [ ] Optimize the public status hot path.
-  - [ ] Stop scanning all `check_results` with `row_number()` to find the latest row.
-  - [ ] Use materialized latest-observation/current-state data.
-  - [ ] Replace per-check uptime queries with one batched query or pre-aggregated time buckets.
-  - [ ] Benchmark `/api/v1/status` and global state pushes at expected production cardinality.
-- [ ] Define and document a supported capacity envelope for DuckDB.
-  - [ ] Measure ingest throughput, query latency, retention duration, row counts, and database growth.
-  - [ ] Decide when hourly aggregation, time partitioning, or a separate raw-observation store is required.
+- [x] Move all synchronous DuckDB work off Tokio worker threads.
+  - [x] Introduce a dedicated blocking database executor or worker.
+  - [x] Remove direct `parking_lot::Mutex<Storage>` contention from async handlers and background tasks.
+  - [x] Add load tests proving slow queries do not stall probes, gossip, WebSockets, or unrelated API requests.
+- [x] Replace the full-history anti-entropy digest scan.
+  - [x] Stop scanning full history for `digest(0)` every anti-entropy interval.
+  - [x] Maintain compact per-check replication high-water metadata.
+  - [x] Benchmark anti-entropy with production-scale retained history.
+- [x] Optimize the public status hot path.
+  - [x] Stop scanning all `check_results` with `row_number()` to find the latest row.
+  - [x] Use materialized latest-observation/current-state data.
+  - [x] Replace per-check uptime queries with one batched query or pre-aggregated time buckets.
+  - [x] Benchmark `/api/v1/status` and global state pushes at expected production cardinality.
+- [x] Define and document a supported capacity envelope for DuckDB.
+  - [x] Add a representative-data single-table baseline benchmark that reports DuckDB/WAL growth, history and latency p95, retention pruning, and checkpoint duration.
+  - [x] Measure sustained ingest throughput, query latency, retention duration, row counts, database growth, and backup/restore with production-scale multi-domain data.
+    - [x] Add an ignored benchmark for sustained real coordinator ingest with multi-domain rows/s and batch latency measurements.
+    - [x] Add checkpointed offline backup/restore timing and size to the representative storage baseline.
+    - [x] Batch ingest persistence so 10,000 checks × 3 domains sustain production ingest rates.
+    - [x] Record the measured single-replica envelope and its linear retention projection in `SCALING.md`.
+    - [ ] Re-measure with live probe traffic, network replication, and concurrent query load during retention.
+  - [x] Define raw, minute-rollup, hourly-rollup, state-transition, WAL, and backup retention policy plus per-domain/per-replica capacity estimates.
+  - [x] Decide when hourly aggregation, time partitioning, or a separate raw-observation store is required.
 
 ### Replication and cluster correctness
 
-- [ ] Fix anti-entropy result pagination for rows sharing a timestamp.
-  - [ ] Replace the timestamp-only cursor with a stable composite cursor such as `(ts_millis, agent_id)` or the complete deduplication key.
-  - [ ] Add a test with more than one page of results sharing the same timestamp.
-- [ ] Add alert and incident anti-entropy recovery.
-  - [ ] Compare alert and incident high-water information during reconciliation.
-  - [ ] Add bounded, cursor-based backfill for alerts, incidents, incident updates, and incident tombstones.
-  - [ ] Verify a peer recovers after missing an entire outage and recovery lifecycle.
+- [x] Fix anti-entropy result pagination for rows sharing a timestamp.
+  - [x] Replace the timestamp-only cursor with a stable composite cursor such as `(ts_millis, agent_id)` or the complete deduplication key.
+  - [x] Add a test with more than one page of results sharing the same timestamp.
+- [x] Add alert and incident anti-entropy recovery.
+  - [x] Compare alert and incident high-water information during reconciliation.
+  - [x] Add bounded, cursor-based backfill for alerts, incidents, incident updates, and incident tombstones.
+  - [x] Verify a peer recovers after missing an entire outage and recovery lifecycle.
 - [ ] Make transition replication idempotent across gossip and cluster replication.
   - [ ] Carry the originating alert ID through gossip.
   - [ ] Use the same content-aware upsert path for both replication mechanisms.
@@ -73,10 +80,13 @@ Prioritized action items from the production-readiness review. Existing items fr
   - [ ] Evaluate indexes for alert, incident, and state-history lookup patterns.
   - [ ] Confirm index behavior and write cost with the bundled DuckDB version.
 - [ ] Make retention and cleanup operations transactional where partial completion can expose inconsistent state.
+- [ ] Implement minute/hour latency rollups, query resolution switching, and raw/rollup boundary semantics before reducing raw retention.
+- [ ] Replace monolithic raw-result deletes with a benchmarked, crash-safe time-partition lifecycle that drops expired partitions only after rollup coverage is complete.
+- [ ] Define retention-aware peer recovery for nodes behind raw retention: snapshot restore, explicit raw-data gaps, or extended catch-up storage.
 - [ ] Run large retention deletes outside Tokio worker threads and avoid holding the main storage lock for the full operation.
 - [ ] Add explicit checkpoint/file-size maintenance after large pruning operations if benchmarks show it is needed.
 - [ ] Monitor logical row counts, DuckDB file size, prune duration, query duration, and database errors.
-- [ ] Cap the internal backfill endpoint's requested page size.
+- [ ] Cap route/list page sizes consistently; the internal anti-entropy backfill endpoint is capped, but user-facing route pagination still needs explicit limits.
 - [ ] Replace the correlated state-history prune query with a bounded/windowed approach if production benchmarks show poor scaling.
 - [ ] Create and test documented backup and restore procedures.
 - [ ] Add restart/recovery tests using a persistent production-sized database.
