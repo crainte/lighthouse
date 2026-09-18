@@ -28,6 +28,9 @@ struct SectionDto {
     position: i32,
     /// Whether the public page renders this section collapsed on first load.
     collapsed: bool,
+    /// `inline` or `page`. The public page needs it to decide between rendering
+    /// the section's rows and rendering a tile that links to them.
+    display: storage::SectionDisplay,
 }
 
 impl From<storage::Section> for SectionDto {
@@ -36,6 +39,7 @@ impl From<storage::Section> for SectionDto {
             name: s.name,
             position: s.position,
             collapsed: s.collapsed,
+            display: s.display,
         }
     }
 }
@@ -57,6 +61,10 @@ pub(in crate::coordinator) struct SectionNameRequest {
     /// flag can't silently expand every section it touches.
     #[serde(default)]
     collapsed: Option<bool>,
+    /// Absent means "leave it as it is", for the same reason: an older admin
+    /// client editing a name must not reset a paged section to inline.
+    #[serde(default)]
+    display: Option<storage::SectionDisplay>,
 }
 
 #[derive(Deserialize)]
@@ -119,8 +127,9 @@ pub(in crate::coordinator) async fn create_section_handler(
     };
     let create_name = name.clone();
     let collapsed = body.collapsed.unwrap_or(false);
+    let display = body.display.unwrap_or_default();
     match coord
-        .db(move |storage| storage.create_section(&create_name, collapsed))
+        .db(move |storage| storage.create_section(&create_name, collapsed, display))
         .await
     {
         Ok(true) => {}
@@ -139,7 +148,8 @@ pub(in crate::coordinator) async fn create_section_handler(
         section: SectionDto {
             name,
             position: 0,
-            collapsed: body.collapsed.unwrap_or(false),
+            collapsed,
+            display,
         },
     })
     .into_response()
@@ -173,6 +183,7 @@ pub(in crate::coordinator) async fn rename_section_handler(
     let rename_from = current.clone();
     let rename_to = name.clone();
     let collapsed = body.collapsed;
+    let display = body.display;
     match coord
         .db(move |storage| {
             let renamed = storage.rename_section(
@@ -183,6 +194,9 @@ pub(in crate::coordinator) async fn rename_section_handler(
             if renamed {
                 if let Some(collapsed) = collapsed {
                     storage.set_section_collapsed(&rename_to, collapsed)?;
+                }
+                if let Some(display) = display {
+                    storage.set_section_display(&rename_to, display)?;
                 }
             }
             Ok(renamed)
@@ -226,18 +240,19 @@ pub(in crate::coordinator) async fn rename_section_handler(
             .await;
     }
     info!(from = %current, to = %name, "section renamed");
-    let collapsed = coord
+    // Read back rather than echo the request: `collapsed` and `display` are both
+    // optional, so what was stored is the only thing that knows the new state.
+    let stored = coord
         .db(|storage| storage.list_sections())
         .await
         .ok()
-        .and_then(|all| all.into_iter().find(|s| s.name == name))
-        .map(|s| s.collapsed)
-        .unwrap_or(false);
+        .and_then(|all| all.into_iter().find(|s| s.name == name));
     Json(SectionResponse {
         section: SectionDto {
             name,
             position: 0,
-            collapsed,
+            collapsed: stored.as_ref().is_some_and(|s| s.collapsed),
+            display: stored.map(|s| s.display).unwrap_or_default(),
         },
     })
     .into_response()

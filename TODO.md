@@ -138,42 +138,56 @@ Prioritized action items from the production-readiness review. Existing items fr
 Batching bounds the number of *requests* a status page makes; it does not bound the
 amount of work behind them. A flat page still computes and ships every visible check's
 90-segment strip, which is unreadable for an operator and wasteful for the server long
-before 10,000 checks. Sub-pages bound both. Not P0: the batching above removes the
-acute failure mode, and this is the structural fix behind it.
+before 10,000 checks. Sub-pages bound both.
 
 Display mode is a per-section admin choice, not a global migration. Both behaviours stay
 supported: a small section is better inline, and forcing a click for three checks would
 be worse than what exists today.
 
-- [ ] Add a per-section display mode: expand inline (today's behaviour) or link to its
+- [x] Add a per-section display mode: expand inline (today's behaviour) or link to its
       own status page.
-  - [ ] Add the mode to `Section` next to `name`/`position`/`collapsed`, defaulting to
+  - [x] Add the mode to `Section` next to `name`/`position`/`collapsed`, defaulting to
         inline so existing deployments render unchanged. `collapsed` stays the initial
         render state for inline sections and is meaningless for paged ones.
-  - [ ] Carry it through the section config-replication path with `#[serde(default)]`,
+  - [x] Carry it through the section config-replication path with `#[serde(default)]`,
         so a peer on an older build still parses the document.
-  - [ ] Add the control to `SectionsAdmin.svelte`.
-- [ ] Add the paged view.
-  - [ ] Add a `#/group/<name>` view to `viewFromHash()` in `App.svelte`, alongside the
+  - [x] Add the control to `SectionsAdmin.svelte`.
+- [x] Add the paged view.
+  - [x] Add a `#/group/<name>` view to `viewFromHash()` in `App.svelte`, alongside the
         existing `#/check/`, `#/incident/` and `#/admin/` routes.
-  - [ ] Render a paged section on the primary page as a summary tile (green/yellow/red)
+  - [x] Render a paged section on the primary page as a summary tile (green/yellow/red)
         instead of its rows.
-  - [ ] Derive a tile's colour from `crate::rollup::RollupPolicy` (`Threshold`/quorum),
+  - [x] Derive a tile's colour from `crate::rollup::RollupPolicy` (`Threshold`/quorum),
         which already expresses "this node is degraded when N children fail" for zones
         and regions — a section is another node set, so it must not get a second,
-        inconsistent rule.
-  - [ ] Fetch strips and sparklines only for the checks actually rendered, so a paged
-        section costs nothing until it is opened.
-  - [ ] Decide explicitly whether a tile shows its own history strip. If it does, that is
-        one group-level uptime query folded from state spans for all sections — not one
-        query per section, and not free.
-  - [ ] Keep deep links working: a check page must remain reachable without loading its
-        section's page first.
-- [ ] Surface the cost of leaving a large section inline.
-  - [ ] Because the mode is an operator choice, an all-inline deployment keeps the flat
-        page's cost — the bound is available, not automatic. Warn in `SectionsAdmin` when
-        an inline section exceeds a configured check count rather than silently
-        overriding the choice.
+        inconsistent rule. Computed by `section_rollups` on the coordinator under the
+        override key `section:<name>`, falling back to `CHECK_DEFAULT`, and shipped on
+        `/api/v1/status`. The browser never folds a section state itself.
+  - [x] Fetch strips and sparklines only for the checks actually rendered, so a paged
+        section costs nothing until it is opened. `/api/v1/uptime` and
+        `/api/v1/latency-points` take `?section=<name>`; absent means the primary page,
+        which the server reads as loose checks plus inline sections.
+  - [x] Decide explicitly whether a tile shows its own history strip. **It does not.**
+        Colour and counts only ("12 checks · 1 down"), both of which the rollup already
+        carries, so a paged section adds no query to the hot path at all. A strip would
+        have been one folded group-level query over state spans — cheap per section, but
+        paid by every visitor on every load to decorate a tile most never open.
+  - [x] Keep deep links working: a check page must remain reachable without loading its
+        section's page first. `#/check/<id>` matches independently of `#/group/`.
+- [x] Surface the cost of leaving a large section inline.
+  - [x] Because the mode is an operator choice, an all-inline deployment keeps the flat
+        page's cost — the bound is available, not automatic. `SectionsAdmin` warns above
+        `INLINE_WARN_AT` checks rather than silently overriding the choice.
+
+Follow-ups, deliberately not done here:
+
+- [ ] Navigating from a section page into a check and back refetches that section's
+      charts. Two bounded requests, not a fan-out, so it is a fair price for maps that
+      hold exactly the current scope at the current window and nothing stale — but a
+      last-loaded-scope guard would remove it if the round trip is ever felt.
+- [ ] A section page has no rollup banner of its own; it just repeats the primary page's
+      per-check rows under a heading. The state is already computed and shipped, so this
+      is presentation only.
 
 ## P2 — Maintainability and code reduction
 

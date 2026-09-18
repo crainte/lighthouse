@@ -21,6 +21,7 @@
     UptimeBucket,
     LatencyPoint,
     PublicSection,
+    SectionRollup,
   } from './lib/api';
   import { connectWs } from './lib/ws';
   import type { WsStatus } from './lib/ws';
@@ -42,6 +43,7 @@
   import CheckDetail from './components/CheckDetail.svelte';
   import DayDetailModal from './components/DayDetailModal.svelte';
   import CollapsibleGroup from './components/CollapsibleGroup.svelte';
+  import SectionTile from './components/SectionTile.svelte';
   import ServerRow from './components/ServerRow.svelte';
   import LoginModal from './components/LoginModal.svelte';
   import ChecksAdmin from './components/ChecksAdmin.svelte';
@@ -168,7 +170,10 @@
         panel: AdminPanel;
         edit?: { id: string | null };
         incident?: { id: string | null };
-      };
+      }
+    // One section's own page. Carries the name, not a resolved section: the
+    // route must survive a deep link that lands before `/api/v1/sections` has.
+    | { name: 'group'; sectionName: string };
   type DayModal = { checkId: string; bucket: UptimeBucket } | null;
 
   // The view is reflected in the URL hash so the browser/mouse Back button steps
@@ -205,6 +210,11 @@
     }
     const inc = location.hash.match(/^#\/incident\/(.+)$/);
     if (inc) return { name: 'incident', incidentId: decodeURIComponent(inc[1]) };
+    // #/group/<name> — a section an admin set to render as its own page. A
+    // check page stays reachable at #/check/<id> without passing through here,
+    // so a deep link into a paged section's check still works.
+    const grp = location.hash.match(/^#\/group\/(.+)$/);
+    if (grp) return { name: 'group', sectionName: decodeURIComponent(grp[1]) };
     const m = location.hash.match(/^#\/check\/(.+)$/);
     return m ? { name: 'detail', checkId: decodeURIComponent(m[1]) } : { name: 'home' };
   }
@@ -222,6 +232,10 @@
   // Only carries the headings' metadata — /api/v1/status has none, and the
   // collapsed flag decides how a group first renders.
   let sections = $state<PublicSection[]>([]);
+  // Per-section states, rolled up by the coordinator under the same policy the
+  // zone and region rows use. Never recomputed here: a tile and a zone row
+  // disagreeing about what "degraded" means is the bug this avoids.
+  let sectionRollups = $state<SectionRollup[]>([]);
   let uptime = $state<Record<string, UptimeResponse>>({});
   // Points only: the row chart reads nothing else, and the per-agent breakdown
   // the detail view shows would double the server's scan to populate here.
@@ -269,6 +283,12 @@
     history.pushState(null, '', `#/incident/${encodeURIComponent(incidentId)}`);
     pushedNav = true;
     view = { name: 'incident', incidentId };
+  }
+
+  function openGroup(sectionName: string) {
+    history.pushState(null, '', `#/group/${encodeURIComponent(sectionName)}`);
+    pushedNav = true;
+    view = { name: 'group', sectionName };
   }
 
   /** Opens the admin incident editor. `null` is an incident being created.
@@ -393,18 +413,42 @@
 
   let days = $state(storedDays());
 
-  // Every visible check's strip and sparkline, in two requests regardless of
-  // check count. The server applies the same visibility rule the status list
-  // uses, and omits sparklines for checks that never draw one, so this asks for
-  // nothing the page will not render.
-  async function loadCharts(window: number) {
+  // Every chart the current view renders, in two requests regardless of check
+  // count. The server applies the same visibility rule the status list uses,
+  // omits sparklines for checks that never draw one, and — given a scope —
+  // returns only that scope's checks, so this asks for nothing the page will
+  // not draw.
+  //
+  // `scope` is the section whose own page is open, or null for the primary
+  // page, which excludes every paged section. The maps are REPLACED rather than
+  // merged: they then always hold exactly the current view's charts at the
+  // current window, so no entry can survive at a stale range after `setDays`.
+  async function loadCharts(window: number, scope: string | null) {
     const [strips, lines] = await Promise.all([
-      fetchUptimeStrips(window, STRIP_SEGMENTS),
-      fetchLatencyPoints(window * 24, STRIP_SEGMENTS),
+      fetchUptimeStrips(window, STRIP_SEGMENTS, scope),
+      fetchLatencyPoints(window * 24, STRIP_SEGMENTS, scope),
     ]);
     uptime = Object.fromEntries(strips.checks.map((u) => [u.check_id, u]));
     sparkline = Object.fromEntries(lines.checks.map((l) => [l.check_id, l.points]));
   }
+
+  // The charts a view needs are a function of which section is open and which
+  // window is selected, so that is what drives the fetch — rather than a call
+  // at each of the several places either can change, where a missed one leaves
+  // an opened section permanently blank.
+  const chartScope = $derived(view.name === 'group' ? view.sectionName : null);
+
+  $effect(() => {
+    // A check or incident page renders no list and fetches its own charts, so
+    // there is nothing here for it to load.
+    if (view.name !== 'home' && view.name !== 'group') return;
+    const scope = chartScope;
+    const window = days;
+    loadCharts(window, scope).catch(() => {
+      // Leave the last known charts up; status, alerts and incidents are
+      // loaded separately and a failure here must not blank the page.
+    });
+  });
 
   // Refetch one check's uptime strip and (if it opted in) its latency graph,
   // replacing just that check's entry. Used after a live state change so the
@@ -478,21 +522,22 @@
       incidents = inc.incidents;
       fleet = s.agents;
       maintenance = s.maintenance;
-      await loadCharts(days);
+      sectionRollups = s.sections;
+      await loadCharts(days, chartScope);
     } catch {
       // A failed resync leaves the last-known state; the next reconnect retries.
     }
   }
 
-  // Only the per-check charts depend on the window, so refetch those rather than
-  // reloading status, alerts and agents too.
-  async function setDays(next: number) {
+  // Only the per-check charts depend on the window, so nothing reloads status,
+  // alerts or agents here. The refetch itself is left to the effect above,
+  // which already watches `days`.
+  function setDays(next: number) {
     if (next === days) return;
     days = next;
     try {
       localStorage.setItem(RANGE_STORAGE_KEY, String(next));
     } catch {}
-    await loadCharts(next);
   }
 
   // The order an admin arranged, not alphabetical. Name breaks ties so the list
@@ -515,12 +560,36 @@
       else groups.set(c.group, [c]);
     }
     // A group with no matching section row — a check pointing at a name the
-    // sections table never had — renders expanded rather than vanishing.
-    return [...groups].map(([name, checks]) => ({
+    // sections table never had — renders expanded and inline rather than
+    // vanishing or becoming an empty tile.
+    return [...groups].map(([name, checks]) => {
+      const section = sections.find((s) => s.name === name);
+      return {
+        name,
+        checks,
+        collapsed: section?.collapsed ?? false,
+        display: section?.display ?? 'inline',
+      };
+    });
+  });
+
+  // The primary page renders inline sections as rows and paged ones as tiles.
+  // Splitting here keeps the markup from testing `display` twice and getting
+  // the two branches out of step.
+  const inlineGroups = $derived(monitorGroups.filter((g) => g.display === 'inline'));
+  const pagedGroups = $derived(monitorGroups.filter((g) => g.display === 'page'));
+
+  // The section whose own page is open, resolved against the status list. An
+  // empty `checks` here is a real state — a section can be emptied while its
+  // page is bookmarked — and renders as a message, not a blank page.
+  const groupPage = $derived.by(() => {
+    if (view.name !== 'group') return null;
+    const name = view.sectionName;
+    return {
       name,
-      checks,
-      collapsed: sections.find((s) => s.name === name)?.collapsed ?? false,
-    }));
+      checks: ordered.filter((c) => c.group === name),
+      known: sections.some((s) => s.name === name),
+    };
   });
 
   // Everything without a group is listed loose, so a check can never be hidden
@@ -547,10 +616,9 @@
       fleet = s.agents;
       maintenance = s.maintenance;
       sections = sec;
-      // Both charts come batched: one request each, whatever the check count.
-      // Fetching them per check made a page load cost 1 + N + M requests and as
-      // many database jobs, which at scale backpressured result ingest.
-      await loadCharts(days);
+      sectionRollups = s.sections;
+      // Charts are not awaited here. They are driven by `chartScope`/`days`,
+      // and that request runs in parallel with this one rather than after it.
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
@@ -793,6 +861,40 @@
       refreshKey={detailRefresh}
       onback={goBack}
     />
+  {:else if view.name === 'group' && groupPage}
+    <button class="link" onclick={goBack}>← Back</button>
+    <section class="section">
+      <div class="section-bar">
+        <h2 class="section-title">{groupPage.name}</h2>
+        <div class="range-switch" role="group" aria-label="chart window">
+          {#each RANGES as r (r.days)}
+            <button class="range-btn" class:active={days === r.days} onclick={() => setDays(r.days)}>
+              {r.label}
+            </button>
+          {/each}
+        </div>
+      </div>
+      {#if groupPage.checks.length}
+        <div class="components">
+          {#each groupPage.checks as c (c.check_id)}
+            <ComponentRow
+              check={c}
+              uptime={uptime[c.check_id]}
+              sparkline={sparkline[c.check_id] ?? null}
+              incident={openIncidentForCheck(incidents, c.check_id)}
+              onselect={openDetail}
+              onbarclick={(id, b) => (dayModal = { checkId: id, bucket: b })}
+            />
+          {/each}
+        </div>
+      {:else}
+        <div class="notice">
+          {groupPage.known
+            ? 'This section has no checks in it.'
+            : 'No such section. It may have been renamed or deleted.'}
+        </div>
+      {/if}
+    </section>
   {:else}
     <OverallBanner {checks} />
 
@@ -847,7 +949,16 @@
           />
         {/each}
 
-        {#each monitorGroups as g (g.name)}
+        {#each pagedGroups as g (g.name)}
+          <SectionTile
+            name={g.name}
+            rollup={sectionRollups.find((r) => r.name === g.name)}
+            count={g.checks.length}
+            onopen={openGroup}
+          />
+        {/each}
+
+        {#each inlineGroups as g (g.name)}
           <CollapsibleGroup
             name={g.name}
             status={worstStatus(g.checks)}

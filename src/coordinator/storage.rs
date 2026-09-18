@@ -503,6 +503,40 @@ pub struct LatencyPoint {
     pub avg_latency_ms: Option<f64>,
 }
 
+/// How the public page renders a section. An operator choice per section, not a
+/// global rule: a three-check section is better inline, and forcing a click for
+/// it would be worse than a flat page. A large one is unreadable inline and
+/// costs a strip per check to render, which is what `Page` bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SectionDisplay {
+    /// Render the section's rows on the primary page, as it always has.
+    #[default]
+    Inline,
+    /// Render a summary tile on the primary page linking to the section's own
+    /// page, where its rows and their charts are loaded on demand.
+    Page,
+}
+
+impl SectionDisplay {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::Page => "page",
+        }
+    }
+
+    /// Anything unrecognised reads as `Inline`. A row written by a newer peer
+    /// with a mode this build has never heard of must still render its checks;
+    /// hiding the section instead would hide live monitoring.
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "page" => Self::Page,
+            _ => Self::Inline,
+        }
+    }
+}
+
 /// A named, ordered group on the status page. Stored separately from checks so
 /// it can exist while empty and be renamed without touching what is in it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -510,7 +544,13 @@ pub struct Section {
     pub name: String,
     pub position: i32,
     /// Whether the public page renders this section collapsed on first load.
+    /// The initial render state of an *inline* section, and meaningless for a
+    /// paged one — a tile has nothing to collapse.
     pub collapsed: bool,
+    /// Defaulted so a section document written by a peer that predates the mode
+    /// still parses, rendering as it does today rather than failing the batch.
+    #[serde(default)]
+    pub display: SectionDisplay,
 }
 
 /// Express a plain interval as the equivalent cron, for migrating rows written
@@ -1846,6 +1886,9 @@ impl Storage {
                 name     VARCHAR PRIMARY KEY,
                 position INTEGER NOT NULL,
                 collapsed BOOLEAN DEFAULT FALSE,
+                -- 'inline' or 'page'. Stored as text rather than a boolean so
+                -- a third mode does not need a second column.
+                display VARCHAR DEFAULT 'inline',
                 -- HLC, as on `checks`.
                 updated_at BIGINT,
                 updated_by VARCHAR
@@ -2034,6 +2077,11 @@ impl Storage {
         }
         if !section_columns.iter().any(|c| c == "collapsed") {
             conn.execute_batch("ALTER TABLE sections ADD COLUMN collapsed BOOLEAN DEFAULT FALSE")?;
+        }
+        // Defaulting to 'inline' is what keeps an existing deployment rendering
+        // exactly as it did before the mode existed.
+        if !section_columns.iter().any(|c| c == "display") {
+            conn.execute_batch("ALTER TABLE sections ADD COLUMN display VARCHAR DEFAULT 'inline'")?;
         }
         // The hold-down timer, persisted. `pending_since` is what makes a
         // hold-down survive a restart: without it a node rebooting mid-window
@@ -2306,21 +2354,30 @@ impl Storage {
 
     /// Sections in display order.
     pub fn list_sections(&self) -> Result<Vec<Section>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT name, position, collapsed FROM sections ORDER BY position, name")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT name, position, collapsed, display FROM sections ORDER BY position, name",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok(Section {
                 name: row.get(0)?,
                 position: row.get::<_, i32>(1)?,
                 collapsed: row.get::<_, Option<bool>>(2)?.unwrap_or(false),
+                display: row
+                    .get::<_, Option<String>>(3)?
+                    .as_deref()
+                    .map_or(SectionDisplay::Inline, SectionDisplay::from_db),
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// Create a section at the end. Returns false when the name is taken.
-    pub fn create_section(&self, name: &str, collapsed: bool) -> Result<bool> {
+    pub fn create_section(
+        &self,
+        name: &str,
+        collapsed: bool,
+        display: SectionDisplay,
+    ) -> Result<bool> {
         let exists: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM sections WHERE name = ?",
             duckdb::params![name],
@@ -2335,8 +2392,8 @@ impl Storage {
             |r| r.get(0),
         )?;
         self.conn.execute(
-            "INSERT INTO sections (name, position, collapsed) VALUES (?, ?, ?)",
-            duckdb::params![name, next, collapsed],
+            "INSERT INTO sections (name, position, collapsed, display) VALUES (?, ?, ?, ?)",
+            duckdb::params![name, next, collapsed, display.as_str()],
         )?;
         Ok(true)
     }
@@ -2368,6 +2425,15 @@ impl Storage {
         let n = self.conn.execute(
             "UPDATE sections SET collapsed = ? WHERE name = ?",
             duckdb::params![collapsed, name],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Set whether the public page renders a section inline or as its own page.
+    pub fn set_section_display(&self, name: &str, display: SectionDisplay) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE sections SET display = ? WHERE name = ?",
+            duckdb::params![display.as_str(), name],
         )?;
         Ok(n > 0)
     }
@@ -2433,7 +2499,7 @@ impl Storage {
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<std::result::Result<_, _>>()?;
         for name in names {
-            self.create_section(&name, false)?;
+            self.create_section(&name, false, SectionDisplay::Inline)?;
         }
         Ok(())
     }
@@ -5369,9 +5435,16 @@ impl Storage {
                 self.conn
                     .execute("DELETE FROM sections WHERE name = ?", duckdb::params![id])?;
                 self.conn.execute(
-                    "INSERT INTO sections (name, position, collapsed, updated_at, updated_by)
-                     VALUES (?, ?, ?, ?, ?)",
-                    duckdb::params![s.name, s.position, s.collapsed, hlc.millis, hlc.node_id],
+                    "INSERT INTO sections (name, position, collapsed, display, updated_at, updated_by)
+                     VALUES (?, ?, ?, ?, ?, ?)",
+                    duckdb::params![
+                        s.name,
+                        s.position,
+                        s.collapsed,
+                        s.display.as_str(),
+                        hlc.millis,
+                        hlc.node_id
+                    ],
                 )?;
             }
             ConfigKind::Setting => {
@@ -5511,7 +5584,7 @@ impl Storage {
             }
             ConfigKind::Section => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT name, position, collapsed, updated_at, updated_by
+                    "SELECT name, position, collapsed, display, updated_at, updated_by
                      FROM sections WHERE name = ?",
                 )?;
                 let mut rows = stmt.query_map(duckdb::params![id], |r| {
@@ -5519,11 +5592,15 @@ impl Storage {
                         name: r.get::<_, String>(0)?,
                         position: r.get::<_, i32>(1)?,
                         collapsed: r.get::<_, Option<bool>>(2)?.unwrap_or(false),
+                        display: r
+                            .get::<_, Option<String>>(3)?
+                            .as_deref()
+                            .map_or(SectionDisplay::Inline, SectionDisplay::from_db),
                     };
                     Ok((
                         section,
-                        r.get::<_, Option<i64>>(3)?,
-                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<i64>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
                     ))
                 })?;
                 match rows.next().transpose()? {
@@ -8088,6 +8165,7 @@ mod tests {
             name: "core".into(),
             position: 3,
             collapsed: true,
+            display: SectionDisplay::Page,
         };
         let e = ConfigEntry {
             kind: ConfigKind::Section,
@@ -9181,16 +9259,65 @@ mod tests {
     }
 
     #[test]
+    fn section_display_mode_persists_across_writes() {
+        let store = Storage::open(":memory:").unwrap();
+        store
+            .create_section("edge", false, SectionDisplay::Page)
+            .unwrap();
+        store
+            .create_section("core", true, SectionDisplay::Inline)
+            .unwrap();
+
+        let mode = |store: &Storage, name: &str| {
+            store
+                .list_sections()
+                .unwrap()
+                .into_iter()
+                .find(|s| s.name == name)
+                .map(|s| s.display)
+        };
+        assert_eq!(mode(&store, "edge"), Some(SectionDisplay::Page));
+        assert_eq!(mode(&store, "core"), Some(SectionDisplay::Inline));
+
+        store
+            .set_section_display("core", SectionDisplay::Page)
+            .unwrap();
+        assert_eq!(mode(&store, "core"), Some(SectionDisplay::Page));
+
+        // A rename carries the mode with the section. Losing it here would flip
+        // a paged section back to inline as a side effect of an edit that was
+        // only ever about its name, re-expanding the thing the operator paged
+        // precisely because it was too big to render.
+        store.rename_section("core", "core-eu", 0).unwrap();
+        assert_eq!(mode(&store, "core-eu"), Some(SectionDisplay::Page));
+
+        // `collapsed` and `display` are independent: a paged section's stored
+        // `collapsed` is meaningless but must not be destroyed, so toggling one
+        // never rewrites the other.
+        store.set_section_collapsed("core-eu", false).unwrap();
+        assert_eq!(mode(&store, "core-eu"), Some(SectionDisplay::Page));
+    }
+
+    #[test]
     fn document_encodings_are_pinned() {
         let section = Section {
             name: "core".into(),
             position: 2,
             collapsed: true,
+            display: SectionDisplay::Page,
         };
         assert_eq!(
             serde_json::to_string(&section).unwrap(),
-            r#"{"name":"core","position":2,"collapsed":true}"#
+            r#"{"name":"core","position":2,"collapsed":true,"display":"page"}"#
         );
+        // The compatibility that matters in both directions. A document from a
+        // peer that predates the mode has no `display` and must still parse,
+        // reading as inline; a peer that predates it parses a document that has
+        // one by ignoring the field, which is why it was added rather than
+        // replacing `collapsed`.
+        let legacy: Section =
+            serde_json::from_str(r#"{"name":"core","position":2,"collapsed":true}"#).unwrap();
+        assert_eq!(legacy.display, SectionDisplay::Inline);
 
         let value = "dark".to_string();
         assert_eq!(serde_json::to_string(&value).unwrap(), r#""dark""#);
@@ -9355,9 +9482,17 @@ mod migration_tests {
         // Sections are new too, and must be adopted from existing group names.
         store.seed_sections_from_checks().unwrap();
         let sections = store.list_sections().unwrap();
-        assert!(
-            sections.iter().any(|s| s.name == "Old"),
-            "existing group names should become sections, got {sections:?}"
+        let old = sections
+            .iter()
+            .find(|s| s.name == "Old")
+            .unwrap_or_else(|| {
+                panic!("existing group names should become sections, got {sections:?}")
+            });
+        assert_eq!(
+            old.display,
+            SectionDisplay::Inline,
+            "a section that predates the display mode must render as it always did, \
+             not silently become a tile an operator has to click through"
         );
 
         // Opening again must be a no-op rather than a duplicate-column error.

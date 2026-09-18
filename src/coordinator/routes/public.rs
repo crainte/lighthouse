@@ -44,6 +44,25 @@ struct StatusResponse {
     /// the announced ones: a silent window suppresses paging and tells nobody,
     /// which is a deliberate choice an operator makes per window.
     maintenance: Vec<MaintenanceNoticeDto>,
+    /// One rolled-up state per section that has checks. Computed here rather
+    /// than in the browser so a section tile and a zone row cannot disagree
+    /// about what "this set of children is degraded" means — a section is
+    /// another node set, and it gets the same `RollupPolicy` machinery.
+    sections: Vec<SectionRollupDto>,
+}
+
+#[derive(Serialize)]
+struct SectionRollupDto {
+    name: String,
+    #[serde(rename = "status")]
+    state: NodeState,
+    /// Counts for the tile's caption. A tile shows no history strip, so these
+    /// are all a collapsed section says about itself, and "12 checks, 1 down"
+    /// is the difference between a red tile an operator can triage and one
+    /// they have to open to understand.
+    checks: usize,
+    degraded: usize,
+    down: usize,
 }
 
 #[derive(Serialize)]
@@ -200,6 +219,8 @@ pub(in crate::coordinator) struct DaysQuery {
     /// How many segments to split the window into; the strip keeps a constant
     /// bar count across ranges.
     buckets: Option<usize>,
+    /// Scope the request to one section. See [`in_scope`].
+    section: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -315,6 +336,31 @@ pub(in crate::coordinator) struct HoursQuery {
     /// segment it actually covers instead of a `now`-anchored guess.
     from: Option<i64>,
     to: Option<i64>,
+    /// Scope the request to one section. See [`in_scope`].
+    section: Option<String>,
+}
+
+/// Whether a check belongs in a chart request scoped to `scope`.
+///
+/// `None` is the primary page: loose checks, plus the checks of sections that
+/// render inline. A section set to render as its own page is excluded, and that
+/// exclusion is the entire point of the mode — its strips cost nothing until a
+/// visitor opens it. `Some(name)` is that page, and matches exactly the named
+/// section's checks.
+///
+/// A group with no section row counts as inline. Such a check is a name a
+/// section table never had, and the page renders it expanded rather than hiding
+/// it; dropping its chart here would leave a visible row with a blank strip.
+fn in_scope(sections: &[storage::Section], scope: Option<&str>, group: Option<&str>) -> bool {
+    match scope {
+        Some(want) => group == Some(want),
+        None => group.is_none_or(|g| {
+            sections
+                .iter()
+                .find(|s| s.name == g)
+                .is_none_or(|s| s.display == storage::SectionDisplay::Inline)
+        }),
+    }
 }
 
 // ---- Handlers ----
@@ -404,16 +450,58 @@ pub(in crate::coordinator) async fn status_handler(
                 })
                 .collect();
             checks.extend(pending);
+            let sections = section_rollups(&coord, &checks);
             let agents = fleet_health(&coord, now).await;
             Json(StatusResponse {
                 checks,
                 agents,
                 maintenance: announced_maintenance(&coord, now),
+                sections,
             })
             .into_response()
         }
         Err(e) => internal_error(e),
     }
+}
+
+/// Fold each section's checks into one state, using the same policy lookup the
+/// zone and region rows use.
+///
+/// The per-section override key is `section:<name>`, so an operator who wants a
+/// section to go red only when most of it fails writes that in the same place
+/// they set it for a zone. The fallback is `CHECK_DEFAULT` — the policy already
+/// applied to a set of checks at the global root — not a fourth constant
+/// invented for sections.
+///
+/// Loose checks are deliberately absent: they render as their own rows, and a
+/// rollup over "everything with no section" is not a thing the page shows.
+fn section_rollups(coord: &Coordinator, checks: &[CheckStatusDto]) -> Vec<SectionRollupDto> {
+    use std::collections::BTreeMap;
+
+    let mut by_section: BTreeMap<&str, Vec<NodeState>> = BTreeMap::new();
+    for check in checks {
+        if let Some(group) = check.group.as_deref() {
+            by_section.entry(group).or_default().push(check.state);
+        }
+    }
+
+    let policies = coord.inner.rollup_policies.read();
+    by_section
+        .into_iter()
+        .map(|(name, states)| {
+            let policy = policies
+                .get(&format!("section:{name}"))
+                .copied()
+                .unwrap_or(crate::rollup::RollupPolicy::CHECK_DEFAULT);
+            SectionRollupDto {
+                name: name.to_string(),
+                state: crate::rollup::rollup(&policy, &states),
+                checks: states.len(),
+                degraded: states.iter().filter(|s| **s == NodeState::Degraded).count(),
+                down: states.iter().filter(|s| **s == NodeState::Down).count(),
+            }
+        })
+        .collect()
 }
 
 pub(in crate::coordinator) async fn history_handler(
@@ -681,16 +769,28 @@ pub(in crate::coordinator) async fn uptime_strips_handler(
     // Resolved metadata, not the persisted override: a check inherits the
     // coordinator default when its own setting is absent, exactly as the
     // single-check route does.
-    let wanted: Vec<(CheckId, bool)> = {
+    let candidates: Vec<(CheckId, bool, Option<String>)> = {
         let by_id = coord.inner.checks.read();
         by_id
             .iter()
             .filter(|(_, meta)| meta.visible)
-            .map(|(id, meta)| (*id, meta.degraded_is_downtime))
+            .map(|(id, meta)| (*id, meta.degraded_is_downtime, meta.group.clone()))
             .collect()
     };
+    let scope = q.section;
     match coord
-        .db(move |storage| storage.uptime_strips(&wanted, days, buckets, now))
+        // Sections are read inside this closure rather than in their own call:
+        // scoping needs them before the scan, and a second `db` hop would put
+        // an extra job on the single database worker for a handful of rows.
+        .db(move |storage| {
+            let sections = storage.list_sections()?;
+            let wanted: Vec<(CheckId, bool)> = candidates
+                .into_iter()
+                .filter(|(_, _, group)| in_scope(&sections, scope.as_deref(), group.as_deref()))
+                .map(|(id, degraded_is_downtime, _)| (id, degraded_is_downtime))
+                .collect();
+            storage.uptime_strips(&wanted, days, buckets, now)
+        })
         .await
     {
         Ok(strips) => Json(UptimeStripsResponse {
@@ -738,16 +838,25 @@ pub(in crate::coordinator) async fn latency_points_handler(
             (now - hours * 3_600_000, now)
         }
     };
-    let wanted: Vec<CheckId> = {
+    let candidates: Vec<(CheckId, Option<String>)> = {
         let by_id = coord.inner.checks.read();
         by_id
             .iter()
             .filter(|(_, meta)| meta.visible && meta.latency_graph)
-            .map(|(id, _)| *id)
+            .map(|(id, meta)| (*id, meta.group.clone()))
             .collect()
     };
+    let scope = q.section;
     match coord
-        .db(move |storage| storage.latency_points_for(&wanted, from, to, buckets))
+        .db(move |storage| {
+            let sections = storage.list_sections()?;
+            let wanted: Vec<CheckId> = candidates
+                .into_iter()
+                .filter(|(_, group)| in_scope(&sections, scope.as_deref(), group.as_deref()))
+                .map(|(id, _)| id)
+                .collect();
+            storage.latency_points_for(&wanted, from, to, buckets)
+        })
         .await
     {
         Ok(series) => Json(LatencyPointsResponse {
@@ -793,5 +902,46 @@ pub(in crate::coordinator) async fn alerts_handler(
             Json(AlertsResponse { alerts }).into_response()
         }
         Err(e) => internal_error(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use storage::{Section, SectionDisplay};
+
+    fn section(name: &str, display: SectionDisplay) -> Section {
+        Section {
+            name: name.into(),
+            position: 0,
+            collapsed: false,
+            display,
+        }
+    }
+
+    #[test]
+    fn a_paged_section_costs_nothing_until_it_is_opened() {
+        let sections = vec![
+            section("edge", SectionDisplay::Page),
+            section("core", SectionDisplay::Inline),
+        ];
+
+        // The primary page charts what it renders, and a paged section renders
+        // as a tile. Including it here would defeat the mode entirely: the
+        // server would still scan every one of its checks on every page load.
+        assert!(in_scope(&sections, None, None), "loose checks are rendered");
+        assert!(in_scope(&sections, None, Some("core")));
+        assert!(!in_scope(&sections, None, Some("edge")));
+
+        // The section's own page charts exactly its checks, and nothing else —
+        // opening one section must not re-fetch the whole page's strips.
+        assert!(in_scope(&sections, Some("edge"), Some("edge")));
+        assert!(!in_scope(&sections, Some("edge"), Some("core")));
+        assert!(!in_scope(&sections, Some("edge"), None));
+
+        // A group naming a section that does not exist renders expanded, so it
+        // must be charted. Excluding it would leave a visible row whose strip
+        // never arrives.
+        assert!(in_scope(&sections, None, Some("ghost")));
     }
 }

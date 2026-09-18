@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { AdminCheck, Section } from '../lib/admin';
+  import type { AdminCheck, Section, SectionDisplay } from '../lib/admin';
   import {
     AdminError,
     fetchAdminChecks,
@@ -33,6 +33,12 @@
   /** A check-order write is in flight; the whole list freezes until it lands. */
   let busyOrder = $state(false);
   let orderError = $state<string | null>(null);
+
+  /** Above this many checks, rendering a section inline costs a history strip
+   *  per check on every visitor's first paint. The admin is warned rather than
+   *  overridden: the mode is an operator's call, and silently paging a section
+   *  they chose to keep inline would be a worse surprise than a large page. */
+  const INLINE_WARN_AT = 25;
 
   /** Native HTML5 drag carries no usable payload between elements, so the source
    *  row lives here. `list` is 'sections' or `check:<group>`, and a drag never
@@ -162,6 +168,27 @@
       const saved = await updateSection(s.name, { collapsed: !s.collapsed });
       sections = sections.map((x) =>
         x.name === s.name ? { ...x, collapsed: saved.collapsed } : x,
+      );
+      onchanged();
+    } catch (e) {
+      sectionError = fail(e);
+    } finally {
+      busySection = null;
+    }
+  }
+
+  /** Inline renders the section's rows on the primary page; page renders a
+   *  summary tile linking to `#/group/<name>`, whose rows and charts load only
+   *  when a visitor opens it. `collapsed` is deliberately left alone — a
+   *  section switched to a page and back must come back the way it was. */
+  async function setDisplay(s: Section, display: SectionDisplay) {
+    if (busySection || s.display === display) return;
+    busySection = s.name;
+    sectionError = null;
+    try {
+      const saved = await updateSection(s.name, { display });
+      sections = sections.map((x) =>
+        x.name === s.name ? { ...x, display: saved.display } : x,
       );
       onchanged();
     } catch (e) {
@@ -367,18 +394,37 @@
               <span class="sname">{s.name}</span>
               <span class="scount">{members} {members === 1 ? 'check' : 'checks'}</span>
               <span class="sactions">
-                <label
-                  class="toggle collapse-toggle"
-                  title="How the public status page first renders this section. Visitors can still expand it."
-                >
-                  <input
-                    type="checkbox"
-                    checked={s.collapsed}
+                <label class="toggle display-mode">
+                  <em>Public page</em>
+                  <select
+                    value={s.display}
                     disabled={busySection !== null}
-                    onchange={() => toggleCollapsed(s)}
-                  />
-                  <em>Collapsed on public page</em>
+                    onchange={(e) => setDisplay(s, e.currentTarget.value as SectionDisplay)}
+                  >
+                    <option value="inline">Rows inline</option>
+                    <option value="page">Tile linking to its own page</option>
+                  </select>
                 </label>
+                {#if s.display === 'inline'}
+                  <label
+                    class="toggle collapse-toggle"
+                    title="How the public status page first renders this section. Visitors can still expand it."
+                  >
+                    <input
+                      type="checkbox"
+                      checked={s.collapsed}
+                      disabled={busySection !== null}
+                      onchange={() => toggleCollapsed(s)}
+                    />
+                    <em>Collapsed on public page</em>
+                  </label>
+                  {#if members > INLINE_WARN_AT}
+                    <span class="inline-warn">
+                      {members} checks render inline on the primary page, each with its own history
+                      strip. Its own page would load them only when a visitor opens it.
+                    </span>
+                  {/if}
+                {/if}
                 {#if pendingDelete === s.name}
                   <span class="confirm">
                     Delete “{s.name}”? The checks in it are not deleted — they stay configured and
@@ -550,6 +596,26 @@
   .collapse-toggle {
     font-size: 0.72rem;
     margin-right: 0.35rem;
+  }
+  .display-mode {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    font-size: 0.72rem;
+    margin-right: 0.35rem;
+  }
+  .display-mode select {
+    font-size: 0.72rem;
+    padding: 0.1rem 0.2rem;
+  }
+  /* A caption, not an error: the operator's choice stands, and this only says
+     what it costs. Sized to wrap under the controls rather than stretch the
+     row, which would shift every other section's buttons. */
+  .inline-warn {
+    font-size: 0.7rem;
+    color: var(--degraded, var(--text-dim));
+    max-width: 26rem;
+    text-align: right;
   }
 
   .srow {

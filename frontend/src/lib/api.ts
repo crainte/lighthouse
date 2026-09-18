@@ -114,6 +114,19 @@ export interface StatusResponse {
   agents: FleetRow[];
   /** Announced windows running right now, soonest to end first. */
   maintenance: MaintenanceNotice[];
+  /** One entry per section that has checks, rolled up by the coordinator. The
+   *  rule lives there so a section tile and a zone row cannot disagree; do not
+   *  recompute a state from `checks` here. */
+  sections: SectionRollup[];
+}
+
+export interface SectionRollup {
+  name: string;
+  status: Status;
+  /** Caption counts. A tile shows no history strip, so these are all it says. */
+  checks: number;
+  degraded: number;
+  down: number;
 }
 
 export interface HistoryPoint {
@@ -447,10 +460,18 @@ export interface UptimeStripsResponse {
 export function fetchUptimeStrips(
   days = 90,
   buckets = 90,
+  section: string | null = null,
 ): Promise<UptimeStripsResponse> {
   return getJson<UptimeStripsResponse>(
-    `/api/v1/uptime?days=${days}&buckets=${buckets}`,
+    `/api/v1/uptime?days=${days}&buckets=${buckets}${sectionParam(section)}`,
   );
+}
+
+/** Scope a batched chart request. Null is the primary page, which the server
+ *  reads as "loose checks and inline sections" — a section rendered as its own
+ *  page is excluded until that page asks for it by name. */
+function sectionParam(section: string | null): string {
+  return section === null ? "" : `&section=${encodeURIComponent(section)}`;
 }
 
 /** Sparkline points for every check that draws one.
@@ -472,9 +493,10 @@ export interface LatencyPointsResponse {
 export function fetchLatencyPoints(
   hours = 24,
   buckets = 120,
+  section: string | null = null,
 ): Promise<LatencyPointsResponse> {
   return getJson<LatencyPointsResponse>(
-    `/api/v1/latency-points?hours=${hours}&buckets=${buckets}`,
+    `/api/v1/latency-points?hours=${hours}&buckets=${buckets}${sectionParam(section)}`,
   );
 }
 
@@ -497,7 +519,12 @@ export interface PublicSection {
   name: string;
   position: number;
   collapsed: boolean;
+  /** `inline` renders the section's rows here; `page` renders a tile linking to
+   *  `#/group/<name>`, where its rows and charts load on demand. */
+  display: SectionDisplay;
 }
+
+export type SectionDisplay = "inline" | "page";
 
 export function fetchPublicSections(): Promise<PublicSection[]> {
   return getJson<{ sections: PublicSection[] }>("/api/v1/sections").then(

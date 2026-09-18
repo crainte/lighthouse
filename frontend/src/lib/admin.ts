@@ -200,9 +200,14 @@ export interface Section {
   name: string;
   position: number;
   /** The PUBLIC status page renders this section collapsed on first load. The
-   *  admin view ignores it. */
+   *  admin view ignores it, and a paged section has nothing to collapse. */
   collapsed: boolean;
+  /** How the PUBLIC status page renders this section: its rows inline, or a
+   *  tile linking to its own page. */
+  display: SectionDisplay;
 }
+
+export type SectionDisplay = "inline" | "page";
 
 export interface EvalSample {
   eval: string;
@@ -418,17 +423,18 @@ export async function createSection(name: string): Promise<Section> {
   return r.section;
 }
 
-/** Rename and/or set the collapsed flag. A rename moves every check in the
- *  section with it — callers do not patch checks. Omitting `collapsed` leaves
- *  it as it is, so this one call serves both the rename and the toggle. */
+/** Rename and/or set the presentation flags. A rename moves every check in the
+ *  section with it — callers do not patch checks. An omitted `collapsed` or
+ *  `display` is left as it is, so this one call serves the rename and both
+ *  toggles without one of them clobbering the others. */
 export async function updateSection(
   current: string,
-  next: { name?: string; collapsed?: boolean },
+  next: { name?: string; collapsed?: boolean; display?: SectionDisplay },
 ): Promise<Section> {
   const r = await send<{ section: Section }>(
     "PUT",
     `/api/v1/admin/sections/${encodeURIComponent(current)}`,
-    { name: next.name ?? current, collapsed: next.collapsed },
+    { name: next.name ?? current, collapsed: next.collapsed, display: next.display },
   );
   return r.section;
 }
