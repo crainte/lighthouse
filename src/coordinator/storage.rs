@@ -429,6 +429,65 @@ pub struct UptimeBucket {
 }
 
 /// A single latency data point for the sparkline chart.
+/// One check's uptime strip plus its exact figure for the whole window. Paired
+/// because every caller that draws the strip also prints the number, and
+/// deriving the number from the rounded segments would disagree with it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckUptime {
+    pub buckets: Vec<UptimeBucket>,
+    pub overall: Option<f64>,
+}
+
+/// One check's per-segment totals while folding the aggregated rows DuckDB
+/// returned. Parallel vectors rather than a `Vec` of structs because every
+/// segment exists whether or not a row landed in it, and the empty ones are the
+/// common case on a sparse window.
+struct SegmentCounts {
+    sum_ms: Vec<f64>,
+    attempts: Vec<u32>,
+    up: Vec<u32>,
+}
+
+impl SegmentCounts {
+    fn new(buckets: usize) -> Self {
+        Self {
+            sum_ms: vec![0.0; buckets],
+            attempts: vec![0; buckets],
+            up: vec![0; buckets],
+        }
+    }
+}
+
+/// The segment grid an uptime strip is drawn on. Shared by the single-check and
+/// batched paths so their segment edges cannot drift apart: a strip fetched for
+/// one check must tile identically to the same check's strip on the status page.
+struct BucketGrid {
+    lower: i64,
+    bucket_ms: i64,
+    buckets: usize,
+}
+
+impl BucketGrid {
+    fn new(now_millis: i64, days: usize, buckets: usize) -> Self {
+        const DAY: i64 = 86_400_000;
+        let buckets = buckets.max(1);
+        let bucket_ms = ((days as i64 * DAY) / buckets as i64).max(1);
+        // Recompute the span from the bucket width so segment edges tile exactly:
+        // integer division would otherwise leave a sliver unaccounted for.
+        Self {
+            lower: now_millis - bucket_ms * buckets as i64,
+            bucket_ms,
+            buckets,
+        }
+    }
+
+    /// Lower bound is exclusive, so shift before dividing: a timestamp landing
+    /// exactly on a boundary belongs to the segment below it.
+    fn index(&self, ts: i64) -> usize {
+        (((ts - self.lower - 1).max(0) / self.bucket_ms) as usize).min(self.buckets - 1)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LatencyPoint {
     pub timestamp: i64, // unix millis of the window start
@@ -4150,14 +4209,8 @@ impl Storage {
         now_millis: i64,
         degraded_is_downtime: bool,
     ) -> Result<Vec<UptimeBucket>> {
-        const DAY: i64 = 86_400_000;
-        let buckets = buckets.max(1);
-        let window = days as i64 * DAY;
-        let bucket_ms = (window / buckets as i64).max(1);
-        // Recompute the span from the bucket width so segment edges tile exactly:
-        // integer division would otherwise leave a sliver unaccounted for.
-        let span = bucket_ms * buckets as i64;
-        let lower = now_millis - span;
+        let grid = BucketGrid::new(now_millis, days, buckets);
+        let buckets = grid.buckets;
         let spans = self.state_spans(check_id)?;
         let mut result_up = vec![0_u64; buckets];
         let mut result_total = vec![0_u64; buckets];
@@ -4165,12 +4218,12 @@ impl Storage {
             "SELECT ts_millis, status FROM check_results
              WHERE check_id = ? AND ts_millis > ? AND ts_millis <= ?",
         )?;
-        let rows = stmt.query_map(duckdb::params![check_id, lower, now_millis], |row| {
+        let rows = stmt.query_map(duckdb::params![check_id, grid.lower, now_millis], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
         for row in rows {
             let (ts, status) = row?;
-            let index = (((ts - lower - 1).max(0) / bucket_ms) as usize).min(buckets - 1);
+            let index = grid.index(ts);
             result_total[index] = result_total[index].saturating_add(1);
             if status == "up" {
                 result_up[index] = result_up[index].saturating_add(1);
@@ -4179,8 +4232,8 @@ impl Storage {
 
         Ok((0..buckets)
             .map(|i| {
-                let start = lower + i as i64 * bucket_ms;
-                let end = start + bucket_ms;
+                let start = grid.lower + i as i64 * grid.bucket_ms;
+                let end = start + grid.bucket_ms;
                 let uptime = uptime_counts(&spans, start, end, degraded_is_downtime)
                     .map(|(up_ms, known_ms)| up_ms as f64 / known_ms as f64);
                 UptimeBucket {
@@ -4190,6 +4243,185 @@ impl Storage {
                     up: result_up[i],
                     total: result_total[i],
                 }
+            })
+            .collect())
+    }
+
+    /// Uptime strips for many checks in two queries rather than two per check.
+    ///
+    /// The status page draws one strip per visible check, so the per-check path
+    /// turned a page load into N round trips and N scans. Here the bucketing is
+    /// pushed into DuckDB, so `check_results` is scanned once and yields at most
+    /// one row per check per segment.
+    ///
+    /// `checks` carries each check's resolved `degraded_is_downtime`, because
+    /// that is a per-check decision the caller has already made and storage must
+    /// not guess at.
+    pub fn uptime_strips(
+        &self,
+        checks: &[(CheckId, bool)],
+        days: usize,
+        buckets: usize,
+        now_millis: i64,
+    ) -> Result<BTreeMap<CheckId, CheckUptime>> {
+        let grid = BucketGrid::new(now_millis, days, buckets);
+        let wanted: std::collections::HashMap<CheckId, bool> = checks.iter().copied().collect();
+
+        let mut spans: BTreeMap<CheckId, Vec<StateSpan>> = BTreeMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT check_id, state, since FROM state_history ORDER BY check_id, since",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, CheckId>(0)?,
+                    NodeState::from_db(&row.get::<_, String>(1)?),
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (check_id, state, since) = row?;
+                if wanted.contains_key(&check_id) {
+                    spans
+                        .entry(check_id)
+                        .or_default()
+                        .push(StateSpan { state, since });
+                }
+            }
+        }
+
+        let mut counts: BTreeMap<CheckId, (Vec<u64>, Vec<u64>)> = BTreeMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT check_id, ((ts_millis - ? - 1) // ?)::BIGINT AS idx,
+                        COUNT(*), COUNT(*) FILTER (WHERE status = 'up')
+                 FROM check_results
+                 WHERE ts_millis > ? AND ts_millis <= ?
+                 GROUP BY 1, 2",
+            )?;
+            let rows = stmt.query_map(
+                duckdb::params![grid.lower, grid.bucket_ms, grid.lower, now_millis],
+                |row| {
+                    Ok((
+                        row.get::<_, CheckId>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (check_id, index, total, up) = row?;
+                if !wanted.contains_key(&check_id) {
+                    continue;
+                }
+                let entry = counts
+                    .entry(check_id)
+                    .or_insert_with(|| (vec![0; grid.buckets], vec![0; grid.buckets]));
+                let index = (index.max(0) as usize).min(grid.buckets - 1);
+                entry.0[index] = entry.0[index].saturating_add(up.max(0) as u64);
+                entry.1[index] = entry.1[index].saturating_add(total.max(0) as u64);
+            }
+        }
+
+        Ok(checks
+            .iter()
+            .map(|(check_id, degraded_is_downtime)| {
+                let spans = spans.get(check_id).map(Vec::as_slice).unwrap_or_default();
+                let counted = counts.get(check_id);
+                let strip = (0..grid.buckets)
+                    .map(|i| {
+                        let start = grid.lower + i as i64 * grid.bucket_ms;
+                        let end = start + grid.bucket_ms;
+                        UptimeBucket {
+                            start,
+                            end,
+                            uptime: uptime_counts(spans, start, end, *degraded_is_downtime)
+                                .map(|(up_ms, known_ms)| up_ms as f64 / known_ms as f64),
+                            up: counted.map(|c| c.0[i]).unwrap_or(0),
+                            total: counted.map(|c| c.1[i]).unwrap_or(0),
+                        }
+                    })
+                    .collect();
+                let overall = uptime_counts(spans, grid.lower, now_millis, *degraded_is_downtime)
+                    .map(|(up_ms, known_ms)| up_ms as f64 / known_ms as f64);
+                (
+                    *check_id,
+                    CheckUptime {
+                        buckets: strip,
+                        overall,
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// Sparkline points for many checks in one scan.
+    ///
+    /// Deliberately points only: the status page's row chart reads nothing else,
+    /// while the per-agent breakdown and overall band belong to the single-check
+    /// detail view, which keeps using `latency_series`. Computing them here would
+    /// double the scan to populate fields nobody on this page renders.
+    pub fn latency_points_for(
+        &self,
+        checks: &[CheckId],
+        from: i64,
+        to: i64,
+        buckets: usize,
+    ) -> Result<BTreeMap<CheckId, Vec<LatencyPoint>>> {
+        let buckets = buckets.max(1);
+        let bucket_ms = ((to - from) / buckets as i64).max(1);
+        let wanted: std::collections::HashSet<CheckId> = checks.iter().copied().collect();
+
+        let mut folded: BTreeMap<CheckId, SegmentCounts> = BTreeMap::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT check_id, ((ts_millis - ? - 1) // ?)::BIGINT AS idx,
+                    COUNT(*), COUNT(*) FILTER (WHERE status = 'up'),
+                    COALESCE(SUM(latency_ms) FILTER (WHERE status = 'up'), 0)
+             FROM check_results
+             WHERE ts_millis > ? AND ts_millis <= ?
+             GROUP BY 1, 2",
+        )?;
+        let rows = stmt.query_map(duckdb::params![from, bucket_ms, from, to], |row| {
+            Ok((
+                row.get::<_, CheckId>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (check_id, index, attempts, up, sum_ms) = row?;
+            if !wanted.contains(&check_id) {
+                continue;
+            }
+            let entry = folded
+                .entry(check_id)
+                .or_insert_with(|| SegmentCounts::new(buckets));
+            let index = (index.max(0) as usize).min(buckets - 1);
+            entry.sum_ms[index] += sum_ms.max(0) as f64;
+            entry.attempts[index] = entry.attempts[index].saturating_add(attempts.max(0) as u32);
+            entry.up[index] = entry.up[index].saturating_add(up.max(0) as u32);
+        }
+
+        Ok(checks
+            .iter()
+            .map(|check_id| {
+                let counted = folded.get(check_id);
+                let points = (0..buckets)
+                    .map(|i| {
+                        let up = counted.map(|c| c.up[i]).unwrap_or(0);
+                        LatencyPoint {
+                            timestamp: from + i as i64 * bucket_ms,
+                            attempts: counted.map(|c| c.attempts[i]).unwrap_or(0),
+                            up,
+                            avg_latency_ms: (up > 0)
+                                .then(|| counted.map(|c| c.sum_ms[i]).unwrap_or(0.0) / up as f64),
+                        }
+                    })
+                    .collect();
+                (*check_id, points)
             })
             .collect())
     }
@@ -6788,6 +7020,105 @@ mod tests {
             s.uptime_between(cid("x"), now - 3 * day, now, true)
                 .unwrap(),
             Some(0.5)
+        );
+    }
+
+    /// The batched strip replaces N per-check queries on the status page, so it
+    /// must return exactly what those queries returned — same segment edges,
+    /// same counts, same time-weighted fraction, and the same per-check
+    /// `degraded_is_downtime` decision.
+    #[test]
+    fn batched_uptime_strips_agree_with_the_per_check_query() {
+        let s = Storage::open(":memory:").unwrap();
+        let now = 1_000_000_000_000i64;
+        let day = 86_400_000i64;
+
+        for (name, offset) in [("x", 0), ("y", day / 4)] {
+            s.insert_results(&[
+                (result(name, now - 2 * day + offset, 10), Status::Up),
+                (result(name, now - day + offset, 20), Status::Down),
+                (result(name, now - day / 2 + offset, 30), Status::Up),
+            ])
+            .unwrap();
+        }
+        s.record_state(cid("x"), NodeState::Up, now - 3 * day)
+            .unwrap();
+        s.record_state(cid("x"), NodeState::Down, now - day)
+            .unwrap();
+        s.record_state(cid("x"), NodeState::Up, now - day / 2)
+            .unwrap();
+        s.record_state(cid("y"), NodeState::Degraded, now - 3 * day)
+            .unwrap();
+
+        // `y` treats Degraded as downtime and `x` does not, so a shared flag
+        // would show up as a mismatch on one of them.
+        let checks = [(cid("x"), false), (cid("y"), true)];
+        let batched = s.uptime_strips(&checks, 3, 12, now).unwrap();
+        assert_eq!(batched.len(), 2);
+
+        for (check_id, degraded_is_downtime) in checks {
+            let expected = s
+                .uptime_buckets(check_id, 3, 12, now, degraded_is_downtime)
+                .unwrap();
+            let got = &batched[&check_id];
+            assert_eq!(got.buckets, expected, "{check_id} strip must match");
+            assert_eq!(
+                got.overall,
+                s.uptime_between(check_id, now - 3 * day, now, degraded_is_downtime)
+                    .unwrap(),
+                "{check_id} overall must match the single-check figure"
+            );
+        }
+    }
+
+    /// A check with no rows at all must still get a full strip of empty
+    /// segments, because the page renders one bar per segment regardless.
+    #[test]
+    fn batched_uptime_strips_cover_checks_with_no_data() {
+        let s = Storage::open(":memory:").unwrap();
+        let now = 1_000_000_000_000i64;
+
+        let strips = s
+            .uptime_strips(&[(cid("absent"), false)], 7, 90, now)
+            .unwrap();
+        let strip = &strips[&cid("absent")];
+        assert_eq!(strip.buckets.len(), 90);
+        assert!(strip.buckets.iter().all(|b| b.uptime.is_none()));
+        assert!(strip.buckets.iter().all(|b| b.total == 0));
+        assert_eq!(strip.overall, None, "nothing known is not zero uptime");
+    }
+
+    /// Same contract for the sparkline: one scan for many checks must produce
+    /// the points the per-check series produced.
+    #[test]
+    fn batched_latency_points_agree_with_the_per_check_series() {
+        let s = Storage::open(":memory:").unwrap();
+        let now = 1_000_000_000_000i64;
+        let hour = 3_600_000i64;
+
+        for (name, base) in [("x", 10u64), ("y", 100)] {
+            let mut down = result(name, now - 3 * hour, base + 5);
+            down.agent_id = "agent-b".into();
+            s.insert_results(&[
+                (result(name, now - 4 * hour, base), Status::Up),
+                (down, Status::Down),
+                (result(name, now - hour, base + 15), Status::Up),
+            ])
+            .unwrap();
+        }
+
+        let from = now - 6 * hour;
+        let ids = [cid("x"), cid("y"), cid("absent")];
+        let batched = s.latency_points_for(&ids, from, now, 6).unwrap();
+        assert_eq!(batched.len(), 3);
+
+        for check_id in ids {
+            let expected = s.latency_series(check_id, from, now, 6).unwrap().points;
+            assert_eq!(batched[&check_id], expected, "{check_id} points must match");
+        }
+        assert!(
+            batched[&cid("absent")].iter().all(|p| p.attempts == 0),
+            "a check with no rows still gets a full, empty series"
         );
     }
 

@@ -54,8 +54,8 @@ use routes::policies::{
     upsert_rollup_policy_handler,
 };
 use routes::public::{
-    alerts_handler, history_handler, latency_sparkline_handler, results_handler, status_handler,
-    uptime_handler,
+    alerts_handler, history_handler, latency_points_handler, latency_sparkline_handler,
+    results_handler, status_handler, uptime_handler, uptime_strips_handler,
 };
 use routes::sections::{
     create_section_handler, delete_section_handler, list_sections_handler, public_sections_handler,
@@ -3089,6 +3089,11 @@ impl Coordinator {
                 "/api/v1/checks/:id/latency-sparkline",
                 get(latency_sparkline_handler),
             )
+            // Batched twins of the two routes above. The status page draws a
+            // strip and a sparkline per check, so fetching them per check cost
+            // one request and one database job each — 1 + N + M for a page load.
+            .route("/api/v1/uptime", get(uptime_strips_handler))
+            .route("/api/v1/latency-points", get(latency_points_handler))
             .route("/api/v1/alerts", get(alerts_handler))
             // Public reads: the list and the per-incident permalink. The
             // narrative is the point of writing it, so an anonymous visitor

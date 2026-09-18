@@ -413,6 +413,52 @@ retention, and online backup. The backup step copies a closed, checkpointed file
 reported ~0 ms here because the filesystem performed a copy-on-write clone; treat
 backup duration as unmeasured on filesystems without reflink support.
 
+### Read path: the status page is not the status endpoint
+
+`/api/v1/status` is one batched query whose cost is independent of check count, and the
+benchmark above measures that endpoint. It is not what loading the page costs.
+
+The page additionally fetches one uptime strip per visible check and one latency
+sparkline per graph-enabled check, so a load is `1 + N + M` requests and as many jobs on
+the single database worker:
+
+| Checks on page | Requests | Worker jobs |
+|---:|---:|---:|
+| 11 | ~23 | ~22 |
+| 500 | ~1,001 | ~1,000 |
+| 10,000 | ~20,001 | ~20,000 |
+
+At 10,000 checks this overruns the worker's 256-slot queue. Because `Database::call`
+awaits on `send`, the overflow becomes backpressure on everything sharing that worker —
+including result ingest. One operator loading the dashboard can therefore stall
+ingestion, which no storage-layer measurement would reveal.
+
+Two independent changes are required, and they fix different halves:
+
+1. **Batch the endpoints.** Set-based `uptime_strips` and `latency_points_for` push the
+   segment bucketing into DuckDB, so `check_results` is scanned once and returns at most
+   one row per check per segment instead of N scans of raw rows. This takes a page load
+   to a constant number of requests.
+2. **Bound the page.** Batching still computes and ships every visible check's
+   90-segment strip. A flat page listing thousands of checks is also unreadable, so the
+   structural fix is a per-section display mode: expand inline as today, or render as a
+   rolled-up tile linking to the section's own status page. Cost then scales with the
+   section being viewed rather than with the size of the deployment.
+
+Both display modes stay supported because they suit different sections — a three-check
+section is better inline, and a three-hundred-check section is not. The consequence is
+that the bound is **available rather than automatic**: a deployment that leaves every
+section inline keeps the flat page's cost. That is an operator decision, so the admin UI
+should surface the cost of a large inline section rather than override the choice.
+
+Section rollups must reuse `crate::rollup::RollupPolicy`, the same `Threshold`/quorum
+mechanism that decides zone and region state. A section is another node set; giving it a
+separate rule would mean two answers to "when is this amber rather than red".
+
+Neither change is captured by the existing
+`benchmark_status_and_global_push_production_cardinality`, which exercises the endpoint.
+A page-load benchmark is required before any read-path claim.
+
 ### Current single-table capacity baseline
 
 The ignored `benchmark_representative_storage_capacity_baseline` test characterizes the

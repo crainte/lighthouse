@@ -14,11 +14,20 @@ Prioritized action items from the production-readiness review. Existing items fr
   - [x] Stop scanning full history for `digest(0)` every anti-entropy interval.
   - [x] Maintain compact per-check replication high-water metadata.
   - [x] Benchmark anti-entropy with production-scale retained history.
-- [x] Optimize the public status hot path.
+- [ ] Optimize the public status hot path.
   - [x] Stop scanning all `check_results` with `row_number()` to find the latest row.
   - [x] Use materialized latest-observation/current-state data.
   - [x] Replace per-check uptime queries with one batched query or pre-aggregated time buckets.
   - [x] Benchmark `/api/v1/status` and global state pushes at expected production cardinality.
+  - [ ] Remove the per-check fan-out from the status **page load**, not just `/api/v1/status`.
+    The endpoint is one batched query, but `App.svelte` then issues one `fetchUptime` per
+    check and one `fetchLatencySparkline` per graph-enabled check, so a page load costs
+    `1 + N + M` requests and as many database-worker jobs. At 10,000 checks that is ~20,000
+    jobs against a 256-slot queue, and the overflow backpressures result ingest.
+    - [x] Add set-based `uptime_strips` and `latency_points_for` storage methods that push
+      bucketing into DuckDB and scan `check_results` once.
+    - [ ] Add batched public routes and collapse the `App.svelte` fan-out onto them.
+    - [ ] Benchmark a full status **page load** at production cardinality, not the endpoint alone.
 - [x] Define and document a supported capacity envelope for DuckDB.
   - [x] Add a representative-data single-table baseline benchmark that reports DuckDB/WAL growth, history and latency p95, retention pruning, and checkpoint duration.
   - [x] Measure sustained ingest throughput, query latency, retention duration, row counts, database growth, and backup/restore with production-scale multi-domain data.
@@ -123,6 +132,48 @@ Prioritized action items from the production-readiness review. Existing items fr
 - [ ] Consolidate duplicate initial session checks in `App.svelte`.
 - [ ] Show acknowledgement failures to the operator instead of only logging them to the console.
 - [ ] Add an `aria-live` announcement for important live status changes.
+
+### Status sub-pages
+
+Batching bounds the number of *requests* a status page makes; it does not bound the
+amount of work behind them. A flat page still computes and ships every visible check's
+90-segment strip, which is unreadable for an operator and wasteful for the server long
+before 10,000 checks. Sub-pages bound both. Not P0: the batching above removes the
+acute failure mode, and this is the structural fix behind it.
+
+Display mode is a per-section admin choice, not a global migration. Both behaviours stay
+supported: a small section is better inline, and forcing a click for three checks would
+be worse than what exists today.
+
+- [ ] Add a per-section display mode: expand inline (today's behaviour) or link to its
+      own status page.
+  - [ ] Add the mode to `Section` next to `name`/`position`/`collapsed`, defaulting to
+        inline so existing deployments render unchanged. `collapsed` stays the initial
+        render state for inline sections and is meaningless for paged ones.
+  - [ ] Carry it through the section config-replication path with `#[serde(default)]`,
+        so a peer on an older build still parses the document.
+  - [ ] Add the control to `SectionsAdmin.svelte`.
+- [ ] Add the paged view.
+  - [ ] Add a `#/group/<name>` view to `viewFromHash()` in `App.svelte`, alongside the
+        existing `#/check/`, `#/incident/` and `#/admin/` routes.
+  - [ ] Render a paged section on the primary page as a summary tile (green/yellow/red)
+        instead of its rows.
+  - [ ] Derive a tile's colour from `crate::rollup::RollupPolicy` (`Threshold`/quorum),
+        which already expresses "this node is degraded when N children fail" for zones
+        and regions — a section is another node set, so it must not get a second,
+        inconsistent rule.
+  - [ ] Fetch strips and sparklines only for the checks actually rendered, so a paged
+        section costs nothing until it is opened.
+  - [ ] Decide explicitly whether a tile shows its own history strip. If it does, that is
+        one group-level uptime query folded from state spans for all sections — not one
+        query per section, and not free.
+  - [ ] Keep deep links working: a check page must remain reachable without loading its
+        section's page first.
+- [ ] Surface the cost of leaving a large section inline.
+  - [ ] Because the mode is an operator choice, an all-inline deployment keeps the flat
+        page's cost — the bound is available, not automatic. Warn in `SectionsAdmin` when
+        an inline section exceeds a configured check count rather than silently
+        overriding the choice.
 
 ## P2 — Maintainability and code reduction
 

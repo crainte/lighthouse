@@ -435,6 +435,49 @@ export function fetchLatencySparkline(
   );
 }
 
+/** Every visible check's strip in one request.
+ *
+ *  The status page draws one per check, so fetching them individually made a
+ *  page load cost a request and a database job per check. */
+export interface UptimeStripsResponse {
+  days: number;
+  checks: UptimeResponse[];
+}
+
+export function fetchUptimeStrips(
+  days = 90,
+  buckets = 90,
+): Promise<UptimeStripsResponse> {
+  return getJson<UptimeStripsResponse>(
+    `/api/v1/uptime?days=${days}&buckets=${buckets}`,
+  );
+}
+
+/** Sparkline points for every check that draws one.
+ *
+ *  Only `points`: the row chart reads nothing else, and the per-agent breakdown
+ *  belongs to the single-check detail view. */
+export interface CheckLatencyPoints {
+  check_id: string;
+  points: LatencyPoint[];
+}
+
+export interface LatencyPointsResponse {
+  from: number;
+  to: number;
+  buckets: number;
+  checks: CheckLatencyPoints[];
+}
+
+export function fetchLatencyPoints(
+  hours = 24,
+  buckets = 120,
+): Promise<LatencyPointsResponse> {
+  return getJson<LatencyPointsResponse>(
+    `/api/v1/latency-points?hours=${hours}&buckets=${buckets}`,
+  );
+}
+
 /** Same series over an explicit window, so a clicked uptime bar can chart the
  *  segment it actually covers instead of the newest rows. */
 export function fetchLatencyWindow(

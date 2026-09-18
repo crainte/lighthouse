@@ -220,6 +220,37 @@ struct UptimeBucketDto {
     total: u32,
 }
 
+/// Every visible check's strip in one response.
+///
+/// Carries the same per-check shape as `UptimeResponse` rather than a flatter
+/// one, so the page keys it exactly as it keyed the N individual responses this
+/// replaces.
+#[derive(Serialize)]
+struct UptimeStripsResponse {
+    days: usize,
+    checks: Vec<UptimeResponse>,
+}
+
+/// Sparkline points for every check that draws one.
+///
+/// Deliberately not `LatencySparklineResponse`: the row chart reads only
+/// `points`, while `overall` and `agents` exist for the single-check detail
+/// view. Serving them here would double the scan to fill fields this page never
+/// renders.
+#[derive(Serialize)]
+struct LatencyPointsResponse {
+    from: i64,
+    to: i64,
+    buckets: usize,
+    checks: Vec<CheckLatencyPointsDto>,
+}
+
+#[derive(Serialize)]
+struct CheckLatencyPointsDto {
+    check_id: CheckId,
+    points: Vec<LatencyPointDto>,
+}
+
 #[derive(Serialize)]
 struct LatencySparklineResponse {
     check_id: CheckId,
@@ -631,6 +662,115 @@ pub(in crate::coordinator) async fn latency_sparkline_handler(
             })
             .into_response()
         }
+        Err(e) => internal_error(e),
+    }
+}
+
+/// Every visible check's uptime strip in one request.
+///
+/// The status page draws a strip per check, so fetching them individually made
+/// a page load cost one request and one database job per check. The visibility
+/// rule is the status page's, so the strips cover exactly the rows it lists.
+pub(in crate::coordinator) async fn uptime_strips_handler(
+    State(coord): State<Coordinator>,
+    Query(q): Query<DaysQuery>,
+) -> Response {
+    let days = q.days.unwrap_or(90).clamp(1, 365);
+    let buckets = q.buckets.unwrap_or(90).clamp(1, 500);
+    let now = chrono::Utc::now().timestamp_millis();
+    // Resolved metadata, not the persisted override: a check inherits the
+    // coordinator default when its own setting is absent, exactly as the
+    // single-check route does.
+    let wanted: Vec<(CheckId, bool)> = {
+        let by_id = coord.inner.checks.read();
+        by_id
+            .iter()
+            .filter(|(_, meta)| meta.visible)
+            .map(|(id, meta)| (*id, meta.degraded_is_downtime))
+            .collect()
+    };
+    match coord
+        .db(move |storage| storage.uptime_strips(&wanted, days, buckets, now))
+        .await
+    {
+        Ok(strips) => Json(UptimeStripsResponse {
+            days,
+            checks: strips
+                .into_iter()
+                .map(|(check_id, strip)| UptimeResponse {
+                    check_id,
+                    name: coord.check_name(check_id),
+                    days,
+                    overall_uptime: strip.overall,
+                    buckets: strip
+                        .buckets
+                        .into_iter()
+                        .map(|b| UptimeBucketDto {
+                            start: b.start,
+                            end: b.end,
+                            uptime: b.uptime,
+                            up: b.up.min(u32::MAX as u64) as u32,
+                            total: b.total.min(u32::MAX as u64) as u32,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        })
+        .into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// Sparkline points for every visible check that opted into a latency graph.
+///
+/// Checks without one are omitted rather than returned empty: the page skips
+/// them anyway, and sending empty series would grow the payload for nothing.
+pub(in crate::coordinator) async fn latency_points_handler(
+    State(coord): State<Coordinator>,
+    Query(q): Query<HoursQuery>,
+) -> Response {
+    let buckets = q.buckets.unwrap_or(120).clamp(1, 500);
+    let now = chrono::Utc::now().timestamp_millis();
+    let (from, to) = match (q.from, q.to) {
+        (Some(f), Some(t)) if t > f => (f, t),
+        _ => {
+            let hours = q.hours.unwrap_or(24).clamp(1, 24 * 365) as i64;
+            (now - hours * 3_600_000, now)
+        }
+    };
+    let wanted: Vec<CheckId> = {
+        let by_id = coord.inner.checks.read();
+        by_id
+            .iter()
+            .filter(|(_, meta)| meta.visible && meta.latency_graph)
+            .map(|(id, _)| *id)
+            .collect()
+    };
+    match coord
+        .db(move |storage| storage.latency_points_for(&wanted, from, to, buckets))
+        .await
+    {
+        Ok(series) => Json(LatencyPointsResponse {
+            from,
+            to,
+            buckets,
+            checks: series
+                .into_iter()
+                .map(|(check_id, points)| CheckLatencyPointsDto {
+                    check_id,
+                    points: points
+                        .into_iter()
+                        .map(|p| LatencyPointDto {
+                            timestamp: p.timestamp,
+                            attempts: p.attempts,
+                            up: p.up,
+                            avg_latency_ms: p.avg_latency_ms,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        })
+        .into_response(),
         Err(e) => internal_error(e),
     }
 }

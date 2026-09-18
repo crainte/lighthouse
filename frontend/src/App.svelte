@@ -7,6 +7,8 @@
     addIncidentUpdate,
     fetchUptime,
     fetchLatencySparkline,
+    fetchUptimeStrips,
+    fetchLatencyPoints,
     fetchPublicSections,
   } from './lib/api';
   import type {
@@ -17,7 +19,7 @@
     MaintenanceNotice,
     UptimeResponse,
     UptimeBucket,
-    LatencySparklineResponse,
+    LatencyPoint,
     PublicSection,
   } from './lib/api';
   import { connectWs } from './lib/ws';
@@ -221,7 +223,9 @@
   // collapsed flag decides how a group first renders.
   let sections = $state<PublicSection[]>([]);
   let uptime = $state<Record<string, UptimeResponse>>({});
-  let sparkline = $state<Record<string, LatencySparklineResponse>>({});
+  // Points only: the row chart reads nothing else, and the per-agent breakdown
+  // the detail view shows would double the server's scan to populate here.
+  let sparkline = $state<Record<string, LatencyPoint[]>>({});
   let loading = $state(true);
   let error = $state<string | null>(null);
   let wsStatus = $state<WsStatus>('connecting');
@@ -389,10 +393,24 @@
 
   let days = $state(storedDays());
 
+  // Every visible check's strip and sparkline, in two requests regardless of
+  // check count. The server applies the same visibility rule the status list
+  // uses, and omits sparklines for checks that never draw one, so this asks for
+  // nothing the page will not render.
+  async function loadCharts(window: number) {
+    const [strips, lines] = await Promise.all([
+      fetchUptimeStrips(window, STRIP_SEGMENTS),
+      fetchLatencyPoints(window * 24, STRIP_SEGMENTS),
+    ]);
+    uptime = Object.fromEntries(strips.checks.map((u) => [u.check_id, u]));
+    sparkline = Object.fromEntries(lines.checks.map((l) => [l.check_id, l.points]));
+  }
+
   // Refetch one check's uptime strip and (if it opted in) its latency graph,
   // replacing just that check's entry. Used after a live state change so the
   // percentage and charts converge on the server's numbers rather than staying
-  // frozen at page-load values.
+  // frozen at page-load values. Stays per-check: this is one check, not a
+  // fan-out over the whole page.
   async function refreshCheckCharts(id: string) {
     const c = checks.find((ch) => ch.check_id === id);
     if (!c) return;
@@ -404,7 +422,7 @@
           : Promise.resolve(null),
       ]);
       uptime = { ...uptime, [id]: u };
-      if (line) sparkline = { ...sparkline, [id]: line };
+      if (line) sparkline = { ...sparkline, [id]: line.points };
     } catch {
       // A failed refresh leaves the last-known values in place; the next event
       // or a reconnect resync will try again.
@@ -460,16 +478,7 @@
       incidents = inc.incidents;
       fleet = s.agents;
       maintenance = s.maintenance;
-      const strips = await Promise.all(
-        s.checks.map((c) => fetchUptime(c.check_id, days, STRIP_SEGMENTS)),
-      );
-      uptime = Object.fromEntries(strips.map((u) => [u.check_id, u]));
-      const lines = await Promise.all(
-        s.checks
-          .filter((c) => c.latency_graph)
-          .map((c) => fetchLatencySparkline(c.check_id, days * 24, STRIP_SEGMENTS)),
-      );
-      sparkline = Object.fromEntries(lines.map((l) => [l.check_id, l]));
+      await loadCharts(days);
     } catch {
       // A failed resync leaves the last-known state; the next reconnect retries.
     }
@@ -483,16 +492,7 @@
     try {
       localStorage.setItem(RANGE_STORAGE_KEY, String(next));
     } catch {}
-    const [strips, lines] = await Promise.all([
-      Promise.all(checks.map((c) => fetchUptime(c.check_id, next, STRIP_SEGMENTS))),
-      Promise.all(
-        checks
-          .filter((c) => c.latency_graph)
-          .map((c) => fetchLatencySparkline(c.check_id, next * 24, STRIP_SEGMENTS)),
-      ),
-    ]);
-    uptime = Object.fromEntries(strips.map((u) => [u.check_id, u]));
-    sparkline = Object.fromEntries(lines.map((l) => [l.check_id, l]));
+    await loadCharts(next);
   }
 
   // The order an admin arranged, not alphabetical. Name breaks ties so the list
@@ -547,19 +547,10 @@
       fleet = s.agents;
       maintenance = s.maintenance;
       sections = sec;
-      // Both per-check charts use the selected window; the latency graph is only
-      // fetched for checks that opted in, so we don't pay for graphs nobody
-      // renders.
-      const strips = await Promise.all(
-        s.checks.map((c) => fetchUptime(c.check_id, days, STRIP_SEGMENTS)),
-      );
-      uptime = Object.fromEntries(strips.map((u) => [u.check_id, u]));
-      const lines = await Promise.all(
-        s.checks
-          .filter((c) => c.latency_graph)
-          .map((c) => fetchLatencySparkline(c.check_id, days * 24, STRIP_SEGMENTS)),
-      );
-      sparkline = Object.fromEntries(lines.map((l) => [l.check_id, l]));
+      // Both charts come batched: one request each, whatever the check count.
+      // Fetching them per check made a page load cost 1 + N + M requests and as
+      // many database jobs, which at scale backpressured result ingest.
+      await loadCharts(days);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
@@ -849,7 +840,7 @@
           <ComponentRow
             check={c}
             uptime={uptime[c.check_id]}
-            sparkline={sparkline[c.check_id]?.points ?? null}
+            sparkline={sparkline[c.check_id] ?? null}
             incident={openIncidentForCheck(incidents, c.check_id)}
             onselect={openDetail}
             onbarclick={(id, b) => (dayModal = { checkId: id, bucket: b })}
@@ -867,7 +858,7 @@
               <ComponentRow
                 check={c}
                 uptime={uptime[c.check_id]}
-                sparkline={sparkline[c.check_id]?.points ?? null}
+                sparkline={sparkline[c.check_id] ?? null}
                 incident={openIncidentForCheck(incidents, c.check_id)}
                 onselect={openDetail}
                 onbarclick={(id, b) => (dayModal = { checkId: id, bucket: b })}
