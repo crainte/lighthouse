@@ -335,6 +335,18 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
             out.push((acc >> bits) as u8);
         }
     }
+    // The leftover bits must be zero, or the encoding is not canonical. A
+    // 32-byte HMAC tag occupies 43 characters — 258 bits — so the final
+    // character carries two bits that no byte of the tag uses. Discarding them
+    // unchecked would make four different final characters decode to the same
+    // tag, so a token could be edited and still verify. That forges nothing
+    // (the tag itself is still unreachable without the key) but it means the
+    // cookie an admin holds is not the only string that opens their session,
+    // and any check that compares token text rather than payload would be
+    // bypassable by rewriting one character.
+    if bits > 0 && acc & ((1 << bits) - 1) != 0 {
+        return None;
+    }
     Some(out)
 }
 
@@ -354,6 +366,31 @@ mod tests {
 
     fn auth() -> Auth {
         Auth::new(Some("hunter2".into()))
+    }
+
+    #[test]
+    fn a_token_has_exactly_one_encoding() {
+        let a = auth();
+        let token = a.login("hunter2", IP, 1_000_000).expect("login succeeds");
+        assert!(a.open(&token).is_some(), "the minted token opens");
+
+        // Rewriting the last character of the signature must break it. The
+        // final character of a 43-character tag carries two bits the tag does
+        // not use, so a decoder that drops them unchecked accepts four
+        // different spellings of the same session — and this assertion passes
+        // only by luck, roughly fifteen times in sixteen, when it does.
+        let (payload, sig) = token.rsplit_once('.').expect("token is payload.sig");
+        let last = sig.chars().next_back().expect("signature is non-empty");
+        for alt in ['Y', 'Z', 'a', 'b'] {
+            if alt == last {
+                continue;
+            }
+            let edited = format!("{payload}.{}{alt}", &sig[..sig.len() - 1]);
+            assert!(
+                a.open(&edited).is_none(),
+                "a token ending {alt} instead of {last} must not open the same session"
+            );
+        }
     }
 
     #[test]
