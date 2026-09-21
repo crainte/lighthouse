@@ -818,7 +818,14 @@ async fn relay_handler(
         Some(id) => node.inner.cache.owner_region_endpoints(id, now),
         None if path == "api/v1/alerts"
             || path == "api/v1/incidents"
-            || path == "api/v1/admin/results" =>
+            || path == "api/v1/admin/results"
+            // The status page's batched series. Fleet-wide *data*, not config:
+            // a check is observed only by the agents of the region holding it,
+            // so one region answers with empty buckets for every check it does
+            // not probe — which the page renders as "Collecting latency data…"
+            // for checks that have plenty of it elsewhere.
+            || path == "api/v1/uptime"
+            || path == "api/v1/latency-points" =>
         {
             node.inner.cache.region_endpoints(now)
         }
@@ -1066,6 +1073,11 @@ fn merge_responses(
         .map(|(_, value)| value)
         .cloned()
         .unwrap_or_default();
+    // Before the suffix rules: `/api/v1/uptime` also ends with `/uptime`, and
+    // the batched shape is a list of the single-check one, not the thing itself.
+    if path == "/api/v1/uptime" || path == "/api/v1/latency-points" {
+        return merge_check_series(path, responses).map(Json);
+    }
     if path.ends_with("/uptime") {
         return merge_uptime(&first, &responses).map(Json);
     }
@@ -1152,6 +1164,77 @@ fn query_limit(query: Option<&str>) -> Option<usize> {
         pair.split_once('=')
             .and_then(|(key, value)| (key == "limit").then(|| value.parse().ok()).flatten())
     })
+}
+
+/// Merge a batched series — one response per region, each carrying every check
+/// that region knows — by grouping on `check_id` and reusing the single-check
+/// merges. A check observed in two regions has its buckets summed exactly as
+/// the drill-down endpoints already sum them; a check observed in one is
+/// carried through unchanged.
+fn merge_check_series(
+    path: &str,
+    responses: Vec<(String, serde_json::Value)>,
+) -> Result<serde_json::Value, String> {
+    let latency = path.ends_with("latency-points");
+    let mut order: Vec<String> = Vec::new();
+    let mut by_check: HashMap<String, Vec<(String, serde_json::Value)>> = HashMap::new();
+    for (region, value) in &responses {
+        for entry in value["checks"].as_array().into_iter().flatten() {
+            let Some(id) = entry.get("check_id").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            by_check
+                .entry(id.to_string())
+                .or_insert_with(|| {
+                    order.push(id.to_string());
+                    Vec::new()
+                })
+                .push((region.clone(), entry.clone()));
+        }
+    }
+
+    let mut checks = Vec::with_capacity(order.len());
+    for id in order {
+        let entries = by_check.remove(&id).unwrap_or_default();
+        let first = entries
+            .first()
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default();
+        let mut merged = if latency {
+            let mut merged = merge_latency(&first, &entries)?;
+            // The single-check endpoint answers with a per-agent breakdown, an
+            // overall band and its own window; the batched shape carries none
+            // of them, and the page would parse them once per check on it.
+            if let Some(object) = merged.as_object_mut() {
+                object.remove("overall");
+                object.remove("agents");
+                object.remove("from");
+                object.remove("to");
+                object.remove("buckets");
+            }
+            merged
+        } else {
+            merge_uptime(&first, &entries)?
+        };
+        // Display name is config, identical in every region, and not something
+        // either single-check merge carries.
+        if let Some(name) = first.get("name") {
+            merged["name"] = name.clone();
+        }
+        checks.push(merged);
+    }
+
+    let first = responses
+        .first()
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default();
+    let mut out = serde_json::json!({ "checks": checks });
+    for key in ["from", "to", "days", "buckets"] {
+        if let Some(value) = first.get(key) {
+            out[key] = value.clone();
+        }
+    }
+    Ok(out)
 }
 
 fn merge_uptime(
@@ -1553,6 +1636,105 @@ fn error_response(code: StatusCode, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The status page asks one question for the whole estate, but a check is
+    /// only observed where its agents are. Relaying that question to a single
+    /// region answers "no data" for every check that region does not probe,
+    /// which the page renders as "Collecting latency data…" — so the batched
+    /// series must be asked of every region and merged per check.
+    #[test]
+    fn batched_latency_points_merge_every_region_per_check() {
+        let responses = vec![
+            (
+                "us".into(),
+                serde_json::json!({
+                    "from": 0, "to": 100, "buckets": 2,
+                    "checks": [
+                        {"check_id": "probed-in-us", "name": "web", "points": [
+                            {"timestamp": 0, "attempts": 4, "up": 4, "avg_latency_ms": 100.0},
+                            {"timestamp": 50, "attempts": 4, "up": 2, "avg_latency_ms": 200.0}
+                        ]},
+                        {"check_id": "probed-in-both", "points": [
+                            {"timestamp": 0, "attempts": 2, "up": 2, "avg_latency_ms": 10.0},
+                            {"timestamp": 50, "attempts": 2, "up": 2, "avg_latency_ms": 10.0}
+                        ]}
+                    ]
+                }),
+            ),
+            (
+                "tw".into(),
+                serde_json::json!({
+                    "from": 0, "to": 100, "buckets": 2,
+                    "checks": [
+                        {"check_id": "probed-in-us", "name": "web", "points": [
+                            {"timestamp": 0, "attempts": 0, "up": 0, "avg_latency_ms": null},
+                            {"timestamp": 50, "attempts": 0, "up": 0, "avg_latency_ms": null}
+                        ]},
+                        {"check_id": "probed-in-both", "points": [
+                            {"timestamp": 0, "attempts": 2, "up": 2, "avg_latency_ms": 30.0},
+                            {"timestamp": 50, "attempts": 2, "up": 0, "avg_latency_ms": null}
+                        ]}
+                    ]
+                }),
+            ),
+        ];
+        let Json(merged) = merge_responses("/api/v1/latency-points", None, responses).unwrap();
+        let checks = merged["checks"].as_array().unwrap();
+        assert_eq!(checks.len(), 2, "every check, once");
+
+        let us = &checks[0];
+        assert_eq!(us["check_id"], "probed-in-us");
+        assert_eq!(us["name"], "web", "display name survives the merge");
+        assert_eq!(
+            us["points"][0]["attempts"], 4,
+            "a region that does not probe the check must not erase the one that does"
+        );
+
+        let both = &checks[1];
+        assert_eq!(both["points"][0]["attempts"], 4, "2 + 2 attempts");
+        assert_eq!(
+            both["points"][0]["avg_latency_ms"], 20.0,
+            "latency is weighted by successful attempts, not averaged twice"
+        );
+        assert_eq!(both["points"][1]["attempts"], 4);
+        assert_eq!(
+            both["points"][1]["avg_latency_ms"], 10.0,
+            "a region with no successes contributes none of the mean"
+        );
+    }
+
+    /// `/api/v1/uptime` also ends with `/uptime`, so the batched shape must be
+    /// recognised before the single-check rule that would read its fields.
+    #[test]
+    fn batched_uptime_merges_per_check_rather_than_as_one_check() {
+        let bucket = |up: u64, total: u64| {
+            serde_json::json!({"start": 0, "end": 10, "up": up, "total": total,
+                               "uptime": up as f64 / total as f64})
+        };
+        let responses = vec![
+            (
+                "us".into(),
+                serde_json::json!({"days": 1, "checks": [
+                    {"check_id": "c1", "name": "web", "days": 1, "overall_uptime": 1.0,
+                     "buckets": [bucket(10, 10)]}
+                ]}),
+            ),
+            (
+                "tw".into(),
+                serde_json::json!({"days": 1, "checks": [
+                    {"check_id": "c1", "name": "web", "days": 1, "overall_uptime": 0.5,
+                     "buckets": [bucket(5, 10)]}
+                ]}),
+            ),
+        ];
+        let Json(merged) = merge_responses("/api/v1/uptime", None, responses).unwrap();
+        let checks = merged["checks"].as_array().unwrap();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0]["buckets"][0]["up"], 15);
+        assert_eq!(checks[0]["buckets"][0]["total"], 20);
+        assert_eq!(checks[0]["name"], "web");
+        assert_eq!(merged["days"], 1);
+    }
 
     #[test]
     fn merged_lists_deduplicate_and_apply_the_requested_limit() {
