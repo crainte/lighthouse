@@ -465,6 +465,45 @@ batch while provisioning 10,000 checks, and a peer's full `config_entries` read 
 ~2.2 s at that cardinality. Both are provisioning-time, not steady-state, so they are
 tracked as follow-up work rather than as part of this gate.
 
+### What the gate did not remove: dedup cost grows with retained history
+
+The replicated-result anti-join is bounded by the batch's own minimum timestamp, which
+is sound (a duplicate carries the staged row's exact timestamp, so nothing that could
+match is excluded) and lets DuckDB prune by zone map. It does not make the probe
+constant. `benchmark_replicated_dedup_against_retained_history` measures a live-shaped
+500-row batch against a seeded table:
+
+| Retained rows | Bounded p50 | Unbounded p50 |
+|---:|---:|---:|
+| 20M | 17 ms | 32 ms |
+| 40M | 20 ms | 51 ms |
+
+The bound cuts the slope from ~0.95 ms to ~0.15 ms per million retained rows.
+Extrapolated to a 30-day, three-domain replica (2.6B rows) that is roughly 0.4 s per
+batch bounded against ~2.5 s unbounded — survivable versus fatal, but neither is free.
+**Retention depth, not check count, is what ends this design.** The standing option is
+the one already noted beside `insert_results_dedup`: a `UNIQUE(check_id, agent_id,
+ts_millis)` index with `INSERT OR IGNORE`, which trades write throughput for a constant
+probe and must be measured before it is adopted.
+
+### Measured status, page, and global-push cardinality
+
+`benchmark_status_and_global_push_production_cardinality` at 10,000 checks and four
+regions:
+
+| Path | p95 | Bytes |
+|---|---:|---:|
+| Regional `/api/v1/status` | 56 ms | 2.39 MB |
+| Full status **page** (3 requests) | 509 ms | 134.7 MB |
+| Global push (per region, per interval) | 101 ms | 2.14 MB |
+| Global `/api/v1/status` | 34 ms | 2.15 MB |
+
+The status page is the outlier by two orders of magnitude: 134.7 MB is uptime strips and
+latency points for 10,000 checks, and no browser should be asked to take that. The
+supported dashboard cardinality is therefore far below the supported *monitoring*
+cardinality — treat a 10,000-check deployment as one that needs paginated or filtered
+views, not one where the whole estate renders on one page.
+
 Still unmeasured, and therefore outside a full 10,000-check support claim:
 representative multi-protocol targets, three and five observation domains, 30-day
 retained data alongside live traffic, an hour-long peer outage/catch-up, and online

@@ -93,6 +93,13 @@ Measured during the passing 10,000-check gate; provisioning-time, not steady-sta
 
 - [ ] Fix alert ids that name a different check on different nodes. Observed in the global Compose stack: id `01a08215-de63-…-1788912120134-down` is stored against check `01a08215-de63-…` on `coordinator-us-b`/`-us-c` and against check `018f0000-…` (`upstream`) on `coordinator-us-a`. Both nodes believe their own row, so `upsert_alert` reports a conflict, the alert stream never converges, and anti-entropy re-offers the same page every sweep. Likely the originating-alert-id pass-through combined with dependency/upstream incident joining; a conflicting alert is now skipped rather than failing the whole replication batch, which contains the damage but does not resolve it.
 
+### Limits measured during the 10,000-check gate
+
+- [ ] Replicated dedup still scales with retained history: a 500-row batch costs 17 ms against 20M rows and 20 ms against 40M (≈0.15 ms per million, ≈0.4 s per batch extrapolated to a 30-day three-domain replica). Measure `UNIQUE(check_id, agent_id, ts_millis)` with `INSERT OR IGNORE` against its write cost.
+- [ ] The full status page is 134.7 MB over 3 requests at 10,000 checks (p95 509 ms). Paginate or filter the dashboard; the monitoring cardinality is supportable, the single-page rendering of it is not.
+- [ ] `agent_checks_handler` runs `list_checks()` on the database worker for every agent poll, though the coordinator already caches check metadata in memory. Cost is `agents / poll_secs × O(checks)` on the one worker.
+- [ ] The notification dispatcher is a single serial loop with a 10 s per-send timeout, fed by a 1,024-slot channel whose `try_send` drops on overflow — a slow notifier delays every other alert, and an overflow loses alerts with no retry row written.
+
 ### Storage maintenance
 
 - [ ] Review and add appropriate physical organization/indexing for common queries.

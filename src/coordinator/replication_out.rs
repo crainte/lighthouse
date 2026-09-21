@@ -32,6 +32,14 @@ use super::Timings;
 /// state moving.
 const MAX_PENDING_RESULTS: usize = 100_000;
 
+/// Results per request. Coalescing decides how much this node *holds*; it must
+/// not also decide how much one request *carries*, because the receiver rejects
+/// a body over its `/internal/replicate` limit (32 MiB) outright — and would
+/// reject the same oversized batch on every retry, turning a burst into
+/// permanent divergence. A drained queue is posted as however many requests it
+/// takes, still one at a time.
+const MAX_RESULTS_PER_POST: usize = 20_000;
+
 /// Same ceiling, applied to the lifecycle streams that ride along.
 const MAX_PENDING_LIFECYCLE: usize = 20_000;
 
@@ -135,26 +143,55 @@ fn spawn_worker(cluster: Arc<Cluster>, timings: Arc<Timings>, peer: String, queu
                     );
                 }
             }
-            let started = Instant::now();
-            let accepted = cluster
-                .post_json(&peer, "/internal/replicate", &batch)
-                .await;
-            if timings.enabled {
-                timings.broadcast_network.observe(
-                    "replication_broadcast",
-                    "network",
-                    started.elapsed(),
-                );
-                if !accepted {
-                    timings.broadcast_failures.observe(
+            for chunk in chunks(batch) {
+                let started = Instant::now();
+                let accepted = cluster
+                    .post_json(&peer, "/internal/replicate", &chunk)
+                    .await;
+                if timings.enabled {
+                    timings.broadcast_network.observe(
                         "replication_broadcast",
-                        "failure",
-                        Duration::ZERO,
+                        "network",
+                        started.elapsed(),
                     );
+                    if !accepted {
+                        timings.broadcast_failures.observe(
+                            "replication_broadcast",
+                            "failure",
+                            Duration::ZERO,
+                        );
+                    }
+                }
+                if !accepted {
+                    // A peer that refused or timed out on this chunk will most
+                    // likely do the same with the rest, and each attempt costs
+                    // the full request budget. Stop and let anti-entropy carry
+                    // what is left: it is idempotent and already cursored.
+                    break;
                 }
             }
         }
     });
+}
+
+/// Split a drained batch into requests the receiver will accept. The lifecycle
+/// streams ride in the first request only — they are small, and duplicating
+/// them per chunk would mean re-applying the same alerts and incidents once per
+/// chunk for no gain.
+fn chunks(mut batch: ReplicationBatch) -> Vec<ReplicationBatch> {
+    if batch.results.len() <= MAX_RESULTS_PER_POST {
+        return vec![batch];
+    }
+    let tail = batch.results.split_off(MAX_RESULTS_PER_POST);
+    let mut out = vec![batch];
+    for rest in tail.chunks(MAX_RESULTS_PER_POST) {
+        out.push(ReplicationBatch {
+            origin: out[0].origin.clone(),
+            results: rest.to_vec(),
+            ..Default::default()
+        });
+    }
+    out
 }
 
 /// Fold `next` into `existing`, oldest-first, then trim to the pending
@@ -280,6 +317,53 @@ mod tests {
             .find(|b| b.agent_id == "a")
             .expect("agent a belief");
         assert_eq!(a.consecutive_failures, 2);
+    }
+
+    /// The receiver rejects a body over 32 MiB, and would reject the same one
+    /// on every retry. A full request must stay well inside that with room for
+    /// the widest realistic row.
+    #[test]
+    fn a_full_request_stays_inside_the_receivers_body_limit() {
+        let id = new_check_id();
+        let mut wide = result(id, 1);
+        wide.result.agent_id = "agent-eu-west-1-probe-000000".into();
+        wide.result.zone = "eu-west-1a-availability-zone".into();
+        wide.result.region = "eu-west-1-frankfurt-region".into();
+        wide.result.error = Some("x".repeat(512));
+        let batch = ReplicationBatch {
+            origin: "coordinator-eu-west-1a".into(),
+            results: vec![wide; MAX_RESULTS_PER_POST],
+            ..Default::default()
+        };
+        let bytes = serde_json::to_vec(&batch).unwrap().len();
+        assert!(
+            bytes < 32 * 1024 * 1024,
+            "a full request serialized to {bytes} bytes, over the receiver's limit"
+        );
+    }
+
+    #[test]
+    fn a_drained_queue_is_posted_as_several_accepted_requests() {
+        let id = new_check_id();
+        let batch = ReplicationBatch {
+            origin: "a".into(),
+            results: (0..(MAX_RESULTS_PER_POST as i64 * 2 + 1))
+                .map(|ts| result(id, ts))
+                .collect(),
+            beliefs: vec![belief(id, "a", 0)],
+            ..Default::default()
+        };
+        let parts = chunks(batch);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].results.len(), MAX_RESULTS_PER_POST);
+        assert_eq!(parts[1].results.len(), MAX_RESULTS_PER_POST);
+        assert_eq!(parts[2].results.len(), 1);
+        assert_eq!(
+            parts.iter().filter(|p| !p.beliefs.is_empty()).count(),
+            1,
+            "lifecycle rows must ride exactly once"
+        );
+        assert!(parts.iter().all(|p| p.origin == "a"));
     }
 
     #[test]

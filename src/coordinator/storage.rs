@@ -2246,6 +2246,11 @@ impl Storage {
         store.backfill_latest_check_results()?;
         store.backfill_result_replication_watermarks()?;
         store.rebuild_stream_watermarks()?;
+        // Staging tables live for the life of this connection, so every write
+        // path can assume them. Created here rather than inside the writers:
+        // the replication path runs inside an explicit transaction, and DDL
+        // interleaved with DML there is a needless thing to depend on.
+        store.prepare_ingest()?;
         Ok(store)
     }
 
@@ -2910,7 +2915,6 @@ impl Storage {
         if states.is_empty() {
             return Ok(());
         }
-        self.prepare_ingest()?;
         self.conn.execute_batch("DELETE FROM ingest_agent_stage;")?;
         self.stage_agent_states(states)?;
         self.conn.execute_batch(AGENT_STATE_MERGE_SQL)?;
@@ -4991,7 +4995,6 @@ impl Storage {
         if rows.is_empty() {
             return Ok(0);
         }
-        self.prepare_ingest()?;
         self.conn.execute_batch(
             "DELETE FROM ingest_results_stage; DELETE FROM replicate_new_results;",
         )?;
@@ -5004,6 +5007,14 @@ impl Storage {
                  WHERE existing.check_id = staged.check_id
                    AND existing.agent_id = staged.agent_id
                    AND existing.ts_millis = staged.ts_millis
+                   -- Sound because a duplicate of a staged row carries that
+                   -- row's exact `ts_millis`, which is never below the batch
+                   -- minimum: nothing that could match is excluded. Without it
+                   -- the anti-join probes every retained row, so replication
+                   -- cost would grow with history rather than with the batch —
+                   -- fine at 30,000 rows, fatal at two billion. Results are
+                   -- appended in time order, so the bound prunes by zone map.
+                   AND existing.ts_millis >= (SELECT MIN(ts_millis) FROM ingest_results_stage)
              )
              QUALIFY row_number() OVER (
                  PARTITION BY staged.check_id, staged.agent_id, staged.ts_millis
@@ -5794,10 +5805,10 @@ impl Storage {
     pub fn apply_config_entries(&self, entries: &[ConfigEntry]) -> Result<Vec<bool>> {
         self.conn.execute_batch("BEGIN")?;
         let write = || -> Result<Vec<bool>> {
-            let stamps = self.local_config_stamps(entries)?;
+            let mut stamps = self.local_config_stamps(entries)?;
             entries
                 .iter()
-                .map(|entry| self.apply_config_entry_uncommitted(entry, &stamps))
+                .map(|entry| self.apply_config_entry_uncommitted(entry, &mut stamps))
                 .collect()
         };
         match write() {
@@ -5815,7 +5826,7 @@ impl Storage {
     fn apply_config_entry_uncommitted(
         &self,
         e: &ConfigEntry,
-        stamps: &ConfigStamps,
+        stamps: &mut ConfigStamps,
     ) -> Result<bool> {
         let key = (e.kind, e.id.clone());
         if let Some(local) = stamps.newest.get(&key) {
@@ -5824,6 +5835,16 @@ impl Storage {
             }
         }
         let tombstoned = stamps.tombstoned.contains(&key);
+        // The snapshot has to track what this batch itself writes. Two entries
+        // for one id in a single batch must still resolve by HLC, exactly as
+        // they would arriving separately — otherwise the last one in the vector
+        // wins and an older edit can overwrite a newer one.
+        stamps.newest.insert(key.clone(), e.hlc.clone());
+        if e.is_tombstone() {
+            stamps.tombstoned.insert(key.clone());
+        } else {
+            stamps.tombstoned.remove(&key);
+        }
         if e.is_tombstone() {
             self.delete_config_row(e.kind, &e.id)?;
             if tombstoned {
@@ -8599,6 +8620,40 @@ mod tests {
         );
     }
 
+    /// Arbitration is per entry, not per batch. Two edits to one id travelling
+    /// together must resolve by HLC exactly as they would arriving separately:
+    /// a batch is a transport detail, never a rule about who wins.
+    #[test]
+    fn a_batch_carrying_two_edits_to_one_id_still_resolves_by_hlc() {
+        let s = Storage::open(":memory:").unwrap();
+        let newer = setting_entry("theme", 2_000, "n1", "dark");
+        let older = setting_entry("theme", 1_000, "n1", "light");
+
+        let applied = s
+            .apply_config_entries(&[newer.clone(), older.clone()])
+            .unwrap();
+        assert_eq!(
+            applied,
+            vec![true, false],
+            "the older edit must lose even though it is last in the batch"
+        );
+        let back = s
+            .config_entry(ConfigKind::Setting, "theme")
+            .unwrap()
+            .unwrap();
+        assert_eq!(back.hlc, newer.hlc);
+
+        // And the same pair in the other order still converges on the newer.
+        let s = Storage::open(":memory:").unwrap();
+        let applied = s.apply_config_entries(&[older, newer.clone()]).unwrap();
+        assert_eq!(applied, vec![true, true]);
+        let back = s
+            .config_entry(ConfigKind::Setting, "theme")
+            .unwrap()
+            .unwrap();
+        assert_eq!(back.hlc, newer.hlc);
+    }
+
     #[test]
     fn config_entry_round_trips_each_kind_through_apply_and_read_back() {
         let s = Storage::open(":memory:").unwrap();
@@ -9214,6 +9269,90 @@ mod tests {
 
         drop(store);
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// Replication dedup must cost what the *batch* costs, not what the
+    /// *history* costs. The anti-join is bounded by the batch's own minimum
+    /// timestamp precisely so a node holding a month of results does not pay a
+    /// full-table probe for every batch a peer sends it. Seeds a large table
+    /// and asserts a live-shaped batch still applies in bounded time.
+    ///
+    /// `WARDEN_BENCH_DEDUP_ROWS` (default 20,000,000) sets the retained rows.
+    #[test]
+    #[ignore = "capacity baseline; configure WARDEN_BENCH_* for the intended scale"]
+    fn benchmark_replicated_dedup_against_retained_history() {
+        let retained: u64 = std::env::var("WARDEN_BENCH_DEDUP_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20_000_000);
+        let path =
+            std::env::temp_dir().join(format!("warden-dedup-{}.duckdb", uuid::Uuid::now_v7()));
+        let store = Storage::open(path.to_str().unwrap()).unwrap();
+        let check_key = "dedup-scaling-check";
+        let check = cid(check_key);
+
+        // Rows land in time order, as live ingest writes them.
+        let seeded = std::time::Instant::now();
+        store
+            .conn
+            .execute_batch(&format!(
+                "INSERT INTO check_results
+                 SELECT '{check}'::UUID, 'agent-a', i, 'up', 10, 200, NULL, 'z', 'r', NULL
+                 FROM generate_series(1, {retained}) t(i);"
+            ))
+            .unwrap();
+        let seed_elapsed = seeded.elapsed();
+
+        // A live batch: 500 fresh rows, all newer than everything retained.
+        let rows: Vec<(CheckResult, Status)> = (0..500)
+            .map(|i| {
+                let mut r = result(check_key, retained as i64 + i, 10);
+                r.agent_id = "agent-b".into();
+                (r, Status::Up)
+            })
+            .collect();
+
+        let mut samples = Vec::new();
+        for round in 0..5 {
+            let rows: Vec<(CheckResult, Status)> = rows
+                .iter()
+                .map(|(r, s)| {
+                    let mut r = r.clone();
+                    r.timestamp = chrono::DateTime::from_timestamp_millis(
+                        r.timestamp.timestamp_millis() + round * 1_000,
+                    )
+                    .unwrap();
+                    (r, *s)
+                })
+                .collect();
+            let started = std::time::Instant::now();
+            let inserted = store.insert_results_dedup(&rows).unwrap();
+            samples.push(started.elapsed());
+            assert_eq!(inserted, 500);
+        }
+        samples.sort();
+        let p50 = samples[samples.len() / 2];
+        let max = *samples.last().unwrap();
+
+        // A replay of the same batch must still be recognised as a replay:
+        // the bound narrows the probe, it must not lose a duplicate.
+        let replay = store.insert_results_dedup(&rows).unwrap();
+
+        println!(
+            "replicated_dedup retained_rows={retained} seed_ms={} batch_rows=500 p50_ms={} max_ms={} replay_inserted={replay}",
+            seed_elapsed.as_millis(),
+            p50.as_millis(),
+            max.as_millis()
+        );
+        assert_eq!(replay, 0, "an exact replay must insert nothing");
+        let bounded = max.as_millis() <= 500;
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            bounded,
+            "a 500-row batch took {max:?} against {retained} retained rows; \
+             dedup is scaling with history rather than with the batch"
+        );
     }
 
     #[test]
