@@ -123,6 +123,98 @@ async fn login(base: &str) -> String {
 }
 
 #[tokio::test]
+async fn http_security_headers_and_cookie_policy_are_applied() {
+    let addr = spawn_server(coordinator().await);
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let status = client
+        .get(format!("{base}/api/v1/status"))
+        .send()
+        .await
+        .unwrap();
+    let headers = status.headers();
+    assert_eq!(headers["content-security-policy"], "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' ws: wss:");
+    assert_eq!(headers["x-frame-options"], "DENY");
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+    assert_eq!(
+        headers["referrer-policy"],
+        "strict-origin-when-cross-origin"
+    );
+
+    // A client can forge this header; it must not make cookies Secure.
+    let login = client
+        .post(format!("{base}/api/v1/login"))
+        .header("X-Forwarded-Proto", "https")
+        .json(&json!({ "password": PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert!(!login.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .contains("Secure"));
+
+    let secure = Coordinator::new(&CoordinatorConfig {
+        listen: "127.0.0.1:0".into(),
+        db_path: ":memory:".into(),
+        admin_password: Some(PASSWORD.into()),
+        secure_cookies: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let secure_addr = spawn_server(secure);
+    let secure_login = client
+        .post(format!("http://{secure_addr}/api/v1/login"))
+        .json(&json!({ "password": PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert!(secure_login.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .contains("Secure"));
+}
+
+#[tokio::test]
+async fn oversized_login_and_admin_json_are_rejected_before_and_after_authentication() {
+    let addr = spawn_server(coordinator().await);
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let login_oversized = client
+        .post(format!("{base}/api/v1/login"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(vec![b'x'; 16 * 1024 + 1])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login_oversized.status(), 413);
+
+    let oversized = vec![b'x'; 1024 * 1024 + 1];
+    let anonymous = client
+        .post(format!("{base}/api/v1/admin/eval-test"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(oversized.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), 413);
+
+    let session = login(&base).await;
+    let authenticated = client
+        .post(format!("{base}/api/v1/admin/eval-test"))
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(oversized)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authenticated.status(), 413);
+}
+
+#[tokio::test]
 async fn the_check_editor_is_unusable_without_a_session() {
     let addr = spawn_server(coordinator().await);
     let base = format!("http://{addr}");

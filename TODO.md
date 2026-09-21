@@ -14,28 +14,28 @@ Prioritized action items from the production-readiness review. Existing items fr
   - [x] Stop scanning full history for `digest(0)` every anti-entropy interval.
   - [x] Maintain compact per-check replication high-water metadata.
   - [x] Benchmark anti-entropy with production-scale retained history.
-- [ ] Optimize the public status hot path.
+- [x] Optimize the public status hot path.
   - [x] Stop scanning all `check_results` with `row_number()` to find the latest row.
   - [x] Use materialized latest-observation/current-state data.
   - [x] Replace per-check uptime queries with one batched query or pre-aggregated time buckets.
   - [x] Benchmark `/api/v1/status` and global state pushes at expected production cardinality.
-  - [ ] Remove the per-check fan-out from the status **page load**, not just `/api/v1/status`.
+  - [x] Remove the per-check fan-out from the status **page load**, not just `/api/v1/status`.
     The endpoint is one batched query, but `App.svelte` then issues one `fetchUptime` per
     check and one `fetchLatencySparkline` per graph-enabled check, so a page load costs
     `1 + N + M` requests and as many database-worker jobs. At 10,000 checks that is ~20,000
     jobs against a 256-slot queue, and the overflow backpressures result ingest.
     - [x] Add set-based `uptime_strips` and `latency_points_for` storage methods that push
       bucketing into DuckDB and scan `check_results` once.
-    - [ ] Add batched public routes and collapse the `App.svelte` fan-out onto them.
-    - [ ] Benchmark a full status **page load** at production cardinality, not the endpoint alone.
-- [x] Define and document a supported capacity envelope for DuckDB.
+    - [x] Add batched public routes and collapse the `App.svelte` fan-out onto them.
+    - [x] Benchmark a full status **page load** at production cardinality, not the endpoint alone.
+- [x] Define and document a supported capacity envelope for DuckDB (offline single-replica envelope and the live three-peer 10,000-check gate both measured; see `SCALING.md`).
   - [x] Add a representative-data single-table baseline benchmark that reports DuckDB/WAL growth, history and latency p95, retention pruning, and checkpoint duration.
   - [x] Measure sustained ingest throughput, query latency, retention duration, row counts, database growth, and backup/restore with production-scale multi-domain data.
     - [x] Add an ignored benchmark for sustained real coordinator ingest with multi-domain rows/s and batch latency measurements.
     - [x] Add checkpointed offline backup/restore timing and size to the representative storage baseline.
     - [x] Batch ingest persistence so 10,000 checks × 3 domains sustain production ingest rates.
     - [x] Record the measured single-replica envelope and its linear retention projection in `SCALING.md`.
-    - [ ] Re-measure with live probe traffic, network replication, and concurrent query load during retention.
+    - [x] Re-measure with live probe traffic, network replication, and concurrent query load during retention (`tests/release_benchmark.rs`; 10,000 checks passed three consecutive runs at 785–1,577 results/s with read p95 3 ms).
   - [x] Define raw, minute-rollup, hourly-rollup, state-transition, WAL, and backup retention policy plus per-domain/per-replica capacity estimates.
   - [x] Decide when hourly aggregation, time partitioning, or a separate raw-observation store is required.
 
@@ -48,39 +48,50 @@ Prioritized action items from the production-readiness review. Existing items fr
   - [x] Compare alert and incident high-water information during reconciliation.
   - [x] Add bounded, cursor-based backfill for alerts, incidents, incident updates, and incident tombstones.
   - [x] Verify a peer recovers after missing an entire outage and recovery lifecycle.
-- [ ] Make transition replication idempotent across gossip and cluster replication.
-  - [ ] Carry the originating alert ID through gossip.
-  - [ ] Use the same content-aware upsert path for both replication mechanisms.
-  - [ ] Add race-order tests where gossip arrives before and after `/internal/replicate`.
-  - [ ] Decide whether the legacy gossip transition path can be removed in favor of one replication plane.
-- [ ] Ensure dead cluster members can rejoin without a process restart.
-  - [ ] Periodically retry dead members and configured seeds at a slower cadence.
-  - [ ] Test recovery after a two-node partition and a full multi-node network bisection.
-- [ ] Make each logical ingest/state transition transactional.
-  - [ ] Atomically persist raw results, agent beliefs, current state, state history, alerts, and incident changes where appropriate.
-  - [ ] Do not publish replication, WebSocket events, or notifications until the transaction commits.
-  - [ ] Add failure-injection tests for partial database errors and process interruption.
+- [x] Make transition replication idempotent across gossip and cluster replication.
+  - [x] Carry the originating alert ID through gossip.
+  - [x] Use the same content-aware upsert path for both replication mechanisms.
+  - [x] Add race-order tests where gossip arrives before and after `/internal/replicate`.
+  - [x] Retain the legacy gossip transport for configured non-membership peers and rolling upgrades; upgraded senders now carry the same alert identity on both paths.
+- [x] Ensure dead cluster members can rejoin without a process restart.
+  - [x] Periodically retry dead members and configured seeds at a slower cadence.
+  - [x] Test recovery after a two-node partition and a full multi-node network bisection.
+- [x] Make each logical ingest/state transition transactional.
+  - [x] Local ingest, replicated batches (including peer beliefs), and gossip transitions commit their storage changes together.
+  - [x] Ingest, replication, and gossip publish after commit; keep local ingest's in-memory tracker state unchanged on write failure.
+  - [x] Local ingest constraint-failure rollback/retry, replicated batch rollback, uncommitted-close/reopen, gossip write-failure, and process-interruption coverage.
 
 ### Release security and dependency hygiene
 
-- [ ] Upgrade frontend dependencies until `bun audit` is clean or every remaining advisory is explicitly accepted.
-  - [ ] Upgrade vulnerable Vite, Vitest, PostCSS, NanoID, esbuild, and related transitive packages.
-  - [ ] Rebuild and rerun all frontend tests after upgrades.
-- [ ] Add Rust dependency auditing to CI.
-  - [ ] Install and run `cargo-audit` or an equivalent advisory scanner.
-  - [ ] Fail release builds on unaccepted high/critical advisories.
-- [ ] Add explicit request-body limits.
-  - [ ] Set route-specific limits for result ingest, peer replication, config transfer, login, and admin JSON bodies.
-  - [ ] Add tests for oversized authenticated and unauthenticated requests.
-- [ ] Add production HTTP security headers.
-  - [ ] Add a Content Security Policy.
-  - [ ] Prevent framing with `frame-ancestors` and/or `X-Frame-Options`.
-  - [ ] Add `X-Content-Type-Options: nosniff` and a suitable referrer policy.
-- [ ] Make secure session-cookie behavior configurable for TLS deployments.
-  - [ ] Support the `Secure` cookie attribute without breaking intentional plain-HTTP LAN deployments.
-  - [ ] Do not trust forwarded-protocol headers unless the proxy is explicitly trusted.
+- [x] Upgrade frontend dependencies until `bun audit` is clean or every remaining advisory is explicitly accepted.
+  - [x] Upgrade vulnerable Vite, Vitest, PostCSS, NanoID, esbuild, and related transitive packages.
+  - [x] Rebuild and rerun all frontend tests after upgrades.
+- [x] Add Rust dependency auditing to CI.
+  - [x] Install and run `cargo-audit` or an equivalent advisory scanner.
+  - [x] Fail release builds on unaccepted high/critical advisories.
+- [x] Add explicit request-body limits.
+  - [x] Set route-specific limits for result ingest, peer replication, config transfer, login, and admin JSON bodies.
+  - [x] Add tests for oversized authenticated and unauthenticated requests.
+- [x] Add production HTTP security headers.
+  - [x] Add a Content Security Policy.
+  - [x] Prevent framing with `frame-ancestors` and/or `X-Frame-Options`.
+  - [x] Add `X-Content-Type-Options: nosniff` and a suitable referrer policy.
+- [x] Make secure session-cookie behavior configurable for TLS deployments.
+  - [x] Support the `Secure` cookie attribute without breaking intentional plain-HTTP LAN deployments.
+  - [x] Do not trust forwarded-protocol headers unless the proxy is explicitly trusted.
 
 ## P1 — Reliability and data integrity
+
+### Config-plane provisioning cost
+
+Measured during the passing 10,000-check gate; provisioning-time, not steady-state.
+
+- [ ] Batch `apply_config_entries` writes instead of one upsert per entry (up to ~4.6 s on the database worker per batch while provisioning 10,000 checks).
+- [ ] Page or project `config_entries` for peers; a full read of 10,000 check documents costs ~2.2 s on the worker.
+
+### Alert identity
+
+- [ ] Fix alert ids that name a different check on different nodes. Observed in the global Compose stack: id `01a08215-de63-…-1788912120134-down` is stored against check `01a08215-de63-…` on `coordinator-us-b`/`-us-c` and against check `018f0000-…` (`upstream`) on `coordinator-us-a`. Both nodes believe their own row, so `upsert_alert` reports a conflict, the alert stream never converges, and anti-entropy re-offers the same page every sweep. Likely the originating-alert-id pass-through combined with dependency/upstream incident joining; a conflicting alert is now skipped rather than failing the whole replication batch, which contains the damage but does not resolve it.
 
 ### Storage maintenance
 
@@ -132,6 +143,23 @@ Prioritized action items from the production-readiness review. Existing items fr
 - [ ] Consolidate duplicate initial session checks in `App.svelte`.
 - [ ] Show acknowledgement failures to the operator instead of only logging them to the console.
 - [ ] Add an `aria-live` announcement for important live status changes.
+- [ ] Make "Past Incidents" respect the status page's selected time window.
+  - [ ] Symptom: selecting `24h` still lists incidents from 11 days ago. The range switch
+        only drives the charts — `setDays()` in `App.svelte` calls `loadCharts()` and
+        nothing else, and `fetchIncidents()` sends only `?limit=`.
+  - [ ] Add a `since` (epoch ms) parameter to `IncidentQuery` in
+        `coordinator/routes/incidents.rs` and a bound to `Storage::list_incidents`, so the
+        window is applied in SQL rather than by shipping full history to the browser. The
+        global relay forwards the query string as-is, so it needs no change.
+  - [ ] Keep unresolved incidents visible regardless of `since`: the window bounds resolved
+        incidents only, so an ongoing outage older than the window is never hidden from the
+        status page.
+  - [ ] Refetch incidents from `setDays()`, and keep the admin console's list unwindowed —
+        `App.svelte` currently feeds one `incidents` array to both `IncidentsList` (admin)
+        and `PastIncidents` (public), so a windowed shared fetch would truncate the console
+        too.
+  - [ ] Cover it with a test that a resolved incident outside the window is absent while an
+        open one outside it is still returned.
 
 ### Status sub-pages
 
@@ -286,6 +314,9 @@ Follow-ups, deliberately not done here:
 ## Existing product issues
 
 - [ ] Convert global coordinator credentials to per-region credentials used to attach regional coordinators to the global coordinator.
+- [ ] Add a supported way to decommission a cluster member.
+  - [ ] Remove it from persistent membership and configured seeds on every node; stop retries and replication to it.
+  - [ ] Define and test how removal propagates without stale gossip or a returning node resurrecting membership.
 - [ ] Add a supported way to remove a region.
   - [ ] Define removal behavior for cached state, credentials, checks, incidents, and stale regional coordinators.
   - [ ] Propagate deletion safely and prevent a removed region from being resurrected by stale state.

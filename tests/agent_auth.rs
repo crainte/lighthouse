@@ -463,3 +463,30 @@ async fn a_zone_may_hold_several_credentials() {
         "revoking one credential must not take down the rest of the zone"
     );
 }
+
+/// The ingest route accepts batches bigger than the coordinator-wide 1 MiB
+/// default, but must still refuse anything over its own 16 MiB ceiling before
+/// either authentication or JSON parsing takes place.
+#[tokio::test]
+async fn oversized_result_ingest_is_rejected_for_authenticated_and_anonymous_callers() {
+    let addr = serve(coordinator(None).await).await;
+    let base = format!("http://{addr}");
+    let session = login(&base).await;
+    let token = mint(&base, &session, "eu-west-1a", "eu-west").await;
+    let oversized = vec![b'x'; 16 * 1024 * 1024 + 1];
+
+    for credential in [Some(token.as_str()), None] {
+        let mut request = reqwest::Client::new()
+            .post(format!("{base}/api/v1/results"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        if let Some(credential) = credential {
+            request = request.bearer_auth(credential);
+        }
+        let response = request.body(oversized.clone()).send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+            "the route limit must reject an oversized ingest before auth distinguishes callers"
+        );
+    }
+}

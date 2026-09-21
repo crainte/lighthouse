@@ -209,6 +209,120 @@ async fn a_transition_reaches_the_peer_without_paging_twice() {
     );
 }
 
+async fn post_peer(addr: SocketAddr, path: &str, body: &Value) {
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}{path}"))
+        .bearer_auth(PEER_TOKEN)
+        .json(body)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{path} rejected: {}",
+        response.status()
+    );
+}
+
+#[tokio::test]
+async fn gossip_and_batch_replication_are_idempotent_in_either_order() {
+    let (_sink, sink_addr) = alert_sink().await;
+    let alert_id = Uuid::now_v7().to_string();
+    let gossip = serde_json::json!({
+        "alert_id": alert_id,
+        "check_id": cid(CHECK),
+        "from": "up",
+        "to": "down",
+        "timestamp": 2_000,
+    });
+    let batch = serde_json::json!({
+        "origin": "observer",
+        "alerts": [{
+            "id": alert_id,
+            "scope": "check",
+            "node_id": cid(CHECK).to_string(),
+            "previous_state": "up",
+            "current_state": "down",
+            "timestamp": 2_000,
+            "incident_id": null,
+        }],
+    });
+
+    for paths in [
+        ["/internal/gossip", "/internal/replicate"],
+        ["/internal/replicate", "/internal/gossip"],
+    ] {
+        let coord = coordinator(sink_addr, vec![]).await;
+        let addr = serve(coord.router()).await;
+        for path in paths {
+            post_peer(
+                addr,
+                path,
+                if path.ends_with("gossip") {
+                    &gossip
+                } else {
+                    &batch
+                },
+            )
+            .await;
+        }
+
+        let alerts = get_json(&format!("http://{addr}/api/v1/alerts")).await;
+        assert_eq!(alerts["alerts"].as_array().unwrap().len(), 1);
+        assert_eq!(alerts["alerts"][0]["id"], alert_id);
+        assert_eq!(peer_status(addr).await, "down");
+    }
+}
+
+#[tokio::test]
+async fn replication_failure_rolls_back_alerts_results_and_beliefs() {
+    let (_sink, sink_addr) = alert_sink().await;
+    let coord = coordinator(sink_addr, vec![]).await;
+    let addr = serve(coord.router()).await;
+    let batch = serde_json::json!({
+        "origin": "observer",
+        "results": [{"result": result(500, 2_000), "status": "down"}],
+        "alerts": [{
+            "id": Uuid::now_v7().to_string(),
+            "scope": "check",
+            "node_id": cid(CHECK).to_string(),
+            "previous_state": "up",
+            "current_state": "down",
+            "timestamp": 2_000,
+        }, {
+            "id": Uuid::now_v7().to_string(),
+            "scope": "check",
+            "node_id": "invalid-check-id",
+            "previous_state": "up",
+            "current_state": "down",
+            "timestamp": 2_000,
+        }],
+        "beliefs": [{
+            "check_id": cid(CHECK), "agent_id": "peer-agent", "zone": "z",
+            "region": "r", "status": "down", "consecutive_failures": 1,
+            "last_check": 2_000,
+        }],
+    });
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/internal/replicate"))
+        .bearer_auth(PEER_TOKEN)
+        .json(&batch)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(
+        get_json(&format!("http://{addr}/api/v1/alerts")).await["alerts"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_ne!(peer_status(addr).await, "down");
+}
+
 #[tokio::test]
 async fn gossip_is_not_anonymously_writable() {
     let (_sink, addr_sink) = alert_sink().await;

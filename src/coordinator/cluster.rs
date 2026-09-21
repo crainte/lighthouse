@@ -22,6 +22,7 @@
 //! likely node to want to page is the one that just went quiet. A `warn!` on
 //! state change is what this module owns.
 
+use futures_util::{stream, StreamExt};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -32,6 +33,13 @@ use tracing::warn;
 /// A peer that accepts the connection and never answers would otherwise hold a
 /// spawned task forever, one per ping. Matches `gossip::GOSSIP_TIMEOUT`.
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The data plane's budget. A replication or config batch is applied inside one
+/// transaction on the receiver, behind its `state_write` and its single
+/// database worker, so it cannot share the control plane's ping budget: five
+/// seconds abandons work the peer is still committing, counts a success as a
+/// failure, and hands anti-entropy a repair for data that arrived anyway.
+const DATA_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Liveness as this node currently believes it, one member at a time.
 ///
@@ -143,9 +151,8 @@ pub struct Cluster {
     generation: i64,
     members: RwLock<HashMap<String, Member>>,
     links: RwLock<HashMap<(String, String), LinkObservation>>,
-    /// Contacted whenever we have no member entry for them yet — the only way
-    /// a completely fresh node, with nothing persisted, ever hears from the
-    /// rest of the cluster for the first time.
+    /// Bootstrap addresses retried even after a member learned through them dies,
+    /// so a changed address or a healed partition can restore contact.
     seeds: Vec<String>,
     client: reqwest::Client,
     /// Peers authenticate as agents do; see `CoordinatorConfig::resolved_peer_token`.
@@ -324,71 +331,96 @@ impl Cluster {
         }
     }
 
-    /// Ping every known non-dead member, plus any seed we have no member
-    /// entry for yet — the bootstrap path for a node that persisted nothing.
-    /// Each response is merged as it arrives; failures are logged and
-    /// abandoned, since this runs off a timer with nobody to report to.
+    /// Ping live and suspect members on the normal heartbeat cadence.
     pub async fn ping_all(&self, now_millis: i64) {
-        let targets: Vec<(String, Option<String>)> = {
+        let targets = self
+            .members
+            .read()
+            .values()
+            .filter(|m| m.state != MemberState::Dead)
+            .map(|m| (m.url.clone(), Some(m.node_id.clone())))
+            .collect();
+        self.ping_targets(targets, now_millis).await;
+    }
+
+    /// Retry dead members and seeds less often than the normal heartbeat. A
+    /// seed may now point to a different member, so keep trying its address
+    /// even if the old member has moved or died.
+    pub async fn retry_discovery(&self, now_millis: i64) {
+        let targets = {
             let guard = self.members.read();
-            let known: Vec<(String, Option<String>)> = guard
+            let mut targets: HashMap<String, Option<String>> = guard
                 .values()
-                .filter(|m| m.state != MemberState::Dead)
+                .filter(|m| m.state == MemberState::Dead)
                 .map(|m| (m.url.clone(), Some(m.node_id.clone())))
                 .collect();
-            let unknown_seeds = self
-                .seeds
-                .iter()
-                .filter(|s| !guard.values().any(|m| &m.url == *s) && s.as_str() != self.self_url)
-                .cloned()
-                .map(|url| (url, None));
-            known.into_iter().chain(unknown_seeds).collect()
+            for seed in &self.seeds {
+                if seed.trim_end_matches('/') != self.self_url.trim_end_matches('/')
+                    && !guard.values().any(|m| {
+                        m.state != MemberState::Dead
+                            && m.url.trim_end_matches('/') == seed.trim_end_matches('/')
+                    })
+                {
+                    targets.entry(seed.clone()).or_insert(None);
+                }
+            }
+            targets.into_iter().collect()
         };
+        self.ping_targets(targets, now_millis).await;
+    }
 
+    async fn ping_targets(&self, targets: Vec<(String, Option<String>)>, now_millis: i64) {
         let body = self.ping_body(now_millis);
-        for (peer, known_id) in targets {
-            let url = Self::endpoint(&peer, "internal/cluster/ping");
-            let mut req = self.client.post(&url).json(&body);
-            if let Some(t) = &self.token {
-                req = req.bearer_auth(t);
-            }
-            match tokio::time::timeout(PING_TIMEOUT, req.send()).await {
-                Ok(Ok(r)) if r.status().is_success() => match r.json::<PingBody>().await {
-                    Ok(reply) => {
-                        self.observe_link(
-                            reply.node_id.clone(),
-                            now_millis,
-                            LinkOutcome::Connected,
-                        );
-                        self.merge(&reply, now_millis);
+        stream::iter(targets)
+            .for_each_concurrent(32, |(peer, known_id)| {
+                let body = &body;
+                async move {
+                    let url = Self::endpoint(&peer, "internal/cluster/ping");
+                    let mut req = self.client.post(&url).json(body);
+                    if let Some(t) = &self.token {
+                        req = req.bearer_auth(t);
                     }
-                    Err(e) => {
-                        if let Some(target) = known_id.clone() {
-                            self.observe_link(target, now_millis, LinkOutcome::Failed);
+                    match tokio::time::timeout(PING_TIMEOUT, async {
+                        let response = req.send().await?;
+                        let status = response.status();
+                        if !status.is_success() {
+                            return Ok(Err(status));
                         }
-                        warn!(%peer, error = %e, "cluster ping reply unreadable");
+                        response.json::<PingBody>().await.map(Ok)
+                    })
+                    .await
+                    {
+                        Ok(Ok(Ok(reply))) => {
+                            let received_at = chrono::Utc::now().timestamp_millis();
+                            self.observe_link(
+                                reply.node_id.clone(),
+                                received_at,
+                                LinkOutcome::Connected,
+                            );
+                            self.merge(&reply, received_at);
+                        }
+                        Ok(Ok(Err(status))) => {
+                            if let Some(target) = known_id.clone() {
+                                self.observe_link(target, now_millis, LinkOutcome::Failed);
+                            }
+                            warn!(%peer, %status, "cluster ping rejected");
+                        }
+                        Ok(Err(e)) => {
+                            if let Some(target) = known_id.clone() {
+                                self.observe_link(target, now_millis, LinkOutcome::Failed);
+                            }
+                            warn!(%peer, error = %e, "cluster ping failed");
+                        }
+                        Err(_) => {
+                            if let Some(target) = known_id {
+                                self.observe_link(target, now_millis, LinkOutcome::Failed);
+                            }
+                            warn!(%peer, "cluster ping timed out");
+                        }
                     }
-                },
-                Ok(Ok(r)) => {
-                    if let Some(target) = known_id.clone() {
-                        self.observe_link(target, now_millis, LinkOutcome::Failed);
-                    }
-                    warn!(%peer, status = %r.status(), "cluster ping rejected");
                 }
-                Ok(Err(e)) => {
-                    if let Some(target) = known_id.clone() {
-                        self.observe_link(target, now_millis, LinkOutcome::Failed);
-                    }
-                    warn!(%peer, error = %e, "cluster ping failed");
-                }
-                Err(_) => {
-                    if let Some(target) = known_id {
-                        self.observe_link(target, now_millis, LinkOutcome::Failed);
-                    }
-                    warn!(%peer, "cluster ping timed out");
-                }
-            }
-        }
+            })
+            .await;
     }
 
     /// Advance liveness by elapsed silence: `Alive` -> `Suspect` past one
@@ -453,13 +485,16 @@ impl Cluster {
     /// POST a JSON body to one peer at `path`, returning whether it accepted.
     /// General on purpose: later replication and config-propagation slices
     /// reuse this rather than each rolling their own client call.
+    ///
+    /// Runs on `DATA_TIMEOUT`, not the ping budget: every caller here posts a
+    /// batch the peer has to commit before it can answer.
     pub async fn post_json<T: Serialize>(&self, peer: &str, path: &str, body: &T) -> bool {
         let url = Self::endpoint(peer, path);
         let mut req = self.client.post(&url).json(body);
         if let Some(t) = &self.token {
             req = req.bearer_auth(t);
         }
-        match tokio::time::timeout(PING_TIMEOUT, req.send()).await {
+        match tokio::time::timeout(DATA_TIMEOUT, req.send()).await {
             Ok(Ok(r)) if r.status().is_success() => true,
             Ok(Ok(r)) => {
                 warn!(%peer, %path, status = %r.status(), "peer rejected");
@@ -498,7 +533,7 @@ pub fn spawn_heartbeat(cluster: Arc<Cluster>, interval_secs: u64) {
             tick.tick().await;
             let now = chrono::Utc::now().timestamp_millis();
             cluster.ping_all(now).await;
-            cluster.sweep(now);
+            cluster.sweep(chrono::Utc::now().timestamp_millis());
         }
     });
 }
@@ -523,6 +558,96 @@ mod tests {
 
     fn cluster(id: &str, url: &str, generation: i64) -> Cluster {
         Cluster::new(id, url, generation, vec![], None, 15)
+    }
+
+    #[tokio::test]
+    async fn partitions_heal_without_restarting_members() {
+        use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        for count in [2, 4] {
+            let split = Arc::new(AtomicBool::new(false));
+            let mut listeners = Vec::new();
+            for _ in 0..count {
+                listeners.push(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+            }
+            let urls: Vec<String> = listeners
+                .iter()
+                .map(|listener| format!("http://{}", listener.local_addr().unwrap()))
+                .collect();
+            let mut nodes = Vec::new();
+            for (i, listener) in listeners.into_iter().enumerate() {
+                let seeds = if i == 0 {
+                    vec![]
+                } else {
+                    vec![urls[i - 1].clone()]
+                };
+                let node = Arc::new(Cluster::new(i.to_string(), &urls[i], 1, seeds, None, 1));
+                let gate = split.clone();
+                let app =
+                    Router::new()
+                        .route(
+                            "/internal/cluster/ping",
+                            post(
+                                move |State(node): State<Arc<Cluster>>,
+                                      Json(body): Json<PingBody>| async move {
+                                    let from: usize = body.node_id.parse().unwrap();
+                                    if gate.load(Ordering::Relaxed)
+                                        && (from < count / 2) != (i < count / 2)
+                                    {
+                                        return Err(StatusCode::SERVICE_UNAVAILABLE);
+                                    }
+                                    Ok(Json(
+                                        node.handle_ping(
+                                            &body,
+                                            chrono::Utc::now().timestamp_millis(),
+                                        ),
+                                    ))
+                                },
+                            ),
+                        )
+                        .with_state(node.clone());
+                tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                nodes.push(node);
+            }
+            for _ in 0..count + 2 {
+                for node in &nodes {
+                    node.retry_discovery(chrono::Utc::now().timestamp_millis())
+                        .await;
+                    node.ping_all(chrono::Utc::now().timestamp_millis()).await;
+                }
+            }
+            assert!(nodes.iter().all(|node| node.snapshot().len() == count - 1));
+
+            split.store(true, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(2100)).await;
+            for node in &nodes {
+                node.ping_all(chrono::Utc::now().timestamp_millis()).await;
+            }
+            for node in &nodes {
+                node.sweep(chrono::Utc::now().timestamp_millis());
+                node.sweep(chrono::Utc::now().timestamp_millis());
+                assert_eq!(
+                    node.snapshot()
+                        .iter()
+                        .filter(|m| m.state == MemberState::Dead)
+                        .count(),
+                    count / 2
+                );
+            }
+            split.store(false, Ordering::Relaxed);
+            for node in &nodes {
+                node.retry_discovery(chrono::Utc::now().timestamp_millis())
+                    .await;
+            }
+            for node in &nodes {
+                node.ping_all(chrono::Utc::now().timestamp_millis()).await;
+                assert!(node
+                    .snapshot()
+                    .iter()
+                    .all(|m| m.state == MemberState::Alive));
+            }
+        }
     }
 
     // -- transitive discovery --

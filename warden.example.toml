@@ -13,6 +13,9 @@
 [agent]
 agent_id = "local-01"
 flush_secs = 5
+# Concurrent probes per agent (default 128). Must be positive; raise it for
+# larger agents when their socket, CPU, and network budgets allow.
+max_in_flight_probes = 128
 # Ignored in standalone. In agent mode this is where results are posted and
 # work is polled for. One URL, or a list for failover across the coordinators
 # of a region — they are interchangeable for an agent, since config and
@@ -85,6 +88,10 @@ degraded_is_downtime = false
 # mode.
 #
 # admin_password = "change-me"
+# Set only when clients reach this server through HTTPS (including a TLS
+# terminator you trust). Warden never trusts Forwarded/X-Forwarded-Proto from a
+# request to decide this, because clients can forge those headers.
+# secure_cookies = true
 
 # Regional clustering. Irrelevant to a standalone install — `peers` empty (the
 # default) is what makes it standalone — so everything below is commented out.

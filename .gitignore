@@ -6,3 +6,6 @@
 # Local tooling caches, not project state.
 /.rtk
 /.vite
+
+# Vitest JSON reporter output, written by the frontend test gate.
+/frontend/.vitest

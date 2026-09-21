@@ -886,3 +886,45 @@ async fn an_anti_entropy_pull_does_not_overwrite_a_newer_local_edit() {
         "a pulled entry with an older HLC must lose to the newer local edit"
     );
 }
+
+/// Replication carries result history and gets 32 MiB; config transfers carry
+/// documents and get 8 MiB. Both must override the coordinator-wide 1 MiB
+/// default while still rejecting the byte immediately above their own ceiling.
+#[tokio::test]
+async fn peer_replication_and_config_transfer_enforce_their_route_specific_limits() {
+    let node = spawn_node("limits", vec![], vec![]).await;
+
+    for (path, limit) in [
+        ("/internal/replicate", 32 * 1024 * 1024),
+        ("/internal/config", 8 * 1024 * 1024),
+    ] {
+        let client = reqwest::Client::new();
+        let within_route_limit = client
+            .post(format!("http://{}{path}", node.addr))
+            .bearer_auth(PEER_TOKEN)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(vec![b'x'; 1024 * 1024 + 1])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            within_route_limit.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{path} must pass bodies above the global limit to its handler"
+        );
+
+        let oversized = client
+            .post(format!("http://{}{path}", node.addr))
+            .bearer_auth(PEER_TOKEN)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(vec![b'x'; limit + 1])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            oversized.status(),
+            reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+            "{path} must enforce its dedicated {limit}-byte limit"
+        );
+    }
+}

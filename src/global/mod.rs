@@ -60,6 +60,7 @@ struct Inner {
     /// credential the global node presents *back* to a region as a `Bearer` to
     /// relay admin operations an operator drives from the global dashboard.
     token: Option<String>,
+    secure_cookies: bool,
     /// Client for proxying drill-down reads and admin writes to regions.
     client: reqwest::Client,
     /// Fan-out for dashboard WebSocket clients. A `state_change` is published
@@ -89,6 +90,7 @@ impl GlobalNode {
                 alerter: GlobalAlerter::new(cfg.notifiers.clone()),
                 auth,
                 token: cfg.resolved_token(),
+                secure_cookies: cfg.secure_cookies,
                 client: reqwest::Client::new(),
                 events,
             }),
@@ -111,7 +113,10 @@ impl GlobalNode {
             .route("/api/v1/agents", get(agents_handler))
             // Auth: same contract as the coordinator so the SPA's login flow
             // works unchanged. `session` also carries a `mode` marker.
-            .route("/api/v1/login", post(login_handler))
+            .route(
+                "/api/v1/login",
+                post(login_handler).layer(DefaultBodyLimit::max(16 * 1024)),
+            )
             .route("/api/v1/logout", post(logout_handler))
             .route("/api/v1/session", get(session_handler))
             // Live dashboard socket. The global node has no incident engine, so
@@ -130,6 +135,8 @@ impl GlobalNode {
             // out to every region so the fleet stays uniform. `any` so writes,
             // not just GETs, reach the relay.
             .fallback(any(relay_handler))
+            .layer(DefaultBodyLimit::max(1024 * 1024))
+            .layer(axum::middleware::from_fn(crate::security::security_headers))
             .with_state(self)
     }
 }
@@ -633,11 +640,17 @@ async fn login_handler(
     let now = chrono::Utc::now().timestamp_millis();
     match node.inner.auth.login(&body.password, peer.ip(), now) {
         Ok(token) => {
+            let secure = if node.inner.secure_cookies {
+                "; Secure"
+            } else {
+                ""
+            };
             let cookie = format!(
-                "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+                "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
                 crate::auth::GLOBAL_SESSION_COOKIE,
                 token,
-                12 * 60 * 60
+                12 * 60 * 60,
+                secure,
             );
             (
                 StatusCode::OK,
@@ -666,9 +679,15 @@ async fn logout_handler(State(node): State<GlobalNode>, headers: HeaderMap) -> R
     if let Some(token) = session_token(&headers) {
         node.inner.auth.logout(token);
     }
+    let secure = if node.inner.secure_cookies {
+        "; Secure"
+    } else {
+        ""
+    };
     let cleared = format!(
-        "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
-        crate::auth::GLOBAL_SESSION_COOKIE
+        "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
+        crate::auth::GLOBAL_SESSION_COOKIE,
+        secure,
     );
     (
         StatusCode::OK,

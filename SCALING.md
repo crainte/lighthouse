@@ -407,11 +407,70 @@ transient checkpoint/prune space. Daily retention removes roughly one day of raw
 at three domains that is ~86M rows per run, measured at 23.5 s, which is why monolithic
 deletes remain acceptable at this scale and time partitioning is not yet required.
 
-Still unmeasured, and therefore outside any support claim: a full 30-day dataset,
-live probe traffic, network replication and peer catch-up, concurrent query load during
-retention, and online backup. The backup step copies a closed, checkpointed file and
-reported ~0 ms here because the filesystem performed a copy-on-write clone; treat
-backup duration as unmeasured on filesystems without reflink support.
+An isolated release-mode benchmark (`tests/release_benchmark.rs`) exercises actual HTTP
+probes, three coordinator peers, global state, online retention of an expired sentinel,
+and concurrent status/history/latency requests on fresh temporary databases.
+
+The 10,000-check gate **passes** as of 2026-09-21, in a container with a 65,536
+file-descriptor limit, 2,048 concurrent probes per agent, a 30-second cadence and
+anti-entropy enabled. Three consecutive runs converged three peers and the global
+node, and pruned the retention sentinel, in 43–63 s:
+
+| Run | Ingested results/s | Concurrent reads/s | Read p50 / p95 | Wall clock |
+|---|---:|---:|---:|---:|
+| 1 | 785 | 646 | 1 / 3 ms | 63 s |
+| 2 | 1,577 | 640 | 1 / 3 ms | 43 s |
+| 3 | 1,147 | 704 | 0 / 3 ms | 60 s |
+
+Getting there took four changes, each measured rather than assumed. Per-call-site
+slow-job attribution (`Database::call` is `#[track_caller]`, and jobs over 250 ms log
+their submitting line) is what identified them:
+
+1. **One in-flight replication request per peer, coalescing behind it**
+   (`src/coordinator/replication_out.rs`). Ingest used to spawn a post per batch per
+   peer, so a busy node aimed an unbounded number of concurrent `/internal/replicate`
+   requests at one receiver, all contending for its single `state_write` and database
+   worker. Backpressure is now coalescing: while a post is in flight, everything
+   produced for that peer folds into one batch.
+2. **A data-plane request budget of 30 s, separate from the 5-second ping budget.**
+   Abandoning a replication post at five seconds discarded work the peer was still
+   committing and handed anti-entropy a repair for data that had arrived anyway.
+3. **Set-based replicated result insertion.** Dedup was a correlated `WHERE NOT EXISTS`
+   per row plus per-row watermark and latest-result maintenance; it now stages the batch
+   and does one anti-join, one watermark merge, and one latest-result merge.
+4. **Set-based replicated belief merge and bulk config stamp loading.** Per-row
+   `agent_check_state` upserts and two point lookups per config entry were the remaining
+   multi-second holds on the database worker.
+
+Before those changes a 3,000-check run failed to converge with replication applies
+holding the single database worker for up to 26 s; after them, the same shape passed
+at 403 results/s, and 10,000 checks passed at 785–1,577 results/s.
+
+Run the benchmark from a release build with a file-descriptor limit of at least 65,536
+(the shell default of 1,024/4,096 causes `EMFILE`, including on DuckDB WAL files):
+
+```
+docker run --rm --ulimit nofile=65536:65536 \
+  -v "$PWD/target/release/deps/release_benchmark-<hash>:/bench:ro" \
+  -e WARDEN_BENCH_CHECKS=10000 -e WARDEN_BENCH_SECS=120 \
+  -e WARDEN_BENCH_MAX_IN_FLIGHT_PROBES=2048 -e WARDEN_BENCH_MAX_DISK_MB=4096 \
+  ubuntu:25.10 /bench --ignored --nocapture --test-threads 1
+```
+
+Do not use the existing global Compose volumes for this test.
+
+The remaining measured stall is the config plane, not the data plane: applying a bulk
+config push still costs one upsert per entry and holds the worker for up to ~4.6 s per
+batch while provisioning 10,000 checks, and a peer's full `config_entries` read costs
+~2.2 s at that cardinality. Both are provisioning-time, not steady-state, so they are
+tracked as follow-up work rather than as part of this gate.
+
+Still unmeasured, and therefore outside a full 10,000-check support claim:
+representative multi-protocol targets, three and five observation domains, 30-day
+retained data alongside live traffic, an hour-long peer outage/catch-up, and online
+backup. The offline backup step copies a closed, checkpointed file and reported ~0 ms
+because the filesystem performed a copy-on-write clone; treat backup duration as
+unmeasured on filesystems without reflink support.
 
 ### Read path: the status page is not the status endpoint
 
@@ -465,9 +524,9 @@ mechanism that decides zone and region state, via `section_rollups` in
 answers to "when is this amber rather than red". The browser never folds a section state
 itself — `frontend/src/lib/rollup.ts` mirrors the fold only to preview an unsaved policy.
 
-Neither change is captured by the existing
-`benchmark_status_and_global_push_production_cardinality`, which exercises the endpoint.
-A page-load benchmark is required before any read-path claim.
+The ignored `benchmark_status_and_global_push_production_cardinality` now measures the
+three concurrent requests made by a full page load — status, uptime strips, and latency
+points — and validates that both chart responses contain every configured check.
 
 ### Current single-table capacity baseline
 
@@ -526,10 +585,12 @@ WARDEN_BENCH_CHECKS=10000 WARDEN_BENCH_REGIONS=3 WARDEN_BENCH_SAMPLES=20 \
 rtk cargo test benchmark_status_and_global_push_production_cardinality -- --ignored --nocapture
 ```
 
-It reports regional/global status p95 and response bytes, plus global-push p95 and
-payload bytes. Optional `WARDEN_BENCH_MAX_REGIONAL_STATUS_P95_MS`,
-`WARDEN_BENCH_MAX_GLOBAL_PUSH_P95_MS`, `WARDEN_BENCH_MAX_GLOBAL_STATUS_P95_MS`, and
-`WARDEN_BENCH_MAX_PUSH_BYTES` variables enforce local acceptance ceilings. The global
+It reports regional/global status p95 and response bytes, full status-page p95 and bytes,
+plus global-push p95 and payload bytes. Optional
+`WARDEN_BENCH_MAX_REGIONAL_STATUS_P95_MS`, `WARDEN_BENCH_MAX_STATUS_PAGE_P95_MS`,
+`WARDEN_BENCH_MAX_STATUS_PAGE_BYTES`, `WARDEN_BENCH_MAX_GLOBAL_PUSH_P95_MS`,
+`WARDEN_BENCH_MAX_GLOBAL_STATUS_P95_MS`, and `WARDEN_BENCH_MAX_PUSH_BYTES` variables
+enforce local acceptance ceilings. The global
 push route has an explicit 16 MiB limit so supported 10,000-check snapshots are not
 rejected by Axum's 2 MiB default. This validates cardinality, not sustained concurrent
 load or the full production capacity envelope.

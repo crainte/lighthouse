@@ -80,6 +80,7 @@ async fn main() -> Result<()> {
 /// Standalone: agent produces results into an in-process channel that
 /// the coordinator drains directly — no HTTP hop.
 async fn run_standalone(mut cfg: Config) -> Result<()> {
+    cfg.agent.validate()?;
     cfg.coordinator.validate_cluster()?;
     let coord = Coordinator::new(&cfg.coordinator).await?;
     let (tx, mut rx) = mpsc::channel(1024);
@@ -114,6 +115,7 @@ async fn run_standalone(mut cfg: Config) -> Result<()> {
 }
 
 async fn run_agent(cfg: Config) -> Result<()> {
+    cfg.agent.validate()?;
     let (tx, rx) = mpsc::channel(1024);
     tokio::spawn(agent::sync_loop(cfg.agent.clone(), tx, Vec::new()));
     agent::poster_loop(cfg.agent, rx).await;

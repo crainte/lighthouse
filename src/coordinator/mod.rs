@@ -4,6 +4,7 @@ mod database;
 mod fleet;
 pub mod gossip;
 pub mod hlc;
+mod replication_out;
 mod routes;
 pub mod state;
 pub mod storage;
@@ -14,7 +15,7 @@ use crate::models::{eval, CheckKind, CheckResult, NodeState, Status};
 use crate::rollup::{rollup, RollupPolicy};
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -43,11 +44,11 @@ use routes::peer::{
     alerts_backfill_handler, backfill_handler, cluster_ping_handler, cluster_view_handler,
     config_entries_handler, config_handler, digest_handler, gossip_handler,
     incident_tombstones_backfill_handler, incidents_backfill_handler,
-    read_config_entry_for_replication, replicate_handler, ConfigBatch,
+    read_config_entry_for_replication, replicate_handler, results_backfill_handler, ConfigBatch,
 };
 pub use routes::peer::{
     CheckDigestDto, ConfigDigestDto, DigestResponse, ReplicatedAlert, ReplicatedBelief,
-    ReplicatedResult, ReplicationBatch,
+    ReplicatedResult, ReplicationBatch, StreamDigestDto,
 };
 use routes::policies::{
     delete_rollup_policy_handler, list_rollup_policies_handler, region_tree_handler,
@@ -68,10 +69,85 @@ use routes::settings::{
 };
 use serde::Serialize;
 use state::StateTracker;
-use std::sync::Arc;
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 use storage::Storage;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
+
+/// Stay well below `/internal/config`'s 8 MiB body limit so JSON framing and a
+/// future field cannot turn a bulk edit into a rejected replication request.
+const MAX_CONFIG_BATCH_BYTES: usize = 6 * 1024 * 1024;
+const CONFIG_APPLY_CHUNK: usize = 1_000;
+const TIMING_REPORT_EVERY: u64 = 128;
+
+#[derive(Default)]
+struct TimingCounter {
+    count: AtomicU64,
+    total_us: AtomicU64,
+    max_us: AtomicU64,
+}
+
+impl TimingCounter {
+    fn observe(
+        &self,
+        component: &'static str,
+        operation: &'static str,
+        elapsed: std::time::Duration,
+    ) {
+        let micros = elapsed.as_micros().min(u64::MAX as u128) as u64;
+        self.total_us.fetch_add(micros, Ordering::Relaxed);
+        self.max_us.fetch_max(micros, Ordering::Relaxed);
+        let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        if count.is_multiple_of(TIMING_REPORT_EVERY) {
+            tracing::info!(
+                target: "warden_bench",
+                component,
+                operation,
+                samples = count,
+                total_us = self.total_us.load(Ordering::Relaxed),
+                max_us = self.max_us.load(Ordering::Relaxed),
+                "aggregated timing"
+            );
+        }
+    }
+}
+
+struct Timings {
+    enabled: bool,
+    local_state_wait: TimingCounter,
+    local_state_hold: TimingCounter,
+    replicated_state_wait: TimingCounter,
+    replicated_state_hold: TimingCounter,
+    anti_entropy_page: TimingCounter,
+    broadcast_network: TimingCounter,
+    broadcast_failures: TimingCounter,
+    /// How long a coalesced batch waited behind the peer's in-flight request.
+    broadcast_queue_wait: TimingCounter,
+}
+
+impl Timings {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var_os("WARDEN_BENCH_TIMINGS").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+                || std::env::var("RUST_LOG").is_ok_and(|filter| filter.contains("warden_bench")),
+            local_state_wait: TimingCounter::default(),
+            local_state_hold: TimingCounter::default(),
+            replicated_state_wait: TimingCounter::default(),
+            replicated_state_hold: TimingCounter::default(),
+            anti_entropy_page: TimingCounter::default(),
+            broadcast_network: TimingCounter::default(),
+            broadcast_failures: TimingCounter::default(),
+            broadcast_queue_wait: TimingCounter::default(),
+        }
+    }
+}
 
 /// A live event broadcast to WebSocket clients. Two families: plain state
 /// changes (matching the persisted alert shape) and incident lifecycle events,
@@ -255,6 +331,39 @@ fn format_duration(ms: i64) -> String {
     }
 }
 
+/// Derive the in-memory fields consumers need from one persisted check.
+fn check_meta(c: &CheckConfig, defaults: crate::config::RollupDefaults) -> CheckMeta {
+    CheckMeta {
+        name: c.name.clone(),
+        kind: c.kind,
+        group: c.group.clone(),
+        latency_graph: c.latency_graph,
+        expect_status: c.expect.status,
+        cron: c.cron.clone(),
+        visible: c.visible,
+        eval: c.eval.clone(),
+        position: c.position,
+        failures_before_down: c.failures_before_down,
+        enabled: c.enabled,
+        notify: c.notify,
+        notifiers: c.notifiers.clone(),
+        agents: c.agents.clone(),
+        depends_on: c.depends_on.clone(),
+        default_status: match c.default_status {
+            crate::config::DefaultStatus::Up => Status::Up,
+            crate::config::DefaultStatus::Down => Status::Down,
+            crate::config::DefaultStatus::Unknown => Status::Unknown,
+        },
+        rollup: c.rollup,
+        min_incident_secs: c.min_incident_secs.unwrap_or(defaults.min_incident_secs),
+        min_recovery_secs: c.min_recovery_secs.unwrap_or(defaults.min_recovery_secs),
+        notify_degraded: c.notify_degraded.unwrap_or(defaults.notify_degraded),
+        degraded_is_downtime: c
+            .degraded_is_downtime
+            .unwrap_or(defaults.degraded_is_downtime),
+    }
+}
+
 /// Index config rows by check id for the lookups ingest and the status page do.
 fn meta_by_id(
     checks: &[CheckConfig],
@@ -262,40 +371,7 @@ fn meta_by_id(
 ) -> std::collections::HashMap<crate::models::CheckId, CheckMeta> {
     checks
         .iter()
-        .map(|c| {
-            (
-                c.id,
-                CheckMeta {
-                    name: c.name.clone(),
-                    kind: c.kind,
-                    group: c.group.clone(),
-                    latency_graph: c.latency_graph,
-                    expect_status: c.expect.status,
-                    cron: c.cron.clone(),
-                    visible: c.visible,
-                    eval: c.eval.clone(),
-                    position: c.position,
-                    failures_before_down: c.failures_before_down,
-                    enabled: c.enabled,
-                    notify: c.notify,
-                    notifiers: c.notifiers.clone(),
-                    agents: c.agents.clone(),
-                    depends_on: c.depends_on.clone(),
-                    default_status: match c.default_status {
-                        crate::config::DefaultStatus::Up => Status::Up,
-                        crate::config::DefaultStatus::Down => Status::Down,
-                        crate::config::DefaultStatus::Unknown => Status::Unknown,
-                    },
-                    rollup: c.rollup,
-                    min_incident_secs: c.min_incident_secs.unwrap_or(defaults.min_incident_secs),
-                    min_recovery_secs: c.min_recovery_secs.unwrap_or(defaults.min_recovery_secs),
-                    notify_degraded: c.notify_degraded.unwrap_or(defaults.notify_degraded),
-                    degraded_is_downtime: c
-                        .degraded_is_downtime
-                        .unwrap_or(defaults.degraded_is_downtime),
-                },
-            )
-        })
+        .map(|check| (check.id, check_meta(check, defaults)))
         .collect()
 }
 
@@ -358,9 +434,96 @@ struct StartupData {
     rollup_policies: Vec<storage::RollupPolicyRow>,
 }
 
+#[derive(Default)]
+struct RepairCursors {
+    /// Cursors are meaningful only for the peer that produced them. Switching
+    /// peers restarts from the beginning: a cursor into one peer's ordered
+    /// history can skip rows unique to another peer.
+    peer: Option<String>,
+    results: Option<(i64, String, String)>,
+    alerts: Option<(i64, String)>,
+    incidents: Option<(i64, String)>,
+    incident_tombstones: Option<(i64, String)>,
+    /// Digest observed when the cursors were last used. Retention can make a
+    /// cursor point past a peer's new history, so a lower snapshot restarts it.
+    checks_snapshot: Vec<CheckDigestDto>,
+    alerts_snapshot: Option<(i64, String, i64)>,
+    incidents_snapshot: Option<(i64, String, i64)>,
+    tombstones_snapshot: Option<(i64, String, i64)>,
+}
+
+impl RepairCursors {
+    fn for_peer(&mut self, peer: &str) {
+        if self.peer.as_deref() != Some(peer) {
+            *self = Self {
+                peer: Some(peer.to_string()),
+                ..Self::default()
+            };
+        }
+    }
+
+    fn in_progress(&self) -> bool {
+        self.results.is_some()
+            || self.alerts.is_some()
+            || self.incidents.is_some()
+            || self.incident_tombstones.is_some()
+    }
+
+    fn refresh_digest(&mut self, digest: &DigestResponse) {
+        let stream = |d: &StreamDigestDto| (d.max_millis, d.max_id.clone(), d.count);
+        let decreased = |before: &(i64, String, i64), now: &(i64, String, i64)| {
+            now.0 < before.0 || now.2 < before.2
+        };
+        if self
+            .alerts_snapshot
+            .as_ref()
+            .is_some_and(|before| decreased(before, &stream(&digest.alerts)))
+        {
+            self.alerts = None;
+        }
+        if self
+            .incidents_snapshot
+            .as_ref()
+            .is_some_and(|before| decreased(before, &stream(&digest.incidents)))
+        {
+            self.incidents = None;
+        }
+        if self
+            .tombstones_snapshot
+            .as_ref()
+            .is_some_and(|before| decreased(before, &stream(&digest.incident_tombstones)))
+        {
+            self.incident_tombstones = None;
+        }
+        if self.checks_snapshot.iter().any(|before| {
+            digest
+                .checks
+                .iter()
+                .find(|now| now.check_id == before.check_id)
+                .is_none_or(|now| now.max_ts < before.max_ts || now.count < before.count)
+        }) {
+            self.results = None;
+        }
+        self.checks_snapshot = digest.checks.clone();
+        self.alerts_snapshot = Some(stream(&digest.alerts));
+        self.incidents_snapshot = Some(stream(&digest.incidents));
+        self.tombstones_snapshot = Some(stream(&digest.incident_tombstones));
+    }
+}
+
 struct Inner {
     database: Database,
+    timings: Arc<Timings>,
+    /// One bounded, coalescing queue per peer for `/internal/replicate`, so a
+    /// busy node never aims more than one concurrent request at a receiver's
+    /// single write path.
+    replication_out: replication_out::Outbox,
     tracker: Mutex<StateTracker>,
+    state_write: tokio::sync::Mutex<()>,
+    /// Progress for bounded anti-entropy pages. Kept in memory because a
+    /// restart safely begins another idempotent replay rather than risking a
+    /// persisted cursor outliving retention or a peer's history.
+    repair_cursors: Mutex<RepairCursors>,
     /// Last observed zone and region rollups. The first observation establishes
     /// a silent baseline; only subsequent changes become persisted alerts.
     intermediate_states:
@@ -405,6 +568,7 @@ struct Inner {
     /// restart does not briefly forget the whole fleet.
     seen: parking_lot::RwLock<std::collections::HashMap<String, SeenAgent>>,
     auth: crate::auth::Auth,
+    secure_cookies: bool,
     /// Minted agent credentials by id. Cached because every ingest matches
     /// against them; rebuilt on mint and revoke so a revocation bites at once.
     credentials: parking_lot::RwLock<std::collections::HashMap<String, AgentCredential>>,
@@ -500,12 +664,19 @@ struct SeenAgent {
 }
 
 impl Coordinator {
-    async fn db<T, F>(&self, operation: F) -> Result<T>
+    /// Every database job in the coordinator goes through here, so the slow-job
+    /// log would name this one line for all of them unless the real call site
+    /// is forwarded. Synchronous-returning-a-future for the same reason
+    /// `Database::call` is: `#[track_caller]` does not cross an `async fn`.
+    #[track_caller]
+    fn db<T, F>(&self, operation: F) -> impl std::future::Future<Output = Result<T>> + Send + '_
     where
         T: Send + 'static,
         F: FnOnce(&Storage) -> Result<T> + Send + 'static,
     {
-        self.inner.database.call(operation).await
+        self.inner
+            .database
+            .call_at(operation, std::panic::Location::caller())
     }
 
     pub fn mark_embedded_agent_live(&self, agent: &crate::config::AgentConfig) {
@@ -665,7 +836,11 @@ impl Coordinator {
         let coord = Self {
             inner: Arc::new(Inner {
                 database,
+                timings: Arc::new(Timings::new()),
+                replication_out: replication_out::Outbox::default(),
                 tracker: Mutex::new(tracker),
+                state_write: tokio::sync::Mutex::new(()),
+                repair_cursors: Mutex::new(RepairCursors::default()),
                 intermediate_states: Mutex::new(std::collections::HashMap::new()),
                 retention: cfg.retention.clone(),
                 notify_tx,
@@ -699,6 +874,7 @@ impl Coordinator {
                         .collect(),
                 ),
                 auth,
+                secure_cookies: cfg.secure_cookies,
                 credentials: parking_lot::RwLock::new(
                     credentials.into_iter().map(|c| (c.id.clone(), c)).collect(),
                 ),
@@ -800,7 +976,19 @@ impl Coordinator {
     ) {
         let coord = self.clone();
         tokio::spawn(async move {
-            let client = reqwest::Client::new();
+            // A wedged peer must not pin this sweep (or the periodic task that
+            // owns it) indefinitely. Every digest and backfill request shares the
+            // bound, while independent later sweeps can proceed normally.
+            let client = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+            {
+                Ok(client) => client,
+                Err(error) => {
+                    tracing::warn!(%error, "anti-entropy: failed to build HTTP client");
+                    return;
+                }
+            };
             while let Some((t, routed_to)) = rx.recv().await {
                 // Cloned per alert: the list is edited at runtime, and a lock
                 // must not be held across the send.
@@ -994,12 +1182,27 @@ impl Coordinator {
                 tick.tick().await;
                 let now = chrono::Utc::now().timestamp_millis();
                 heartbeat_cluster.ping_all(now).await;
-                for (node_id, state) in heartbeat_cluster.sweep(now) {
+                for (node_id, state) in
+                    heartbeat_cluster.sweep(chrono::Utc::now().timestamp_millis())
+                {
                     let _ = heartbeat_coord
                         .inner
                         .events
                         .send(WsEvent::ClusterChange { node_id, state });
                 }
+            }
+        });
+
+        let retry_cluster = cluster.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(
+                gossip_interval.saturating_mul(3).max(1),
+            ));
+            loop {
+                tick.tick().await;
+                retry_cluster
+                    .retry_discovery(chrono::Utc::now().timestamp_millis())
+                    .await;
             }
         });
 
@@ -1192,33 +1395,59 @@ impl Coordinator {
     async fn apply_config_entries(
         &self,
         entries: Vec<storage::ConfigEntry>,
-    ) -> Result<(bool, bool, bool, Vec<String>)> {
+    ) -> Result<(Vec<storage::ConfigEntry>, bool, bool, Vec<String>)> {
         let entries: Vec<_> = entries
             .into_iter()
             .inspect(|entry| self.inner.clock.observe(&entry.hlc))
             .collect();
         self.db(move |store| {
-            let mut checks = false;
+            let entries: Vec<_> = entries
+                .into_iter()
+                .map(|mut entry| {
+                    if entry.kind == storage::ConfigKind::Setting {
+                        if let Some(document) = entry.document.take() {
+                            entry.document =
+                                Some(serde_json::to_string(&document).unwrap_or(document));
+                        }
+                    }
+                    entry
+                })
+                .collect();
+            // Keep the peer API's fault isolation: a malformed entry must not
+            // reject unrelated entries sharing its bounded wire batch. Validate
+            // check identity before the transaction; the storage write still
+            // owns LWW arbitration and commits every accepted entry together.
+            let entries: Vec<_> = entries
+                .into_iter()
+                .filter(|entry| {
+                    let valid = entry.kind != storage::ConfigKind::Check
+                        || entry.is_tombstone()
+                        || entry.document.as_deref().is_some_and(|document| {
+                            serde_json::from_str::<CheckConfig>(document)
+                                .ok()
+                                .is_some_and(|check| check.id.to_string() == entry.id)
+                        });
+                    if !valid {
+                        warn!(kind = entry.kind.as_str(), id = %entry.id, "config: malformed entry skipped");
+                    }
+                    valid
+                })
+                .collect();
+            let applied = store.apply_config_entries(&entries)?;
+            let mut checks = Vec::new();
             let mut credentials = false;
             let mut policies = false;
             let mut settings = Vec::new();
-            for raw in entries {
-                let mut entry = raw;
-                if entry.kind == storage::ConfigKind::Setting {
-                    if let Some(document) = entry.document.take() {
-                        entry.document = Some(serde_json::to_string(&document).unwrap_or(document));
-                    }
+            for (entry, applied) in entries.into_iter().zip(applied) {
+                if !applied {
+                    continue;
                 }
-                match store.apply_config_entry(&entry) {
-                    Ok(true) => match entry.kind {
-                        storage::ConfigKind::Check => checks = true,
-                        storage::ConfigKind::Credential => credentials = true,
-                        storage::ConfigKind::RollupPolicy => policies = true,
-                        storage::ConfigKind::Setting => settings.push(entry.id),
-                        storage::ConfigKind::Section => {}
-                    },
-                    Ok(false) => {}
-                    Err(error) => warn!(%error, kind = entry.kind.as_str(), id = %entry.id, "config: failed to apply an entry, skipping it"),
+                match entry.kind {
+                    storage::ConfigKind::Check => checks.push(entry),
+                    storage::ConfigKind::Credential => credentials = true,
+                    storage::ConfigKind::RollupPolicy => policies = true,
+                    storage::ConfigKind::Setting => settings.push(entry.id),
+                    storage::ConfigKind::Section => {}
                 }
             }
             Ok((checks, credentials, policies, settings))
@@ -1343,8 +1572,9 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Re-read check definitions after an admin edit so ingest and the status
-    /// page pick them up without a restart.
+    /// Re-read every check definition after a bulk SQL mutation (such as a
+    /// section rename or reorder) so ingest and the status page pick it up.
+    /// Normal config entries update only their affected metadata below.
     async fn reload_checks(&self) -> Result<Vec<CheckConfig>> {
         let stored = self.db(|storage| storage.list_checks()).await?;
         *self.inner.checks.write() = meta_by_id(&stored, self.inner.rollup_defaults);
@@ -1390,7 +1620,9 @@ impl Coordinator {
 
     /// Apply a batch of config entries through the one HLC-arbitrated write path
     /// (`Storage::apply_config_entry`), then refresh whichever in-memory
-    /// caches that path bypasses. The single point both `config_handler`
+    /// caches that path bypasses. Check entries replace or remove only their
+    /// own metadata; this keeps singleton edits O(1) at large cardinalities.
+    /// The single point both `config_handler`
     /// (an entry that arrived over the wire) and `Coordinator::write_config`
     /// (a local admin edit) go through, so the two can never disagree about
     /// what "applied" means.
@@ -1412,8 +1644,28 @@ impl Coordinator {
     async fn apply_config_batch(&self, entries: &[storage::ConfigEntry]) -> Result<()> {
         let (checks, credentials, policies, settings) =
             self.apply_config_entries(entries.to_vec()).await?;
-        if checks {
-            self.reload_checks().await?;
+        if !checks.is_empty() {
+            let mut cached = self.inner.checks.write();
+            for entry in checks {
+                if entry.is_tombstone() {
+                    if let Ok(id) = entry.id.parse() {
+                        cached.remove(&id);
+                    }
+                    continue;
+                }
+                match entry
+                    .document
+                    .as_deref()
+                    .and_then(|document| serde_json::from_str::<CheckConfig>(document).ok())
+                {
+                    Some(check) => {
+                        cached.insert(check.id, check_meta(&check, self.inner.rollup_defaults));
+                    }
+                    None => {
+                        warn!(id = %entry.id, "config: applied check has invalid metadata document")
+                    }
+                }
+            }
         }
         if credentials {
             self.reload_credentials().await?;
@@ -1486,18 +1738,47 @@ impl Coordinator {
         let Some(cluster) = &self.inner.cluster else {
             return;
         };
-        let live = cluster.live_urls();
-        if live.is_empty() {
+        if cluster.live_urls().is_empty() {
             return;
         }
-        let batch = ConfigBatch {
-            origin: self.inner.node_id.clone(),
-            entries,
-        };
+        let origin = self.inner.node_id.clone();
         let cluster = Arc::clone(cluster);
         tokio::spawn(async move {
-            cluster.broadcast_json("/internal/config", &batch).await;
+            for entries in Self::config_batches(entries) {
+                cluster
+                    .broadcast_json(
+                        "/internal/config",
+                        &ConfigBatch {
+                            origin: origin.clone(),
+                            entries,
+                        },
+                    )
+                    .await;
+            }
         });
+    }
+
+    fn config_batches(entries: Vec<storage::ConfigEntry>) -> Vec<Vec<storage::ConfigEntry>> {
+        let mut batches = Vec::new();
+        let mut batch = Vec::new();
+        let mut bytes = 0;
+        for entry in entries {
+            let entry_bytes =
+                serde_json::to_vec(&entry).map_or(MAX_CONFIG_BATCH_BYTES, |v| v.len());
+            if !batch.is_empty()
+                && (batch.len() == CONFIG_APPLY_CHUNK
+                    || bytes + entry_bytes > MAX_CONFIG_BATCH_BYTES)
+            {
+                batches.push(std::mem::take(&mut batch));
+                bytes = 0;
+            }
+            bytes += entry_bytes;
+            batch.push(entry);
+        }
+        if !batch.is_empty() {
+            batches.push(batch);
+        }
+        batches
     }
 
     /// Stamp and push whatever row `id` currently holds, for a write that
@@ -2027,6 +2308,26 @@ impl Coordinator {
     /// Evaluate and persist observations, then publish one rolled-up root per
     /// affected check. Everything downstream is driven solely by root changes.
     pub async fn ingest(&self, mut results: Vec<CheckResult>) {
+        let state_wait_started = Instant::now();
+        let _state_write = self.inner.state_write.lock().await;
+        if self.inner.timings.enabled {
+            self.inner.timings.local_state_wait.observe(
+                "state_write",
+                "local_wait",
+                state_wait_started.elapsed(),
+            );
+        }
+        let state_hold_started = Instant::now();
+        let check_ids: std::collections::HashSet<_> = results.iter().map(|r| r.check_id).collect();
+        let mut staged = self.inner.tracker.lock().snapshot_checks(&check_ids);
+        let mut intermediate_cache: std::collections::HashMap<_, _> = self
+            .inner
+            .intermediate_states
+            .lock()
+            .iter()
+            .filter(|((id, _), _)| check_ids.contains(id))
+            .map(|(key, value)| (key.clone(), *value))
+            .collect();
         results.sort_by(|a, b| (&a.agent_id, a.timestamp).cmp(&(&b.agent_id, b.timestamp)));
         let mut rows = Vec::with_capacity(results.len());
         let mut affected: std::collections::HashMap<crate::models::CheckId, (CheckResult, i64)> =
@@ -2034,7 +2335,7 @@ impl Coordinator {
         let mut leaf_updates = Vec::with_capacity(results.len());
 
         {
-            let mut tracker = self.inner.tracker.lock();
+            let tracker = &mut staged;
             for mut r in results {
                 let meta = self.inner.checks.read().get(&r.check_id).cloned();
                 let status = match meta.as_ref().and_then(|m| m.eval.as_deref()) {
@@ -2083,11 +2384,11 @@ impl Coordinator {
         for (check_id, (_, ts)) in &affected {
             let check_id = *check_id;
             let meta = self.inner.checks.read().get(&check_id).cloned();
-            let leaves = self.inner.tracker.lock().children(check_id);
+            let leaves = staged.children(check_id);
             let candidate =
                 self.rollup_candidate(&check_id.to_string(), meta.as_ref(), leaves, *ts);
             let (transition, state, pending, was_unpublished) = {
-                let mut tracker = self.inner.tracker.lock();
+                let tracker = &mut staged;
                 let was_unpublished = tracker.state(check_id).is_none();
                 let transition = tracker.publish(
                     check_id,
@@ -2108,7 +2409,7 @@ impl Coordinator {
             // a swallowed blip still leaks zone/region alerts to the UI.
             if was_unpublished || transition.is_some() {
                 let previous_regions = {
-                    let mut cache = self.inner.intermediate_states.lock();
+                    let cache = &mut intermediate_cache;
                     let mut previous = std::collections::BTreeSet::new();
                     let mut had_baseline = false;
                     for intermediate in &candidate.intermediates {
@@ -2171,208 +2472,226 @@ impl Coordinator {
         let leaf_updates_for_replication = leaf_updates.clone();
         let transitions_for_publish = transitions.clone();
         let coord = self.clone();
-        let persisted = self.db(move |store| {
-            let mut incident_events = Vec::new();
-            let mut incident_for = std::collections::HashMap::<crate::models::CheckId, String>::new();
-            let mut replicated_alerts = Vec::<ReplicatedAlert>::new();
-            let mut replicated_incidents = Vec::<storage::ReplicatedIncident>::new();
-            store.persist_ingest(&rows, &leaf_updates, &state_updates)?;
+        let persisted = self
+            .db(move |store| {
+                let mut incident_events = Vec::new();
+                let mut incident_for =
+                    std::collections::HashMap::<crate::models::CheckId, String>::new();
+                let mut replicated_alerts = Vec::<ReplicatedAlert>::new();
+                let mut replicated_incidents = Vec::<storage::ReplicatedIncident>::new();
+                store.prepare_ingest()?;
+                store.transaction(|store| {
+                    store.persist_ingest_uncommitted(&rows, &leaf_updates, &state_updates)?;
 
-            for (check_id, state, ts) in &baseline_failures {
-                let Some((result, _)) = affected.get(check_id) else {
-                    continue;
-                };
-                let regions = root_regions.get(check_id).cloned().unwrap_or_default();
-                match coord.attach_or_open(store, result, *state, &regions, *ts) {
-                    Ok((id, opened, changed)) => {
-                        if opened || changed {
-                            if let Ok(Some(i)) = store.incident(&id) {
-                                let incident = IncidentDto::from_row(i, *ts, false);
-                                incident_events.push(if opened {
-                                    WsEvent::IncidentOpened { incident }
-                                } else {
-                                    WsEvent::IncidentUpdated { incident }
-                                });
-                            }
-                        }
-                        incident_for.insert(*check_id, id);
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, check = %check_id, "failed to reconcile baseline incident")
-                    }
-                }
-            }
-            for (t, ts) in &transitions {
-                let Some((result, _)) = affected.get(&t.check_id) else {
-                    continue;
-                };
-                if t.to.is_failing() {
-                    let regions = root_regions.get(&t.check_id).cloned().unwrap_or_default();
-                    match coord.attach_or_open(store, result, t.to, &regions, *ts) {
-                        Ok((id, opened, changed)) => {
-                            if opened || changed {
-                                if let Ok(Some(i)) = store.incident(&id) {
-                                    let incident = IncidentDto::from_row(i, *ts, false);
-                                    incident_events.push(if opened {
-                                        WsEvent::IncidentOpened { incident }
-                                    } else {
-                                        WsEvent::IncidentUpdated { incident }
-                                    });
-                                }
-                            }
-                            incident_for.insert(t.check_id, id);
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, check = %t.check_id, "failed to reconcile incident")
-                        }
-                    }
-                } else if t.to == NodeState::Up {
-                    match store.open_incident_for(t.check_id) {
-                        Ok(Some(inc)) => {
-                            incident_for.insert(t.check_id, inc.id.clone());
-                            match coord.try_resolve(store, &inc, *ts) {
-                                Ok(true) => {
-                                    if let Ok(Some(i)) = store.incident(&inc.id) {
-                                        let ack = store.is_acknowledged(&inc.id).unwrap_or(false);
-                                        incident_events.push(WsEvent::IncidentUpdated {
-                                            incident: IncidentDto::from_row(i, *ts, ack),
+                    for (check_id, state, ts) in &baseline_failures {
+                        let Some((result, _)) = affected.get(check_id) else {
+                            continue;
+                        };
+                        let regions = root_regions.get(check_id).cloned().unwrap_or_default();
+                        match coord.attach_or_open(store, result, *state, &regions, *ts) {
+                            Ok((id, opened, changed)) => {
+                                if opened || changed {
+                                    if let Some(i) = store.incident(&id)? {
+                                        let incident = IncidentDto::from_row(i, *ts, false);
+                                        incident_events.push(if opened {
+                                            WsEvent::IncidentOpened { incident }
+                                        } else {
+                                            WsEvent::IncidentUpdated { incident }
                                         });
                                     }
                                 }
-                                Ok(false) => {}
-                                Err(e) => {
-                                    tracing::error!(error = %e, incident = %inc.id, "failed to resolve incident")
+                                incident_for.insert(*check_id, id);
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    for (t, ts) in &transitions {
+                        let Some((result, _)) = affected.get(&t.check_id) else {
+                            continue;
+                        };
+                        if t.to.is_failing() {
+                            let regions =
+                                root_regions.get(&t.check_id).cloned().unwrap_or_default();
+                            match coord.attach_or_open(store, result, t.to, &regions, *ts) {
+                                Ok((id, opened, changed)) => {
+                                    if opened || changed {
+                                        if let Some(i) = store.incident(&id)? {
+                                            let incident = IncidentDto::from_row(i, *ts, false);
+                                            incident_events.push(if opened {
+                                                WsEvent::IncidentOpened { incident }
+                                            } else {
+                                                WsEvent::IncidentUpdated { incident }
+                                            });
+                                        }
+                                    }
+                                    incident_for.insert(t.check_id, id);
                                 }
+                                Err(e) => return Err(e),
+                            }
+                        } else if t.to == NodeState::Up {
+                            match store.open_incident_for(t.check_id) {
+                                Ok(Some(inc)) => {
+                                    incident_for.insert(t.check_id, inc.id.clone());
+                                    match coord.try_resolve(store, &inc, *ts) {
+                                        Ok(true) => {
+                                            if let Some(i) = store.incident(&inc.id)? {
+                                                let ack = store.is_acknowledged(&inc.id)?;
+                                                incident_events.push(WsEvent::IncidentUpdated {
+                                                    incident: IncidentDto::from_row(i, *ts, ack),
+                                                });
+                                            }
+                                        }
+                                        Ok(false) => {}
+                                        Err(e) => return Err(e),
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => return Err(e),
                             }
                         }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::error!(error = %e, check = %t.check_id, "failed to look up incident")
-                        }
                     }
-                }
-            }
 
-            let reconcile_ts = affected
-                .values()
-                .map(|(_, ts)| *ts)
-                .max()
-                .unwrap_or_default();
-            match coord.reconcile_open_incidents(store, reconcile_ts) {
-                Ok(rows) => {
-                    for row in rows {
-                        let ack = store.is_acknowledged(&row.id).unwrap_or(false);
-                        if let Some(origin) = row.origin_check {
-                            incident_for.insert(origin, row.id.clone());
+                    let reconcile_ts = affected
+                        .values()
+                        .map(|(_, ts)| *ts)
+                        .max()
+                        .unwrap_or_default();
+                    match coord.reconcile_open_incidents(store, reconcile_ts) {
+                        Ok(rows) => {
+                            for row in rows {
+                                let ack = store.is_acknowledged(&row.id)?;
+                                if let Some(origin) = row.origin_check {
+                                    incident_for.insert(origin, row.id.clone());
+                                }
+                                incident_events.push(WsEvent::IncidentUpdated {
+                                    incident: IncidentDto::from_row(row, reconcile_ts, ack),
+                                });
+                            }
                         }
-                        incident_events.push(WsEvent::IncidentUpdated {
-                            incident: IncidentDto::from_row(row, reconcile_ts, ack),
-                        });
+                        Err(e) => return Err(e),
                     }
-                }
-                Err(e) => tracing::error!(error = %e, "failed to reconcile open incidents"),
-            }
 
-            for (check_id, previous, current, ts) in &region_set_changes {
-                if published_states.get(check_id) != Some(&NodeState::Degraded) {
-                    continue;
-                }
-                match store.open_incident_for(*check_id) {
-                    Ok(Some(inc)) => {
-                        if let Err(e) = store.add_update(
-                            &inc.id,
-                            inc.state,
-                            &region_change_narrative(previous, current),
-                            None,
-                            *ts,
-                        ) {
-                            tracing::error!(error = %e, incident = %inc.id, "failed to record region change");
+                    for (check_id, previous, current, ts) in &region_set_changes {
+                        if published_states.get(check_id) != Some(&NodeState::Degraded) {
                             continue;
                         }
-                        let title = incident_title(
-                            &coord.check_name(*check_id),
-                            NodeState::Degraded,
-                            current,
-                        );
-                        if inc.title != title {
-                            if let Err(e) =
-                                store.edit_incident(&inc.id, &title, inc.started_at, inc.global)
-                            {
-                                tracing::error!(error = %e, incident = %inc.id, "failed to update degraded incident title");
+                        match store.open_incident_for(*check_id) {
+                            Ok(Some(inc)) => {
+                                store.add_update(
+                                    &inc.id,
+                                    inc.state,
+                                    &region_change_narrative(previous, current),
+                                    None,
+                                    *ts,
+                                )?;
+                                let title = incident_title(
+                                    &coord.check_name(*check_id),
+                                    NodeState::Degraded,
+                                    current,
+                                );
+                                if inc.title != title {
+                                    store.edit_incident(
+                                        &inc.id,
+                                        &title,
+                                        inc.started_at,
+                                        inc.global,
+                                    )?;
+                                }
+                                incident_for.insert(*check_id, inc.id.clone());
+                                if let Some(row) = store.incident(&inc.id)? {
+                                    let ack = store.is_acknowledged(&inc.id)?;
+                                    incident_events.push(WsEvent::IncidentUpdated {
+                                        incident: IncidentDto::from_row(row, *ts, ack),
+                                    });
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+
+                    for (scope, node_id, previous, current, ts) in &intermediate_transitions {
+                        match store.insert_alert(
+                            *scope,
+                            node_id,
+                            Some(*previous),
+                            *current,
+                            *ts,
+                            None,
+                        ) {
+                            Ok(id) => replicated_alerts.push(ReplicatedAlert {
+                                id,
+                                scope: scope.as_str().to_string(),
+                                node_id: node_id.clone(),
+                                previous_state: Some(*previous),
+                                current_state: *current,
+                                timestamp: *ts,
+                                incident_id: None,
+                            }),
+                            Err(e) => return Err(e),
+                        }
+                    }
+
+                    for (t, ts) in transitions.iter().filter(|(t, _)| alert::should_alert(t)) {
+                        let incident_id = incident_for.get(&t.check_id).cloned();
+                        match store.insert_alert(
+                            storage::AlertScope::Check,
+                            &t.check_id.to_string(),
+                            Some(t.from),
+                            t.to,
+                            *ts,
+                            incident_id.as_deref(),
+                        ) {
+                            Ok(id) => replicated_alerts.push(ReplicatedAlert {
+                                id,
+                                scope: storage::AlertScope::Check.as_str().to_string(),
+                                node_id: t.check_id.to_string(),
+                                previous_state: Some(t.from),
+                                current_state: t.to,
+                                timestamp: *ts,
+                                incident_id,
+                            }),
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    let mut seen_incidents = std::collections::HashSet::new();
+                    for id in incident_for.values() {
+                        if seen_incidents.insert(id.as_str()) {
+                            if let Some(row) = store.replicated_incident(id)? {
+                                replicated_incidents.push(row);
                             }
                         }
-                        incident_for.insert(*check_id, inc.id.clone());
-                        if let Ok(Some(row)) = store.incident(&inc.id) {
-                            let ack = store.is_acknowledged(&inc.id).unwrap_or(false);
-                            incident_events.push(WsEvent::IncidentUpdated {
-                                incident: IncidentDto::from_row(row, *ts, ack),
-                            });
-                        }
                     }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::error!(error = %e, check = %check_id, "failed to find degraded incident")
-                    }
-                }
-            }
-
-            for (scope, node_id, previous, current, ts) in &intermediate_transitions {
-                match store.insert_alert(*scope, node_id, Some(*previous), *current, *ts, None) {
-                    Ok(id) => replicated_alerts.push(ReplicatedAlert {
-                        id,
-                        scope: scope.as_str().to_string(),
-                        node_id: node_id.clone(),
-                        previous_state: Some(*previous),
-                        current_state: *current,
-                        timestamp: *ts,
-                        incident_id: None,
-                    }),
-                    Err(e) => {
-                        tracing::error!(error = %e, node = %node_id, "failed to persist rollup alert")
-                    }
-                }
-            }
-
-            for (t, ts) in transitions.iter().filter(|(t, _)| alert::should_alert(t)) {
-                let incident_id = incident_for.get(&t.check_id).cloned();
-                match store.insert_alert(
-                    storage::AlertScope::Check,
-                    &t.check_id.to_string(),
-                    Some(t.from),
-                    t.to,
-                    *ts,
-                    incident_id.as_deref(),
-                ) {
-                    Ok(id) => replicated_alerts.push(ReplicatedAlert {
-                        id,
-                        scope: storage::AlertScope::Check.as_str().to_string(),
-                        node_id: t.check_id.to_string(),
-                        previous_state: Some(t.from),
-                        current_state: t.to,
-                        timestamp: *ts,
-                        incident_id,
-                    }),
-                    Err(e) => tracing::error!(error = %e, "failed to persist alert"),
-                }
-            }
-            let mut seen_incidents = std::collections::HashSet::new();
-            for id in incident_for.values() {
-                if seen_incidents.insert(id.as_str()) {
-                    if let Ok(Some(row)) = store.replicated_incident(id) {
-                        replicated_incidents.push(row);
-                    }
-                }
-            }
-            Ok((incident_events, incident_for, replicated_alerts, replicated_incidents))
-        }).await;
+                    Ok((
+                        incident_events,
+                        incident_for,
+                        replicated_alerts,
+                        replicated_incidents,
+                    ))
+                })
+            })
+            .await;
         let (incident_events, incident_for, replicated_alerts, replicated_incidents) =
             match persisted {
                 Ok(value) => value,
                 Err(error) => {
+                    if self.inner.timings.enabled {
+                        self.inner.timings.local_state_hold.observe(
+                            "state_write",
+                            "local_hold",
+                            state_hold_started.elapsed(),
+                        );
+                    }
                     tracing::error!(%error, "failed to persist ingest batch");
                     return;
                 }
             };
+        self.inner.tracker.lock().install_checks(staged, &check_ids);
+        {
+            let mut cache = self.inner.intermediate_states.lock();
+            cache.retain(|(id, _), _| !check_ids.contains(id));
+            cache.extend(intermediate_cache);
+        }
         let rows = rows_for_replication;
         let transitions = transitions_for_publish;
 
@@ -2382,7 +2701,19 @@ impl Coordinator {
                 let messages: Vec<_> = transitions
                     .iter()
                     .map(|(t, ts)| {
-                        gossip::Message::new(t, *ts, incident_for.get(&t.check_id).cloned())
+                        let alert = replicated_alerts.iter().find(|alert| {
+                            alert.scope == storage::AlertScope::Check.as_str()
+                                && alert.node_id == t.check_id.to_string()
+                                && alert.timestamp == *ts
+                                && alert.previous_state == Some(t.from)
+                                && alert.current_state == t.to
+                        });
+                        gossip::Message::new(
+                            t,
+                            *ts,
+                            alert.map(|alert| alert.id.clone()),
+                            incident_for.get(&t.check_id).cloned(),
+                        )
                     })
                     .collect();
                 tokio::spawn(async move {
@@ -2422,10 +2753,9 @@ impl Coordinator {
                         incidents: replicated_incidents,
                         ..Default::default()
                     };
-                    let cluster = Arc::clone(cluster);
-                    tokio::spawn(async move {
-                        cluster.broadcast_json("/internal/replicate", &batch).await;
-                    });
+                    self.inner
+                        .replication_out
+                        .broadcast(cluster, &self.inner.timings, &batch);
                 }
             }
         }
@@ -2454,6 +2784,13 @@ impl Coordinator {
         for event in incident_events {
             let _ = self.inner.events.send(event);
         }
+        if self.inner.timings.enabled {
+            self.inner.timings.local_state_hold.observe(
+                "state_write",
+                "local_hold",
+                state_hold_started.elapsed(),
+            );
+        }
     }
 
     /// Apply a peer's replication batch: incidents, then alerts, then raw
@@ -2462,109 +2799,155 @@ impl Coordinator {
     /// nothing else it does — no `eval`, no `notify_tx`, no re-broadcast to
     /// the cluster or to `self.inner.gossip` — because the sender already
     /// decided all of that and owns paging for it.
-    async fn apply_replicated(&self, batch: ReplicationBatch) {
+    async fn apply_replicated(&self, batch: ReplicationBatch) -> anyhow::Result<()> {
+        let state_wait_started = Instant::now();
+        let _state_write = self.inner.state_write.lock().await;
+        if self.inner.timings.enabled {
+            self.inner.timings.replicated_state_wait.observe(
+                "state_write",
+                "replicated_wait",
+                state_wait_started.elapsed(),
+            );
+        }
+        self.apply_replicated_locked(batch).await
+    }
+
+    /// Repair must never join the state-write wait queue ahead of fresh agent
+    /// observations. If ingest owns or is waiting for it, this page waits for
+    /// the next sweep; idempotent cursored replay makes that safe.
+    async fn apply_replicated_repair(&self, batch: ReplicationBatch) -> anyhow::Result<bool> {
+        let Ok(_state_write) = self.inner.state_write.try_lock() else {
+            return Ok(false);
+        };
+        self.apply_replicated_locked(batch).await?;
+        Ok(true)
+    }
+
+    /// Called only while `state_write` is held. Keeping tracker and database
+    /// updates in this one transactional path preserves the atomicity shared
+    /// by ingest and ordinary replication.
+    async fn apply_replicated_locked(&self, batch: ReplicationBatch) -> anyhow::Result<()> {
+        let state_hold_started = Instant::now();
         let beliefs = batch.beliefs.clone();
-        let persisted = self.db(move |store| {
-            let mut incident_events = Vec::new();
-            let mut state_changes: Vec<(crate::models::CheckId, Option<NodeState>, NodeState, i64)> = Vec::new();
-            let now = chrono::Utc::now().timestamp_millis();
-            // Deletes are applied before upserts, so a batch that carries both
-            // an incident and its deletion (a reconciler replaying a peer's
-            // whole state) converges on deleted rather than on ordering luck.
-            for tombstone in &batch.deleted_incidents {
-                match store.apply_incident_tombstone(tombstone) {
-                    // Only announce a delete that actually removed something:
-                    // a tombstone for an incident this node never had is not
-                    // news any dashboard can act on.
-                    Ok(true) => incident_events.push(WsEvent::IncidentDeleted { id: tombstone.id.clone() }),
-                    Ok(false) => {}
-                    Err(e) => {
-                        tracing::warn!(error = %e, incident = %tombstone.id, "replicate: failed to delete incident")
-                    }
-                }
-            }
-            // Poll rows are a merge on `polled_at`, so a stale batch cannot
-            // un-see a live agent and applying the same batch twice is a no-op.
-            for p in &batch.polls {
-                if let Err(e) = store.record_agent_poll(p) {
-                    tracing::warn!(error = %e, agent = %p.agent_id, "replicate: failed to persist agent poll");
-                }
-            }
-            for i in &batch.incidents {
-                let existed = matches!(store.incident(&i.id), Ok(Some(_)));
-                let changed = match store.upsert_incident(i) {
-                    Ok(changed) => changed,
-                    Err(e) => {
-                        tracing::warn!(error = %e, incident = %i.id, "replicate: failed to persist incident");
-                        continue;
-                    }
-                };
-                if changed {
-                    if let Ok(Some(row)) = store.incident(&i.id) {
-                        let ack = store.is_acknowledged(&i.id).unwrap_or(false);
-                        let dto = IncidentDto::from_row(row, now, ack);
-                        incident_events.push(if existed {
-                            WsEvent::IncidentUpdated { incident: dto }
-                        } else {
-                            WsEvent::IncidentOpened { incident: dto }
-                        });
-                    }
-                }
-            }
-            for a in &batch.alerts {
-                let row = a.clone().into_row();
-                let inserted = match store.upsert_alert(&row) {
-                    Ok(inserted) => inserted,
-                    Err(e) => {
-                        tracing::warn!(error = %e, alert = %a.id, "replicate: failed to persist alert");
-                        continue;
-                    }
-                };
-                // Zone and region alerts are topology narratives only. They
-                // replicate for the alert feed, but never masquerade as check
-                // roots in current state or websocket notifications.
-                if inserted && row.scope == storage::AlertScope::Check {
-                    match a.node_id.parse::<crate::models::CheckId>() {
-                        Ok(check_id) => state_changes.push((
-                            check_id,
-                            a.previous_state,
-                            a.current_state,
-                            a.timestamp,
-                        )),
-                        Err(_) => {
-                            tracing::warn!(node_id = %a.node_id, "replicate: check-scoped alert has a non-uuid node_id, skipping")
+        let persisted = self
+            .db(move |store| {
+                store.transaction(|store| {
+                    let mut incident_events = Vec::new();
+                    let mut state_changes: Vec<(
+                        crate::models::CheckId,
+                        Option<NodeState>,
+                        NodeState,
+                        i64,
+                    )> = Vec::new();
+                    let now = chrono::Utc::now().timestamp_millis();
+                    // Deletes are applied before upserts, so a batch that carries both
+                    // an incident and its deletion (a reconciler replaying a peer's
+                    // whole state) converges on deleted rather than on ordering luck.
+                    for tombstone in &batch.deleted_incidents {
+                        if store.apply_incident_tombstone_uncommitted(tombstone)? {
+                            incident_events.push(WsEvent::IncidentDeleted {
+                                id: tombstone.id.clone(),
+                            });
                         }
                     }
-                }
-            }
-            if !batch.results.is_empty() {
-                let rows: Vec<(CheckResult, Status)> = batch
-                    .results
-                    .into_iter()
-                    .map(|r| (r.result, r.status))
-                    .collect();
-                if let Err(e) = store.insert_results_dedup(&rows) {
-                    tracing::warn!(error = %e, "replicate: failed to persist results");
-                }
-            }
-            for (check_id, _, current, ts) in &state_changes {
-                if let Err(e) = store.update_current_state(*check_id, *current, None, *ts) {
-                    tracing::warn!(error = %e, check = %check_id, "replicate: failed to persist state");
-                }
-                if let Err(e) = store.record_state(*check_id, *current, *ts) {
-                    tracing::warn!(error = %e, check = %check_id, "replicate: failed to persist state history");
-                }
-            }
-            Ok((incident_events, state_changes))
-        }).await;
+                    // Poll rows are a merge on `polled_at`, so a stale batch cannot
+                    // un-see a live agent and applying the same batch twice is a no-op.
+                    for p in &batch.polls {
+                        store.record_agent_poll(p)?;
+                    }
+                    for i in &batch.incidents {
+                        let existed = matches!(store.incident(&i.id), Ok(Some(_)));
+                        let changed = store.upsert_incident_uncommitted(i)?;
+                        if changed {
+                            if let Some(row) = store.incident(&i.id)? {
+                                let ack = store.is_acknowledged(&i.id)?;
+                                let dto = IncidentDto::from_row(row, now, ack);
+                                incident_events.push(if existed {
+                                    WsEvent::IncidentUpdated { incident: dto }
+                                } else {
+                                    WsEvent::IncidentOpened { incident: dto }
+                                });
+                            }
+                        }
+                    }
+                    for a in &batch.alerts {
+                        let row = a.clone().into_row();
+                        let applied = store.upsert_alert(&row)?;
+                        if applied == storage::AlertApply::Conflict {
+                            // One disagreeing event must not sink the batch it
+                            // arrived in: the local event stands, and every
+                            // other row here still applies.
+                            //
+                            // Debug, not warn: anti-entropy re-offers the same
+                            // rows every sweep for as long as the two nodes
+                            // disagree, so a warning here is a repeating log
+                            // rather than an event. The divergence itself is
+                            // tracked as an alert-identity bug, not as a
+                            // replication failure.
+                            tracing::debug!(
+                                alert = %row.id,
+                                "replicate: alert id conflicts with a different local event, keeping the local one"
+                            );
+                        }
+                        let inserted = applied == storage::AlertApply::Inserted;
+                        // Zone and region alerts are topology narratives only. They
+                        // replicate for the alert feed, but never masquerade as check
+                        // roots in current state or websocket notifications.
+                        if inserted && row.scope == storage::AlertScope::Check {
+                            let check_id = a.node_id.parse::<crate::models::CheckId>()?;
+                            state_changes.push((
+                                check_id,
+                                a.previous_state,
+                                a.current_state,
+                                a.timestamp,
+                            ));
+                        }
+                    }
+                    if !batch.results.is_empty() {
+                        let rows: Vec<(CheckResult, Status)> = batch
+                            .results
+                            .into_iter()
+                            .map(|r| (r.result, r.status))
+                            .collect();
+                        store.insert_results_dedup_uncommitted(&rows)?;
+                    }
+                    for (check_id, _, current, ts) in &state_changes {
+                        store.update_current_state(*check_id, *current, None, *ts)?;
+                        store.record_state(*check_id, *current, *ts)?;
+                    }
+                    let leaves: Vec<storage::AgentCheckStateRow> = batch
+                        .beliefs
+                        .iter()
+                        .map(|belief| storage::AgentCheckStateRow {
+                            check_id: belief.check_id,
+                            agent_id: belief.agent_id.clone(),
+                            zone: belief.zone.clone(),
+                            region: belief.region.clone(),
+                            status: belief.status,
+                            consecutive_failures: belief.consecutive_failures,
+                            last_check: belief.last_check,
+                        })
+                        .collect();
+                    store.update_agent_check_states_uncommitted(&leaves)?;
+                    Ok((incident_events, state_changes))
+                })
+            })
+            .await;
         let (incident_events, state_changes) = match persisted {
             Ok(value) => value,
             Err(error) => {
+                if self.inner.timings.enabled {
+                    self.inner.timings.replicated_state_hold.observe(
+                        "state_write",
+                        "replicated_hold",
+                        state_hold_started.elapsed(),
+                    );
+                }
                 tracing::warn!(%error, "replicate: database worker failed");
-                return;
+                return Err(error);
             }
         };
-        let merged_beliefs: Vec<ReplicatedBelief> = {
+        {
             // The failure count resets, same as `gossip_handler`: this node
             // is not mid-confirmation for something the observer already
             // decided.
@@ -2575,38 +2958,17 @@ impl Coordinator {
             // Leaves from a peer's tracker. `merge_agent` keeps the newer
             // observation, so an out-of-order or replayed batch cannot rewind a
             // live agent, and only what actually won is persisted below.
-            beliefs
-                .into_iter()
-                .filter(|b| {
-                    tracker.merge_agent(
-                        b.check_id,
-                        &b.agent_id,
-                        &b.zone,
-                        &b.region,
-                        b.status,
-                        b.consecutive_failures,
-                        b.last_check,
-                    )
-                })
-                .collect()
-        };
-        if !merged_beliefs.is_empty() {
-            let _ = self
-                .db(move |store| {
-                    for belief in &merged_beliefs {
-                        store.update_agent_check_state(
-                            belief.check_id,
-                            &belief.agent_id,
-                            &belief.zone,
-                            &belief.region,
-                            belief.status,
-                            belief.consecutive_failures,
-                            belief.last_check,
-                        )?;
-                    }
-                    Ok(())
-                })
-                .await;
+            for b in beliefs {
+                tracker.merge_agent(
+                    b.check_id,
+                    &b.agent_id,
+                    &b.zone,
+                    &b.region,
+                    b.status,
+                    b.consecutive_failures,
+                    b.last_check,
+                );
+            }
         }
         for (check_id, from, to, timestamp) in state_changes {
             let _ = self.inner.events.send(WsEvent::StateChange {
@@ -2619,6 +2981,14 @@ impl Coordinator {
         for ev in incident_events {
             let _ = self.inner.events.send(ev);
         }
+        if self.inner.timings.enabled {
+            self.inner.timings.replicated_state_hold.observe(
+                "state_write",
+                "replicated_hold",
+                state_hold_started.elapsed(),
+            );
+        }
+        Ok(())
     }
 
     /// One anti-entropy cycle: pick a live peer at random, compare digests,
@@ -2636,7 +3006,16 @@ impl Coordinator {
             return;
         };
         let live = cluster.live_urls();
-        let Some(peer) = live.choose(&mut rand::thread_rng()).cloned() else {
+        let peer = {
+            let cursors = self.inner.repair_cursors.lock();
+            cursors
+                .peer
+                .as_ref()
+                .filter(|peer| cursors.in_progress() && live.contains(peer))
+                .cloned()
+                .or_else(|| live.choose(&mut rand::thread_rng()).cloned())
+        };
+        let Some(peer) = peer else {
             return;
         };
         let client = reqwest::Client::new();
@@ -2658,34 +3037,49 @@ impl Coordinator {
                 return;
             }
         };
-        for their_check in &their.checks {
-            let ours = our
-                .checks
-                .iter()
-                .find(|c| c.check_id == their_check.check_id);
-            let our_max_ts = ours.map(|c| c.max_ts).unwrap_or(i64::MIN);
-            let our_count = ours.map(|c| c.count).unwrap_or(0);
-            if their_check.max_ts <= our_max_ts && their_check.count == our_count {
-                continue;
-            }
-            // A count mismatch can be a hole below our high-water mark. Replay
-            // the retained stream from its beginning; dedup makes rows already
-            // present cheap no-ops while filling the historical gap.
-            let since = if their_check.count != our_count {
-                i64::MIN
-            } else {
-                our_max_ts
-            };
-            self.backfill_check(
-                &client,
-                &peer,
-                &their_check.check_id,
-                since,
-                their_check.max_ts,
-            )
-            .await;
+        {
+            let mut cursors = self.inner.repair_cursors.lock();
+            cursors.for_peer(&peer);
+            cursors.refresh_digest(&their);
         }
-        self.reconcile_streams(&client, &peer, &their, &our).await;
+        let results_differ = their.checks.iter().any(|theirs| {
+            match our
+                .checks
+                .binary_search_by(|ours| ours.check_id.cmp(&theirs.check_id))
+            {
+                Ok(i) => {
+                    theirs.max_ts > our.checks[i].max_ts || theirs.count != our.checks[i].count
+                }
+                Err(_) => true,
+            }
+        });
+        let stream_pages = [
+            (&their.alerts, &our.alerts),
+            (&their.incidents, &our.incidents),
+            (&their.incident_tombstones, &our.incident_tombstones),
+        ]
+        .into_iter()
+        .filter(|(theirs, ours)| {
+            theirs.count != ours.count
+                || (theirs.max_millis, &theirs.max_id) > (ours.max_millis, &ours.max_id)
+        })
+        .count();
+        if !results_differ {
+            self.set_results_repair_cursor(&peer, None);
+        }
+        let mut pages = ANTI_ENTROPY_PAGES_PER_SWEEP;
+        // Keep one page for alerts/incidents/tombstones: a large result repair
+        // must not indefinitely delay lifecycle convergence.
+        if results_differ {
+            let mut result_pages = pages.saturating_sub(stream_pages);
+            self.backfill_results(&client, &peer, &mut result_pages)
+                .await;
+            pages -= pages.saturating_sub(stream_pages) - result_pages;
+        }
+        self.reconcile_streams(&client, &peer, &their, &our, &mut pages)
+            .await;
+        // Config is bounded by configured objects rather than retained event
+        // history and is applied in one atomic config transaction.
         self.reconcile_config(&client, &peer, &their, &our).await;
     }
 
@@ -2695,6 +3089,7 @@ impl Coordinator {
         peer: &str,
         their: &DigestResponse,
         our: &DigestResponse,
+        pages: &mut usize,
     ) {
         for (path, theirs, ours) in [
             ("alerts", &their.alerts, &our.alerts),
@@ -2705,21 +3100,16 @@ impl Coordinator {
                 &our.incident_tombstones,
             ),
         ] {
+            if *pages == 0 {
+                return;
+            }
             if theirs.count == ours.count
                 && (theirs.max_millis, &theirs.max_id) <= (ours.max_millis, &ours.max_id)
             {
+                self.set_stream_repair_cursor(peer, path, None);
                 continue;
             }
-            // Equal/high local watermarks do not prove there is no older hole.
-            // On count disagreement, replay from the start and rely on each
-            // stream's idempotent merge to retain only missing/newer state.
-            let (since, since_id) = if theirs.count != ours.count {
-                (i64::MIN, "")
-            } else {
-                (ours.max_millis, ours.max_id.as_str())
-            };
-            self.backfill_stream(client, peer, path, since, since_id)
-                .await;
+            self.backfill_stream(client, peer, path, pages).await;
         }
     }
 
@@ -2728,12 +3118,20 @@ impl Coordinator {
         client: &reqwest::Client,
         peer: &str,
         path: &str,
-        since: i64,
-        since_id: &str,
+        pages: &mut usize,
     ) {
         let url = cluster::Cluster::endpoint(peer, &format!("/internal/backfill/{path}"));
-        let mut cursor = (since, since_id.to_string());
-        loop {
+        let mut cursor = {
+            let mut cursors = self.inner.repair_cursors.lock();
+            cursors.for_peer(peer);
+            match path {
+                "alerts" => cursors.alerts.clone(),
+                "incidents" => cursors.incidents.clone(),
+                _ => cursors.incident_tombstones.clone(),
+            }
+            .unwrap_or((i64::MIN, String::new()))
+        };
+        while *pages > 0 {
             let mut query = vec![
                 ("since", cursor.0.to_string()),
                 ("since_id", cursor.1.clone()),
@@ -2772,37 +3170,55 @@ impl Coordinator {
                 _ => batch.deleted_incidents.len(),
             };
             if len == 0 {
+                self.set_stream_repair_cursor(peer, path, None);
                 return;
             }
-            self.apply_replicated(batch).await;
+            let page_started = Instant::now();
+            match self.apply_replicated_repair(batch).await {
+                Ok(true) => {}
+                Ok(false) | Err(_) => {
+                    self.set_stream_repair_cursor(peer, path, Some(cursor));
+                    return;
+                }
+            }
+            *pages -= 1;
+            if self.inner.timings.enabled {
+                self.inner.timings.anti_entropy_page.observe(
+                    "anti_entropy",
+                    "stream_page",
+                    page_started.elapsed(),
+                );
+            }
             if len < ANTI_ENTROPY_PAGE {
+                self.set_stream_repair_cursor(peer, path, None);
                 return;
             }
             let Some(next) = next else {
+                self.set_stream_repair_cursor(peer, path, Some(cursor));
                 return;
             };
             if next <= cursor {
+                tracing::warn!(%peer, path, "anti-entropy: stream backfill cursor did not advance");
+                self.set_stream_repair_cursor(peer, path, None);
                 return;
             }
             cursor = next;
+            self.set_stream_repair_cursor(peer, path, Some(cursor.clone()));
             tokio::task::yield_now().await;
+        }
+        self.set_stream_repair_cursor(peer, path, Some(cursor));
+    }
+
+    fn set_stream_repair_cursor(&self, peer: &str, path: &str, cursor: Option<(i64, String)>) {
+        let mut cursors = self.inner.repair_cursors.lock();
+        cursors.for_peer(peer);
+        match path {
+            "alerts" => cursors.alerts = cursor,
+            "incidents" => cursors.incidents = cursor,
+            _ => cursors.incident_tombstones = cursor,
         }
     }
 
-    /// Pull any config kind where `peer` may hold something this node does
-    /// not. The push in `replicate_config` is the fast path; this is what
-    /// closes the hole when a node was down, or unreachable, at the moment an
-    /// admin saved an edit — nothing would ever mention that row again.
-    ///
-    /// A kind is pulled when the peer's newest stamp is ahead of ours *or*
-    /// the counts disagree. The count half is not redundant: a peer can hold
-    /// a row we lack while our own max HLC is higher because of some other
-    /// row, and a stamp comparison alone would call that converged forever.
-    ///
-    /// Pulling is safe to do more often than strictly needed — every entry
-    /// goes through `apply_config_entry`, which is last-writer-wins and drops
-    /// anything not newer than what is already stored, so a redundant pull
-    /// converges to exactly the same state.
     async fn reconcile_config(
         &self,
         client: &reqwest::Client,
@@ -2828,10 +3244,6 @@ impl Coordinator {
         }
     }
 
-    /// `GET /internal/config?kind=` on `peer`, applied through the same
-    /// `apply_config_batch` the push path uses — so a pulled entry reloads
-    /// the in-memory caches, and fires no notifier, exactly as a pushed one
-    /// does. Unpaged, for the reason given on `config_entries_handler`.
     async fn backfill_config(
         &self,
         client: &reqwest::Client,
@@ -2871,6 +3283,97 @@ impl Coordinator {
         tracing::info!(%peer, kind = kind.as_str(), entries = n, "anti-entropy: config reconciled");
     }
 
+    async fn backfill_results(&self, client: &reqwest::Client, peer: &str, pages: &mut usize) {
+        let url = cluster::Cluster::endpoint(peer, "/internal/backfill/results");
+        let mut cursor = {
+            let mut cursors = self.inner.repair_cursors.lock();
+            cursors.for_peer(peer);
+            cursors
+                .results
+                .clone()
+                .unwrap_or((i64::MIN, String::new(), String::new()))
+        };
+        while *pages > 0 {
+            let mut req = client.get(&url).query(&[
+                ("since", cursor.0.to_string()),
+                ("since_check_id", cursor.1.clone()),
+                ("since_agent_id", cursor.2.clone()),
+                ("limit", ANTI_ENTROPY_PAGE.to_string()),
+            ]);
+            if let Some(t) = &self.inner.peer_token {
+                req = req.bearer_auth(t);
+            }
+            let batch: ReplicationBatch = match req.send().await {
+                Ok(r) if r.status().is_success() => match r.json().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(%peer, error = %e, "anti-entropy: malformed results backfill response");
+                        return;
+                    }
+                },
+                Ok(r) => {
+                    tracing::warn!(%peer, status = %r.status(), "anti-entropy: results backfill request rejected");
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(%peer, error = %e, "anti-entropy: results backfill request failed");
+                    return;
+                }
+            };
+            let page_len = batch.results.len();
+            if page_len == 0 {
+                self.set_results_repair_cursor(peer, None);
+                return;
+            }
+            let next = batch.results.last().map(|row| {
+                (
+                    row.result.timestamp.timestamp_millis(),
+                    row.result.check_id.to_string(),
+                    row.result.agent_id.clone(),
+                )
+            });
+            let page_started = Instant::now();
+            match self.apply_replicated_repair(batch).await {
+                Ok(true) => {}
+                Ok(false) | Err(_) => {
+                    self.set_results_repair_cursor(peer, Some(cursor));
+                    return;
+                }
+            }
+            *pages -= 1;
+            if self.inner.timings.enabled {
+                self.inner.timings.anti_entropy_page.observe(
+                    "anti_entropy",
+                    "results_page",
+                    page_started.elapsed(),
+                );
+            }
+            if page_len < ANTI_ENTROPY_PAGE {
+                self.set_results_repair_cursor(peer, None);
+                return;
+            }
+            let Some(next) = next else {
+                self.set_results_repair_cursor(peer, Some(cursor));
+                return;
+            };
+            if next <= cursor {
+                tracing::warn!(%peer, "anti-entropy: results backfill cursor did not advance");
+                self.set_results_repair_cursor(peer, None);
+                return;
+            }
+            cursor = next;
+            self.set_results_repair_cursor(peer, Some(cursor.clone()));
+            tokio::task::yield_now().await;
+        }
+        self.set_results_repair_cursor(peer, Some(cursor));
+    }
+
+    fn set_results_repair_cursor(&self, peer: &str, cursor: Option<(i64, String, String)>) {
+        let mut cursors = self.inner.repair_cursors.lock();
+        cursors.for_peer(peer);
+        cursors.results = cursor;
+    }
+
     /// `GET /internal/digest` on `peer`, or `None` on any failure — a peer
     /// that is unreachable or rejects the call simply waits for the next
     /// sweep, the same as a dropped replication push does.
@@ -2897,6 +3400,7 @@ impl Coordinator {
     /// the first page, then advanced with the last row's agent id) and `until`
     /// (inclusive), applying each page as it arrives and yielding between
     /// pages so a large catch-up cannot starve `ingest`.
+    #[allow(dead_code)] // Kept for the single-check endpoint's compatibility path.
     async fn backfill_check(
         &self,
         client: &reqwest::Client,
@@ -2948,7 +3452,17 @@ impl Coordinator {
                     Some(row.result.agent_id.clone()),
                 )
             });
-            self.apply_replicated(batch).await;
+            let page_started = Instant::now();
+            if self.apply_replicated(batch).await.is_err() {
+                return;
+            }
+            if self.inner.timings.enabled {
+                self.inner.timings.anti_entropy_page.observe(
+                    "anti_entropy",
+                    "check_page",
+                    page_started.elapsed(),
+                );
+            }
             if page_len < ANTI_ENTROPY_PAGE {
                 return;
             }
@@ -2962,6 +3476,19 @@ impl Coordinator {
             cursor = next_cursor;
             tokio::task::yield_now().await;
         }
+    }
+
+    /// Count distinct checks observed by each requested agent since `since`.
+    /// This is a bounded aggregate for fleet-convergence checks; it does not
+    /// materialize raw history rows.
+    pub async fn result_coverage(
+        &self,
+        check_ids: Vec<crate::models::CheckId>,
+        agent_ids: Vec<String>,
+        since: i64,
+    ) -> Result<Vec<(String, u64)>> {
+        self.db(move |storage| storage.result_coverage(&check_ids, &agent_ids, since))
+            .await
     }
 
     /// Read recent history for a check (newest first), optionally within a time
@@ -3040,6 +3567,39 @@ impl Coordinator {
         id
     }
 
+    /// Test-only bulk provisioning through the production LWW/config replication
+    /// path. Entries commit in bounded transactions and are sent as bounded
+    /// `/internal/config` batches, rather than turning N checks into N broadcasts.
+    pub async fn create_checks_for_test(
+        &self,
+        checks: Vec<CheckConfig>,
+    ) -> Result<Vec<crate::models::CheckId>> {
+        let ids: Vec<_> = checks.iter().map(|check| check.id).collect();
+        let entries: Result<Vec<_>> = checks
+            .into_iter()
+            .map(|check| {
+                Ok(storage::ConfigEntry {
+                    kind: storage::ConfigKind::Check,
+                    id: check.id.to_string(),
+                    hlc: self.inner.clock.now(),
+                    document: Some(serde_json::to_string(&check)?),
+                })
+            })
+            .collect();
+        let entries = entries?;
+        for batch in Self::config_batches(entries.clone()) {
+            self.apply_config_batch(&batch).await?;
+        }
+        self.replicate_config(entries);
+        Ok(ids)
+    }
+
+    /// Direct cache count for bounded provisioning waits; public status remains
+    /// asserted separately by the caller.
+    pub fn check_count_for_test(&self) -> usize {
+        self.inner.checks.read().len()
+    }
+
     /// Persisted alerts, for tests that assert dispatch did not lose one.
     pub async fn alerts_for_test(
         &self,
@@ -3081,7 +3641,10 @@ impl Coordinator {
 
     pub fn router(self) -> Router {
         Router::new()
-            .route("/api/v1/results", post(ingest_handler))
+            .route(
+                "/api/v1/results",
+                post(ingest_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+            )
             .route("/api/v1/status", get(status_handler))
             .route("/api/v1/checks/:id/history", get(history_handler))
             .route("/api/v1/checks/:id/uptime", get(uptime_handler))
@@ -3142,7 +3705,10 @@ impl Coordinator {
             .route("/api/v1/ws", get(ws_handler))
             // Auth. `session` is deliberately unauthenticated and never 401s —
             // it is how the page decides whether to offer the admin UI at all.
-            .route("/api/v1/login", post(login_handler))
+            .route(
+                "/api/v1/login",
+                post(login_handler).layer(DefaultBodyLimit::max(16 * 1024)),
+            )
             .route("/api/v1/logout", post(logout_handler))
             .route("/api/v1/session", get(session_handler))
             // Check editor. Every route here requires an admin session.
@@ -3230,11 +3796,15 @@ impl Coordinator {
             // Cluster-based data-plane replication: results, alerts and
             // incidents together, in place of the transition-only push
             // above wherever clustering is configured.
-            .route("/internal/replicate", post(replicate_handler))
+            .route(
+                "/internal/replicate",
+                post(replicate_handler).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+            )
             // Anti-entropy: a peer's fixed-cost summary, and the paged pull
             // that backfills whatever it says this node is missing.
             .route("/internal/digest", get(digest_handler))
             .route("/internal/backfill", get(backfill_handler))
+            .route("/internal/backfill/results", get(results_backfill_handler))
             .route("/internal/backfill/alerts", get(alerts_backfill_handler))
             .route(
                 "/internal/backfill/incidents",
@@ -3249,7 +3819,9 @@ impl Coordinator {
             // the way a result is. See `config_handler`.
             .route(
                 "/internal/config",
-                post(config_handler).get(config_entries_handler),
+                post(config_handler)
+                    .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
+                    .get(config_entries_handler),
             )
             // Cluster membership. Peer-gated like every other /internal/*
             // route: pinging is how a peer rewrites what this node believes
@@ -3258,6 +3830,10 @@ impl Coordinator {
             // The admin-facing membership view. Admin-gated, not peer-gated:
             // this is read by a human in the browser, not by another node.
             .route("/api/v1/cluster", get(cluster_view_handler))
+            // Admin JSON is deliberately bounded even when unauthenticated: the
+            // limit is enforced before handlers parse or authenticate a body.
+            .layer(DefaultBodyLimit::max(1024 * 1024))
+            .layer(axum::middleware::from_fn(crate::security::security_headers))
             .with_state(self)
             .fallback(static_handler)
     }
@@ -3281,6 +3857,10 @@ const SESSION_KEY_KEY: &str = "cluster.session_key";
 /// so one very-behind check cannot hold `apply_replicated` — and the yield
 /// between pages — for an unbounded stretch.
 const ANTI_ENTROPY_PAGE: usize = 500;
+/// A sweep gets a small, fixed repair budget shared by results and the three
+/// lifecycle streams. Local ingest takes the state-write lock before every
+/// repair page, so it wins whenever both are ready.
+const ANTI_ENTROPY_PAGES_PER_SWEEP: usize = 4;
 
 /// How often the retry job looks for due notifications. Also the finest
 /// backoff granularity there is, which is why the first retry waits exactly
@@ -3531,6 +4111,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn applied_check_entries_update_only_their_cached_metadata() {
+        let coord = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let first = CheckConfig {
+            name: "first".into(),
+            target: "https://first.invalid".into(),
+            ..Default::default()
+        };
+        let second = CheckConfig {
+            name: "second".into(),
+            target: "https://second.invalid".into(),
+            ..Default::default()
+        };
+        let entry = |check: &CheckConfig, millis| super::storage::ConfigEntry {
+            kind: super::storage::ConfigKind::Check,
+            id: check.id.to_string(),
+            hlc: super::hlc::Hlc::new(millis, "peer"),
+            document: Some(serde_json::to_string(check).unwrap()),
+        };
+        coord
+            .apply_config_batch(&[entry(&first, 1), entry(&second, 1)])
+            .await
+            .unwrap();
+
+        let mut replacement = first.clone();
+        replacement.name = "renamed".into();
+        replacement.enabled = false;
+        replacement.notify = false;
+        replacement.notifiers = vec!["primary".into()];
+        replacement.agents = vec!["agent-a".into()];
+        replacement.depends_on = vec![second.id];
+        coord
+            .apply_config_batch(&[entry(&replacement, 2)])
+            .await
+            .unwrap();
+
+        {
+            let checks = coord.inner.checks.read();
+            let updated = checks.get(&first.id).unwrap();
+            assert_eq!(updated.name, "renamed");
+            assert!(!updated.enabled);
+            assert!(!updated.notify);
+            assert_eq!(updated.notifiers, ["primary"]);
+            assert_eq!(updated.agents, ["agent-a"]);
+            assert_eq!(updated.depends_on, [second.id]);
+            assert_eq!(checks.get(&second.id).unwrap().name, "second");
+        }
+
+        coord
+            .apply_config_batch(&[super::storage::ConfigEntry {
+                kind: super::storage::ConfigKind::Check,
+                id: first.id.to_string(),
+                hlc: super::hlc::Hlc::new(3, "peer"),
+                document: None,
+            }])
+            .await
+            .unwrap();
+        let checks = coord.inner.checks.read();
+        assert!(!checks.contains_key(&first.id));
+        assert_eq!(checks.get(&second.id).unwrap().name, "second");
+    }
+
+    #[tokio::test]
+    async fn failed_ingest_does_not_publish_uncommitted_state() {
+        let coord = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let check = coord
+            .create_check_for_test(CheckConfig {
+                name: "transaction-test".into(),
+                target: "https://example.invalid".into(),
+                ..Default::default()
+            })
+            .await;
+        let result = |code, millis| CheckResult {
+            check_id: check,
+            agent_id: "agent".into(),
+            zone: "zone".into(),
+            region: "region".into(),
+            kind: CheckKind::Http,
+            timestamp: chrono::DateTime::from_timestamp_millis(millis).unwrap(),
+            latency_ms: 1,
+            status_code: Some(code),
+            body_matched: None,
+            error: None,
+            failure: None,
+            body: None,
+            headers: None,
+            metric: None,
+            metrics: None,
+        };
+        coord.ingest(vec![result(200, 1_000)]).await;
+        let intermediate_before = coord.inner.intermediate_states.lock().clone();
+        coord
+            .db(|store| {
+                store.insert_alert(
+                    super::storage::AlertScope::Check,
+                    "other",
+                    None,
+                    NodeState::Down,
+                    1,
+                    None,
+                )?;
+                store
+                    .execute_test_sql("CREATE UNIQUE INDEX fail_down ON alerts (current_state)")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        coord.ingest(vec![result(500, 2_000)]).await;
+        assert_eq!(coord.inner.tracker.lock().state(check), Some(NodeState::Up));
+        assert_eq!(coord.inner.tracker.lock().failures(check, "agent"), 0);
+        assert_eq!(*coord.inner.intermediate_states.lock(), intermediate_before);
+        assert_eq!(coord.db(|store| store.count_results()).await.unwrap(), 1);
+        coord
+            .db(|store| {
+                store.execute_test_sql("DROP INDEX fail_down")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        coord.ingest(vec![result(500, 2_000)]).await;
+        assert_eq!(
+            coord.inner.tracker.lock().state(check),
+            Some(NodeState::Down)
+        );
+        assert_eq!(coord.db(|store| store.count_results()).await.unwrap(), 2);
+        assert_eq!(
+            coord
+                .alerts_for_test(10)
+                .await
+                .iter()
+                .filter(|a| a.node_id == check.to_string())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "sustained-ingest benchmark; configure WARDEN_BENCH_* for the intended scale"]
     async fn benchmark_sustained_coordinator_ingest() {
         let check_count = env_usize("WARDEN_BENCH_CHECKS", 10_000);
@@ -3643,6 +4369,7 @@ mod tests {
                 name: format!("check-{index}"),
                 target: "https://example.invalid".into(),
                 notify: false,
+                latency_graph: true,
                 position: index as i32,
                 ..Default::default()
             })
@@ -3695,6 +4422,9 @@ mod tests {
         .await;
         let client = reqwest::Client::new();
         let regional_url = format!("http://{regional_addr}/api/v1/status");
+        let uptime_url = format!("http://{regional_addr}/api/v1/uptime?days=30&buckets=90");
+        let latency_url =
+            format!("http://{regional_addr}/api/v1/latency-points?hours=720&buckets=90");
         let global_url = format!("http://{global_addr}/api/v1/status");
         let push_url = format!("http://{global_addr}/internal/global/state");
 
@@ -3711,6 +4441,48 @@ mod tests {
             regional_bytes = body.len();
             let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(value["checks"].as_array().unwrap().len(), check_count);
+        }
+
+        let warm = tokio::join!(
+            client.get(&regional_url).send(),
+            client.get(&uptime_url).send(),
+            client.get(&latency_url).send(),
+        );
+        assert!(warm.0.unwrap().status().is_success());
+        assert!(warm.1.unwrap().status().is_success());
+        assert!(warm.2.unwrap().status().is_success());
+        let mut page_ms = Vec::with_capacity(sample_count);
+        let mut page_bytes = 0;
+        for _ in 0..sample_count {
+            let started = Instant::now();
+            let (status, uptime, latency) = tokio::join!(
+                client.get(&regional_url).send(),
+                client.get(&uptime_url).send(),
+                client.get(&latency_url).send(),
+            );
+            let (status, uptime, latency) = (status.unwrap(), uptime.unwrap(), latency.unwrap());
+            assert!(status.status().is_success());
+            assert!(uptime.status().is_success());
+            assert!(latency.status().is_success());
+            let (status, uptime, latency) =
+                tokio::join!(status.bytes(), uptime.bytes(), latency.bytes());
+            let (status, uptime, latency) = (status.unwrap(), uptime.unwrap(), latency.unwrap());
+            page_ms.push(started.elapsed().as_millis());
+            page_bytes = status.len() + uptime.len() + latency.len();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&uptime).unwrap()["checks"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                check_count
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&latency).unwrap()["checks"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                check_count
+            );
         }
 
         let mut push_ms = Vec::with_capacity(sample_count * region_count);
@@ -3752,14 +4524,17 @@ mod tests {
         }
 
         let regional_p95 = percentile(&mut regional_ms, 95);
+        let page_p95 = percentile(&mut page_ms, 95);
         let push_p95 = percentile(&mut push_ms, 95);
         let global_p95 = percentile(&mut global_ms, 95);
         assert_ceiling("WARDEN_BENCH_MAX_REGIONAL_STATUS_P95_MS", regional_p95);
+        assert_ceiling("WARDEN_BENCH_MAX_STATUS_PAGE_P95_MS", page_p95);
+        assert_ceiling("WARDEN_BENCH_MAX_STATUS_PAGE_BYTES", page_bytes as u128);
         assert_ceiling("WARDEN_BENCH_MAX_GLOBAL_PUSH_P95_MS", push_p95);
         assert_ceiling("WARDEN_BENCH_MAX_GLOBAL_STATUS_P95_MS", global_p95);
         assert_ceiling("WARDEN_BENCH_MAX_PUSH_BYTES", push_bytes as u128);
         println!(
-            "checks={check_count} regions={region_count} samples={sample_count} regional_status_p95_ms={regional_p95} regional_status_bytes={regional_bytes} global_push_p95_ms={push_p95} push_bytes={push_bytes} global_status_p95_ms={global_p95} global_status_bytes={global_bytes}"
+            "checks={check_count} regions={region_count} samples={sample_count} regional_status_p95_ms={regional_p95} regional_status_bytes={regional_bytes} status_page_p95_ms={page_p95} status_page_bytes={page_bytes} status_page_requests=3 global_push_p95_ms={push_p95} push_bytes={push_bytes} global_status_p95_ms={global_p95} global_status_bytes={global_bytes}"
         );
     }
 

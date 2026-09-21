@@ -66,6 +66,30 @@ impl StateTracker {
         Self::default()
     }
 
+    pub fn snapshot_checks(&self, checks: &std::collections::HashSet<CheckId>) -> Self {
+        Self {
+            agents: self
+                .agents
+                .iter()
+                .filter(|((id, _), _)| checks.contains(id))
+                .map(|(key, belief)| (key.clone(), belief.clone()))
+                .collect(),
+            published: self
+                .published
+                .iter()
+                .filter(|(id, _)| checks.contains(id))
+                .map(|(id, state)| (*id, *state))
+                .collect(),
+        }
+    }
+
+    pub fn install_checks(&mut self, staged: Self, checks: &std::collections::HashSet<CheckId>) {
+        self.agents.retain(|(id, _), _| !checks.contains(id));
+        self.published.retain(|id, _| !checks.contains(id));
+        self.agents.extend(staged.agents);
+        self.published.extend(staged.published);
+    }
+
     /// Record one agent's observation of one check. Returns that agent's
     /// confirmed status afterwards.
     ///

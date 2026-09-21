@@ -65,15 +65,20 @@ pub(in crate::coordinator) async fn login_handler(
     let now = chrono::Utc::now().timestamp_millis();
     match coord.inner.auth.login(&body.password, peer.ip(), now) {
         Ok(token) => {
-            // HttpOnly so page scripts can't read it; SameSite=Strict so another
-            // origin can't ride the session. `Secure` is deliberately omitted —
-            // this is commonly served over plain HTTP on a LAN, and a Secure
-            // cookie would silently never be stored there.
+            // The Secure attribute is an explicit deployment setting, never
+            // inferred from Forwarded/X-Forwarded-Proto headers supplied by an
+            // untrusted client.
+            let secure = if coord.inner.secure_cookies {
+                "; Secure"
+            } else {
+                ""
+            };
             let cookie = format!(
-                "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+                "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
                 crate::auth::SESSION_COOKIE,
                 token,
-                12 * 60 * 60
+                12 * 60 * 60,
+                secure,
             );
             (
                 StatusCode::OK,
@@ -104,9 +109,15 @@ pub(in crate::coordinator) async fn logout_handler(
     if let Some(token) = session_token(&headers) {
         coord.inner.auth.logout(token);
     }
+    let secure = if coord.inner.secure_cookies {
+        "; Secure"
+    } else {
+        ""
+    };
     let cleared = format!(
-        "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
-        crate::auth::SESSION_COOKIE
+        "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
+        crate::auth::SESSION_COOKIE,
+        secure,
     );
     (
         StatusCode::OK,

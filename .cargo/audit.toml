@@ -1,0 +1,6 @@
+[advisories]
+# rust_decimal 1.42.1 (a transitive DuckDB dependency) is pinned to rkyv 0.7.
+# RUSTSEC-2026-0235 has no CVSS severity and requires the incompatible rkyv 0.8.
+# Reassess when DuckDB/rust_decimal supports rkyv >=0.8.
+ignore = ["RUSTSEC-2026-0235"]
+severity_threshold = "high"

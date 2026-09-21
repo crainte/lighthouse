@@ -5,8 +5,14 @@ use chrono::Utc;
 use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::{Resolver, TokioResolver};
-use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, OnceLock,
+    },
+    time::{Duration, Instant},
+};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
 
 /// What a probe observed: an optional HTTP status code, whether the configured
@@ -715,6 +721,125 @@ impl Probes {
     }
 }
 
+/// A bounded, opt-in aggregate for the release benchmark. No samples, check
+/// labels, or metric registry are retained; production avoids every atomic
+/// update unless `WARDEN_BENCH_AGENT_METRICS=1` was set before first use.
+#[derive(Debug, Default)]
+pub struct AgentBenchmarkMetrics {
+    pub scheduled: AtomicU64,
+    pub schedule_lag_ns: AtomicU64,
+    pub schedule_lag_max_ns: AtomicU64,
+    pub permit_wait_ns: AtomicU64,
+    pub permit_wait_max_ns: AtomicU64,
+    pub execute_ns: AtomicU64,
+    pub execute_max_ns: AtomicU64,
+    pub in_flight: AtomicU64,
+    pub in_flight_max: AtomicU64,
+    pub queued: AtomicU64,
+    pub queued_max: AtomicU64,
+    pub post_batches: AtomicU64,
+    pub post_results: AtomicU64,
+    pub post_batch_max: AtomicU64,
+    pub post_latency_ns: AtomicU64,
+    pub post_latency_max_ns: AtomicU64,
+    pub post_queue_max: AtomicU64,
+    pub dropped_results: AtomicU64,
+    pub post_success: AtomicU64,
+    pub post_client_errors: AtomicU64,
+    pub post_server_errors: AtomicU64,
+    pub post_transport_errors: AtomicU64,
+}
+
+impl AgentBenchmarkMetrics {
+    fn observe_max(value: &AtomicU64, sample: u64) {
+        value.fetch_max(sample, Ordering::Relaxed);
+    }
+
+    fn observe_duration(total: &AtomicU64, max: &AtomicU64, elapsed: Duration) {
+        let nanos = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+        total.fetch_add(nanos, Ordering::Relaxed);
+        Self::observe_max(max, nanos);
+    }
+
+    fn observe_queue(&self, len: usize) {
+        Self::observe_max(&self.post_queue_max, len as u64);
+    }
+}
+
+static BENCHMARK_METRICS: OnceLock<Option<Arc<AgentBenchmarkMetrics>>> = OnceLock::new();
+
+/// Return aggregate agent benchmark counters when explicitly enabled by
+/// `WARDEN_BENCH_AGENT_METRICS=1`. The returned counters are process-wide and
+/// bounded; benchmark callers may clear them with [`reset_benchmark_metrics`].
+pub fn benchmark_metrics() -> Option<Arc<AgentBenchmarkMetrics>> {
+    BENCHMARK_METRICS
+        .get_or_init(|| {
+            (std::env::var("WARDEN_BENCH_AGENT_METRICS").ok().as_deref() == Some("1"))
+                .then(|| Arc::new(AgentBenchmarkMetrics::default()))
+        })
+        .clone()
+}
+
+/// Clear the opt-in benchmark aggregate without allocating it when disabled.
+pub fn reset_benchmark_metrics() {
+    let Some(Some(metrics)) = BENCHMARK_METRICS.get() else {
+        return;
+    };
+    for counter in [
+        &metrics.scheduled,
+        &metrics.schedule_lag_ns,
+        &metrics.schedule_lag_max_ns,
+        &metrics.permit_wait_ns,
+        &metrics.permit_wait_max_ns,
+        &metrics.execute_ns,
+        &metrics.execute_max_ns,
+        &metrics.in_flight,
+        &metrics.in_flight_max,
+        &metrics.queued,
+        &metrics.queued_max,
+        &metrics.post_batches,
+        &metrics.post_results,
+        &metrics.post_batch_max,
+        &metrics.post_latency_ns,
+        &metrics.post_latency_max_ns,
+        &metrics.post_queue_max,
+        &metrics.dropped_results,
+        &metrics.post_success,
+        &metrics.post_client_errors,
+        &metrics.post_server_errors,
+        &metrics.post_transport_errors,
+    ] {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Wait for the agent-wide probe budget immediately before a probe executes.
+/// Tokio's semaphore is fair: a check already queued gets a permit before later
+/// arrivals, preventing a busy schedule from starving an older wake-up.
+async fn acquire_probe_permit(
+    permits: Arc<Semaphore>,
+    metrics: Option<&AgentBenchmarkMetrics>,
+) -> OwnedSemaphorePermit {
+    let started = metrics.map(|_| Instant::now());
+    if let Some(metrics) = metrics {
+        let queued = metrics.queued.fetch_add(1, Ordering::Relaxed) + 1;
+        AgentBenchmarkMetrics::observe_max(&metrics.queued_max, queued);
+    }
+    let permit = permits
+        .acquire_owned()
+        .await
+        .expect("probe semaphore is held by check loops");
+    if let Some(metrics) = metrics {
+        metrics.queued.fetch_sub(1, Ordering::Relaxed);
+        AgentBenchmarkMetrics::observe_duration(
+            &metrics.permit_wait_ns,
+            &metrics.permit_wait_max_ns,
+            started.expect("metrics start time").elapsed(),
+        );
+    }
+    permit
+}
+
 /// Spawn one loop per check, each on its own interval so a slow check never
 /// delays a sibling. Results flow into `tx`. Handles are returned so a caller
 /// that re-syncs its check list can replace the whole set.
@@ -768,6 +893,21 @@ pub fn spawn_check_loops(
     checks: Vec<CheckConfig>,
     tx: mpsc::Sender<CheckResult>,
 ) -> Result<Vec<tokio::task::JoinHandle<()>>> {
+    cfg.validate()?;
+    spawn_check_loops_with_permits(
+        cfg,
+        checks,
+        tx,
+        Arc::new(Semaphore::new(cfg.max_in_flight_probes)),
+    )
+}
+
+fn spawn_check_loops_with_permits(
+    cfg: &AgentConfig,
+    checks: Vec<CheckConfig>,
+    tx: mpsc::Sender<CheckResult>,
+    permits: Arc<Semaphore>,
+) -> Result<Vec<tokio::task::JoinHandle<()>>> {
     let probes = Probes::new()?;
     let mut handles = Vec::with_capacity(checks.len());
     for check in checks {
@@ -786,6 +926,8 @@ pub fn spawn_check_loops(
         let probes = probes.clone();
         let origin = OwnedOrigin::from(cfg);
         let tx = tx.clone();
+        let permits = permits.clone();
+        let metrics = benchmark_metrics();
         handles.push(tokio::spawn(async move {
             let mut cadence = ProbeCadence::Scheduled;
             let mut failures = 0;
@@ -804,9 +946,37 @@ pub fn spawn_check_loops(
                     ProbeCadence::Retry => retry_interval,
                     ProbeCadence::Down => down_interval,
                 };
+                let scheduled = Instant::now();
                 tokio::time::sleep(wait).await;
+                if let Some(metrics) = &metrics {
+                    metrics.scheduled.fetch_add(1, Ordering::Relaxed);
+                    let lag = scheduled.elapsed().saturating_sub(wait);
+                    AgentBenchmarkMetrics::observe_duration(
+                        &metrics.schedule_lag_ns,
+                        &metrics.schedule_lag_max_ns,
+                        lag,
+                    );
+                }
 
+                // Wait after the scheduled wake-up, not before it. The queue
+                // therefore bounds only execution/socket use, never schedule
+                // calculation or a check loop's ability to rejoin the queue.
+                let permit = acquire_probe_permit(permits.clone(), metrics.as_deref()).await;
+                if let Some(metrics) = &metrics {
+                    let in_flight = metrics.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+                    AgentBenchmarkMetrics::observe_max(&metrics.in_flight_max, in_flight);
+                }
+                let execution = metrics.as_ref().map(|_| Instant::now());
                 let result = execute_check(&probes, &origin.borrow(), &check).await;
+                if let Some(metrics) = &metrics {
+                    metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
+                    AgentBenchmarkMetrics::observe_duration(
+                        &metrics.execute_ns,
+                        &metrics.execute_max_ns,
+                        execution.expect("metrics start time").elapsed(),
+                    );
+                }
+                drop(permit);
                 cadence = next_cadence(
                     scheduling_status(&check, &result),
                     &mut failures,
@@ -880,14 +1050,16 @@ pub async fn sync_loop(cfg: AgentConfig, tx: mpsc::Sender<CheckResult>, initial:
     );
     let token = cfg.resolved_token();
 
+    let permits = Arc::new(Semaphore::new(cfg.max_in_flight_probes));
     let mut current = initial;
-    let mut handles = match spawn_check_loops(&cfg, current.clone(), tx.clone()) {
-        Ok(h) => h,
-        Err(e) => {
-            warn!(error = %e, "failed to start check loops");
-            return;
-        }
-    };
+    let mut handles =
+        match spawn_check_loops_with_permits(&cfg, current.clone(), tx.clone(), permits.clone()) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(error = %e, "failed to start check loops");
+                return;
+            }
+        };
 
     let mut poll = tokio::time::interval(std::time::Duration::from_secs(cfg.poll_secs.max(1)));
     // The first tick fires immediately, which is what we want: the config file
@@ -951,7 +1123,12 @@ pub async fn sync_loop(cfg: AgentConfig, tx: mpsc::Sender<CheckResult>, initial:
             h.abort();
         }
         current = fetched;
-        handles = match spawn_check_loops(&cfg, current.clone(), tx.clone()) {
+        handles = match spawn_check_loops_with_permits(
+            &cfg,
+            current.clone(),
+            tx.clone(),
+            permits.clone(),
+        ) {
             Ok(h) => h,
             Err(e) => {
                 warn!(error = %e, "failed to restart check loops");
@@ -1044,81 +1221,196 @@ fn usable_checks(raw: Vec<serde_json::Value>) -> (Vec<CheckConfig>, Vec<String>)
     (usable, skipped)
 }
 
+// A full batch is sent immediately, rather than waiting for the next periodic
+// flush. At the default five-second interval this keeps a 10k-results/30s agent
+// (333 results/s) bounded and lossless while its coordinator is healthy.
+const MAX_RESULTS_PER_BATCH: usize = 500;
+// Thirty seconds of that expected peak rate. This is a result count, not a
+// batch count, so the memory limit remains meaningful if batch sizing changes.
+const MAX_PENDING_RESULTS: usize = 10_000;
+
+/// FIFO retry buffer whose bound is expressed in results rather than batches.
+#[derive(Default)]
+struct PendingResults {
+    batches: std::collections::VecDeque<Vec<CheckResult>>,
+    len: usize,
+}
+
+impl PendingResults {
+    fn is_empty(&self) -> bool {
+        self.batches.is_empty()
+    }
+
+    /// Retain the oldest observations when the coordinator is unavailable:
+    /// replacing them with newer ones would violate retry FIFO.
+    fn push_back(&mut self, batch: Vec<CheckResult>) -> bool {
+        debug_assert!(!batch.is_empty() && batch.len() <= MAX_RESULTS_PER_BATCH);
+        if self.len + batch.len() > MAX_PENDING_RESULTS {
+            return false;
+        }
+        self.len += batch.len();
+        self.batches.push_back(batch);
+        true
+    }
+
+    fn pop_front(&mut self) -> Option<Vec<CheckResult>> {
+        let batch = self.batches.pop_front()?;
+        self.len -= batch.len();
+        Some(batch)
+    }
+
+    fn push_front(&mut self, batch: Vec<CheckResult>) {
+        self.len += batch.len();
+        self.batches.push_front(batch);
+    }
+}
+
+fn queue_current(
+    current: &mut Vec<CheckResult>,
+    pending: &mut PendingResults,
+    metrics: Option<&AgentBenchmarkMetrics>,
+) {
+    if current.is_empty() {
+        return;
+    }
+    let batch_len = current.len();
+    if !pending.push_back(std::mem::take(current)) {
+        if let Some(metrics) = metrics {
+            metrics
+                .dropped_results
+                .fetch_add(batch_len as u64, Ordering::Relaxed);
+        }
+        warn!(
+            buffered = pending.len,
+            cap = MAX_PENDING_RESULTS,
+            "result buffer full, dropping newest batch"
+        );
+    }
+    if let Some(metrics) = metrics {
+        metrics.observe_queue(pending.len);
+    }
+}
+
+async fn post_pending(
+    cfg: &AgentConfig,
+    client: &reqwest::Client,
+    token: &Option<String>,
+    pending: &mut PendingResults,
+    metrics: Option<&AgentBenchmarkMetrics>,
+) {
+    // Retry oldest first, so history reaches the coordinator in order and a
+    // recovered queue never reorders around a gap.
+    while let Some(front) = pending.pop_front() {
+        let batch_len = front.len();
+        let body = ResultBatch { results: front };
+        let started = metrics.map(|_| Instant::now());
+        // Read per batch: the sync loop shares this cursor, so a failover it
+        // decided applies to results already queued.
+        let coordinator = cfg.coordinator().to_string();
+        let mut req = client
+            .post(format!("{coordinator}/api/v1/results"))
+            .json(&body);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        match req.send().await {
+            Ok(r) if r.status().is_success() => {
+                if let Some(metrics) = metrics {
+                    metrics.post_success.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Ok(r) => {
+                warn!(status = %r.status(), "coordinator rejected results");
+                // A 4xx will never succeed on retry; dropping it avoids a
+                // per-flush hot loop. A 5xx is transient.
+                if !r.status().is_server_error() {
+                    if let Some(metrics) = metrics {
+                        metrics.post_client_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
+                    if let Some(metrics) = metrics {
+                        metrics.post_server_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                    pending.push_front(body.results);
+                }
+            }
+            Err(e) => {
+                if let Some(metrics) = metrics {
+                    metrics
+                        .post_transport_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                warn!(error = %e, coordinator = %coordinator, "failed to post results, keeping batch for retry");
+                // The batch is kept, so failing over costs nothing: the next
+                // flush replays it at the next coordinator and coordinator-side
+                // deduplication makes a double delivery a no-op.
+                cfg.rotate_coordinator();
+                pending.push_front(body.results);
+            }
+        }
+        if let Some(metrics) = metrics {
+            metrics.post_batches.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .post_results
+                .fetch_add(batch_len as u64, Ordering::Relaxed);
+            AgentBenchmarkMetrics::observe_max(&metrics.post_batch_max, batch_len as u64);
+            AgentBenchmarkMetrics::observe_duration(
+                &metrics.post_latency_ns,
+                &metrics.post_latency_max_ns,
+                started.expect("metrics start time").elapsed(),
+            );
+            metrics.observe_queue(pending.len);
+        }
+        if !pending.is_empty() {
+            break;
+        }
+    }
+}
+
 /// Batch results and POST them to a remote coordinator (agent mode).
 /// Standalone mode skips this and consumes the channel directly.
 pub async fn poster_loop(cfg: AgentConfig, mut rx: mpsc::Receiver<CheckResult>) {
     let client = reqwest::Client::new();
     let token = cfg.resolved_token();
-    let mut current = Vec::new();
-    // Batches whose POST failed, oldest first. A failed POST keeps its batch
-    // and retries on the next flush instead of dropping it, so a coordinator
-    // that blips for a minute does not silently eat the results that would
-    // have confirmed (or recovered) an outage. Bounded so an unreachable
-    // coordinator cannot grow an unbounded backlog in memory; when the cap is
-    // hit the OLDEST results are dropped, because the freshest observation is
-    // what the status page and the confirmation threshold act on.
-    let mut pending: std::collections::VecDeque<Vec<CheckResult>> =
-        std::collections::VecDeque::new();
-    const MAX_PENDING_BATCHES: usize = 32;
-    let mut flush = tokio::time::interval(std::time::Duration::from_secs(cfg.flush_secs));
+    let mut current = Vec::with_capacity(MAX_RESULTS_PER_BATCH);
+    let mut pending = PendingResults::default();
+    let metrics = benchmark_metrics();
+    let mut flush = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(cfg.flush_secs),
+        Duration::from_secs(cfg.flush_secs),
+    );
+    let mut receiver_open = true;
 
     loop {
         tokio::select! {
-            maybe = rx.recv() => match maybe {
-                Some(r) => current.push(r),
-                None => break, // producers gone
+            maybe = rx.recv(), if receiver_open => match maybe {
+                Some(r) => {
+                    current.push(r);
+                    if current.len() == MAX_RESULTS_PER_BATCH {
+                        let was_empty = pending.is_empty();
+                        queue_current(&mut current, &mut pending, metrics.as_deref());
+                        // A healthy coordinator never accumulates a queue: send
+                        // full batches immediately. Once a retry is queued,
+                        // wait for the periodic flush before retrying it.
+                        if was_empty {
+                            post_pending(&cfg, &client, &token, &mut pending, metrics.as_deref()).await;
+                        }
+                    }
+                }
+                None => {
+                    queue_current(&mut current, &mut pending, metrics.as_deref());
+                    post_pending(&cfg, &client, &token, &mut pending, metrics.as_deref()).await;
+                    if pending.is_empty() {
+                        return;
+                    }
+                    receiver_open = false;
+                }
             },
             _ = flush.tick() => {
-                if current.is_empty() && pending.is_empty() {
-                    continue;
-                }
-                if !current.is_empty() {
-                    pending.push_back(std::mem::take(&mut current));
-                    while pending.len() > MAX_PENDING_BATCHES {
-                        warn!("result buffer full, dropping oldest batch");
-                        pending.pop_front();
-                    }
-                }
-                // Retry oldest first, so history reaches the coordinator in
-                // order and a recovered queue never reorders around a gap.
-                while let Some(front) = pending.pop_front() {
-                    let body = ResultBatch { results: front };
-                    // Read per batch: the sync loop shares this cursor, so a
-                    // failover it decided applies to results already queued.
-                    let coordinator = cfg.coordinator().to_string();
-                    let mut req = client
-                        .post(format!("{coordinator}/api/v1/results"))
-                        .json(&body);
-                    if let Some(t) = &token {
-                        req = req.bearer_auth(t);
-                    }
-                    match req.send().await {
-                        Ok(r) if r.status().is_success() => {}
-                        // A rejected batch is worth shouting about: a token
-                        // mismatch otherwise looks exactly like a check that
-                        // stopped reporting.
-                        Ok(r) => {
-                            warn!(status = %r.status(), "coordinator rejected results");
-                            // A 4xx will never succeed on retry; dropping it
-                            // avoids a per-flush hot loop. A 5xx is transient.
-                            if !r.status().is_server_error() {
-                                continue;
-                            }
-                            pending.push_front(body.results);
-                            break;
-                        }
-                        Err(e) => {
-                            warn!(error = %e, coordinator = %coordinator, "failed to post results, keeping batch for retry");
-                            // The batch is kept, so failing over costs nothing:
-                            // the next flush replays it at the next coordinator
-                            // and `insert_results_dedup` makes a double
-                            // delivery a no-op if the first one landed after
-                            // all.
-                            cfg.rotate_coordinator();
-                            pending.push_front(body.results);
-                            break;
-                        }
-                    }
+                queue_current(&mut current, &mut pending, metrics.as_deref());
+                post_pending(&cfg, &client, &token, &mut pending, metrics.as_deref()).await;
+                if !receiver_open && pending.is_empty() {
+                    return;
                 }
             }
         }
@@ -1127,9 +1419,22 @@ pub async fn poster_loop(cfg: AgentConfig, mut rx: mpsc::Receiver<CheckResult>) 
 
 #[cfg(test)]
 mod sync_tests {
-    use super::{next_cadence, same_checks, usable_checks, ProbeCadence};
-    use crate::config::CheckConfig;
-    use crate::models::Status;
+    use super::{
+        acquire_probe_permit, next_cadence, poster_loop, same_checks, usable_checks, ProbeCadence,
+    };
+    use crate::config::{AgentConfig, CheckConfig};
+    use crate::models::{CheckId, CheckKind, CheckResult, ResultBatch, Status};
+    use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+    use chrono::Utc;
+    use std::{
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
+        time::Duration,
+    };
+    use tokio::sync::{mpsc, watch, Semaphore};
+    use tokio::time::timeout;
 
     fn dns_check() -> CheckConfig {
         CheckConfig {
@@ -1138,6 +1443,183 @@ mod sync_tests {
             target: "home.example.com".into(),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn probe_permits_bound_execution_and_queued_checks_progress_fairly() {
+        let permits = Arc::new(Semaphore::new(3));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (started_tx, mut started_rx) = mpsc::channel(12);
+        let (release_tx, release_rx) = watch::channel(false);
+        let mut workers = Vec::new();
+        for _ in 0..12 {
+            let permits = permits.clone();
+            let active = active.clone();
+            let peak = peak.clone();
+            let started_tx = started_tx.clone();
+            let mut release_rx = release_rx.clone();
+            workers.push(tokio::spawn(async move {
+                let _permit = acquire_probe_permit(permits, None).await;
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                started_tx.send(()).await.unwrap();
+                release_rx.wait_for(|released| *released).await.unwrap();
+                active.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        drop(started_tx);
+
+        for _ in 0..3 {
+            timeout(Duration::from_secs(1), started_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), 3);
+        release_tx.send(true).unwrap();
+        for worker in workers {
+            timeout(Duration::from_secs(1), worker)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert!(
+            started_rx.recv().await.is_some(),
+            "queued checks must eventually run"
+        );
+
+        let permits = Arc::new(Semaphore::new(1));
+        let held = permits.clone().acquire_owned().await.unwrap();
+        let (order_tx, mut order_rx) = mpsc::channel(2);
+        let (queued_tx, mut queued_rx) = mpsc::channel(2);
+        for check in ["older", "newer"] {
+            let permits = permits.clone();
+            let order_tx = order_tx.clone();
+            let queued_tx = queued_tx.clone();
+            tokio::spawn(async move {
+                queued_tx.send(()).await.unwrap();
+                let _permit = acquire_probe_permit(permits, None).await;
+                order_tx.send(check).await.unwrap();
+            });
+            timeout(Duration::from_secs(1), queued_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::task::yield_now().await;
+        }
+        drop(held);
+        assert_eq!(
+            timeout(Duration::from_secs(1), order_rx.recv())
+                .await
+                .unwrap(),
+            Some("older")
+        );
+    }
+
+    fn result(sequence: u128) -> CheckResult {
+        CheckResult {
+            check_id: CheckId::from_u128(sequence),
+            agent_id: "batch-test".into(),
+            zone: "test-zone".into(),
+            region: "test-region".into(),
+            kind: CheckKind::Http,
+            timestamp: Utc::now(),
+            latency_ms: 0,
+            status_code: Some(200),
+            body_matched: None,
+            error: None,
+            failure: None,
+            body: None,
+            headers: None,
+            metric: None,
+            metrics: None,
+        }
+    }
+
+    type SinkState = (Arc<Mutex<Vec<Vec<u128>>>>, Arc<AtomicBool>);
+
+    async fn start_result_sink(reject_first: bool) -> (String, Arc<Mutex<Vec<Vec<u128>>>>) {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let reject = Arc::new(AtomicBool::new(reject_first));
+        let app = Router::new()
+            .route(
+                "/api/v1/results",
+                post(
+                    |State((received, reject)): State<SinkState>,
+                     Json(batch): Json<ResultBatch>| async move {
+                        let ids = batch
+                            .results
+                            .into_iter()
+                            .map(|r| r.check_id.as_u128())
+                            .collect();
+                        received.lock().unwrap().push(ids);
+                        if reject.swap(false, Ordering::SeqCst) {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        } else {
+                            StatusCode::OK
+                        }
+                    },
+                ),
+            )
+            .with_state((received.clone(), reject));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (base, received)
+    }
+
+    #[tokio::test]
+    async fn poster_splits_sustained_bursts_into_bounded_batches() {
+        let (base, received) = start_result_sink(false).await;
+        let (tx, rx) = mpsc::channel(1_100);
+        let mut cfg = AgentConfig::default();
+        cfg.coordinator_url = vec![base];
+        cfg.flush_secs = 60;
+        let poster = tokio::spawn(poster_loop(cfg, rx));
+        for sequence in 0..1_001 {
+            tx.send(result(sequence)).await.unwrap();
+        }
+        drop(tx);
+        timeout(Duration::from_secs(5), poster)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let received = received.lock().unwrap().clone();
+        assert!(
+            received
+                .iter()
+                .all(|batch| batch.len() <= super::MAX_RESULTS_PER_BATCH),
+            "each POST must be capped"
+        );
+        assert_eq!(
+            received.into_iter().flatten().collect::<Vec<_>>(),
+            (0..1_001).collect::<Vec<_>>(),
+            "healthy bursts must neither drop nor reorder results"
+        );
+    }
+
+    #[tokio::test]
+    async fn poster_retries_failed_batches_before_later_results() {
+        let (base, received) = start_result_sink(true).await;
+        let (tx, rx) = mpsc::channel(4);
+        let mut cfg = AgentConfig::default();
+        cfg.coordinator_url = vec![base];
+        cfg.flush_secs = 1;
+        let poster = tokio::spawn(poster_loop(cfg, rx));
+        tx.send(result(1)).await.unwrap();
+        tx.send(result(2)).await.unwrap();
+        drop(tx);
+        timeout(Duration::from_secs(5), poster)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let received = received.lock().unwrap().clone();
+        assert_eq!(received, vec![vec![1, 2], vec![1, 2]]);
     }
 
     #[test]

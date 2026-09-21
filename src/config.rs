@@ -69,6 +69,11 @@ pub struct AgentConfig {
     /// a metered or high-latency link can raise it.
     #[serde(default = "default_poll_secs")]
     pub poll_secs: u64,
+    /// At most this many probes may execute concurrently on this agent.
+    /// Shared across every running check loop, including loop generations after a
+    /// coordinator sync. Must be positive; no upper limit is imposed.
+    #[serde(default = "default_max_in_flight_probes")]
+    pub max_in_flight_probes: usize,
     /// Shared secret presented to the coordinator, falling back to
     /// `WARDEN_AGENT_TOKEN`. Must match the coordinator's `agent_token`.
     #[serde(default)]
@@ -124,6 +129,15 @@ impl AgentConfig {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     }
+
+    /// Refuse a zero-sized execution budget rather than starting check loops
+    /// that can never acquire a permit.
+    pub fn validate(&self) -> Result<()> {
+        if self.max_in_flight_probes == 0 {
+            anyhow::bail!("agent.max_in_flight_probes must be positive");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -143,6 +157,11 @@ pub struct CoordinatorConfig {
     /// that silently accepts anonymous edits is worse than one you can't edit.
     #[serde(default)]
     pub admin_password: Option<String>,
+    /// Mark admin session cookies `Secure`. Enable this when TLS terminates at
+    /// this server or at a trusted proxy; it is never inferred from forwarded
+    /// request headers, which untrusted clients can forge.
+    #[serde(default)]
+    pub secure_cookies: bool,
     /// How long result, alert and incident history is kept. A nightly prune
     /// deletes rows older than this; raising the values keeps more history.
     #[serde(default)]
@@ -279,6 +298,10 @@ pub struct GlobalConfig {
     /// when unset — same contract as a coordinator.
     #[serde(default)]
     pub admin_password: Option<String>,
+    /// Mark admin session cookies `Secure`; explicitly enable when this node is
+    /// served over TLS or behind a trusted TLS-terminating proxy.
+    #[serde(default)]
+    pub secure_cookies: bool,
     /// Secret regional coordinators must present to push state. Required in
     /// `global` mode: an unauthenticated push endpoint would let anyone rewrite
     /// what the global dashboard shows. Falls back to `WARDEN_GLOBAL_TOKEN`.
@@ -325,6 +348,7 @@ impl Default for GlobalConfig {
         Self {
             listen: default_global_listen(),
             admin_password: None,
+            secure_cookies: false,
             token: None,
             region_staleness_secs: default_region_staleness_secs(),
             notifiers: Vec::new(),
@@ -1482,6 +1506,9 @@ fn default_poll_secs() -> u64 {
 fn default_flush_secs() -> u64 {
     5
 }
+fn default_max_in_flight_probes() -> usize {
+    128
+}
 fn default_listen() -> String {
     "0.0.0.0:8080".into()
 }
@@ -1504,6 +1531,7 @@ impl Default for AgentConfig {
             region: default_location(),
             flush_secs: default_flush_secs(),
             poll_secs: default_poll_secs(),
+            max_in_flight_probes: default_max_in_flight_probes(),
             token: None,
             cursor: Arc::default(),
         }
@@ -1517,6 +1545,7 @@ impl Default for CoordinatorConfig {
             db_path: default_db_path(),
             notifiers: Vec::new(),
             admin_password: None,
+            secure_cookies: false,
             retention: RetentionConfig::default(),
             peers: Vec::new(),
             peer_token: None,
@@ -1561,6 +1590,30 @@ mod tests {
             cfg.global.regions[0].endpoints,
             vec!["http://coordinator-tw:8080".to_string()]
         );
+    }
+
+    #[test]
+    fn agent_max_in_flight_probes_defaults_to_128() {
+        let cfg: Config = toml::from_str("[agent]").expect("agent config parses");
+        assert_eq!(cfg.agent.max_in_flight_probes, 128);
+        cfg.agent.validate().expect("default is valid");
+    }
+
+    #[test]
+    fn agent_max_in_flight_probes_accepts_any_positive_value() {
+        let cfg: Config = toml::from_str("[agent]\nmax_in_flight_probes = 1000000")
+            .expect("positive budget parses");
+        cfg.agent.validate().expect("positive budget is valid");
+    }
+
+    #[test]
+    fn agent_max_in_flight_probes_rejects_zero() {
+        let cfg: Config = toml::from_str("[agent]\nmax_in_flight_probes = 0")
+            .expect("zero parses so startup can explain the error");
+        let err = cfg.agent.validate().expect_err("zero budget is invalid");
+        assert!(err
+            .to_string()
+            .contains("max_in_flight_probes must be positive"));
     }
 
     #[test]

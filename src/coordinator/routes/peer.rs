@@ -54,49 +54,88 @@ pub(in crate::coordinator) async fn gossip_handler(
         Ok(m) => m,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
+    let _state_write = coord.inner.state_write.lock().await;
     let t = msg.transition();
-    // The peer sends only confirmed flips, so no hold-down remains in flight on
-    // this node for a check somebody else already decided.
-    coord
-        .inner
-        .tracker
-        .lock()
-        .seed_published(t.check_id, t.to, None);
     let persisted = t.clone();
     let timestamp = msg.timestamp;
+    let alert_id = msg.alert_id;
     let message_incident = msg.incident_id;
-    if let Err(error) = coord
+    let inserted = match coord
         .db(move |store| {
-            store.update_current_state(persisted.check_id, persisted.to, None, timestamp)?;
-            if alert::should_alert(&persisted) {
-                let incident_id = message_incident.or_else(|| {
-                    store
-                        .open_incident_for(persisted.check_id)
-                        .ok()
-                        .flatten()
-                        .map(|incident| incident.id)
-                });
-                store.insert_alert(
-                    storage::AlertScope::Check,
-                    &persisted.check_id.to_string(),
-                    Some(persisted.from),
-                    persisted.to,
-                    timestamp,
-                    incident_id.as_deref(),
-                )?;
-            }
-            Ok(())
+            store.transaction(|store| {
+                if !alert::should_alert(&persisted) {
+                    store.update_current_state(
+                        persisted.check_id,
+                        persisted.to,
+                        None,
+                        timestamp,
+                    )?;
+                    return Ok(true);
+                }
+                let incident_id = match message_incident {
+                    Some(id) => Some(id),
+                    None => store
+                        .open_incident_for(persisted.check_id)?
+                        .map(|incident| incident.id),
+                };
+                let inserted = if let Some(id) = alert_id {
+                    let applied = store.upsert_alert(&storage::AlertRow {
+                        id: id.clone(),
+                        scope: storage::AlertScope::Check,
+                        node_id: persisted.check_id.to_string(),
+                        previous_state: Some(persisted.from),
+                        current_state: persisted.to,
+                        timestamp,
+                        incident_id,
+                    })?;
+                    if applied == storage::AlertApply::Conflict {
+                        tracing::warn!(alert = %id, "gossip: alert id conflicts with a different local event, keeping the local one");
+                    }
+                    applied == storage::AlertApply::Inserted
+                } else {
+                    store.insert_alert(
+                        storage::AlertScope::Check,
+                        &persisted.check_id.to_string(),
+                        Some(persisted.from),
+                        persisted.to,
+                        timestamp,
+                        incident_id.as_deref(),
+                    )?;
+                    true
+                };
+                if inserted {
+                    store.update_current_state(
+                        persisted.check_id,
+                        persisted.to,
+                        None,
+                        timestamp,
+                    )?;
+                    store.record_state(persisted.check_id, persisted.to, timestamp)?;
+                }
+                Ok(inserted)
+            })
         })
         .await
     {
-        tracing::warn!(%error, check = %t.check_id, "gossip: failed to persist transition");
+        Ok(inserted) => inserted,
+        Err(error) => {
+            tracing::warn!(%error, check = %t.check_id, "gossip: failed to persist transition");
+            return internal_error(error);
+        }
+    };
+    if inserted {
+        coord
+            .inner
+            .tracker
+            .lock()
+            .seed_published(t.check_id, t.to, None);
+        let _ = coord.inner.events.send(WsEvent::StateChange {
+            check_id: t.check_id,
+            from: t.from,
+            to: t.to,
+            timestamp: msg.timestamp,
+        });
     }
-    let _ = coord.inner.events.send(WsEvent::StateChange {
-        check_id: t.check_id,
-        from: t.from,
-        to: t.to,
-        timestamp: msg.timestamp,
-    });
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -224,8 +263,10 @@ pub(in crate::coordinator) async fn replicate_handler(
     if let Some(denied) = require_peer(&coord, &headers) {
         return denied;
     }
-    coord.apply_replicated(batch).await;
-    StatusCode::NO_CONTENT.into_response()
+    match coord.apply_replicated(batch).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => internal_error(error),
+    }
 }
 
 /// The config plane's push, `POST /internal/config`'s body: a batch of
@@ -545,6 +586,60 @@ pub(in crate::coordinator) struct BackfillQuery {
     since_agent_id: Option<String>,
     until: i64,
     limit: usize,
+}
+
+/// Query for `GET /internal/backfill/results`. Empty composite cursor fields
+/// denote the beginning, allowing callers to use a stable query shape.
+#[derive(Debug, Deserialize)]
+pub(in crate::coordinator) struct ResultsBackfillQuery {
+    since: i64,
+    since_check_id: Option<String>,
+    since_agent_id: Option<String>,
+    limit: usize,
+}
+
+/// `GET /internal/backfill/results`: paged raw rows across all checks. The
+/// composite `(timestamp, check_id, agent_id)` cursor is exclusive and fully
+/// ordered, which avoids one request per divergent check during anti-entropy.
+pub(in crate::coordinator) async fn results_backfill_handler(
+    State(coord): State<Coordinator>,
+    headers: HeaderMap,
+    Query(q): Query<ResultsBackfillQuery>,
+) -> Response {
+    if let Some(denied) = require_peer(&coord, &headers) {
+        return denied;
+    }
+    let since_check_id = match q.since_check_id.as_deref().filter(|id| !id.is_empty()) {
+        Some(id) => match id.parse() {
+            Ok(id) => Some(id),
+            Err(_) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "since_check_id must be a valid UUID",
+                )
+            }
+        },
+        None => None,
+    };
+    let since_agent_id = q.since_agent_id.filter(|id| !id.is_empty());
+    let limit = q.limit.min(super::super::ANTI_ENTROPY_PAGE);
+    match coord
+        .db(move |storage| {
+            storage.results_after(q.since, since_check_id, since_agent_id.as_deref(), limit)
+        })
+        .await
+    {
+        Ok(rows) => Json(ReplicationBatch {
+            origin: coord.inner.node_id.clone(),
+            results: rows
+                .into_iter()
+                .map(|(result, status)| ReplicatedResult { result, status })
+                .collect(),
+            ..Default::default()
+        })
+        .into_response(),
+        Err(e) => internal_error(e),
+    }
 }
 
 /// `GET /internal/backfill`: paged raw rows for one check, with the composite

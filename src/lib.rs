@@ -11,4 +11,5 @@ pub mod openmetrics;
 pub mod placement;
 pub mod rollup;
 pub mod script;
+pub mod security;
 pub mod version;

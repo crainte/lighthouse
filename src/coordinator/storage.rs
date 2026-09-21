@@ -722,7 +722,7 @@ pub struct StreamDigest {
 
 /// Which config table an entry belongs to. `kind` on `ConfigEntry` and
 /// `config_tombstones`, and the discriminant a digest groups by.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigKind {
     Check,
@@ -782,6 +782,15 @@ impl ConfigKind {
             ConfigKind::RollupPolicy => ("rollup_policy", "node_id"),
         }
     }
+}
+
+/// What a replicated alert did on arrival: a new event, a replay of one already
+/// held, or an id whose payload disagrees with the local event of the same id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertApply {
+    Inserted,
+    Replay,
+    Conflict,
 }
 
 /// A row's contribution to a digest: enough to tell a peer whether it is
@@ -1640,6 +1649,64 @@ fn migrate_check_identity(conn: &Connection) -> Result<()> {
     }
 }
 
+/// Merge `ingest_agent_stage` into `agent_check_state`, keeping the newest
+/// belief per `(check_id, agent_id)`. One statement, shared by local ingest and
+/// replication so the two cannot drift on what "newest" means.
+const AGENT_STATE_MERGE_SQL: &str = "INSERT INTO agent_check_state
+     SELECT check_id, agent_id, status, consecutive_failures, zone, region, last_check
+     FROM ingest_agent_stage
+     QUALIFY row_number() OVER (
+         PARTITION BY check_id, agent_id ORDER BY last_check DESC, ordinal DESC
+     ) = 1
+     ON CONFLICT (check_id, agent_id) DO UPDATE SET
+         status = excluded.status,
+         consecutive_failures = excluded.consecutive_failures,
+         zone = excluded.zone,
+         region = excluded.region,
+         last_check = excluded.last_check
+     WHERE excluded.last_check >= agent_check_state.last_check;";
+
+/// Fold rows just written to `check_results` into the tables derived from them:
+/// the anti-entropy watermark and the per-check latest result the status page
+/// reads. `staged` names the table holding exactly the rows that were inserted
+/// — every row in it is counted, so a caller that deduplicates must pass the
+/// surviving rows rather than everything it was offered.
+fn derived_results_sql(staged: &str) -> String {
+    format!(
+        "INSERT INTO result_replication_watermarks
+         SELECT check_id, MAX(ts_millis), COUNT(*) FROM {staged} GROUP BY check_id
+         ON CONFLICT (check_id) DO UPDATE SET
+             max_ts = GREATEST(result_replication_watermarks.max_ts, excluded.max_ts),
+             result_count = result_replication_watermarks.result_count + excluded.result_count;
+         INSERT INTO latest_check_results
+         SELECT check_id, agent_id, ts_millis, status, latency_ms, status_code, error, failure
+         FROM {staged}
+         QUALIFY row_number() OVER (
+             PARTITION BY check_id ORDER BY ts_millis DESC, agent_id DESC
+         ) = 1
+         ON CONFLICT (check_id) DO UPDATE SET
+             agent_id = excluded.agent_id,
+             ts_millis = excluded.ts_millis,
+             status = excluded.status,
+             latency_ms = excluded.latency_ms,
+             status_code = excluded.status_code,
+             error = excluded.error,
+             failure = excluded.failure
+         WHERE excluded.ts_millis > latest_check_results.ts_millis
+            OR (excluded.ts_millis = latest_check_results.ts_millis
+                AND excluded.agent_id > latest_check_results.agent_id);"
+    )
+}
+
+/// What a batch of config entries is arbitrated against: the newest stamp each
+/// `(kind, id)` currently carries here, and which of them carry a tombstone at
+/// all — a delete that is not there does not need clearing.
+#[derive(Default)]
+struct ConfigStamps {
+    newest: std::collections::HashMap<(ConfigKind, String), Hlc>,
+    tombstoned: std::collections::HashSet<(ConfigKind, String)>,
+}
+
 impl Storage {
     /// Open (or create) the database at `path` and ensure the schema exists.
     /// `path` may be ":memory:" for tests.
@@ -2049,6 +2116,39 @@ impl Storage {
                 conn.execute_batch(ddl)?;
             }
         }
+        let incident_columns = table_column_names(&conn, "incidents")?;
+        for (column, ddl) in [
+            (
+                "version_millis",
+                "ALTER TABLE incidents ADD COLUMN version_millis BIGINT",
+            ),
+            (
+                "version_node",
+                "ALTER TABLE incidents ADD COLUMN version_node VARCHAR",
+            ),
+        ] {
+            if !incident_columns.iter().any(|c| c == column) {
+                conn.execute_batch(ddl)?;
+            }
+        }
+        // Incident replication was added after incidents already existed. Use
+        // the newest persisted lifecycle fact as their first version so an old
+        // resolved incident cannot outrank a newer one merely because it was
+        // migrated later. Old rows predate node identities, which means the
+        // local identity is the only stable, deterministic tiebreak available.
+        conn.execute_batch(
+            "UPDATE incidents
+             SET version_millis = GREATEST(
+                     started_at,
+                     COALESCE(resolved_at, started_at),
+                     COALESCE((
+                         SELECT MAX(created_at) FROM incident_updates u
+                         WHERE u.incident_id = incidents.id
+                     ), started_at)
+                 )
+             WHERE version_millis IS NULL;
+             UPDATE incidents SET version_node = 'local' WHERE version_node IS NULL;",
+        )?;
         let section_columns: Vec<String> = {
             let mut stmt = conn.prepare(
                 "SELECT column_name FROM information_schema.columns
@@ -2648,12 +2748,42 @@ impl Storage {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn execute_test_sql(&self, sql: &str) -> Result<()> {
+        self.conn.execute_batch(sql)?;
+        Ok(())
+    }
+
+    pub(crate) fn transaction<T>(&self, operation: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("BEGIN")?;
+        match operation(self) {
+            Ok(value) => {
+                if let Err(error) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(error.into());
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
     pub fn persist_ingest(
         &self,
         rows: &[(CheckResult, Status)],
         agent_states: &[AgentCheckStateRow],
         published_states: &[PublishedStateRow],
     ) -> Result<()> {
+        self.prepare_ingest()?;
+        self.transaction(|store| {
+            store.persist_ingest_uncommitted(rows, agent_states, published_states)
+        })
+    }
+
+    pub(crate) fn prepare_ingest(&self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS ingest_results_stage AS SELECT * FROM check_results WITH NO DATA;
              CREATE TEMP TABLE IF NOT EXISTS ingest_agent_stage (
@@ -2663,134 +2793,128 @@ impl Storage {
              CREATE TEMP TABLE IF NOT EXISTS ingest_state_stage (
                  check_id UUID, status VARCHAR, pending_state VARCHAR,
                  pending_since BIGINT, last_check BIGINT
-             );
-             BEGIN;
-             DELETE FROM ingest_results_stage;
-             DELETE FROM ingest_agent_stage;
-             DELETE FROM ingest_state_stage;",
+              );
+             CREATE TEMP TABLE IF NOT EXISTS replicate_new_results AS SELECT * FROM check_results WITH NO DATA;",
+
         )?;
-        let persist = || -> Result<()> {
-            {
-                let mut appender = self.conn.appender("ingest_results_stage")?;
-                for (result, status) in rows {
-                    appender.append_row(duckdb::params![
-                        result.check_id,
-                        result.agent_id,
-                        result.timestamp.timestamp_millis(),
-                        status.as_str(),
-                        result.latency_ms as i64,
-                        result.status_code.map(|code| code as i32),
-                        result.error,
-                        non_empty(&result.zone),
-                        non_empty(&result.region),
-                        result
-                            .failure
-                            .as_ref()
-                            .map(serde_json::to_string)
-                            .transpose()?,
-                    ])?;
-                }
-                appender.flush()?;
+        Ok(())
+    }
+
+    pub(crate) fn persist_ingest_uncommitted(
+        &self,
+        rows: &[(CheckResult, Status)],
+        agent_states: &[AgentCheckStateRow],
+        published_states: &[PublishedStateRow],
+    ) -> Result<()> {
+        self.conn.execute_batch("DELETE FROM ingest_results_stage; DELETE FROM ingest_agent_stage; DELETE FROM ingest_state_stage;")?;
+        self.stage_results(rows)?;
+        self.stage_agent_states(agent_states)?;
+        {
+            let mut appender = self.conn.appender("ingest_state_stage")?;
+            for state in published_states {
+                appender.append_row(duckdb::params![
+                    state.check_id,
+                    state.state.as_str(),
+                    state.pending.map(|(pending, _)| pending.as_str()),
+                    state.pending.map(|(_, since)| since),
+                    state.last_check,
+                ])?;
             }
-            {
-                let mut appender = self.conn.appender("ingest_agent_stage")?;
-                for (ordinal, state) in agent_states.iter().enumerate() {
-                    appender.append_row(duckdb::params![
-                        ordinal as i64,
-                        state.check_id,
-                        state.agent_id,
-                        state.status.as_str(),
-                        state.consecutive_failures as i32,
-                        state.zone,
-                        state.region,
-                        state.last_check,
-                    ])?;
-                }
-                appender.flush()?;
-            }
-            {
-                let mut appender = self.conn.appender("ingest_state_stage")?;
-                for state in published_states {
-                    appender.append_row(duckdb::params![
-                        state.check_id,
-                        state.state.as_str(),
-                        state.pending.map(|(pending, _)| pending.as_str()),
-                        state.pending.map(|(_, since)| since),
-                        state.last_check,
-                    ])?;
-                }
-                appender.flush()?;
-            }
-            self.conn.execute_batch(
-                "INSERT INTO check_results SELECT * FROM ingest_results_stage;
-                 INSERT INTO result_replication_watermarks
-                 SELECT check_id, MAX(ts_millis), COUNT(*) FROM ingest_results_stage GROUP BY check_id
-                 ON CONFLICT (check_id) DO UPDATE SET
-                     max_ts = GREATEST(result_replication_watermarks.max_ts, excluded.max_ts),
-                     result_count = result_replication_watermarks.result_count + excluded.result_count;
-                 INSERT INTO latest_check_results
-                 SELECT check_id, agent_id, ts_millis, status, latency_ms, status_code, error, failure
-                 FROM ingest_results_stage
-                 QUALIFY row_number() OVER (
-                     PARTITION BY check_id ORDER BY ts_millis DESC, agent_id DESC
-                 ) = 1
-                 ON CONFLICT (check_id) DO UPDATE SET
-                     agent_id = excluded.agent_id,
-                     ts_millis = excluded.ts_millis,
-                     status = excluded.status,
-                     latency_ms = excluded.latency_ms,
-                     status_code = excluded.status_code,
-                     error = excluded.error,
-                     failure = excluded.failure
-                 WHERE excluded.ts_millis > latest_check_results.ts_millis
-                    OR (excluded.ts_millis = latest_check_results.ts_millis
-                        AND excluded.agent_id > latest_check_results.agent_id);
-                 INSERT INTO agent_check_state
-                 SELECT check_id, agent_id, status, consecutive_failures, zone, region, last_check
-                 FROM ingest_agent_stage
-                 QUALIFY row_number() OVER (
-                     PARTITION BY check_id, agent_id ORDER BY last_check DESC, ordinal DESC
-                 ) = 1
-                 ON CONFLICT (check_id, agent_id) DO UPDATE SET
-                     status = excluded.status,
-                     consecutive_failures = excluded.consecutive_failures,
-                     zone = excluded.zone,
-                     region = excluded.region,
-                     last_check = excluded.last_check
-                 WHERE excluded.last_check >= agent_check_state.last_check;
-                 INSERT INTO current_state
-                     (check_id, status, last_check, consecutive_failures, pending_state, pending_since)
-                 SELECT check_id, status, last_check, 0, pending_state, pending_since
-                 FROM ingest_state_stage
-                 ON CONFLICT (check_id) DO UPDATE SET
-                     status = excluded.status,
-                     last_check = excluded.last_check,
-                     consecutive_failures = 0,
-                     pending_state = excluded.pending_state,
-                     pending_since = excluded.pending_since;
-                 INSERT INTO state_history
-                 SELECT staged.check_id, staged.status, staged.last_check
-                 FROM ingest_state_stage staged
-                 LEFT JOIN LATERAL (
-                     SELECT state FROM state_history history
-                     WHERE history.check_id = staged.check_id
-                     ORDER BY since DESC LIMIT 1
-                 ) newest ON true
-                 WHERE newest.state IS NULL OR newest.state <> staged.status
-                 ON CONFLICT DO NOTHING;",
-            )?;
-            Ok(())
-        };
-        match persist() {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(error)
-            }
+            appender.flush()?;
         }
+        self.conn.execute_batch(&format!(
+            "INSERT INTO check_results SELECT * FROM ingest_results_stage;
+             {results}
+             {agents}
+             INSERT INTO current_state
+                 (check_id, status, last_check, consecutive_failures, pending_state, pending_since)
+             SELECT check_id, status, last_check, 0, pending_state, pending_since
+             FROM ingest_state_stage
+             ON CONFLICT (check_id) DO UPDATE SET
+                 status = excluded.status,
+                 last_check = excluded.last_check,
+                 consecutive_failures = 0,
+                 pending_state = excluded.pending_state,
+                 pending_since = excluded.pending_since;
+             INSERT INTO state_history
+             SELECT staged.check_id, staged.status, staged.last_check
+             FROM ingest_state_stage staged
+             LEFT JOIN LATERAL (
+                 SELECT state FROM state_history history
+                 WHERE history.check_id = staged.check_id
+                 ORDER BY since DESC LIMIT 1
+             ) newest ON true
+             WHERE newest.state IS NULL OR newest.state <> staged.status
+             ON CONFLICT DO NOTHING;",
+            results = derived_results_sql("ingest_results_stage"),
+            agents = AGENT_STATE_MERGE_SQL,
+        ))?;
+        Ok(())
+    }
+
+    /// Fill `ingest_results_stage` from a batch. Shared by local ingest and
+    /// replication: both write the same rows, and an appender is an order of
+    /// magnitude cheaper than a prepared insert per row.
+    fn stage_results(&self, rows: &[(CheckResult, Status)]) -> Result<()> {
+        let mut appender = self.conn.appender("ingest_results_stage")?;
+        for (result, status) in rows {
+            appender.append_row(duckdb::params![
+                result.check_id,
+                result.agent_id,
+                result.timestamp.timestamp_millis(),
+                status.as_str(),
+                result.latency_ms as i64,
+                result.status_code.map(|code| code as i32),
+                result.error,
+                non_empty(&result.zone),
+                non_empty(&result.region),
+                result
+                    .failure
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+            ])?;
+        }
+        appender.flush()?;
+        Ok(())
+    }
+
+    /// Fill `ingest_agent_stage`. `ordinal` preserves batch order so the merge
+    /// can break `last_check` ties on arrival order rather than on scan order.
+    fn stage_agent_states(&self, states: &[AgentCheckStateRow]) -> Result<()> {
+        let mut appender = self.conn.appender("ingest_agent_stage")?;
+        for (ordinal, state) in states.iter().enumerate() {
+            appender.append_row(duckdb::params![
+                ordinal as i64,
+                state.check_id,
+                state.agent_id,
+                state.status.as_str(),
+                state.consecutive_failures as i32,
+                state.zone,
+                state.region,
+                state.last_check,
+            ])?;
+        }
+        appender.flush()?;
+        Ok(())
+    }
+
+    /// Merge a batch of per-agent beliefs in one statement. The replication
+    /// path used to run one upsert per belief, which on a coalesced batch of a
+    /// few thousand checks held the single database worker for seconds and
+    /// starved local ingest behind it.
+    pub(crate) fn update_agent_check_states_uncommitted(
+        &self,
+        states: &[AgentCheckStateRow],
+    ) -> Result<()> {
+        if states.is_empty() {
+            return Ok(());
+        }
+        self.prepare_ingest()?;
+        self.conn.execute_batch("DELETE FROM ingest_agent_stage;")?;
+        self.stage_agent_states(states)?;
+        self.conn.execute_batch(AGENT_STATE_MERGE_SQL)?;
+        Ok(())
     }
 
     /// Persist a batch of raw results with their evaluated status.
@@ -2882,6 +3006,47 @@ impl Storage {
     ///
     /// The status filter matters: a day can hold thousands of results, so the
     /// failures worth reading about are not necessarily in the newest `limit`.
+    pub fn result_coverage(
+        &self,
+        check_ids: &[CheckId],
+        agent_ids: &[String],
+        since: i64,
+    ) -> Result<Vec<(String, u64)>> {
+        if check_ids.is_empty() || agent_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let check_placeholders = std::iter::repeat_n("?", check_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let agent_placeholders = std::iter::repeat_n("?", agent_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT agent_id, COUNT(DISTINCT check_id)
+             FROM check_results
+             WHERE ts_millis >= ? AND check_id IN ({check_placeholders})
+               AND agent_id IN ({agent_placeholders})
+             GROUP BY agent_id"
+        );
+        let mut params = vec![duckdb::types::Value::BigInt(since)];
+        params.extend(
+            check_ids
+                .iter()
+                .map(|id| duckdb::types::Value::Text(id.to_string())),
+        );
+        params.extend(agent_ids.iter().cloned().map(duckdb::types::Value::Text));
+        let param_refs: Vec<&dyn duckdb::types::ToSql> = params
+            .iter()
+            .map(|value| value as &dyn duckdb::types::ToSql)
+            .collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        Ok(stmt
+            .query_map(param_refs.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?
+            .collect::<std::result::Result<_, _>>()?)
+    }
+
     pub fn history(
         &self,
         check_id: CheckId,
@@ -4807,69 +4972,65 @@ impl Storage {
     ///
     /// `check_results` carries no unique constraint — adding a primary key to
     /// a hot table is a migration this project does not do — so dedup is an
-    /// anti-join on `(check_id, agent_id, ts_millis)` done per row with a
-    /// `WHERE NOT EXISTS`. Replaying the same batch is then a guaranteed
-    /// no-op, which is what anti-entropy depends on. ponytail: if the
-    /// anti-join ever costs too much against a large table, the fallback is a
-    /// `UNIQUE(check_id, agent_id, ts_millis)` index added in the same DDL
-    /// batch, with `INSERT OR IGNORE` replacing the subquery.
+    /// anti-join on `(check_id, agent_id, ts_millis)`. It runs once for the
+    /// whole batch through a staging table rather than once per row: a
+    /// correlated `WHERE NOT EXISTS` per row costs a lookup per row, which on
+    /// a coalesced replication batch held the single database worker for
+    /// seconds and starved live ingest queued behind it. The batch is also
+    /// deduplicated against itself, so the same row arriving twice in one
+    /// batch inserts once. Replaying a whole batch remains a no-op, which is
+    /// what anti-entropy depends on.
     pub fn insert_results_dedup(&self, rows: &[(CheckResult, Status)]) -> Result<usize> {
-        self.conn.execute_batch("BEGIN")?;
-        let insert = || -> Result<usize> {
-            let mut stmt = self.conn.prepare(
-                "INSERT INTO check_results
-                    (check_id, agent_id, ts_millis, status, latency_ms, status_code,
-                     error, failure, zone, region)
-                 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                 WHERE NOT EXISTS (
-                     SELECT 1 FROM check_results
-                     WHERE check_id = ? AND agent_id = ? AND ts_millis = ?
-                 )",
-            )?;
-            let mut inserted = 0usize;
-            let mut inserted_results = Vec::new();
-            for (r, status) in rows {
-                let ts = r.timestamp.timestamp_millis();
-                let n = stmt.execute(duckdb::params![
-                    r.check_id,
-                    r.agent_id,
-                    ts,
-                    status.as_str(),
-                    r.latency_ms as i64,
-                    r.status_code.map(|c| c as i32),
-                    r.error,
-                    r.failure.as_ref().map(serde_json::to_string).transpose()?,
-                    non_empty(&r.zone),
-                    non_empty(&r.region),
-                    r.check_id,
-                    r.agent_id,
-                    ts,
-                ])?;
-                if n != 0 {
-                    inserted_results.push((r, *status));
-                }
-                inserted += n;
-            }
-            self.record_result_watermarks(inserted_results.iter().map(|(result, _)| *result))?;
-            self.record_latest_results(inserted_results)?;
-            Ok(inserted)
-        };
-        match insert() {
-            Ok(n) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(n)
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
+        self.transaction(|store| store.insert_results_dedup_uncommitted(rows))
+    }
+
+    pub(crate) fn insert_results_dedup_uncommitted(
+        &self,
+        rows: &[(CheckResult, Status)],
+    ) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
         }
+        self.prepare_ingest()?;
+        self.conn.execute_batch(
+            "DELETE FROM ingest_results_stage; DELETE FROM replicate_new_results;",
+        )?;
+        self.stage_results(rows)?;
+        self.conn.execute_batch(&format!(
+            "INSERT INTO replicate_new_results
+             SELECT staged.* FROM ingest_results_stage staged
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM check_results existing
+                 WHERE existing.check_id = staged.check_id
+                   AND existing.agent_id = staged.agent_id
+                   AND existing.ts_millis = staged.ts_millis
+             )
+             QUALIFY row_number() OVER (
+                 PARTITION BY staged.check_id, staged.agent_id, staged.ts_millis
+                 ORDER BY staged.ts_millis
+             ) = 1;
+             INSERT INTO check_results SELECT * FROM replicate_new_results;
+             {derived}",
+            derived = derived_results_sql("replicate_new_results"),
+        ))?;
+        let inserted: i64 =
+            self.conn
+                .query_row("SELECT count(*) FROM replicate_new_results", [], |row| {
+                    row.get(0)
+                })?;
+        Ok(inserted as usize)
     }
 
     /// Insert a replicated alert exactly once. An existing id is a replay only
     /// when its complete immutable payload agrees; replacing a different event
-    /// would silently corrupt the event log after an id collision.
-    pub fn upsert_alert(&self, a: &AlertRow) -> Result<bool> {
+    /// would silently corrupt the event log after an id collision, so a
+    /// disagreeing payload is reported as `Conflict` and nothing is written.
+    ///
+    /// Reported rather than raised because the caller is applying a batch:
+    /// failing the transaction would make one disagreeing row permanently block
+    /// every other row travelling with it, and anti-entropy would replay that
+    /// same doomed batch forever.
+    pub fn upsert_alert(&self, a: &AlertRow) -> Result<AlertApply> {
         let existing = self
             .conn
             .query_row(
@@ -4880,10 +5041,11 @@ impl Storage {
             )
             .ok();
         if let Some(existing) = existing {
-            if existing == *a {
-                return Ok(false);
-            }
-            bail!("replicated alert id {} conflicts with existing event", a.id);
+            return Ok(if existing == *a {
+                AlertApply::Replay
+            } else {
+                AlertApply::Conflict
+            });
         }
         self.conn.execute(
             "INSERT INTO alerts
@@ -4900,13 +5062,17 @@ impl Storage {
             ],
         )?;
         self.record_stream_item("alerts", a.timestamp, &a.id, 1)?;
-        Ok(true)
+        Ok(AlertApply::Inserted)
     }
 
     /// Apply a replicated incident by id. Exact replays are no-ops; an update
     /// id may be reused only for its identical immutable payload, never to
     /// overwrite a different incident's narrative.
     pub fn upsert_incident(&self, i: &ReplicatedIncident) -> Result<bool> {
+        self.transaction(|store| store.upsert_incident_uncommitted(i))
+    }
+
+    pub(crate) fn upsert_incident_uncommitted(&self, i: &ReplicatedIncident) -> Result<bool> {
         // Rows and tombstones share one total order. A newer incident may
         // intentionally recreate a deleted id; an equal/newer tombstone wins,
         // while a stale delete cannot erase a newer row.
@@ -4969,7 +5135,6 @@ impl Storage {
                 }
             }
         }
-        self.conn.execute_batch("BEGIN")?;
         let write = || -> Result<()> {
             self.conn
                 .execute("DELETE FROM incidents WHERE id = ?", duckdb::params![i.id])?;
@@ -5031,16 +5196,8 @@ impl Storage {
             }
             Ok(())
         };
-        match write() {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(true)
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
+        write()?;
+        Ok(true)
     }
 
     /// One incident in the shape it replicates as. `None` when it does not
@@ -5082,13 +5239,14 @@ impl Storage {
             let (sql, params): (&str, Vec<i64>) = if window_start == 0 {
                 (
                     "SELECT check_id, max_ts, result_count
-                     FROM result_replication_watermarks",
+                     FROM result_replication_watermarks
+                     ORDER BY check_id",
                     Vec::new(),
                 )
             } else {
                 (
                     "SELECT check_id, MAX(ts_millis), COUNT(*) FROM check_results
-                     WHERE ts_millis >= ? GROUP BY check_id",
+                     WHERE ts_millis >= ? GROUP BY check_id ORDER BY check_id",
                     vec![window_start],
                 )
             };
@@ -5236,6 +5394,94 @@ impl Storage {
         Ok(out)
     }
 
+    /// All raw result rows after the exclusive `(timestamp, check_id,
+    /// agent_id)` cursor, oldest first. The complete key means a page cannot
+    /// skip rows when more than one check and agent share a timestamp.
+    pub fn results_after(
+        &self,
+        since: i64,
+        since_check_id: Option<CheckId>,
+        since_agent_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(CheckResult, Status)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT check_id, agent_id, ts_millis, status, latency_ms, status_code, error,
+                    failure, zone, region
+             FROM check_results
+             WHERE ts_millis > ? OR (ts_millis = ? AND (
+                 ? IS NULL OR check_id > ? OR (check_id = ? AND agent_id > ?)
+             ))
+             ORDER BY ts_millis ASC, check_id ASC, agent_id ASC
+             LIMIT ?",
+        )?;
+        let rows = stmt
+            .query_map(
+                duckdb::params![
+                    since,
+                    since,
+                    since_check_id,
+                    since_check_id,
+                    since_check_id,
+                    since_agent_id,
+                    limit as i64
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, CheckId>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<i32>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                    ))
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    check_id,
+                    agent_id,
+                    ts,
+                    status,
+                    latency_ms,
+                    status_code,
+                    error,
+                    failure,
+                    zone,
+                    region,
+                )| {
+                    (
+                        CheckResult {
+                            check_id,
+                            agent_id,
+                            zone: zone.unwrap_or_default(),
+                            region: region.unwrap_or_default(),
+                            kind: CheckKind::Http,
+                            timestamp: chrono::DateTime::from_timestamp_millis(ts)
+                                .unwrap_or_default(),
+                            latency_ms: latency_ms as u64,
+                            status_code: status_code.map(|c| c as u16),
+                            body_matched: None,
+                            error,
+                            failure: failure.and_then(|f| serde_json::from_str(&f).ok()),
+                            body: None,
+                            headers: None,
+                            metric: None,
+                            metrics: None,
+                        },
+                        Status::from_db(&status),
+                    )
+                },
+            )
+            .collect())
+    }
+
     /// Alerts after the exclusive `(timestamp, id)` cursor, oldest first.
     pub fn alerts_since(
         &self,
@@ -5335,45 +5581,77 @@ impl Storage {
 
     // ---- Config replication ----
 
-    /// The stamp a row and/or its tombstone currently carry, whichever is
-    /// greater. `None` when neither exists — the id is entirely unknown here.
-    fn local_config_stamp(&self, kind: ConfigKind, id: &str) -> Result<Option<Hlc>> {
-        let (table, pk) = kind.table_and_pk();
-        let row_hlc: Option<Hlc> = {
-            let sql = format!("SELECT updated_at, updated_by FROM {table} WHERE {pk} = ?");
+    /// The stamps a batch of entries is arbitrated against, loaded in one query
+    /// per kind rather than two per entry. A bulk config push — provisioning
+    /// ten thousand checks, or a peer replaying its whole config — is otherwise
+    /// thousands of point lookups on the one database worker, and every read
+    /// and write on this node queues behind them.
+    fn local_config_stamps(&self, entries: &[ConfigEntry]) -> Result<ConfigStamps> {
+        let mut stamps = ConfigStamps::default();
+        let mut by_kind: std::collections::HashMap<ConfigKind, Vec<&str>> =
+            std::collections::HashMap::new();
+        for entry in entries {
+            by_kind.entry(entry.kind).or_default().push(&entry.id);
+        }
+        for (kind, ids) in by_kind {
+            let (table, pk) = kind.table_and_pk();
+            let placeholders = vec!["?"; ids.len()].join(", ");
+            let params: Vec<&dyn duckdb::types::ToSql> = ids
+                .iter()
+                .map(|id| id as &dyn duckdb::types::ToSql)
+                .collect();
+            let sql = format!(
+                "SELECT CAST({pk} AS VARCHAR), updated_at, updated_by
+                 FROM {table} WHERE CAST({pk} AS VARCHAR) IN ({placeholders})"
+            );
             let mut stmt = self.conn.prepare(&sql)?;
-            let check_id = (kind == ConfigKind::Check)
-                .then(|| id.parse::<CheckId>().ok())
-                .flatten();
-            let param: &dyn duckdb::types::ToSql = check_id
-                .as_ref()
-                .map_or(&id as &dyn duckdb::types::ToSql, |id| {
-                    id as &dyn duckdb::types::ToSql
-                });
-            let mut rows = stmt.query_map([param], |r| {
-                Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?))
+            let rows = stmt.query_map(params.as_slice(), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
             })?;
-            // A row whose `updated_at` is NULL was written before stamps
-            // existed, or by a path this project hasn't converted yet. It
-            // counts as the oldest possible HLC — (0, "") — so anything
-            // replicated beats it rather than the merge failing to compare.
-            rows.next()
-                .transpose()?
-                .map(|(millis, node)| Hlc::new(millis.unwrap_or(0), node.unwrap_or_default()))
-        };
-        let tomb_hlc: Option<Hlc> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT deleted_at, node_id FROM config_tombstones WHERE kind = ? AND id = ?",
-            )?;
-            let mut rows = stmt.query_map(duckdb::params![kind.as_str(), id], |r| {
-                Ok(Hlc::new(r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            for row in rows {
+                let (id, millis, node) = row?;
+                // A row whose `updated_at` is NULL was written before stamps
+                // existed, or by a path this project hasn't converted yet. It
+                // counts as the oldest possible HLC — (0, "") — so anything
+                // replicated beats it rather than the merge failing to compare.
+                stamps.newest.insert(
+                    (kind, id),
+                    Hlc::new(millis.unwrap_or(0), node.unwrap_or_default()),
+                );
+            }
+
+            let sql = format!(
+                "SELECT id, deleted_at, node_id FROM config_tombstones
+                 WHERE kind = ? AND id IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let kind_str = kind.as_str();
+            let mut tomb_params: Vec<&dyn duckdb::types::ToSql> =
+                vec![&kind_str as &dyn duckdb::types::ToSql];
+            tomb_params.extend(params);
+            let rows = stmt.query_map(tomb_params.as_slice(), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    Hlc::new(r.get::<_, i64>(1)?, r.get::<_, String>(2)?),
+                ))
             })?;
-            rows.next().transpose()?
-        };
-        Ok(match (row_hlc, tomb_hlc) {
-            (Some(a), Some(b)) => Some(if a >= b { a } else { b }),
-            (a, b) => a.or(b),
-        })
+            for row in rows {
+                let (id, hlc) = row?;
+                let key = (kind, id);
+                stamps.tombstoned.insert(key.clone());
+                match stamps.newest.get(&key) {
+                    Some(existing) if *existing >= hlc => {}
+                    _ => {
+                        stamps.newest.insert(key, hlc);
+                    }
+                }
+            }
+        }
+        Ok(stamps)
     }
 
     fn delete_config_row(&self, kind: ConfigKind, id: &str) -> Result<()> {
@@ -5506,55 +5784,80 @@ impl Storage {
     /// already greater than or equal to `e.hlc`, so nothing changed —
     /// comparison uses `Hlc`'s derived `Ord`, never re-implemented here.
     pub fn apply_config_entry(&self, e: &ConfigEntry) -> Result<bool> {
-        if let Some(local) = self.local_config_stamp(e.kind, &e.id)? {
-            if e.hlc <= local {
+        self.apply_config_entries(std::slice::from_ref(e))
+            .map(|applied| applied.into_iter().next().unwrap_or(false))
+    }
+
+    /// Apply a bounded config batch in one transaction. LWW arbitration remains
+    /// per entry, but a crash can never expose only a prefix of accepted writes.
+    /// Callers use the returned flags to update only caches whose rows changed.
+    pub fn apply_config_entries(&self, entries: &[ConfigEntry]) -> Result<Vec<bool>> {
+        self.conn.execute_batch("BEGIN")?;
+        let write = || -> Result<Vec<bool>> {
+            let stamps = self.local_config_stamps(entries)?;
+            entries
+                .iter()
+                .map(|entry| self.apply_config_entry_uncommitted(entry, &stamps))
+                .collect()
+        };
+        match write() {
+            Ok(applied) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(applied)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    fn apply_config_entry_uncommitted(
+        &self,
+        e: &ConfigEntry,
+        stamps: &ConfigStamps,
+    ) -> Result<bool> {
+        let key = (e.kind, e.id.clone());
+        if let Some(local) = stamps.newest.get(&key) {
+            if e.hlc <= *local {
                 return Ok(false);
             }
         }
-        self.conn.execute_batch("BEGIN")?;
-        let write = || -> Result<()> {
-            if e.is_tombstone() {
-                self.delete_config_row(e.kind, &e.id)?;
-                self.conn.execute(
-                    "DELETE FROM config_tombstones WHERE kind = ? AND id = ?",
-                    duckdb::params![e.kind.as_str(), e.id],
-                )?;
-                self.conn.execute(
-                    "INSERT INTO config_tombstones (kind, id, deleted_at, node_id)
-                     VALUES (?, ?, ?, ?)",
-                    duckdb::params![e.kind.as_str(), e.id, e.hlc.millis, e.hlc.node_id],
-                )?;
-            } else {
-                // A malformed document is an error, not a silent skip: the
-                // caller logs it, but this must never half-apply a document
-                // over a good local row.
-                let doc = e.document.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "config entry for {} has no document and is not a tombstone",
-                        e.id
-                    )
-                })?;
-                self.apply_config_document(e.kind, &e.id, doc, &e.hlc)?;
-                // The edit supersedes any tombstone for this id — leaving one
-                // behind would make the next digest sweep look inconsistent
-                // (a row that exists, with a tombstone that says it doesn't).
+        let tombstoned = stamps.tombstoned.contains(&key);
+        if e.is_tombstone() {
+            self.delete_config_row(e.kind, &e.id)?;
+            if tombstoned {
                 self.conn.execute(
                     "DELETE FROM config_tombstones WHERE kind = ? AND id = ?",
                     duckdb::params![e.kind.as_str(), e.id],
                 )?;
             }
-            Ok(())
-        };
-        match write() {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(true)
-            }
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(err)
+            self.conn.execute(
+                "INSERT INTO config_tombstones (kind, id, deleted_at, node_id)
+                 VALUES (?, ?, ?, ?)",
+                duckdb::params![e.kind.as_str(), e.id, e.hlc.millis, e.hlc.node_id],
+            )?;
+        } else {
+            // A malformed document is an error, not a silent skip: the caller
+            // logs it, but this must never half-apply a document over a good
+            // local row.
+            let doc = e.document.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "config entry for {} has no document and is not a tombstone",
+                    e.id
+                )
+            })?;
+            self.apply_config_document(e.kind, &e.id, doc, &e.hlc)?;
+            // The edit supersedes any tombstone for this id — leaving one
+            // behind would make the next digest sweep look inconsistent.
+            if tombstoned {
+                self.conn.execute(
+                    "DELETE FROM config_tombstones WHERE kind = ? AND id = ?",
+                    duckdb::params![e.kind.as_str(), e.id],
+                )?;
             }
         }
+        Ok(true)
     }
 
     /// Read back the entry a row would replicate as, for pushing to peers
@@ -5857,6 +6160,13 @@ impl Storage {
     }
 
     pub fn apply_incident_tombstone(&self, tombstone: &IncidentTombstone) -> Result<bool> {
+        self.transaction(|store| store.apply_incident_tombstone_uncommitted(tombstone))
+    }
+
+    pub(crate) fn apply_incident_tombstone_uncommitted(
+        &self,
+        tombstone: &IncidentTombstone,
+    ) -> Result<bool> {
         let id = &tombstone.id;
         let incoming_version = Hlc::new(tombstone.deleted_at, tombstone.node_id.clone());
         if let Some(incident) = self.replicated_incident(id)? {
@@ -5872,7 +6182,6 @@ impl Storage {
         } else {
             false
         };
-        self.conn.execute_batch("BEGIN")?;
         let write = || -> Result<bool> {
             self.conn.execute(
                 "DELETE FROM incident_updates WHERE incident_id = ?",
@@ -5910,16 +6219,7 @@ impl Storage {
             self.rebuild_stream_watermarks()?;
             Ok(removed > 0)
         };
-        match write() {
-            Ok(removed) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(removed)
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
+        write()
     }
 
     /// Whether an incident id has been deleted anywhere in the cluster.
@@ -6229,6 +6529,163 @@ mod tests {
         )
         .expect("the connection survives a failed batch");
         assert_eq!(s.count_results().unwrap(), 2);
+    }
+
+    #[test]
+    fn ingest_transition_failure_rolls_back_all_rows_and_recovers() {
+        let s = Storage::open(":memory:").unwrap();
+        s.prepare_ingest().unwrap();
+        let attempt = || {
+            s.transaction(|store| {
+                store.persist_ingest_uncommitted(
+                    &[(result("a", 1_000, 5), Status::Down)],
+                    &[agent_state("a", "agent", Status::Down, 1_000)],
+                    &[published("a", NodeState::Down, 1_000)],
+                )?;
+                store.create_incident(
+                    "incident-a",
+                    "Down",
+                    IncidentState::Detected,
+                    1_000,
+                    false,
+                    Some(cid("a")),
+                    &[IncidentCheckRow {
+                        check_id: cid("a"),
+                        source: AffectSource::Origin,
+                    }],
+                    None,
+                )?;
+                store.insert_alert(
+                    AlertScope::Check,
+                    &cid("a").to_string(),
+                    Some(NodeState::Up),
+                    NodeState::Down,
+                    1_000,
+                    Some("incident-a"),
+                )?;
+                Ok(())
+            })
+        };
+        s.conn
+            .execute_batch("CREATE UNIQUE INDEX reject_alert ON alerts (ts_millis)")
+            .unwrap();
+        s.conn.execute_batch("INSERT INTO alerts (id, scope, node_id, current_state, ts_millis) VALUES ('block', 'check', 'block', 'up', 1000)").unwrap();
+        assert!(attempt().is_err());
+        assert_eq!(s.count_results().unwrap(), 0);
+        assert!(s.list_current_state().unwrap().is_empty());
+        assert!(s.list_agent_check_state().unwrap().is_empty());
+        assert!(s.state_spans(cid("a")).unwrap().is_empty());
+        assert!(s.incident("incident-a").unwrap().is_none());
+        s.conn
+            .execute_batch("DELETE FROM alerts WHERE id = 'block'")
+            .unwrap();
+        attempt().unwrap();
+        assert_eq!(s.count_results().unwrap(), 1);
+        assert!(s.incident("incident-a").unwrap().is_some());
+        assert_eq!(s.recent_alerts(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn uncommitted_ingest_is_not_visible_after_reopen() {
+        let path =
+            std::env::temp_dir().join(format!("warden-ingest-{}.duckdb", uuid::Uuid::now_v7()));
+        {
+            let s = Storage::open(path.to_str().unwrap()).unwrap();
+            s.prepare_ingest().unwrap();
+            s.conn.execute_batch("BEGIN").unwrap();
+            s.persist_ingest_uncommitted(
+                &[(result("a", 1_000, 5), Status::Down)],
+                &[agent_state("a", "agent", Status::Down, 1_000)],
+                &[published("a", NodeState::Down, 1_000)],
+            )
+            .unwrap();
+            s.create_incident(
+                "incident-a",
+                "Down",
+                IncidentState::Detected,
+                1_000,
+                false,
+                Some(cid("a")),
+                &[],
+                None,
+            )
+            .unwrap();
+        }
+        let s = Storage::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(s.count_results().unwrap(), 0);
+        assert!(s.list_current_state().unwrap().is_empty());
+        assert!(s.incident("incident-a").unwrap().is_none());
+        drop(s);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reopening_legacy_incidents_backfills_replication_versions_idempotently() {
+        let path = std::env::temp_dir().join(format!(
+            "warden-legacy-incidents-{}.duckdb",
+            uuid::Uuid::now_v7()
+        ));
+        let path = path.to_string_lossy().into_owned();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE incidents (
+                    id VARCHAR PRIMARY KEY,
+                    title VARCHAR NOT NULL,
+                    state VARCHAR NOT NULL,
+                    started_at BIGINT NOT NULL,
+                    resolved_at BIGINT,
+                    global BOOLEAN NOT NULL DEFAULT FALSE,
+                    origin_check UUID
+                );
+                CREATE TABLE incident_updates (
+                    id VARCHAR PRIMARY KEY,
+                    incident_id VARCHAR NOT NULL,
+                    state VARCHAR NOT NULL,
+                    body VARCHAR NOT NULL,
+                    author VARCHAR,
+                    created_at BIGINT NOT NULL
+                );
+                INSERT INTO incidents VALUES
+                    ('legacy', 'Persisted incident', 'resolved', 100, 200, FALSE, NULL);
+                INSERT INTO incident_updates VALUES
+                    ('legacy-update', 'legacy', 'resolved', 'Fixed', NULL, 300);",
+            )
+            .unwrap();
+        }
+
+        let reopened = Storage::open(&path).unwrap();
+        assert_eq!(
+            reopened.incident("legacy").unwrap().unwrap().title,
+            "Persisted incident"
+        );
+        let version: (i64, String) = reopened
+            .conn
+            .query_row(
+                "SELECT version_millis, version_node FROM incidents WHERE id = 'legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(version, (300, "local".into()));
+        drop(reopened);
+
+        let reopened_again = Storage::open(&path).unwrap();
+        let second_version: (i64, String) = reopened_again
+            .conn
+            .query_row(
+                "SELECT version_millis, version_node FROM incidents WHERE id = 'legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            second_version, version,
+            "a second reopen must not restamp rows"
+        );
+        assert_eq!(reopened_again.list_incidents(10, None).unwrap().len(), 1);
+        drop(reopened_again);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -7889,15 +8346,17 @@ mod tests {
             timestamp: 1000,
             incident_id: Some("inc-1".into()),
         };
-        assert!(s.upsert_alert(&a).unwrap());
-        assert!(
-            !s.upsert_alert(&a).unwrap(),
+        assert_eq!(s.upsert_alert(&a).unwrap(), AlertApply::Inserted);
+        assert_eq!(
+            s.upsert_alert(&a).unwrap(),
+            AlertApply::Replay,
             "an identical replay is a no-op"
         );
         let mut collision = a.clone();
         collision.current_state = NodeState::Up;
-        assert!(
-            s.upsert_alert(&collision).is_err(),
+        assert_eq!(
+            s.upsert_alert(&collision).unwrap(),
+            AlertApply::Conflict,
             "a reused id must not replace an event"
         );
         assert_eq!(s.recent_alerts(10).unwrap(), vec![a]);
@@ -8621,6 +9080,37 @@ mod tests {
             .unwrap();
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].0.agent_id, "agent-0500");
+    }
+
+    #[test]
+    fn global_result_backfill_cursor_pages_shared_timestamp_across_checks() {
+        let s = Storage::open(":memory:").unwrap();
+        let rows = (0..501)
+            .map(|i| {
+                let mut row = result(&format!("check-{i:04}"), 2_000, i);
+                row.agent_id = "same-agent".into();
+                (row, Status::Up)
+            })
+            .collect::<Vec<_>>();
+        s.insert_results(&rows).unwrap();
+
+        let first = s.results_after(i64::MIN, None, None, 500).unwrap();
+        assert_eq!(first.len(), 500);
+        let cursor = &first[499].0;
+        let second = s
+            .results_after(
+                cursor.timestamp.timestamp_millis(),
+                Some(cursor.check_id),
+                Some(&cursor.agent_id),
+                500,
+            )
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert!(first
+            .iter()
+            .all(|(row, _)| row.timestamp.timestamp_millis() == 2_000));
+        assert_eq!(second[0].0.timestamp.timestamp_millis(), 2_000);
+        assert_ne!(first.last().unwrap().0.check_id, second[0].0.check_id);
     }
 
     // ---- Clustering: digest ----

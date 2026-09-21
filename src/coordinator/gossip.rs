@@ -38,6 +38,8 @@ const GOSSIP_TIMEOUT: Duration = Duration::from_secs(5);
 /// transitions are unaffected in either direction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
+    #[serde(default)]
+    pub alert_id: Option<String>,
     pub check_id: crate::models::CheckId,
     pub from: NodeState,
     pub to: NodeState,
@@ -54,8 +56,14 @@ pub struct Message {
 }
 
 impl Message {
-    pub fn new(t: &Transition, timestamp: i64, incident_id: Option<String>) -> Self {
+    pub fn new(
+        t: &Transition,
+        timestamp: i64,
+        alert_id: Option<String>,
+        incident_id: Option<String>,
+    ) -> Self {
         Self {
+            alert_id,
             check_id: t.check_id,
             from: t.from,
             to: t.to,
@@ -153,7 +161,7 @@ mod tests {
             from: NodeState::Up,
             to: NodeState::Down,
         };
-        let msg = Message::new(&t, 1_700_000_000_000, None);
+        let msg = Message::new(&t, 1_700_000_000_000, None, None);
 
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""from":"up""#), "{json}");
@@ -174,7 +182,7 @@ mod tests {
             from: NodeState::Up,
             to: NodeState::Degraded,
         };
-        let json = serde_json::to_string(&Message::new(&t, 1, None)).unwrap();
+        let json = serde_json::to_string(&Message::new(&t, 1, None, None)).unwrap();
         assert!(json.contains(r#""to":"degraded""#), "{json}");
         let back: Message = serde_json::from_str(&json).unwrap();
         assert_eq!(back.to, NodeState::Degraded);

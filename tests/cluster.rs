@@ -582,6 +582,64 @@ async fn replaying_a_replicate_batch_does_not_duplicate_history() {
     );
 }
 
+/// A replicated alert whose id already names a *different* local event must not
+/// sink the batch it arrived in. Two nodes that disagree about one immutable
+/// event still have to converge on everything else; failing the transaction
+/// would make anti-entropy replay the same doomed batch forever, and every
+/// result travelling with it would never land.
+#[tokio::test]
+async fn a_conflicting_alert_does_not_reject_the_rest_of_the_batch() {
+    let b = spawn_node("b", vec![], NO_TIMEOUT).await;
+    let alert = |state: &str| {
+        json!({
+            "id": "shared-alert-id",
+            "scope": "check",
+            "node_id": cid_str(CHECK),
+            "previous_state": "up",
+            "current_state": state,
+            "timestamp": 1_000,
+        })
+    };
+    let batch = |state: &str, ts: i64| {
+        json!({
+            "origin": "a",
+            "alerts": [alert(state)],
+            "results": [replicated_result(result(200, ts), "up")],
+        })
+    };
+
+    assert_eq!(
+        replicate(b.addr, &batch("down", 1_000)).await,
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert_eq!(history(b.addr, &cid_str(CHECK)).await.len(), 1);
+
+    // Same alert id, different immutable payload, riding with a new result.
+    assert_eq!(
+        replicate(b.addr, &batch("degraded", 2_000)).await,
+        reqwest::StatusCode::NO_CONTENT,
+        "a conflicting alert must not fail the request"
+    );
+    assert_eq!(
+        history(b.addr, &cid_str(CHECK)).await.len(),
+        2,
+        "the result travelling with the conflicting alert must still land"
+    );
+
+    let alerts = get_json(&format!("http://{}/api/v1/alerts", b.addr)).await;
+    let stored: Vec<&Value> = alerts["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|al| al["id"] == "shared-alert-id")
+        .collect();
+    assert_eq!(stored.len(), 1, "the local event must not be duplicated");
+    assert_eq!(
+        stored[0]["current_state"], "down",
+        "the local event must not be overwritten by the conflicting one"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 5. No double paging — THE INVARIANT TEST
 // ---------------------------------------------------------------------------
@@ -766,7 +824,7 @@ async fn anti_entropy_repairs_a_historical_result_hole_below_local_high_water() 
 #[tokio::test]
 async fn anti_entropy_pages_rows_sharing_a_timestamp() {
     let a = spawn_node("a", vec![], NO_TIMEOUT).await;
-    let rows = (0..501)
+    let rows = (0..2_001)
         .map(|i| {
             let mut row = result(200, 1_000);
             row.agent_id = format!("agent-{i:04}");
@@ -778,6 +836,9 @@ async fn anti_entropy_pages_rows_sharing_a_timestamp() {
     let b = spawn_node("b", vec![], NO_TIMEOUT).await;
     let session_a = login(a.addr).await;
     gossip_step(a.addr, &session_a, b.addr).await;
+    // One sweep is bounded; later sweeps resume the pinned peer's result
+    // cursor rather than replaying its first page.
+    b.coord.anti_entropy_sweep().await;
     b.coord.anti_entropy_sweep().await;
 
     let dig_b = digest(b.addr).await;
@@ -787,8 +848,32 @@ async fn anti_entropy_pages_rows_sharing_a_timestamp() {
         .iter()
         .find(|check| check["check_id"] == cid_str(CHECK))
         .expect("B's digest should contain the backfilled check");
-    assert_eq!(entry["count"], 501);
+    assert_eq!(entry["count"], 2_001);
     assert_eq!(entry["max_ts"], 1_000);
+}
+
+#[tokio::test]
+async fn anti_entropy_backfills_many_divergent_checks_in_global_pages() {
+    let a = spawn_node("a", vec![], NO_TIMEOUT).await;
+    let rows = (0..501)
+        .map(|i| {
+            let mut row = result(200, 1_000);
+            row.check_id = Uuid::new_v5(&Uuid::NAMESPACE_DNS, format!("many-{i:04}").as_bytes());
+            row.agent_id = "same-agent".into();
+            row
+        })
+        .collect();
+    a.coord.ingest(rows).await;
+
+    let b = spawn_node("b", vec![], NO_TIMEOUT).await;
+    let session_a = login(a.addr).await;
+    gossip_step(a.addr, &session_a, b.addr).await;
+    b.coord.anti_entropy_sweep().await;
+
+    let recovered = digest(b.addr).await;
+    let checks = recovered["checks"].as_array().unwrap();
+    assert_eq!(checks.len(), 501);
+    assert!(checks.iter().all(|check| check["count"] == 1));
 }
 
 #[tokio::test]
@@ -839,6 +924,19 @@ async fn anti_entropy_recovers_a_complete_missed_incident_lifecycle() {
     a.coord.ingest(vec![result(200, 1_000)]).await;
     a.coord.ingest(vec![result(500, 2_000)]).await;
     a.coord.ingest(vec![result(200, 3_000)]).await;
+    // Four pages of results would otherwise exhaust a sweep and defer all
+    // lifecycle streams. This backfill must still recover the incident now.
+    a.coord
+        .ingest(
+            (0..2_001)
+                .map(|i| {
+                    let mut row = result(200, 4_000);
+                    row.agent_id = format!("repair-{i:04}");
+                    row
+                })
+                .collect(),
+        )
+        .await;
 
     let incident_id = a.coord.incidents_for_test(1).await[0].id.clone();
     assert_eq!(a.coord.updates_for_test(&incident_id).await.len(), 2);

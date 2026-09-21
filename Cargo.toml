@@ -49,7 +49,7 @@ lettre = { version = "0.11.23", default-features = false, features = ["tokio1", 
 # Immutable check identity: UUIDv7 gives insertion-ordered, collision-proof
 # check IDs stored natively as DuckDB UUID columns — see models::CheckId.
 uuid = { version = "1", features = ["v7", "v5", "serde"] }
+futures-util = "0.3"
 
 [dev-dependencies]
 tokio-tungstenite = "0.24"
-futures-util = "0.3"
