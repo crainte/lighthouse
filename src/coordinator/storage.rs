@@ -2799,7 +2799,9 @@ impl Storage {
                  check_id UUID, status VARCHAR, pending_state VARCHAR,
                  pending_since BIGINT, last_check BIGINT
               );
-             CREATE TEMP TABLE IF NOT EXISTS replicate_new_results AS SELECT * FROM check_results WITH NO DATA;",
+             CREATE TEMP TABLE IF NOT EXISTS replicate_new_results AS SELECT * FROM check_results WITH NO DATA;
+             CREATE TEMP TABLE IF NOT EXISTS replicate_probe_stage AS SELECT * FROM check_results WITH NO DATA;
+             CREATE TEMP TABLE IF NOT EXISTS prune_results_counts (check_id UUID, removed BIGINT);",
 
         )?;
         Ok(())
@@ -4254,19 +4256,87 @@ impl Storage {
     /// deleted, and hand it straight back on the next anti-entropy sweep —
     /// the exact resurrection tombstones exist to prevent. Returns the number
     /// of rows removed.
+    /// Delete raw results older than `before`, keeping the two tables derived
+    /// from them true without rebuilding either.
+    ///
+    /// Both rebuilds used to scan everything that *survived* the delete, which
+    /// is the expensive half of retention: pruning one day out of thirty read
+    /// twenty-nine. Neither is necessary.
+    ///
+    /// `result_replication_watermarks.max_ts` is a maximum above the cutoff by
+    /// definition, so deleting below the cutoff cannot change it; only
+    /// `result_count` moves, by exactly what was removed per check. A check
+    /// whose count reaches zero has no rows left and loses its row, which is
+    /// what a rebuild would have done.
+    ///
+    /// `latest_check_results` holds one row per check, the newest. If that row
+    /// is at or above the cutoff it survives the delete and is still correct;
+    /// if it is below the cutoff then every row for that check was below it
+    /// too, so the entry must go. That is a one-row-per-check delete, not a
+    /// window function over the whole history.
+    pub(crate) fn prune_results(&self, before: i64) -> Result<u64> {
+        self.conn
+            .execute_batch("DELETE FROM prune_results_counts;")?;
+        self.conn.execute(
+            "INSERT INTO prune_results_counts
+             SELECT check_id, COUNT(*) FROM check_results WHERE ts_millis < ?
+             GROUP BY check_id",
+            duckdb::params![before],
+        )?;
+        let removed = self.conn.execute(
+            "DELETE FROM check_results WHERE ts_millis < ?",
+            duckdb::params![before],
+        )? as u64;
+        if removed == 0 {
+            return Ok(0);
+        }
+        self.conn.execute(
+            "DELETE FROM latest_check_results WHERE ts_millis < ?",
+            duckdb::params![before],
+        )?;
+        self.conn.execute_batch(
+            "UPDATE result_replication_watermarks
+                SET result_count = result_replication_watermarks.result_count - pruned.removed
+             FROM prune_results_counts pruned
+             WHERE pruned.check_id = result_replication_watermarks.check_id;
+             DELETE FROM result_replication_watermarks WHERE result_count <= 0;",
+        )?;
+        Ok(removed)
+    }
+
+    /// The oldest raw result held, or `None` when there are none. Cheap: a
+    /// minimum over a column written in ascending order.
+    pub fn oldest_result_ts(&self) -> Result<Option<i64>> {
+        let oldest: Option<i64> = self
+            .conn
+            .query_row("SELECT MIN(ts_millis) FROM check_results", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(None);
+        Ok(oldest)
+    }
+
     pub fn prune(&self, results_days: u64, alerts_days: u64, now_millis: i64) -> Result<u64> {
+        let results_before = now_millis - (results_days as i64) * 86_400_000;
+        let mut removed = self.prune_results(results_before)?;
+        removed += self.prune_metadata(results_days, alerts_days, now_millis)?;
+        Ok(removed)
+    }
+
+    /// Everything retention removes apart from raw results: the event log,
+    /// resolved incidents and their narrative, given-up notifications, closed
+    /// state spans, and expired tombstones. Bounded by the size of those
+    /// streams rather than by raw history, so unlike `prune_results` it has no
+    /// reason to be sliced.
+    pub(crate) fn prune_metadata(
+        &self,
+        results_days: u64,
+        alerts_days: u64,
+        now_millis: i64,
+    ) -> Result<u64> {
         let results_before = now_millis - (results_days as i64) * 86_400_000;
         let alerts_before = now_millis - (alerts_days as i64) * 86_400_000;
         let mut removed = 0u64;
-        let removed_results = self.conn.execute(
-            "DELETE FROM check_results WHERE ts_millis < ?",
-            duckdb::params![results_before],
-        )? as u64;
-        removed += removed_results;
-        if removed_results != 0 {
-            self.rebuild_result_watermarks()?;
-            self.rebuild_latest_check_results()?;
-        }
         removed += self.conn.execute(
             "DELETE FROM alerts WHERE ts_millis < ?",
             duckdb::params![alerts_before],
@@ -4976,14 +5046,16 @@ impl Storage {
     ///
     /// `check_results` carries no unique constraint — adding a primary key to
     /// a hot table is a migration this project does not do — so dedup is an
-    /// anti-join on `(check_id, agent_id, ts_millis)`. It runs once for the
-    /// whole batch through a staging table rather than once per row: a
-    /// correlated `WHERE NOT EXISTS` per row costs a lookup per row, which on
-    /// a coalesced replication batch held the single database worker for
-    /// seconds and starved live ingest queued behind it. The batch is also
-    /// deduplicated against itself, so the same row arriving twice in one
-    /// batch inserts once. Replaying a whole batch remains a no-op, which is
-    /// what anti-entropy depends on.
+    /// anti-join on `(check_id, agent_id, ts_millis)`, done once for the whole
+    /// batch through a staging table rather than once per row.
+    ///
+    /// Most of a batch never reaches the anti-join: rows newer than the
+    /// per-check high-water mark cannot be duplicates, which is every row of an
+    /// ordinary replication push. What remains — a repair replaying old rows —
+    /// is probed with the scan bounded to that subset's own time range. The
+    /// batch is also deduplicated against itself, so the same row arriving
+    /// twice in one batch inserts once. Replaying a whole batch remains a
+    /// no-op, which is what anti-entropy depends on.
     pub fn insert_results_dedup(&self, rows: &[(CheckResult, Status)]) -> Result<usize> {
         self.transaction(|store| store.insert_results_dedup_uncommitted(rows))
     }
@@ -4996,31 +5068,69 @@ impl Storage {
             return Ok(0);
         }
         self.conn.execute_batch(
-            "DELETE FROM ingest_results_stage; DELETE FROM replicate_new_results;",
+            "DELETE FROM ingest_results_stage;
+             DELETE FROM replicate_new_results;
+             DELETE FROM replicate_probe_stage;",
         )?;
         self.stage_results(rows)?;
-        self.conn.execute_batch(&format!(
+        // Split the batch on this node's own high-water mark before touching
+        // `check_results` at all. A row newer than the newest one held for its
+        // check cannot be a duplicate of anything, which in steady-state
+        // replication is every row in the batch — so the ordinary path never
+        // probes the history table, and its cost stops depending on how much
+        // history there is. Only repair, which replays old rows by definition,
+        // pays for the anti-join.
+        //
+        // This rests on `result_replication_watermarks.max_ts` being the true
+        // maximum for the check. Every writer of `check_results` maintains it
+        // in the same statement or transaction, `Storage::open` backfills it,
+        // and `prune` keeps it true by construction — deleting rows below a
+        // cutoff cannot lower a maximum above it.
+        self.conn.execute_batch(
             "INSERT INTO replicate_new_results
              SELECT staged.* FROM ingest_results_stage staged
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM check_results existing
-                 WHERE existing.check_id = staged.check_id
-                   AND existing.agent_id = staged.agent_id
-                   AND existing.ts_millis = staged.ts_millis
-                   -- Sound because a duplicate of a staged row carries that
-                   -- row's exact `ts_millis`, which is never below the batch
-                   -- minimum: nothing that could match is excluded. Without it
-                   -- the anti-join probes every retained row, so replication
-                   -- cost would grow with history rather than with the batch —
-                   -- fine at 30,000 rows, fatal at two billion. Results are
-                   -- appended in time order, so the bound prunes by zone map.
-                   AND existing.ts_millis >= (SELECT MIN(ts_millis) FROM ingest_results_stage)
-             )
+             LEFT JOIN result_replication_watermarks mark
+                    ON mark.check_id = staged.check_id
+             WHERE mark.max_ts IS NULL OR staged.ts_millis > mark.max_ts
              QUALIFY row_number() OVER (
                  PARTITION BY staged.check_id, staged.agent_id, staged.ts_millis
                  ORDER BY staged.ts_millis
              ) = 1;
-             INSERT INTO check_results SELECT * FROM replicate_new_results;
+             INSERT INTO replicate_probe_stage
+             SELECT staged.* FROM ingest_results_stage staged
+             JOIN result_replication_watermarks mark
+               ON mark.check_id = staged.check_id
+             WHERE staged.ts_millis <= mark.max_ts;",
+        )?;
+        let probed: i64 =
+            self.conn
+                .query_row("SELECT count(*) FROM replicate_probe_stage", [], |row| {
+                    row.get(0)
+                })?;
+        if probed > 0 {
+            self.conn.execute_batch(
+                "INSERT INTO replicate_new_results
+                 SELECT staged.* FROM replicate_probe_stage staged
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM check_results existing
+                     WHERE existing.check_id = staged.check_id
+                       AND existing.agent_id = staged.agent_id
+                       AND existing.ts_millis = staged.ts_millis
+                       -- Sound because a duplicate of a staged row carries that
+                       -- row's exact `ts_millis`, never below this minimum, so
+                       -- nothing that could match is excluded. Results are
+                       -- appended in time order, so the bound prunes by zone
+                       -- map instead of probing every retained row.
+                       AND existing.ts_millis >= (SELECT MIN(ts_millis) FROM replicate_probe_stage)
+                 )
+                 QUALIFY row_number() OVER (
+                     PARTITION BY staged.check_id, staged.agent_id, staged.ts_millis
+                     ORDER BY staged.ts_millis
+                 ) = 1;",
+            )?;
+        }
+        self.conn.execute_batch(&format!(
+            "INSERT INTO check_results SELECT * FROM replicate_new_results;
              {derived}",
             derived = derived_results_sql("replicate_new_results"),
         ))?;
@@ -9271,6 +9381,69 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    /// Retention must cost what it *removes*, not what it keeps. Seeds a table
+    /// spanning two windows, prunes the older one, and reports the delete
+    /// beside the full rebuilds it replaced — the rebuilds are timed here only
+    /// to keep the comparison honest, they are no longer on the path.
+    ///
+    /// `WARDEN_BENCH_PRUNE_ROWS` (default 20,000,000) sets the retained rows.
+    #[test]
+    #[ignore = "capacity baseline; configure WARDEN_BENCH_* for the intended scale"]
+    fn benchmark_retention_prune_against_retained_history() {
+        let retained: u64 = std::env::var("WARDEN_BENCH_PRUNE_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20_000_000);
+        let checks: u64 = 1_000;
+        let path =
+            std::env::temp_dir().join(format!("warden-prune-{}.duckdb", uuid::Uuid::now_v7()));
+        let store = Storage::open(path.to_str().unwrap()).unwrap();
+
+        let seeded = std::time::Instant::now();
+        // A realistic estate: a bounded set of checks, each with a long history.
+        // Deriving the id from the row number keeps that shape without sending
+        // twenty million values across the wire.
+        store
+            .conn
+            .execute_batch(&format!(
+                "INSERT INTO check_results
+                 SELECT ('00000000-0000-7000-8000-' ||
+                         lpad(((i % {checks}))::VARCHAR, 12, '0'))::UUID,
+                        'agent-a', i, 'up', 10, 200, NULL, 'z', 'r', NULL
+                 FROM generate_series(1, {retained}) t(i);"
+            ))
+            .unwrap();
+        store.rebuild_result_watermarks().unwrap();
+        store.rebuild_latest_check_results().unwrap();
+        let seed_elapsed = seeded.elapsed();
+
+        // One window out of `WARDEN_BENCH_PRUNE_WINDOWS`, as a daily run takes
+        // one day out of the retention period.
+        let windows: u64 = std::env::var("WARDEN_BENCH_PRUNE_WINDOWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+        let cutoff = (retained / windows) as i64;
+        let started = std::time::Instant::now();
+        let removed = store.prune_results(cutoff).unwrap();
+        let prune_elapsed = started.elapsed();
+
+        // What the old path did after the same delete.
+        let started = std::time::Instant::now();
+        store.rebuild_result_watermarks().unwrap();
+        store.rebuild_latest_check_results().unwrap();
+        let rebuild_elapsed = started.elapsed();
+
+        println!(
+            "retention_prune retained_rows={retained} windows={windows} seed_ms={} removed={removed} prune_ms={} replaced_rebuild_ms={}",
+            seed_elapsed.as_millis(),
+            prune_elapsed.as_millis(),
+            rebuild_elapsed.as_millis()
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Replication dedup must cost what the *batch* costs, not what the
     /// *history* costs. The anti-join is bounded by the batch's own minimum
     /// timestamp precisely so a node holding a month of results does not pay a
@@ -9278,6 +9451,73 @@ mod tests {
     /// and asserts a live-shaped batch still applies in bounded time.
     ///
     /// `WARDEN_BENCH_DEDUP_ROWS` (default 20,000,000) sets the retained rows.
+    /// Retention keeps the derived tables true without rebuilding them, so the
+    /// property to hold is equivalence: what prune leaves behind must equal
+    /// what a full rebuild would have produced. Covers the two cases that
+    /// differ — a check still reporting across the cutoff, and one that stopped
+    /// before it and must disappear entirely.
+    #[test]
+    fn pruning_leaves_the_derived_tables_exactly_as_a_rebuild_would() {
+        let s = Storage::open(":memory:").unwrap();
+        let live = "still-reporting";
+        let gone = "stopped-before-the-cutoff";
+        let cutoff = 5_000i64;
+
+        s.insert_results(&[
+            (result(live, 1_000, 10), Status::Up),
+            (result(live, 4_000, 11), Status::Up),
+            (result(live, 9_000, 12), Status::Down),
+            (result(gone, 1_000, 13), Status::Up),
+            (result(gone, 4_000, 14), Status::Up),
+        ])
+        .unwrap();
+
+        let removed = s.prune_results(cutoff).unwrap();
+        assert_eq!(removed, 4, "every row below the cutoff");
+
+        let marks = |s: &Storage| -> Vec<(String, i64, i64)> {
+            let mut stmt = s
+                .conn
+                .prepare(
+                    "SELECT CAST(check_id AS VARCHAR), max_ts, result_count
+                     FROM result_replication_watermarks ORDER BY 1",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        let latest = |s: &Storage| -> Vec<(String, i64)> {
+            let mut stmt = s
+                .conn
+                .prepare(
+                    "SELECT CAST(check_id AS VARCHAR), ts_millis
+                     FROM latest_check_results ORDER BY 1",
+                )
+                .unwrap();
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+
+        let after_marks = marks(&s);
+        let after_latest = latest(&s);
+        s.rebuild_result_watermarks().unwrap();
+        s.rebuild_latest_check_results().unwrap();
+        assert_eq!(after_marks, marks(&s), "watermarks must match a rebuild");
+        assert_eq!(
+            after_latest,
+            latest(&s),
+            "latest results must match a rebuild"
+        );
+        assert!(
+            !after_latest
+                .iter()
+                .any(|(id, _)| *id == cid(gone).to_string()),
+            "a check whose every row aged out must leave no latest row"
+        );
+    }
+
     #[test]
     #[ignore = "capacity baseline; configure WARDEN_BENCH_* for the intended scale"]
     fn benchmark_replicated_dedup_against_retained_history() {
@@ -9301,6 +9541,10 @@ mod tests {
                  FROM generate_series(1, {retained}) t(i);"
             ))
             .unwrap();
+        // Seeded straight into the table, so restore the invariant every real
+        // writer maintains: the benchmark measures dedup, not a corrupt store.
+        store.rebuild_result_watermarks().unwrap();
+        store.rebuild_latest_check_results().unwrap();
         let seed_elapsed = seeded.elapsed();
 
         // A live batch: 500 fresh rows, all newer than everything retained.

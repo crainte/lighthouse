@@ -478,13 +478,48 @@ constant. `benchmark_replicated_dedup_against_retained_history` measures a live-
 | 20M | 17 ms | 32 ms |
 | 40M | 20 ms | 51 ms |
 
-The bound cuts the slope from ~0.95 ms to ~0.15 ms per million retained rows.
-Extrapolated to a 30-day, three-domain replica (2.6B rows) that is roughly 0.4 s per
-batch bounded against ~2.5 s unbounded — survivable versus fatal, but neither is free.
-**Retention depth, not check count, is what ends this design.** The standing option is
-the one already noted beside `insert_results_dedup`: a `UNIQUE(check_id, agent_id,
-ts_millis)` index with `INSERT OR IGNORE`, which trades write throughput for a constant
-probe and must be measured before it is adopted.
+Bounding the probe by the batch's timestamp range only flattened the slope. Splitting
+the batch on the per-check high-water mark removes it: a row newer than the newest one
+held for its check cannot be a duplicate of anything, which in steady-state replication
+is every row in the batch, so the history table is never probed at all. Only repair,
+which replays old rows by definition, reaches the anti-join.
+
+| Retained rows | Watermark split | Timestamp bound only | Unbounded |
+|---:|---:|---:|---:|
+| 20M | 17 ms | 17 ms | 32 ms |
+| 40M | 16 ms | 20 ms | 51 ms |
+
+Replication cost now depends on batch size alone. The remaining ~16 ms is staging 500
+rows and merging the derived tables. `UNIQUE(check_id, agent_id, ts_millis)` with
+`INSERT OR IGNORE` is no longer needed for the live path; it remains the option if
+repair throughput ever becomes the constraint.
+
+### Retention costs what it removes, not what it keeps
+
+`prune` used to follow the raw-result delete with two full rebuilds —
+`result_replication_watermarks` and `latest_check_results` — each scanning everything
+that *survived*. Pruning one day out of thirty read the other twenty-nine. Neither is
+necessary: a maximum above the cutoff cannot be changed by deleting below it, so only
+`result_count` moves, by exactly what was removed per check; and `latest_check_results`
+holds one row per check, so an entry is stale precisely when its own timestamp is below
+the cutoff.
+
+`benchmark_retention_prune_against_retained_history`, 1,000 checks, one window out of
+thirty removed:
+
+| Retained rows | Removed | Prune | Rebuilds it replaced |
+|---:|---:|---:|---:|
+| 20M | 10.0M (half) | 514 ms | 2,148 ms |
+| 40M | 1.33M (1/30th) | 176 ms | 7,552 ms |
+
+The second row is the shape of a daily run: 43× less work, and what remains scales with
+rows removed rather than rows retained. Extrapolated to a 30-day three-domain replica
+(2.6B rows, ~86M removed daily) that is ~11 s of delete instead of minutes of rebuild.
+
+The delete itself is then sliced across 24 database jobs (`Coordinator::prune_in_slices`)
+so the worker interleaves probes and reads between them. Slicing makes retention
+interruptible, not cheaper: each slice is a committed deletion of a time range, so an
+interrupted run leaves a consistent database with more to remove tomorrow.
 
 ### Measured status, page, and global-push cardinality
 

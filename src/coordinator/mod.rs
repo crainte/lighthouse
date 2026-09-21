@@ -1940,6 +1940,46 @@ impl Coordinator {
     /// Start the retention job: prune once at startup, then once a day. Runs
     /// beside ingest on its own task; a failed prune is logged and the
     /// schedule continues rather than taking the server down.
+    /// How many jobs a day's raw-result delete is cut into. The database worker
+    /// runs one job at a time, so the whole deletion in one job is the whole
+    /// deletion in one stall: every probe result and every dashboard read waits
+    /// behind it. Slicing does not make retention cheaper, it makes it
+    /// interruptible — the other work in the queue runs between slices.
+    const RETENTION_SLICES: i64 = 24;
+
+    /// Raw results first, in slices, then everything else in one job. Each
+    /// slice is a complete, committed deletion of a time range, so an
+    /// interrupted run leaves a consistent database that simply has more left
+    /// to remove tomorrow.
+    async fn prune_in_slices(
+        &self,
+        results_days: u64,
+        alerts_days: u64,
+        now_millis: i64,
+    ) -> Result<u64> {
+        let cutoff = now_millis - (results_days as i64) * 86_400_000;
+        let mut removed = 0u64;
+        if let Some(oldest) = self.db(|storage| storage.oldest_result_ts()).await? {
+            if oldest < cutoff {
+                let step = ((cutoff - oldest) / Self::RETENTION_SLICES).max(3_600_000);
+                let mut edge = oldest.saturating_add(step);
+                while edge < cutoff {
+                    removed += self.db(move |storage| storage.prune_results(edge)).await?;
+                    edge = edge.saturating_add(step);
+                }
+                removed += self
+                    .db(move |storage| storage.prune_results(cutoff))
+                    .await?;
+            }
+        }
+        // The rest is bounded by the number of alerts, incidents and
+        // tombstones, not by raw history, so it stays one job.
+        removed += self
+            .db(move |storage| storage.prune_metadata(results_days, alerts_days, now_millis))
+            .await?;
+        Ok(removed)
+    }
+
     pub fn spawn_retention(&self) {
         let retention = self.inner.retention.clone();
         let coord = self.clone();
@@ -1950,10 +1990,7 @@ impl Coordinator {
                 let now = chrono::Utc::now().timestamp_millis();
                 let results_days = retention.results_days;
                 let alerts_days = retention.alerts_days;
-                match coord
-                    .db(move |storage| storage.prune(results_days, alerts_days, now))
-                    .await
-                {
+                match coord.prune_in_slices(results_days, alerts_days, now).await {
                     Ok(0) => {}
                     Ok(removed) => {
                         tracing::info!(removed, "retention prune removed old rows");
@@ -4068,6 +4105,61 @@ fn error_response(code: StatusCode, message: &str) -> Response {
 
 #[cfg(test)]
 mod tests {
+
+    /// Slicing is a scheduling change, never a semantic one: a sliced run must
+    /// remove exactly what a single-shot prune removes, and leave the same
+    /// rows behind. Runs a day's worth of history through both.
+    #[tokio::test]
+    async fn a_sliced_prune_removes_exactly_what_one_pass_would() {
+        let now = 30 * 86_400_000i64;
+        let cfg = CoordinatorConfig {
+            db_path: ":memory:".into(),
+            retention: crate::config::RetentionConfig {
+                results_days: 7,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let coord = Coordinator::new(&cfg).await.unwrap();
+        let check = crate::models::new_check_id();
+        let rows: Vec<(crate::models::CheckResult, crate::models::Status)> = (0..30)
+            .map(|day| {
+                let mut r = crate::models::CheckResult {
+                    check_id: check,
+                    agent_id: "a".into(),
+                    zone: "z".into(),
+                    region: "r".into(),
+                    kind: crate::models::CheckKind::Http,
+                    timestamp: chrono::DateTime::from_timestamp_millis(day * 86_400_000).unwrap(),
+                    latency_ms: 1,
+                    status_code: Some(200),
+                    body_matched: None,
+                    error: None,
+                    failure: None,
+                    body: None,
+                    headers: None,
+                    metric: None,
+                    metrics: None,
+                };
+                r.agent_id = "a".into();
+                (r, crate::models::Status::Up)
+            })
+            .collect();
+        coord
+            .db(move |storage| storage.insert_results(&rows))
+            .await
+            .unwrap();
+
+        let removed = coord.prune_in_slices(7, 90, now).await.unwrap();
+        assert_eq!(removed, 23, "every day older than the retention window");
+        let left = coord
+            .db(move |storage| storage.history(check, 100, None, None, None))
+            .await
+            .unwrap();
+        assert_eq!(left.len(), 7, "the retention window itself survives");
+        // Idempotent: a second run has nothing left to take.
+        assert_eq!(coord.prune_in_slices(7, 90, now).await.unwrap(), 0);
+    }
     use super::{incident_title, region_change_narrative, Coordinator};
     use crate::{
         config::{CheckConfig, CoordinatorConfig, GlobalConfig},
