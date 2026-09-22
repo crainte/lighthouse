@@ -160,4 +160,23 @@ describe('sortChecks', () => {
     const desc = sortChecks(checks, 'uptime', 'desc');
     expect(desc.map((c) => c.uptime_24h)).toEqual([0.99, 0.9, 0.8, 0.5]);
   });
+
+  it('ranks unmeasured checks last in both directions', () => {
+    const list = [
+      { check_id: 'measured-bad', name: 'a', status: 'down', latency_ms: 1, last_check: 1, uptime_24h: 0 },
+      { check_id: 'unmeasured', name: 'b', status: 'up', latency_ms: 0, last_check: 0, uptime_24h: null },
+      { check_id: 'measured-good', name: 'c', status: 'up', latency_ms: 1, last_check: 1, uptime_24h: 1 },
+    ] as Parameters<typeof sortChecks>[0];
+
+    expect(sortChecks(list, 'uptime', 'asc').map((c) => c.check_id)).toEqual([
+      'measured-bad',
+      'measured-good',
+      'unmeasured',
+    ]);
+    expect(sortChecks(list, 'uptime', 'desc').map((c) => c.check_id)).toEqual([
+      'measured-good',
+      'measured-bad',
+      'unmeasured',
+    ]);
+  });
 });

@@ -253,7 +253,9 @@ struct CheckStatusDto {
     state: NodeState,
     latency_ms: u64,
     last_check: i64,
-    uptime_24h: f64,
+    /// `None` when no region measured anything in the window; see the
+    /// coordinator's own status DTO.
+    uptime_24h: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     status_code: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]

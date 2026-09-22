@@ -21,7 +21,10 @@ export interface Check {
   status: Status;
   latency_ms: number | null;
   last_check: number;
-  uptime_24h: number;
+  /** `null` when nothing was measured in the window — a check configured on
+   *  this coordinator but placed in another region, or one probed for the first
+   *  time moments ago. Distinct from `0`, which is a real outage. */
+  uptime_24h: number | null;
   /** HTTP status code from the latest attempt, when the probe was HTTP. */
   status_code?: number;
   /** Why the latest attempt failed. Absent when it succeeded. */

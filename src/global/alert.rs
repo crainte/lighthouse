@@ -175,7 +175,7 @@ mod tests {
             per_region: regions.iter().map(|(r, s)| ((*r).into(), *s)).collect(),
             latency_ms: 0,
             last_check: 0,
-            uptime_24h: 0.0,
+            uptime_24h: None,
             status_code: None,
             error: None,
             kind: None,

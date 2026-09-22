@@ -74,7 +74,11 @@ struct CheckStatusDto {
     state: NodeState,
     latency_ms: u64,
     last_check: i64,
-    uptime_24h: f64,
+    /// `None` when the window holds no observation at all — a check configured
+    /// here but placed elsewhere, or one probed for the first time moments ago.
+    /// Not `0.0`: "nothing was measured" and "nothing was up" are different
+    /// answers, and only one of them is an outage.
+    uptime_24h: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     status_code: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -408,7 +412,7 @@ pub(in crate::coordinator) async fn status_handler(
                         state: r.state,
                         latency_ms: r.latency_ms,
                         last_check: r.last_check,
-                        uptime_24h: r.uptime_24h,
+                        uptime_24h: Some(r.uptime_24h),
                         status_code: r.status_code,
                         error: public_error(r.error, r.failure, detailed),
                     }
@@ -439,7 +443,7 @@ pub(in crate::coordinator) async fn status_handler(
                         .unwrap_or_else(|| m.default_status.into()),
                     latency_ms: 0,
                     last_check: 0,
-                    uptime_24h: 0.0,
+                    uptime_24h: None,
                     status_code: None,
                     error: None,
                     kind: Some(m.kind),

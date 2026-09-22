@@ -122,6 +122,80 @@ async fn login(base: &str) -> String {
     set.split(';').next().unwrap().to_string()
 }
 
+/// "Nothing was measured" and "nothing was up" must not be the same answer.
+/// A check configured here but never observed — placed in another region, or
+/// simply new — reports `uptime_24h: null`; one that *was* observed reports a
+/// number. Reporting 0.0 for the first case ranks a check nobody was asked to
+/// watch alongside a total outage.
+#[tokio::test]
+async fn an_unobserved_check_reports_null_uptime_rather_than_zero() {
+    let coord = coordinator().await;
+    let addr = spawn_server(coord);
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let session = login(&base).await;
+
+    let created = client
+        .post(format!("{base}/api/v1/admin/checks"))
+        .header(reqwest::header::COOKIE, &session)
+        .json(&check_body("never-probed", "https://example.com/a"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 200);
+    let observed = client
+        .post(format!("{base}/api/v1/admin/checks"))
+        .header(reqwest::header::COOKIE, &session)
+        .json(&check_body("probed", "https://example.com/b"))
+        .send()
+        .await
+        .unwrap();
+    let observed_id = observed.json::<Value>().await.unwrap()["check"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    client
+        .post(format!("{base}/api/v1/results"))
+        .bearer_auth(AGENT_TOKEN)
+        .json(&json!({"results": [{
+            "check_id": observed_id,
+            "agent_id": "agent-test",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "latency_ms": 12,
+            "status_code": 200,
+        }]}))
+        .send()
+        .await
+        .unwrap();
+
+    let status: Value = client
+        .get(format!("{base}/api/v1/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let by_name = |name: &str| -> Value {
+        status["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("{name} should be on the status page: {status}"))
+            .clone()
+    };
+    assert!(
+        by_name("never-probed")["uptime_24h"].is_null(),
+        "an unobserved check must report null uptime: {status}"
+    );
+    assert!(
+        by_name("probed")["uptime_24h"].is_f64(),
+        "an observed check must report a number: {status}"
+    );
+}
+
 #[tokio::test]
 async fn http_security_headers_and_cookie_policy_are_applied() {
     let addr = spawn_server(coordinator().await);
@@ -1249,7 +1323,10 @@ async fn a_configured_check_appears_before_it_has_ever_reported() {
         .find(|c| c["check_id"] == slow_id)
         .expect("a configured check belongs on the page before its first result");
     assert_eq!(row["status"], "unknown", "no result yet is not an outage");
-    assert_eq!(row["uptime_24h"], 0.0);
+    assert!(
+        row["uptime_24h"].is_null(),
+        "and for the same reason it is not 0% uptime either: {row}"
+    );
     assert_eq!(row["type"], "dns");
 
     // A hidden check still stays off the page.

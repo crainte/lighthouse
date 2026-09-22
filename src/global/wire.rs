@@ -61,7 +61,11 @@ pub struct CheckSummary {
     pub state: NodeState,
     pub latency_ms: u64,
     pub last_check: i64,
-    pub uptime_24h: f64,
+    /// `None` when this region measured nothing in the window. Skipped on the
+    /// wire when absent, so a node on an older build reads the field as missing
+    /// and defaults it exactly as it did before this was optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uptime_24h: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_code: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

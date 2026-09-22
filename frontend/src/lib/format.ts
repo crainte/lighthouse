@@ -117,7 +117,16 @@ export function sortChecks(list: Check[], key: SortKey, dir: SortDir): Check[] {
     let cmp: number;
     if (key === 'name') cmp = a.name.localeCompare(b.name);
     else if (key === 'status') cmp = STATUS_RANK[a.status] - STATUS_RANK[b.status];
-    else cmp = a.uptime_24h - b.uptime_24h;
+    else {
+      // An unmeasured check has no place on an uptime ranking: sorting it as
+      // 0% would put "we never looked" above a genuine outage in one direction
+      // and below a perfect record in the other. It goes last either way.
+      if (a.uptime_24h == null || b.uptime_24h == null) {
+        if (a.uptime_24h == null && b.uptime_24h == null) return 0;
+        return a.uptime_24h == null ? 1 : -1;
+      }
+      cmp = a.uptime_24h - b.uptime_24h;
+    }
     return cmp * sign;
   });
 }

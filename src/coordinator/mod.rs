@@ -1299,7 +1299,7 @@ impl Coordinator {
                 state: r.state,
                 latency_ms: r.latency_ms,
                 last_check: r.last_check,
-                uptime_24h: r.uptime_24h,
+                uptime_24h: Some(r.uptime_24h),
                 status_code: r.status_code,
                 // The raw error is redacted from the public page; the global
                 // push carries only the safe category the failure implies.
@@ -1325,7 +1325,7 @@ impl Coordinator {
                     .unwrap_or_else(|| meta.default_status.into()),
                 latency_ms: 0,
                 last_check: 0,
-                uptime_24h: 0.0,
+                uptime_24h: None,
                 status_code: None,
                 error: None,
                 kind: Some(meta.kind),
