@@ -669,6 +669,137 @@ push route has an explicit 16 MiB limit so supported 10,000-check snapshots are 
 rejected by Axum's 2 MiB default. This validates cardinality, not sustained concurrent
 load or the full production capacity envelope.
 
+## Placement-scoped configuration
+
+### The problem
+
+A check's `placement` narrows where it *runs*. Nothing narrows where it is
+*stored*. Admin writes driven from the global dashboard are fanned out to every
+region so the fleet stays uniform, so every region holds the full document for
+every check whether or not it will ever probe it.
+
+Observed in the development stack: `unifi` and `upstream` both carry
+`placement.regions = ["us"]`, and both full definitions — target, expectations,
+everything — sit in `coordinator-tw`'s database. One of those targets embeds a
+push credential in its query string. The `dns` check ships five expected A
+records; `flood` names a private LAN address. None of it is needed in tw, and tw
+was never asked to probe two of the five.
+
+The costs, in order of seriousness:
+
+1. **Distribution of secrets and topology.** A check document carries the target
+   and, for HTTP, arbitrary request headers — which is where credentials live.
+   Today they reach every region's database and are readable by anyone holding
+   an admin session or agent credential in any of them. The objection is not to
+   storing a probe credential in the cluster that probes with it; it is to that
+   credential travelling to clusters that do not.
+2. **Per-region cost proportional to the global catalogue.** Config
+   anti-entropy reads every check document per sweep — measured at 0.64–2.2 s of
+   database-worker time for 10,000 checks — and every region pays it for the
+   whole fleet regardless of its own workload. `list_checks()` on each agent poll
+   is O(total catalogue) for the same reason.
+3. **Regional status pages list checks the region can never observe**, which
+   read as permanently unmeasured because they are.
+
+### The gap this exposes
+
+Cross-region configuration has no repair at all. `fan_out_write` applies a write
+region by region and returns on the first failure — after earlier regions have
+already applied it — so a partial write is reported as an error and then never
+reconciled. A region that is merely stale drops out of the endpoint list and
+misses the write silently. Within a region, peers converge through config
+digests; between regions, nothing does.
+
+Answering "what should this region hold?" is therefore needed twice over: to
+scope distribution, and to repair it.
+
+### The shape
+
+The global tier becomes authoritative for the catalogue and reconciles each
+region against the set its placement implies. The control plane gains a
+dependency on the global tier, which is why that tier wants to be three nodes
+rather than one; the data plane — probing, evaluation, rollup, incidents,
+paging — stays entirely regional and is unaffected by a total global outage.
+
+A global node is then close to *a coordinator that holds the catalogue but no
+results*, so most of the machinery already exists: HLC-stamped config entries,
+per-kind digests, cursored backfill, cluster membership, anti-entropy.
+
+### Unplace is disable-shaped, not delete-shaped
+
+Removing a check from a region must preserve its identity. Three existing
+behaviours decide this:
+
+- **Disable** (`enabled = false`) is an ordinary config edit: identity and
+  history are preserved, and re-enabling reconnects everything.
+- **Delete** writes a `config_tombstone`, which blocks resurrection only by
+  last-writer-wins and is itself pruned at `max(results_days, alerts_days)`.
+- **Recreation through the UI mints a fresh UUIDv7**, so delete-then-recreate
+  produces a *different* check. The old results remain under the old id,
+  queryable but orphaned, with no path from the UI to reattach them. Delete is
+  therefore irreversible in practice — and that is identity minting doing it,
+  not the tombstone.
+
+So unplace must be its own verb: drop the local definition, keep the id, never
+write a tombstone. A tombstone would replicate, and de-placing a check in one
+region would delete it in the region that still probes it.
+
+### History survives unplacement
+
+Raw results are keyed by `check_id` and are untouched by configuration changes.
+The status path already tolerates results whose definition is absent and filters
+them from the page. Unplacing therefore makes a check's history invisible but
+intact, and re-placing it under the same id brings it back with no plumbing.
+
+Retention ages the gap out as it would any other history; a month of
+unplacement against a thirty-day window leaves little behind, which is the
+correct outcome rather than a limitation.
+
+### Cross-region dependency belongs to the global tier
+
+`depends_on` is resolved locally: a dependent check looks up its upstream's open
+incident in *its own* store. An upstream probed only in another region has no
+open incident to find, so the dependent opens its own — the fan-out that
+dependency joining exists to prevent.
+
+Co-placing both ends is not a fix, because the upstream may be one that should
+not be probed in the dependent's region at all. The global tier is the only
+place both states are visible, and is already re-evaluating cross-region rollups
+on every push, so that is where a cross-region edge is attributed.
+
+Note this is a different axis from `RollupPolicy` and the region tree, which
+describe how children fold into a parent's *state*. Dependency describes
+*causation* — who to blame when several things fail together.
+
+### Phases
+
+| Phase | Work |
+|---|---|
+| 1 | Global holds the catalogue and placement durably, replicated between global nodes using the coordinator's existing config plane |
+| 2 | Per-region reconciliation against the set placement implies, with an explicit unplace verb distinct from delete |
+| 3 | Probe detail is delivered only to placed regions; regional pages show only what they hold |
+| 4 | Global runs as three nodes |
+| 5 | Cross-region dependency attribution at the global tier |
+
+No migration or version-gating work is planned: the project is unreleased, so
+wire formats and storage shapes change freely.
+
+### Open decisions
+
+- **Published state on unplace.** Recommended: clear it, so a region stops
+  asserting a state for a check it no longer watches, and the check reads as its
+  `default_status` until the first result after re-placement. Raw results are
+  kept either way.
+- **Cross-region dependency, first cut.** Recommended: attribution visible on
+  the global view only, with each region keeping its own incident. Relaying a
+  "join this incident" instruction down makes incident membership a
+  two-writer problem and should be designed deliberately rather than assumed.
+- **What the global stores.** Either the full check document — making the global
+  the one place a probe credential exists outside the region that probes with it
+  — or the catalogue and placement alone, with probe detail held only by placed
+  regions. The second keeps the global thinner and keeps secrets closest to
+  their use; the first is simpler to reconcile. Undecided.
+
 ## Scaling milestones
 
 ### Now: identity correctness

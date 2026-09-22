@@ -82,6 +82,18 @@ Prioritized action items from the production-readiness review. Existing items fr
 
 ## P1 — Reliability and data integrity
 
+### Placement-scoped configuration
+
+Design settled in `SCALING.md`; three decisions still open there. Nothing here
+is started.
+
+- [ ] **Phase 1** — global holds the catalogue and placement durably, replicated between global nodes, reusing the coordinator's config plane (HLC entries, per-kind digests, cursored backfill, cluster membership). Fixes the existing gap that `fan_out_write` applies partially and nothing reconciles it.
+- [ ] **Phase 2** — per-region reconciliation against the set placement implies, with an `unplace` verb that drops the local definition, keeps the check id, and never writes a tombstone. A tombstone would replicate and delete the check in the region still probing it.
+- [ ] **Phase 3** — deliver probe detail only to placed regions; regional status pages list only what the region holds. Closes the disclosure (a target with an embedded credential currently sits in every region) and cuts per-region config cost.
+- [ ] **Phase 4** — run the global as three nodes.
+- [ ] **Phase 5** — cross-region dependency attribution at the global tier, the only place both ends of the edge are visible. Distinct from `RollupPolicy`, which describes state folding rather than causation.
+- [ ] Clear a check's published state on unplace so a region stops asserting a state it no longer observes; keep raw results, which reconnect by id on re-placement.
+
 ### Config-plane provisioning cost
 
 Measured during the passing 10,000-check gate; provisioning-time, not steady-state.
