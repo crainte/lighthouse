@@ -715,8 +715,9 @@ scope distribution, and to repair it.
 
 ### The shape
 
-The global tier becomes authoritative for the catalogue and reconciles each
-region against the set its placement implies. The control plane gains a
+The global tier becomes authoritative for the catalogue — whole documents, which
+is safe precisely because documents no longer carry secrets (below) — and
+reconciles each region against the set its placement implies. The control plane gains a
 dependency on the global tier, which is why that tier wants to be three nodes
 rather than one; the data plane — probing, evaluation, rollup, incidents,
 paging — stays entirely regional and is unaffected by a total global outage.
@@ -755,6 +756,10 @@ Retention ages the gap out as it would any other history; a month of
 unplacement against a thirty-day window leaves little behind, which is the
 correct outcome rather than a limitation.
 
+The *published* state is cleared on unplace, so a region stops asserting a state
+for a check it no longer watches; the check reads as its `default_status` until
+the first result after re-placement. Raw results are untouched either way.
+
 ### Cross-region dependency belongs to the global tier
 
 `depends_on` is resolved locally: a dependent check looks up its upstream's open
@@ -766,6 +771,11 @@ Co-placing both ends is not a fix, because the upstream may be one that should
 not be probed in the dependent's region at all. The global tier is the only
 place both states are visible, and is already re-evaluating cross-region rollups
 on every push, so that is where a cross-region edge is attributed.
+
+Attribution is a global-tier concern only: regions are not given awareness of
+dependencies they cannot resolve, and each keeps its own incident. Relaying a
+"join this incident" instruction down would make incident membership a
+two-writer problem, and buys nothing a region can act on.
 
 Note this is a different axis from `RollupPolicy` and the region tree, which
 describe how children fold into a parent's *state*. Dependency describes
@@ -784,21 +794,54 @@ describe how children fold into a parent's *state*. Dependency describes
 No migration or version-gating work is planned: the project is unreleased, so
 wire formats and storage shapes change freely.
 
+### Secrets are referenced, not carried
+
+Wanting probe credentials to stay in their own region conflicts with wanting the
+global tier to move a check between regions: whoever moves it needs the whole
+document, and the document is where the credential is. Both halves are right, so
+the premise between them is what has to go — a check document has no business
+containing a secret in the first place.
+
+The convention already exists everywhere else in this project. A peer token, a
+global token, a provisioned agent credential: each is either an inline value for
+a fixture or a *name* resolved locally, with a deliberate error when it cannot
+be resolved. `ProvisionedCredential::resolved_token` is the shape, and its
+sibling `missing_token_error` is the attitude — an unresolvable secret says so
+loudly, because "no results" reads like "not scheduled yet" and this project
+treats that as the dangerous failure.
+
+Applied to checks, a target or header carries a reference and the region
+resolves it at hand-off to its own agents. Three things follow:
+
+- The document stops being sensitive, so the global tier can hold, distribute
+  and move it freely. The conflict disappears rather than being traded off.
+- The value never leaves the region that probes with it, which is what the
+  coordinator cluster is *for*.
+- Moving a check from one region to another becomes: the global hands over the
+  document, and the receiving region reports the named credential as missing
+  until an operator provisions it. Requiring an explicit act to give a new
+  region a credential is the boundary, not friction to be smoothed away.
+
+A useful consequence for the phases below: placement-scoped distribution stops
+being a security control and becomes an optimisation — per-region digest and
+poll cost, and a regional page that lists only what it holds. If it slips,
+nothing leaks.
+
+The secret never appears in the admin UI either, which continues to render the
+reference. Only the hand-off to an agent carries a resolved value, to agents in
+the region entitled to it.
+
 ### Open decisions
 
-- **Published state on unplace.** Recommended: clear it, so a region stops
-  asserting a state for a check it no longer watches, and the check reads as its
-  `default_status` until the first result after re-placement. Raw results are
-  kept either way.
-- **Cross-region dependency, first cut.** Recommended: attribution visible on
-  the global view only, with each region keeping its own incident. Relaying a
-  "join this incident" instruction down makes incident membership a
-  two-writer problem and should be designed deliberately rather than assumed.
-- **What the global stores.** Either the full check document — making the global
-  the one place a probe credential exists outside the region that probes with it
-  — or the catalogue and placement alone, with probe detail held only by placed
-  regions. The second keeps the global thinner and keeps secrets closest to
-  their use; the first is simpler to reconcile. Undecided.
+- **Where resolved values come from.** Recommended first cut: environment
+  indirection, matching `token_env` exactly — no new storage, no new admin
+  surface, provisioned with the deployment. A region-local secret store managed
+  at runtime is the later upgrade if credentials need rotating without a
+  restart; its one rule is that values never cross a region boundary.
+- **What an unresolved reference does to a check.** It must not silently probe
+  with a literal `${...}` or quietly go idle. Recommended: the check reads as a
+  configuration error naming the missing reference, in the same spirit as
+  `missing_token_error`.
 
 ## Scaling milestones
 

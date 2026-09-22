@@ -93,6 +93,7 @@ is started.
 - [ ] **Phase 4** — run the global as three nodes.
 - [ ] **Phase 5** — cross-region dependency attribution at the global tier, the only place both ends of the edge are visible. Distinct from `RollupPolicy`, which describes state folding rather than causation.
 - [ ] Clear a check's published state on unplace so a region stops asserting a state it no longer observes; keep raw results, which reconnect by id on re-placement.
+- [ ] **Phase 0** — reference secrets in check documents rather than carrying them, following the existing `token_env` convention: the region resolves a named credential at hand-off to its own agents, the admin UI renders the reference, and an unresolved reference reads as a configuration error naming it. This is what lets the global tier hold and move whole documents while values stay in the region that probes with them, and it turns placement-scoped distribution from a security control into an optimisation. Do this before Phase 1.
 
 ### Config-plane provisioning cost
 
