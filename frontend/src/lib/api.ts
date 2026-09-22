@@ -113,6 +113,11 @@ export interface MaintenanceNotice {
 
 export interface StatusResponse {
   checks: Check[];
+  /** Bounded status page echoed by chart routes. */
+  page: number;
+  limit: number;
+  total_checks: number;
+  has_more: boolean;
   /** Empty when `[status_page.agents] mode = "off"`. */
   agents: FleetRow[];
   /** Announced windows running right now, soonest to end first. */
@@ -249,8 +254,14 @@ async function getJson<T>(url: string): Promise<T> {
   return res.json();
 }
 
-export function fetchStatus(): Promise<StatusResponse> {
-  return getJson<StatusResponse>("/api/v1/status");
+export function fetchStatus(
+  section: string | null = null,
+  page = 0,
+  limit = 100,
+): Promise<StatusResponse> {
+  return getJson<StatusResponse>(
+    `/api/v1/status?page=${page}&limit=${limit}${sectionParam(section)}`,
+  );
 }
 
 export function fetchHistory(
@@ -332,8 +343,10 @@ export interface IncidentsResponse {
   incidents: Incident[];
 }
 
-export function fetchIncidents(limit = 50): Promise<IncidentsResponse> {
-  return getJson<IncidentsResponse>(`/api/v1/incidents?limit=${limit}`);
+export function fetchIncidents(limit = 50, since?: number): Promise<IncidentsResponse> {
+  let url = `/api/v1/incidents?limit=${limit}`;
+  if (since !== undefined) url += `&since=${since}`;
+  return getJson<IncidentsResponse>(url);
 }
 
 /** One incident with its full update timeline. Public, like the list. */
@@ -464,9 +477,11 @@ export function fetchUptimeStrips(
   days = 90,
   buckets = 90,
   section: string | null = null,
+  page = 0,
+  limit = 100,
 ): Promise<UptimeStripsResponse> {
   return getJson<UptimeStripsResponse>(
-    `/api/v1/uptime?days=${days}&buckets=${buckets}${sectionParam(section)}`,
+    `/api/v1/uptime?days=${days}&buckets=${buckets}&page=${page}&limit=${limit}${sectionParam(section)}`,
   );
 }
 
@@ -497,9 +512,11 @@ export function fetchLatencyPoints(
   hours = 24,
   buckets = 120,
   section: string | null = null,
+  page = 0,
+  limit = 100,
 ): Promise<LatencyPointsResponse> {
   return getJson<LatencyPointsResponse>(
-    `/api/v1/latency-points?hours=${hours}&buckets=${buckets}${sectionParam(section)}`,
+    `/api/v1/latency-points?hours=${hours}&buckets=${buckets}&page=${page}&limit=${limit}${sectionParam(section)}`,
   );
 }
 

@@ -3,10 +3,18 @@ use crate::coordinator::hlc::Hlc;
 use crate::credential::AgentCredential;
 use crate::models::{CheckId, CheckKind, CheckResult, NodeState, Status};
 use anyhow::{bail, Result};
-use duckdb::Connection;
+use duckdb::{Connection, Statement};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as ShaDigest, Sha256};
 use std::collections::BTreeMap;
+
+const MILLIS_PER_MINUTE: i64 = 60_000;
+const MILLIS_PER_HOUR: i64 = 60 * MILLIS_PER_MINUTE;
+const RAW_RETENTION_MILLIS: i64 = 30 * 24 * MILLIS_PER_HOUR;
+const MINUTE_ROLLUP_RETENTION_MILLIS: i64 = 90 * 24 * MILLIS_PER_HOUR;
+// Thirteen 30-day months is deliberately a conservative fixed-duration
+// retention window; unlike calendar months it remains unambiguous in UTC.
+const HOUR_ROLLUP_RETENTION_MILLIS: i64 = 13 * 30 * 24 * MILLIS_PER_HOUR;
 
 /// DuckDB-backed store for check results and materialized current state.
 /// The dedicated database worker exclusively owns this single DuckDB connection.
@@ -219,6 +227,9 @@ pub struct AlertRow {
 /// to dangle when the alert it came from is pruned.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueuedRow {
+    /// Immutable delivery identity. It distinguishes transitions that share a
+    /// notifier, check, and millisecond, and stays stable across retries.
+    pub id: String,
     /// The routing *name*, resolved against the live notifier list at each
     /// attempt. Editing a backend therefore fixes its queued notifications;
     /// deleting it drops them, because there is no longer anyone to page.
@@ -594,17 +605,6 @@ pub struct LatencyBand {
 }
 
 impl LatencyBand {
-    fn observe(&mut self, latency_ms: u64, up: bool) {
-        self.attempts += 1;
-        if !up {
-            return;
-        }
-        self.up += 1;
-        self.sum_ms += latency_ms as f64;
-        self.min_ms = Some(self.min_ms.map_or(latency_ms, |m| m.min(latency_ms)));
-        self.max_ms = Some(self.max_ms.map_or(latency_ms, |m| m.max(latency_ms)));
-    }
-
     fn merge(&mut self, other: &Self) {
         self.attempts += other.attempts;
         self.up += other.up;
@@ -702,6 +702,10 @@ pub struct ReplicatedIncident {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CheckDigest {
     pub check_id: CheckId,
+    /// Oldest raw observation still retained for this check. This is maintained
+    /// alongside the replication high-water mark, so digesting it never scans
+    /// raw history.
+    pub min_ts: i64,
     pub max_ts: i64,
     pub count: i64,
 }
@@ -1649,6 +1653,40 @@ fn migrate_check_identity(conn: &Connection) -> Result<()> {
     }
 }
 
+/// Replace the timestamp-derived delivery key with an immutable one. Existing
+/// rows receive a value derived from their old primary key, which was unique,
+/// so retries queued before this upgrade remain addressable and deliverable.
+fn migrate_notification_queue_identity(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "notification_queue")?
+        || table_column_names(conn, "notification_queue")?
+            .iter()
+            .any(|column| column == "id")
+    {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "CREATE TABLE notification_queue__id_migration (
+            id             VARCHAR PRIMARY KEY,
+            notifier       VARCHAR NOT NULL,
+            check_id       UUID    NOT NULL,
+            previous_state VARCHAR,
+            current_state  VARCHAR NOT NULL,
+            attempts       INTEGER NOT NULL,
+            next_attempt   BIGINT,
+            last_error     VARCHAR NOT NULL,
+            queued_at      BIGINT  NOT NULL
+        );
+        INSERT INTO notification_queue__id_migration
+        SELECT notifier || ':' || check_id::VARCHAR || ':' || queued_at::VARCHAR,
+               notifier, check_id, previous_state, current_state, attempts,
+               next_attempt, last_error, queued_at
+        FROM notification_queue;
+        DROP TABLE notification_queue;
+        ALTER TABLE notification_queue__id_migration RENAME TO notification_queue;",
+    )?;
+    Ok(())
+}
+
 /// Merge `ingest_agent_stage` into `agent_check_state`, keeping the newest
 /// belief per `(check_id, agent_id)`. One statement, shared by local ingest and
 /// replication so the two cannot drift on what "newest" means.
@@ -1673,9 +1711,36 @@ const AGENT_STATE_MERGE_SQL: &str = "INSERT INTO agent_check_state
 /// surviving rows rather than everything it was offered.
 fn derived_results_sql(staged: &str) -> String {
     format!(
-        "INSERT INTO result_replication_watermarks
-         SELECT check_id, MAX(ts_millis), COUNT(*) FROM {staged} GROUP BY check_id
+        "INSERT INTO check_latency_minute_rollups
+         SELECT check_id, agent_id, (ts_millis // {MILLIS_PER_MINUTE}) * {MILLIS_PER_MINUTE},
+                COUNT(*), COUNT(*) FILTER (WHERE status = 'up'),
+                COALESCE(SUM(latency_ms) FILTER (WHERE status = 'up'), 0),
+                MIN(latency_ms) FILTER (WHERE status = 'up'),
+                MAX(latency_ms) FILTER (WHERE status = 'up')
+         FROM {staged} GROUP BY 1, 2, 3
+         ON CONFLICT (check_id, agent_id, bucket_start) DO UPDATE SET
+             attempts = check_latency_minute_rollups.attempts + excluded.attempts,
+             up = check_latency_minute_rollups.up + excluded.up,
+             latency_sum = check_latency_minute_rollups.latency_sum + excluded.latency_sum,
+             latency_min = LEAST(check_latency_minute_rollups.latency_min, excluded.latency_min),
+             latency_max = GREATEST(check_latency_minute_rollups.latency_max, excluded.latency_max);
+         INSERT INTO check_latency_hour_rollups
+         SELECT check_id, agent_id, (ts_millis // {MILLIS_PER_HOUR}) * {MILLIS_PER_HOUR},
+                COUNT(*), COUNT(*) FILTER (WHERE status = 'up'),
+                COALESCE(SUM(latency_ms) FILTER (WHERE status = 'up'), 0),
+                MIN(latency_ms) FILTER (WHERE status = 'up'),
+                MAX(latency_ms) FILTER (WHERE status = 'up')
+         FROM {staged} GROUP BY 1, 2, 3
+         ON CONFLICT (check_id, agent_id, bucket_start) DO UPDATE SET
+             attempts = check_latency_hour_rollups.attempts + excluded.attempts,
+             up = check_latency_hour_rollups.up + excluded.up,
+             latency_sum = check_latency_hour_rollups.latency_sum + excluded.latency_sum,
+             latency_min = LEAST(check_latency_hour_rollups.latency_min, excluded.latency_min),
+             latency_max = GREATEST(check_latency_hour_rollups.latency_max, excluded.latency_max);
+         INSERT INTO result_replication_watermarks
+         SELECT check_id, MIN(ts_millis), MAX(ts_millis), COUNT(*) FROM {staged} GROUP BY check_id
          ON CONFLICT (check_id) DO UPDATE SET
+             min_ts = LEAST(result_replication_watermarks.min_ts, excluded.min_ts),
              max_ts = GREATEST(result_replication_watermarks.max_ts, excluded.max_ts),
              result_count = result_replication_watermarks.result_count + excluded.result_count;
          INSERT INTO latest_check_results
@@ -1756,6 +1821,31 @@ impl Storage {
                 -- than the free text, which quotes whatever the probe saw.
                 failure    VARCHAR
             );
+            -- One row per check, probe domain, and UTC minute/hour. `agent_id`
+            -- is the independent observation domain: replicas in a domain must
+            -- deduplicate, while distinct domains must never be averaged away.
+            CREATE TABLE IF NOT EXISTS check_latency_minute_rollups (
+                check_id UUID NOT NULL,
+                agent_id VARCHAR NOT NULL,
+                bucket_start BIGINT NOT NULL,
+                attempts BIGINT NOT NULL,
+                up BIGINT NOT NULL,
+                latency_sum BIGINT NOT NULL,
+                latency_min BIGINT,
+                latency_max BIGINT,
+                PRIMARY KEY (check_id, agent_id, bucket_start)
+            );
+            CREATE TABLE IF NOT EXISTS check_latency_hour_rollups (
+                check_id UUID NOT NULL,
+                agent_id VARCHAR NOT NULL,
+                bucket_start BIGINT NOT NULL,
+                attempts BIGINT NOT NULL,
+                up BIGINT NOT NULL,
+                latency_sum BIGINT NOT NULL,
+                latency_min BIGINT,
+                latency_max BIGINT,
+                PRIMARY KEY (check_id, agent_id, bucket_start)
+            );
             CREATE TABLE IF NOT EXISTS latest_check_results (
                 check_id    UUID PRIMARY KEY,
                 agent_id    VARCHAR NOT NULL,
@@ -1768,6 +1858,7 @@ impl Storage {
             );
             CREATE TABLE IF NOT EXISTS result_replication_watermarks (
                 check_id     UUID PRIMARY KEY,
+                min_ts       BIGINT NOT NULL,
                 max_ts       BIGINT NOT NULL,
                 result_count BIGINT NOT NULL
             );
@@ -1999,13 +2090,14 @@ impl Storage {
             -- It stores the transition to re-send rather than an alert id: the
             -- retry needs check and states, nothing else, and a foreign key into
             -- a table with its own retention window would dangle. No surrogate
-            -- id either — (notifier, check, queued_at) is unique, since one
-            -- transition enqueues at most once per notifier.
+            -- Every delivery has an immutable id, so distinct transitions at
+            -- the same millisecond cannot replace one another.
             --
             -- `next_attempt` NULL means given up: attempts are exhausted and
             -- nobody was paged. That is derived state made explicit, rather than
             -- a `status` column that can disagree with `attempts`.
             CREATE TABLE IF NOT EXISTS notification_queue (
+                id             VARCHAR PRIMARY KEY,
                 notifier       VARCHAR NOT NULL,
                 check_id       UUID    NOT NULL,
                 previous_state VARCHAR,
@@ -2013,8 +2105,7 @@ impl Storage {
                 attempts       INTEGER NOT NULL,
                 next_attempt   BIGINT,
                 last_error     VARCHAR NOT NULL,
-                queued_at      BIGINT  NOT NULL,
-                PRIMARY KEY (notifier, check_id, queued_at)
+                queued_at      BIGINT  NOT NULL
             );
             -- Who else is in the cluster. Persisted rather than kept in memory
             -- so a restarted node rejoins from what it already knew instead of
@@ -2079,6 +2170,7 @@ impl Storage {
                 node_id    VARCHAR NOT NULL
             );",
         )?;
+        migrate_notification_queue_identity(&conn)?;
         // Columns added after the first release. DuckDB has no
         // ADD COLUMN IF NOT EXISTS, so ask what already exists and add only
         // what's missing. Errors are NOT swallowed: an earlier version of this
@@ -2244,7 +2336,15 @@ impl Storage {
         };
         store.backfill_configs()?;
         store.backfill_latest_check_results()?;
+        let watermark_columns = table_column_names(&store.conn, "result_replication_watermarks")?;
+        if !watermark_columns.iter().any(|column| column == "min_ts") {
+            store.conn.execute_batch(
+                "ALTER TABLE result_replication_watermarks ADD COLUMN min_ts BIGINT",
+            )?;
+            store.rebuild_result_watermarks()?;
+        }
         store.backfill_result_replication_watermarks()?;
+        store.backfill_latency_rollups()?;
         store.rebuild_stream_watermarks()?;
         // Staging tables live for the life of this connection, so every write
         // path can assume them. Created here rather than inside the writers:
@@ -2448,6 +2548,29 @@ impl Storage {
         Ok(rows as u64)
     }
 
+    /// Remove a check definition and the state derived from its local placement,
+    /// without touching raw results or the config tombstone stream. A later
+    /// placement with the same immutable id therefore reconnects its history.
+    pub fn unplace_check_local(&self, check_id: CheckId) -> Result<bool> {
+        self.transaction(|store| {
+            let removed = store
+                .conn
+                .execute("DELETE FROM checks WHERE id = ?", duckdb::params![check_id])?;
+            if removed == 0 {
+                return Ok(false);
+            }
+            store.conn.execute(
+                "DELETE FROM current_state WHERE check_id = ?",
+                duckdb::params![check_id],
+            )?;
+            store.conn.execute(
+                "DELETE FROM agent_check_state WHERE check_id = ?",
+                duckdb::params![check_id],
+            )?;
+            Ok(true)
+        })
+    }
+
     /// Returns whether a row was actually removed, so the handler can 404
     /// instead of reporting success for an id that never existed.
     pub fn delete_check(&self, check_id: CheckId) -> Result<bool> {
@@ -2618,34 +2741,50 @@ impl Storage {
         if watermark_count == 0 {
             self.conn.execute_batch(
                 "INSERT INTO result_replication_watermarks
-                     SELECT check_id, MAX(ts_millis), COUNT(*)
+                     SELECT check_id, MIN(ts_millis), MAX(ts_millis), COUNT(*)
                      FROM check_results GROUP BY check_id",
             )?;
         }
         Ok(())
     }
 
-    fn record_result_watermarks<'a>(
-        &self,
-        rows: impl IntoIterator<Item = &'a CheckResult>,
-    ) -> Result<()> {
-        let mut updates = BTreeMap::<CheckId, (i64, i64)>::new();
-        for result in rows {
-            let timestamp = result.timestamp.timestamp_millis();
-            let entry = updates.entry(result.check_id).or_insert((timestamp, 0));
-            entry.0 = entry.0.max(timestamp);
-            entry.1 += 1;
-        }
-        let mut stmt = self.conn.prepare(
-            "INSERT INTO result_replication_watermarks (check_id, max_ts, result_count)
-             VALUES (?, ?, ?)
-             ON CONFLICT (check_id) DO UPDATE SET
-                 max_ts = GREATEST(result_replication_watermarks.max_ts, excluded.max_ts),
-                 result_count = result_replication_watermarks.result_count + excluded.result_count",
+    fn backfill_latency_rollups(&self) -> Result<()> {
+        let (minutes, hours, raw): (i64, i64, i64) = self.conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM check_latency_minute_rollups),
+                (SELECT COUNT(*) FROM check_latency_hour_rollups),
+                (SELECT COUNT(*) FROM check_results)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        for (check_id, (max_ts, count)) in updates {
-            stmt.execute(duckdb::params![check_id, max_ts, count])?;
+        // An empty minute tier is normal after its 90-day expiry while hours
+        // remain. Only an old database with raw data and neither tier gets the
+        // one-time rebuild; never overwrite retained summaries at restart.
+        if raw > 0 && minutes == 0 && hours == 0 {
+            self.rebuild_latency_rollups()?;
         }
+        Ok(())
+    }
+
+    fn rebuild_latency_rollups(&self) -> Result<()> {
+        self.conn.execute_batch(&format!(
+            "DELETE FROM check_latency_minute_rollups;
+             INSERT INTO check_latency_minute_rollups
+             SELECT check_id, agent_id, (ts_millis // {MILLIS_PER_MINUTE}) * {MILLIS_PER_MINUTE},
+                    COUNT(*), COUNT(*) FILTER (WHERE status = 'up'),
+                    COALESCE(SUM(latency_ms) FILTER (WHERE status = 'up'), 0),
+                    MIN(latency_ms) FILTER (WHERE status = 'up'),
+                    MAX(latency_ms) FILTER (WHERE status = 'up')
+             FROM check_results GROUP BY 1, 2, 3;
+             DELETE FROM check_latency_hour_rollups;
+             INSERT INTO check_latency_hour_rollups
+             SELECT check_id, agent_id, (ts_millis // {MILLIS_PER_HOUR}) * {MILLIS_PER_HOUR},
+                    COUNT(*), COUNT(*) FILTER (WHERE status = 'up'),
+                    COALESCE(SUM(latency_ms) FILTER (WHERE status = 'up'), 0),
+                    MIN(latency_ms) FILTER (WHERE status = 'up'),
+                    MAX(latency_ms) FILTER (WHERE status = 'up')
+             FROM check_results GROUP BY 1, 2, 3;"
+        ))?;
         Ok(())
     }
 
@@ -2653,7 +2792,7 @@ impl Storage {
         self.conn.execute_batch(
             "DELETE FROM result_replication_watermarks;
              INSERT INTO result_replication_watermarks
-                 SELECT check_id, MAX(ts_millis), COUNT(*)
+                 SELECT check_id, MIN(ts_millis), MAX(ts_millis), COUNT(*)
                  FROM check_results GROUP BY check_id;",
         )?;
         Ok(())
@@ -2707,52 +2846,6 @@ impl Storage {
         Ok(())
     }
 
-    fn record_latest_results<'a>(
-        &self,
-        rows: impl IntoIterator<Item = (&'a CheckResult, Status)>,
-    ) -> Result<()> {
-        let mut stmt = self.conn.prepare(
-            "INSERT INTO latest_check_results
-                 (check_id, agent_id, ts_millis, status, latency_ms, status_code, error, failure)
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM latest_check_results
-                 WHERE check_id = ?
-                   AND (ts_millis > ? OR (ts_millis = ? AND agent_id >= ?))
-             )
-             ON CONFLICT (check_id) DO UPDATE SET
-                 agent_id = excluded.agent_id,
-                 ts_millis = excluded.ts_millis,
-                 status = excluded.status,
-                 latency_ms = excluded.latency_ms,
-                 status_code = excluded.status_code,
-                 error = excluded.error,
-                 failure = excluded.failure",
-        )?;
-        for (result, status) in rows {
-            let ts = result.timestamp.timestamp_millis();
-            stmt.execute(duckdb::params![
-                result.check_id,
-                result.agent_id,
-                ts,
-                status.as_str(),
-                result.latency_ms as i64,
-                result.status_code.map(|code| code as i32),
-                result.error,
-                result
-                    .failure
-                    .as_ref()
-                    .map(serde_json::to_string)
-                    .transpose()?,
-                result.check_id,
-                ts,
-                ts,
-                result.agent_id,
-            ])?;
-        }
-        Ok(())
-    }
-
     #[cfg(test)]
     pub(crate) fn execute_test_sql(&self, sql: &str) -> Result<()> {
         self.conn.execute_batch(sql)?;
@@ -2801,7 +2894,8 @@ impl Storage {
               );
              CREATE TEMP TABLE IF NOT EXISTS replicate_new_results AS SELECT * FROM check_results WITH NO DATA;
              CREATE TEMP TABLE IF NOT EXISTS replicate_probe_stage AS SELECT * FROM check_results WITH NO DATA;
-             CREATE TEMP TABLE IF NOT EXISTS prune_results_counts (check_id UUID, removed BIGINT);",
+             CREATE TEMP TABLE IF NOT EXISTS prune_results_counts (check_id UUID, removed BIGINT);
+             CREATE TEMP TABLE IF NOT EXISTS prune_results_min_ts (check_id UUID, min_ts BIGINT);",
 
         )?;
         Ok(())
@@ -2949,8 +3043,11 @@ impl Storage {
                     non_empty(&r.region),
                 ])?;
             }
-            self.record_result_watermarks(rows.iter().map(|(result, _)| result))?;
-            self.record_latest_results(rows.iter().map(|(result, status)| (result, *status)))?;
+            self.conn
+                .execute_batch("DELETE FROM ingest_results_stage;")?;
+            self.stage_results(rows)?;
+            self.conn
+                .execute_batch(&derived_results_sql("ingest_results_stage"))?;
             Ok(())
         };
         match insert() {
@@ -3002,8 +3099,11 @@ impl Storage {
             ])?;
         }
         appender.flush()?;
-        self.record_result_watermarks(rows.iter().map(|(result, _)| result))?;
-        self.record_latest_results(rows.iter().map(|(result, status)| (result, *status)))?;
+        self.conn
+            .execute_batch("DELETE FROM ingest_results_stage;")?;
+        self.stage_results(rows)?;
+        self.conn
+            .execute_batch(&derived_results_sql("ingest_results_stage"))?;
         Ok(())
     }
 
@@ -3322,21 +3422,21 @@ impl Storage {
         Ok(rows)
     }
 
-    /// Record a notification that could not be delivered, due for another
-    /// attempt at `next_attempt`.
-    ///
-    /// Enqueued on failure, not before the first attempt: the happy path stays
-    /// one HTTP request with no database write. ponytail: the cost is a crash
-    /// between the failed send and this insert losing the retry — the same
-    /// window an unqueued alert has today, and closing it means writing every
-    /// notification twice.
+    /// Record a notification delivery intention or update its retry state.
+    /// Callers creating an alert do this inside the alert transaction; a crash
+    /// after commit therefore leaves an owed delivery for the next dispatcher.
     pub fn enqueue_notification(&self, row: &QueuedRow) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO notification_queue
-                 (notifier, check_id, previous_state, current_state,
+            "INSERT INTO notification_queue
+                 (id, notifier, check_id, previous_state, current_state,
                   attempts, next_attempt, last_error, queued_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (id) DO UPDATE SET
+                 attempts = excluded.attempts,
+                 next_attempt = excluded.next_attempt,
+                 last_error = excluded.last_error",
             duckdb::params![
+                row.id,
                 row.notifier,
                 row.check_id,
                 row.previous_state.map(|s| s.as_str()),
@@ -3354,7 +3454,7 @@ impl Storage {
     /// should be paged in the order it happened.
     pub fn due_notifications(&self, now_millis: i64, limit: usize) -> Result<Vec<QueuedRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT notifier, check_id, previous_state, current_state,
+            "SELECT id, notifier, check_id, previous_state, current_state,
                     attempts, next_attempt, last_error, queued_at
              FROM notification_queue
              WHERE next_attempt IS NOT NULL AND next_attempt <= ?
@@ -3372,7 +3472,7 @@ impl Storage {
     /// of failure this project keeps refusing to leave silent.
     pub fn undelivered_notifications(&self, limit: usize) -> Result<Vec<QueuedRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT notifier, check_id, previous_state, current_state,
+            "SELECT id, notifier, check_id, previous_state, current_state,
                     attempts, next_attempt, last_error, queued_at
              FROM notification_queue
              ORDER BY queued_at DESC
@@ -3384,33 +3484,28 @@ impl Storage {
         Ok(rows)
     }
 
-    pub fn delete_notification(
-        &self,
-        notifier: &str,
-        check_id: CheckId,
-        queued_at: i64,
-    ) -> Result<()> {
+    pub fn delete_notification(&self, id: &str) -> Result<()> {
         self.conn.execute(
-            "DELETE FROM notification_queue
-             WHERE notifier = ? AND check_id = ? AND queued_at = ?",
-            duckdb::params![notifier, check_id, queued_at],
+            "DELETE FROM notification_queue WHERE id = ?",
+            duckdb::params![id],
         )?;
         Ok(())
     }
 
     fn queued_row(row: &duckdb::Row) -> duckdb::Result<QueuedRow> {
         Ok(QueuedRow {
-            notifier: row.get::<_, String>(0)?,
-            check_id: row.get::<_, CheckId>(1)?,
+            id: row.get::<_, String>(0)?,
+            notifier: row.get::<_, String>(1)?,
+            check_id: row.get::<_, CheckId>(2)?,
             previous_state: row
-                .get::<_, Option<String>>(2)?
+                .get::<_, Option<String>>(3)?
                 .as_deref()
                 .map(NodeState::from_db),
-            current_state: NodeState::from_db(&row.get::<_, String>(3)?),
-            attempts: row.get::<_, i32>(4)?,
-            next_attempt: row.get::<_, Option<i64>>(5)?,
-            last_error: row.get::<_, String>(6)?,
-            queued_at: row.get::<_, i64>(7)?,
+            current_state: NodeState::from_db(&row.get::<_, String>(4)?),
+            attempts: row.get::<_, i32>(5)?,
+            next_attempt: row.get::<_, Option<i64>>(6)?,
+            last_error: row.get::<_, String>(7)?,
+            queued_at: row.get::<_, i64>(8)?,
         })
     }
 
@@ -3749,6 +3844,7 @@ impl Storage {
         &self,
         limit: usize,
         open_only: Option<bool>,
+        since: Option<i64>,
     ) -> Result<Vec<IncidentRow>> {
         let mut sql = String::from(
             "SELECT id, title, state, started_at, resolved_at, global, origin_check
@@ -3759,11 +3855,18 @@ impl Storage {
             Some(false) => sql.push_str(" AND state = 'resolved'"),
             None => {}
         }
+        if since.is_some() {
+            sql.push_str(" AND (state <> 'resolved' OR resolved_at >= ?)");
+        }
         sql.push_str(" ORDER BY started_at DESC LIMIT ?");
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt
-            .query_map(duckdb::params![limit as i64], Self::incident_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut rows = if let Some(since) = since {
+            stmt.query_map(duckdb::params![since, limit as i64], Self::incident_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map(duckdb::params![limit as i64], Self::incident_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
         for row in &mut rows {
             row.checks = self.checks_for_incident(&row.id)?;
         }
@@ -4247,7 +4350,6 @@ impl Storage {
         )?;
         Ok(n > 0)
     }
-
     /// Delete rows older than the retention window. `results_days` covers raw
     /// probe results; `alerts_days` covers state-transition alerts and CLOSED
     /// incidents. An open incident is current reality, never pruned. Config
@@ -4276,7 +4378,7 @@ impl Storage {
     /// window function over the whole history.
     pub(crate) fn prune_results(&self, before: i64) -> Result<u64> {
         self.conn
-            .execute_batch("DELETE FROM prune_results_counts;")?;
+            .execute_batch("DELETE FROM prune_results_counts; DELETE FROM prune_results_min_ts;")?;
         self.conn.execute(
             "INSERT INTO prune_results_counts
              SELECT check_id, COUNT(*) FROM check_results WHERE ts_millis < ?
@@ -4294,10 +4396,19 @@ impl Storage {
             "DELETE FROM latest_check_results WHERE ts_millis < ?",
             duckdb::params![before],
         )?;
+        // One grouped query over checks touched by this prune advances their
+        // retained lower bounds; it avoids issuing a history scan per check.
         self.conn.execute_batch(
-            "UPDATE result_replication_watermarks
-                SET result_count = result_replication_watermarks.result_count - pruned.removed
+            "INSERT INTO prune_results_min_ts
+                 SELECT results.check_id, MIN(results.ts_millis)
+                 FROM check_results results
+                 JOIN prune_results_counts pruned ON pruned.check_id = results.check_id
+                 GROUP BY results.check_id;
+             UPDATE result_replication_watermarks
+SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
+                     result_count = result_replication_watermarks.result_count - pruned.removed
              FROM prune_results_counts pruned
+             LEFT JOIN prune_results_min_ts remaining ON remaining.check_id = pruned.check_id
              WHERE pruned.check_id = result_replication_watermarks.check_id;
              DELETE FROM result_replication_watermarks WHERE result_count <= 0;",
         )?;
@@ -4319,6 +4430,20 @@ impl Storage {
     pub fn prune(&self, results_days: u64, alerts_days: u64, now_millis: i64) -> Result<u64> {
         let results_before = now_millis - (results_days as i64) * 86_400_000;
         let mut removed = self.prune_results(results_before)?;
+        // Rollups outlive raw observations. Their cutoffs are independent of
+        // the configurable raw window, so reducing raw retention cannot erase
+        // the summaries that make old latency views meaningful.
+        removed += self.conn.execute(
+            "DELETE FROM check_latency_minute_rollups WHERE bucket_start + ? <= ?",
+            duckdb::params![
+                MILLIS_PER_MINUTE,
+                now_millis - MINUTE_ROLLUP_RETENTION_MILLIS
+            ],
+        )? as u64;
+        removed += self.conn.execute(
+            "DELETE FROM check_latency_hour_rollups WHERE bucket_start + ? <= ?",
+            duckdb::params![MILLIS_PER_HOUR, now_millis - HOUR_ROLLUP_RETENTION_MILLIS],
+        )? as u64;
         removed += self.prune_metadata(results_days, alerts_days, now_millis)?;
         Ok(removed)
     }
@@ -4329,6 +4454,20 @@ impl Storage {
     /// streams rather than by raw history, so unlike `prune_results` it has no
     /// reason to be sliced.
     pub(crate) fn prune_metadata(
+        &self,
+        results_days: u64,
+        alerts_days: u64,
+        now_millis: i64,
+    ) -> Result<u64> {
+        // These deletes maintain several denormalized streams. Keep the whole
+        // cleanup atomic so a failed watermark rebuild or dependent delete
+        // cannot expose an incident without its rows (or stale stream counts).
+        self.transaction(|store| {
+            store.prune_metadata_uncommitted(results_days, alerts_days, now_millis)
+        })
+    }
+
+    fn prune_metadata_uncommitted(
         &self,
         results_days: u64,
         alerts_days: u64,
@@ -4661,6 +4800,42 @@ impl Storage {
             .collect())
     }
 
+    /// Aggregate latency from disjoint retention tiers. Buckets ending at a
+    /// handoff belong to the older tier; raw observations start strictly after
+    /// that handoff. This matches the `(from, to]` public window convention and
+    /// prevents a probe on a boundary from being counted twice.
+    fn latency_source_sql(from: i64, to: i64) -> String {
+        let raw_start =
+            (to - RAW_RETENTION_MILLIS).div_euclid(MILLIS_PER_MINUTE) * MILLIS_PER_MINUTE;
+        let minute_start =
+            (to - MINUTE_ROLLUP_RETENTION_MILLIS).div_euclid(MILLIS_PER_HOUR) * MILLIS_PER_HOUR;
+        format!(
+            "SELECT check_id, agent_id, ts_millis, 1::BIGINT attempts,
+                    (status = 'up')::BIGINT up,
+                    CASE WHEN status = 'up' THEN latency_ms ELSE 0 END latency_sum,
+                    CASE WHEN status = 'up' THEN latency_ms END latency_min,
+                    CASE WHEN status = 'up' THEN latency_ms END latency_max
+             FROM check_results WHERE ts_millis > {from} AND ts_millis <= {to}
+                AND ts_millis > {raw_start}
+             UNION ALL
+             SELECT check_id, agent_id, bucket_start + {MILLIS_PER_MINUTE}, attempts, up,
+                    latency_sum, latency_min, latency_max
+             FROM check_latency_minute_rollups
+             WHERE bucket_start >= {minute_start} AND bucket_start < {raw_start}
+               -- A rollup is indivisible: only use it when its entire bucket
+               -- lies inside the requested `(from, to]` window.
+               AND bucket_start >= {from}
+               AND bucket_start + {MILLIS_PER_MINUTE} <= {to}
+             UNION ALL
+             SELECT check_id, agent_id, bucket_start + {MILLIS_PER_HOUR}, attempts, up,
+                    latency_sum, latency_min, latency_max
+             FROM check_latency_hour_rollups
+             WHERE bucket_start < {minute_start}
+               AND bucket_start >= {from}
+               AND bucket_start + {MILLIS_PER_HOUR} <= {to}",
+        )
+    }
+
     /// Sparkline points for many checks in one scan.
     ///
     /// Deliberately points only: the status page's row chart reads nothing else,
@@ -4679,15 +4854,14 @@ impl Storage {
         let wanted: std::collections::HashSet<CheckId> = checks.iter().copied().collect();
 
         let mut folded: BTreeMap<CheckId, SegmentCounts> = BTreeMap::new();
-        let mut stmt = self.conn.prepare(
+        let source = Self::latency_source_sql(from, to);
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT check_id, ((ts_millis - ? - 1) // ?)::BIGINT AS idx,
-                    COUNT(*), COUNT(*) FILTER (WHERE status = 'up'),
-                    COALESCE(SUM(latency_ms) FILTER (WHERE status = 'up'), 0)
-             FROM check_results
-             WHERE ts_millis > ? AND ts_millis <= ?
-             GROUP BY 1, 2",
-        )?;
-        let rows = stmt.query_map(duckdb::params![from, bucket_ms, from, to], |row| {
+                    SUM(attempts), SUM(up), COALESCE(SUM(latency_sum), 0)
+             FROM ({source}) observations
+             GROUP BY 1, 2"
+        ))?;
+        let rows = stmt.query_map(duckdb::params![from, bucket_ms], |row| {
             Ok((
                 row.get::<_, CheckId>(0)?,
                 row.get::<_, i64>(1)?,
@@ -4758,33 +4932,44 @@ impl Storage {
         let mut up = vec![0u32; buckets];
         let mut agents: BTreeMap<String, LatencyBand> = BTreeMap::new();
 
-        let mut stmt = self.conn.prepare(
-            "SELECT ts_millis, latency_ms, agent_id, status FROM check_results
-             WHERE check_id = ? AND ts_millis > ? AND ts_millis <= ?",
-        )?;
-        let rows = stmt.query_map(duckdb::params![check_id, from, to], |row| {
+        let source = Self::latency_source_sql(from, to);
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT ts_millis, latency_sum, agent_id, attempts, up, latency_min, latency_max
+             FROM ({source}) observations WHERE check_id = ?"
+        ))?;
+        let rows = stmt.query_map(duckdb::params![check_id], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
             ))
         })?;
         for r in rows {
-            let (ts, lat, agent_id, status) = r?;
+            let (ts, latency_sum, agent_id, row_attempts, row_up, latency_min, latency_max) = r?;
             // Lower bound is exclusive, so shift before dividing: a timestamp
             // landing exactly on a boundary belongs to the segment below it.
             let i = (((ts - from - 1).max(0) / bucket_ms) as usize).min(buckets - 1);
-            attempts[i] += 1;
-            let successful = status == "up";
-            if successful {
-                sum[i] += lat as f64;
-                up[i] += 1;
+            attempts[i] = attempts[i].saturating_add(row_attempts.max(0) as u32);
+            sum[i] += latency_sum.max(0) as f64;
+            up[i] = up[i].saturating_add(row_up.max(0) as u32);
+            let band = agents.entry(agent_id).or_default();
+            band.attempts = band.attempts.saturating_add(row_attempts.max(0) as u32);
+            band.up = band.up.saturating_add(row_up.max(0) as u32);
+            band.sum_ms += latency_sum.max(0) as f64;
+            if let Some(minimum) = latency_min {
+                let minimum = minimum as u64;
+                band.min_ms = Some(band.min_ms.map_or(minimum, |old| old.min(minimum)));
             }
-            agents
-                .entry(agent_id)
-                .or_default()
-                .observe(lat as u64, successful);
+            if let Some(maximum) = latency_max {
+                band.max_ms = Some(
+                    band.max_ms
+                        .map_or(maximum as u64, |old| old.max(maximum as u64)),
+                );
+            }
         }
 
         let points = (0..buckets)
@@ -5359,15 +5544,15 @@ impl Storage {
         let checks = {
             let (sql, params): (&str, Vec<i64>) = if window_start == 0 {
                 (
-                    "SELECT check_id, max_ts, result_count
-                     FROM result_replication_watermarks
+                    "SELECT check_id, min_ts, max_ts, result_count
+                      FROM result_replication_watermarks
                      ORDER BY check_id",
                     Vec::new(),
                 )
             } else {
                 (
-                    "SELECT check_id, MAX(ts_millis), COUNT(*) FROM check_results
-                     WHERE ts_millis >= ? GROUP BY check_id ORDER BY check_id",
+                    "SELECT check_id, MIN(ts_millis), MAX(ts_millis), COUNT(*) FROM check_results
+                      WHERE ts_millis >= ? GROUP BY check_id ORDER BY check_id",
                     vec![window_start],
                 )
             };
@@ -5375,8 +5560,9 @@ impl Storage {
             let rows = stmt.query_map(duckdb::params_from_iter(params), |row| {
                 Ok(CheckDigest {
                     check_id: row.get(0)?,
-                    max_ts: row.get(1)?,
-                    count: row.get(2)?,
+                    min_ts: row.get(1)?,
+                    max_ts: row.get(2)?,
+                    count: row.get(3)?,
                 })
             })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -5775,26 +5961,22 @@ impl Storage {
         Ok(stamps)
     }
 
-    fn delete_config_row(&self, kind: ConfigKind, id: &str) -> Result<()> {
-        let (table, pk) = kind.table_and_pk();
-        if kind == ConfigKind::Check {
-            // An id that is not a UUID matches no row, so the delete is
-            // already satisfied — the tombstone written beside it is what
-            // carries the deletion to peers.
-            let Ok(id) = id.parse::<CheckId>() else {
-                return Ok(());
-            };
-            self.conn.execute(
-                &format!("DELETE FROM {table} WHERE {pk} = ?"),
-                duckdb::params![id],
-            )?;
-        } else {
-            self.conn.execute(
-                &format!("DELETE FROM {table} WHERE {pk} = ?"),
-                duckdb::params![id],
-            )?;
-        }
-        Ok(())
+    fn prepare_config_delete_statements(&self) -> Result<Vec<Statement<'_>>> {
+        [
+            ConfigKind::Check,
+            ConfigKind::Section,
+            ConfigKind::Setting,
+            ConfigKind::Credential,
+            ConfigKind::RollupPolicy,
+        ]
+        .into_iter()
+        .map(|kind| {
+            let (table, pk) = kind.table_and_pk();
+            self.conn
+                .prepare(&format!("DELETE FROM {table} WHERE {pk} = ?"))
+        })
+        .collect::<duckdb::Result<_>>()
+        .map_err(Into::into)
     }
 
     /// Write a document over the row named `id`, stamped at `hlc`. The only
@@ -5916,9 +6098,25 @@ impl Storage {
         self.conn.execute_batch("BEGIN")?;
         let write = || -> Result<Vec<bool>> {
             let mut stamps = self.local_config_stamps(entries)?;
+            let mut deletes = self.prepare_config_delete_statements()?;
+            let mut tombstone_deletes = self
+                .conn
+                .prepare("DELETE FROM config_tombstones WHERE kind = ? AND id = ?")?;
+            let mut tombstone_inserts = self.conn.prepare(
+                "INSERT INTO config_tombstones (kind, id, deleted_at, node_id)
+                 VALUES (?, ?, ?, ?)",
+            )?;
             entries
                 .iter()
-                .map(|entry| self.apply_config_entry_uncommitted(entry, &mut stamps))
+                .map(|entry| {
+                    self.apply_config_entry_uncommitted(
+                        entry,
+                        &mut stamps,
+                        &mut deletes[entry.kind as usize],
+                        &mut tombstone_deletes,
+                        &mut tombstone_inserts,
+                    )
+                })
                 .collect()
         };
         match write() {
@@ -5937,6 +6135,9 @@ impl Storage {
         &self,
         e: &ConfigEntry,
         stamps: &mut ConfigStamps,
+        delete: &mut Statement<'_>,
+        tombstone_delete: &mut Statement<'_>,
+        tombstone_insert: &mut Statement<'_>,
     ) -> Result<bool> {
         let key = (e.kind, e.id.clone());
         if let Some(local) = stamps.newest.get(&key) {
@@ -5956,18 +6157,18 @@ impl Storage {
             stamps.tombstoned.remove(&key);
         }
         if e.is_tombstone() {
-            self.delete_config_row(e.kind, &e.id)?;
-            if tombstoned {
-                self.conn.execute(
-                    "DELETE FROM config_tombstones WHERE kind = ? AND id = ?",
-                    duckdb::params![e.kind.as_str(), e.id],
-                )?;
+            if e.kind != ConfigKind::Check || e.id.parse::<CheckId>().is_ok() {
+                delete.execute(duckdb::params![e.id])?;
             }
-            self.conn.execute(
-                "INSERT INTO config_tombstones (kind, id, deleted_at, node_id)
-                 VALUES (?, ?, ?, ?)",
-                duckdb::params![e.kind.as_str(), e.id, e.hlc.millis, e.hlc.node_id],
-            )?;
+            if tombstoned {
+                tombstone_delete.execute(duckdb::params![e.kind.as_str(), e.id])?;
+            }
+            tombstone_insert.execute(duckdb::params![
+                e.kind.as_str(),
+                e.id,
+                e.hlc.millis,
+                e.hlc.node_id
+            ])?;
         } else {
             // A malformed document is an error, not a silent skip: the caller
             // logs it, but this must never half-apply a document over a good
@@ -5982,10 +6183,7 @@ impl Storage {
             // The edit supersedes any tombstone for this id — leaving one
             // behind would make the next digest sweep look inconsistent.
             if tombstoned {
-                self.conn.execute(
-                    "DELETE FROM config_tombstones WHERE kind = ? AND id = ?",
-                    duckdb::params![e.kind.as_str(), e.id],
-                )?;
+                tombstone_delete.execute(duckdb::params![e.kind.as_str(), e.id])?;
             }
         }
         Ok(true)
@@ -6117,6 +6315,64 @@ impl Storage {
             hlc: Hlc::new(at.unwrap_or(0), by.unwrap_or_default()),
             document: Some(document),
         }))
+    }
+
+    /// Read one ordered, bounded page of entries for a config kind. Both the
+    /// candidate-id scan and the document reads are bounded, so a peer pull
+    /// never materializes the full config table before applying its page size.
+    pub fn config_entries_page(
+        &self,
+        kind: ConfigKind,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ConfigEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let (table, pk) = kind.table_and_pk();
+        // Select only a page of ids before projecting documents. The union
+        // keeps live rows and tombstones in the same cursor order.
+        let sql = format!(
+            "SELECT id, deleted_at, node_id FROM (\
+                 SELECT {pk}::VARCHAR AS id, NULL::BIGINT AS deleted_at, NULL::VARCHAR AS node_id \
+                 FROM {table} \
+                 UNION ALL \
+                 SELECT id, deleted_at, node_id FROM config_tombstones WHERE kind = ?\
+             ) entries \
+             WHERE ? IS NULL OR id > ? \
+             ORDER BY id \
+             LIMIT ?"
+        );
+        let rows = self
+            .conn
+            .prepare(&sql)?
+            .query_map(
+                duckdb::params![kind.as_str(), after, after, limit as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut entries = Vec::with_capacity(rows.len());
+        for (id, deleted_at, node_id) in rows {
+            if let Some(deleted_at) = deleted_at {
+                entries.push(ConfigEntry {
+                    kind,
+                    id,
+                    hlc: Hlc::new(deleted_at, node_id.unwrap_or_default()),
+                    document: None,
+                });
+            } else if let Some(entry) = self.config_entry(kind, &id)? {
+                entries.push(entry);
+            }
+        }
+        Ok(entries)
     }
 
     /// Every entry of a kind, tombstones included, for an anti-entropy sweep.
@@ -6814,7 +7070,10 @@ mod tests {
             second_version, version,
             "a second reopen must not restamp rows"
         );
-        assert_eq!(reopened_again.list_incidents(10, None).unwrap().len(), 1);
+        assert_eq!(
+            reopened_again.list_incidents(10, None, None).unwrap().len(),
+            1
+        );
         drop(reopened_again);
         std::fs::remove_file(path).unwrap();
     }
@@ -6838,6 +7097,45 @@ mod tests {
         assert_eq!(first.get_version_num(), 7);
         assert_eq!(first.get_variant(), uuid::Variant::RFC4122);
         assert_ne!(first, deterministic_legacy_check_id("web"));
+    }
+
+    #[test]
+    fn notification_queue_identity_migration_preserves_existing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE notification_queue (
+                notifier VARCHAR NOT NULL,
+                check_id UUID NOT NULL,
+                previous_state VARCHAR,
+                current_state VARCHAR NOT NULL,
+                attempts INTEGER NOT NULL,
+                next_attempt BIGINT,
+                last_error VARCHAR NOT NULL,
+                queued_at BIGINT NOT NULL,
+                PRIMARY KEY (notifier, check_id, queued_at)
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO notification_queue VALUES ('oncall', ?, 'up', 'down', 2, 3, '500', 1)",
+            duckdb::params![cid("api")],
+        )
+        .unwrap();
+
+        migrate_notification_queue_identity(&conn).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM notification_queue", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT id FROM notification_queue", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            format!("oncall:{}:1", cid("api"))
+        );
+        migrate_notification_queue_identity(&conn).unwrap();
     }
 
     #[test]
@@ -6997,7 +7295,6 @@ mod tests {
 
         s.insert_results(&[(wrong_code, Status::Down), (refused, Status::Down)])
             .unwrap();
-
         // history() surfaces the per-attempt reason.
         let hist = s.history(cid("a"), 10, None, None, None).unwrap();
         assert_eq!(hist[0].error.as_deref(), Some("connection refused"));
@@ -7247,7 +7544,6 @@ mod tests {
         );
         assert_eq!(a.latency_ms, 11, "latency comes from the same latest row");
     }
-
     #[test]
     fn history_round_trips_newest_first_with_limit_and_check_filter() {
         let s = Storage::open(":memory:").unwrap();
@@ -8247,7 +8543,6 @@ mod tests {
         // the slice. Filtering by status finds them regardless of position.
         let s = Storage::open(":memory:").unwrap();
         let day_start = 1_000_000i64;
-
         let mut rows = Vec::new();
         // Two early failures...
         for (i, agent) in ["agent-a", "agent-b"].iter().enumerate() {
@@ -8351,6 +8646,7 @@ mod tests {
         // given up on is history, the one still waiting is work in progress and
         // pruning it would silently un-page an outage.
         let queued = |check: &str, attempts: i32, next_attempt: Option<i64>| QueuedRow {
+            id: format!("queued-{check}"),
             notifier: "oncall".into(),
             check_id: cid(check),
             previous_state: Some(NodeState::Up),
@@ -8380,7 +8676,7 @@ mod tests {
         assert_eq!(status[0].check_id, cid("a"));
         assert_eq!(s.recent_alerts(10).unwrap().len(), 1);
         // The open incident survives whole; the resolved one is gone entirely.
-        let incidents = s.list_incidents(10, None).unwrap();
+        let incidents = s.list_incidents(10, None, None).unwrap();
         assert_eq!(incidents.len(), 1);
         assert_eq!(incidents[0].id, "open");
         assert_eq!(incidents[0].state, IncidentState::Detected);
@@ -8393,6 +8689,91 @@ mod tests {
             s.updates_for_incident("old").unwrap().is_empty(),
             "a pruned incident leaves no orphaned narrative behind"
         );
+    }
+
+    #[test]
+    fn prune_metadata_rolls_back_dependent_deletes_when_watermark_rebuild_fails() {
+        let s = Storage::open(":memory:").unwrap();
+        let day = 86_400_000i64;
+        let now = 2 * day;
+        s.insert_alert(
+            AlertScope::Check,
+            "a",
+            Some(NodeState::Up),
+            NodeState::Down,
+            1,
+            None,
+        )
+        .unwrap();
+        s.create_incident(
+            "old",
+            "outage",
+            IncidentState::Detected,
+            0,
+            false,
+            Some(cid("a")),
+            &[IncidentCheckRow {
+                check_id: cid("a"),
+                source: AffectSource::Origin,
+            }],
+            Some(("down", None)),
+        )
+        .unwrap();
+        s.add_update("old", IncidentState::Resolved, "recovered", None, 0)
+            .unwrap();
+
+        // The pre-prune stream maxima differ. After all old metadata is deleted,
+        // rebuilding writes three zero-max rows and this index rejects the
+        // second one, after the dependent deletes have run.
+        s.conn
+            .execute_batch(
+                "CREATE UNIQUE INDEX fail_metadata_watermark_rebuild
+                 ON replication_stream_watermarks (max_millis)",
+            )
+            .unwrap();
+        assert!(s.prune_metadata(1, 1, now).is_err());
+
+        assert_eq!(s.recent_alerts(10).unwrap().len(), 1);
+        let incident = s.incident("old").unwrap().expect("incident rolled back");
+        assert_eq!(incident.checks.len(), 1, "affects row rolled back");
+        assert_eq!(s.updates_for_incident("old").unwrap().len(), 2);
+
+        s.conn
+            .execute_batch("DROP INDEX fail_metadata_watermark_rebuild")
+            .unwrap();
+        assert!(s.prune_metadata(1, 1, now).unwrap() > 0);
+        assert!(s.incident("old").unwrap().is_none());
+    }
+
+    #[test]
+    fn prune_metadata_is_idempotent_after_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "warden-prune-metadata-{}.duckdb",
+            uuid::Uuid::now_v7()
+        ));
+        let path_string = path.to_string_lossy().into_owned();
+        let now = 2 * 86_400_000i64;
+        {
+            let s = Storage::open(&path_string).unwrap();
+            s.insert_alert(
+                AlertScope::Check,
+                "a",
+                Some(NodeState::Up),
+                NodeState::Down,
+                1,
+                None,
+            )
+            .unwrap();
+            assert_eq!(s.prune_metadata(1, 1, now).unwrap(), 1);
+            assert_eq!(s.stream_digest("alerts").unwrap().count, 0);
+        }
+
+        let restarted = Storage::open(&path_string).unwrap();
+        assert_eq!(restarted.prune_metadata(1, 1, now).unwrap(), 0);
+        assert_eq!(restarted.recent_alerts(10).unwrap().len(), 0);
+        assert_eq!(restarted.stream_digest("alerts").unwrap().count, 0);
+        drop(restarted);
+        std::fs::remove_file(path).unwrap();
     }
 
     // ---- Clustering: data-plane replication ----
@@ -8765,6 +9146,43 @@ mod tests {
     }
 
     #[test]
+    fn config_batch_rolls_back_when_a_later_document_is_malformed() {
+        let s = Storage::open(":memory:").unwrap();
+        let valid = setting_entry("theme", 1_000, "n1", "dark");
+        let malformed = ConfigEntry {
+            kind: ConfigKind::Setting,
+            id: "broken".into(),
+            hlc: Hlc::new(1_000, "n1"),
+            document: Some("not JSON".into()),
+        };
+
+        assert!(s.apply_config_entries(&[valid, malformed]).is_err());
+        assert!(s
+            .config_entry(ConfigKind::Setting, "theme")
+            .unwrap()
+            .is_none());
+    }
+
+    /// Manual provisioning benchmark for the config write path. Run with
+    /// `cargo test benchmark_apply_config_entries_10k -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn benchmark_apply_config_entries_10k() {
+        let s = Storage::open(":memory:").unwrap();
+        let entries = (0..10_000)
+            .map(|i| setting_entry(&format!("setting-{i}"), i, "n1", "value"))
+            .collect::<Vec<_>>();
+        let start = std::time::Instant::now();
+        let applied = s.apply_config_entries(&entries).unwrap();
+        eprintln!(
+            "applied {} config entries in {:?}",
+            applied.iter().filter(|applied| **applied).count(),
+            start.elapsed()
+        );
+        assert!(applied.iter().all(|applied| *applied));
+    }
+
+    #[test]
     fn config_entry_round_trips_each_kind_through_apply_and_read_back() {
         let s = Storage::open(":memory:").unwrap();
         let hlc = Hlc::new(1_000, "n1");
@@ -8893,6 +9311,48 @@ mod tests {
     }
 
     #[test]
+    fn config_entries_page_orders_and_bounds_live_rows_and_tombstones() {
+        let s = Storage::open(":memory:").unwrap();
+        for id in ["alpha", "charlie", "delta"] {
+            s.apply_config_entry(&setting_entry(id, 100, "a", id))
+                .unwrap();
+        }
+        s.apply_config_entry(&ConfigEntry {
+            kind: ConfigKind::Setting,
+            id: "bravo".into(),
+            hlc: Hlc::new(100, "a"),
+            document: None,
+        })
+        .unwrap();
+
+        let first = s.config_entries_page(ConfigKind::Setting, None, 2).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "bravo"]
+        );
+        assert!(!first[0].is_tombstone());
+        assert!(first[1].is_tombstone());
+
+        let second = s
+            .config_entries_page(ConfigKind::Setting, Some("bravo"), 2)
+            .unwrap();
+        assert_eq!(
+            second
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["charlie", "delta"]
+        );
+        assert!(s
+            .config_entries_page(ConfigKind::Setting, Some("delta"), 2)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn stamp_config_restamps_without_changing_the_row() {
         let s = Storage::open(":memory:").unwrap();
         s.put_setting("k", "value").unwrap();
@@ -8976,7 +9436,7 @@ mod tests {
         let stored = s.incident("inc-1").unwrap().unwrap();
         assert_eq!(stored.title, "Major outage");
         assert_eq!(
-            s.list_incidents(10, None).unwrap().len(),
+            s.list_incidents(10, None, None).unwrap().len(),
             1,
             "still one incident row, not a second one"
         );
@@ -9388,138 +9848,112 @@ mod tests {
     ///
     /// `WARDEN_BENCH_PRUNE_ROWS` (default 20,000,000) sets the retained rows.
     #[test]
-    #[ignore = "capacity baseline; configure WARDEN_BENCH_* for the intended scale"]
-    fn benchmark_retention_prune_against_retained_history() {
-        let retained: u64 = std::env::var("WARDEN_BENCH_PRUNE_ROWS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(20_000_000);
-        let checks: u64 = 1_000;
-        let path =
-            std::env::temp_dir().join(format!("warden-prune-{}.duckdb", uuid::Uuid::now_v7()));
-        let store = Storage::open(path.to_str().unwrap()).unwrap();
-
-        let seeded = std::time::Instant::now();
-        // A realistic estate: a bounded set of checks, each with a long history.
-        // Deriving the id from the row number keeps that shape without sending
-        // twenty million values across the wire.
-        store
-            .conn
-            .execute_batch(&format!(
-                "INSERT INTO check_results
-                 SELECT ('00000000-0000-7000-8000-' ||
-                         lpad(((i % {checks}))::VARCHAR, 12, '0'))::UUID,
-                        'agent-a', i, 'up', 10, 200, NULL, 'z', 'r', NULL
-                 FROM generate_series(1, {retained}) t(i);"
-            ))
-            .unwrap();
-        store.rebuild_result_watermarks().unwrap();
-        store.rebuild_latest_check_results().unwrap();
-        let seed_elapsed = seeded.elapsed();
-
-        // One window out of `WARDEN_BENCH_PRUNE_WINDOWS`, as a daily run takes
-        // one day out of the retention period.
-        let windows: u64 = std::env::var("WARDEN_BENCH_PRUNE_WINDOWS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2);
-        let cutoff = (retained / windows) as i64;
-        let started = std::time::Instant::now();
-        let removed = store.prune_results(cutoff).unwrap();
-        let prune_elapsed = started.elapsed();
-
-        // What the old path did after the same delete.
-        let started = std::time::Instant::now();
-        store.rebuild_result_watermarks().unwrap();
-        store.rebuild_latest_check_results().unwrap();
-        let rebuild_elapsed = started.elapsed();
-
-        println!(
-            "retention_prune retained_rows={retained} windows={windows} seed_ms={} removed={removed} prune_ms={} replaced_rebuild_ms={}",
-            seed_elapsed.as_millis(),
-            prune_elapsed.as_millis(),
-            rebuild_elapsed.as_millis()
-        );
-        drop(store);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// Replication dedup must cost what the *batch* costs, not what the
-    /// *history* costs. The anti-join is bounded by the batch's own minimum
-    /// timestamp precisely so a node holding a month of results does not pay a
-    /// full-table probe for every batch a peer sends it. Seeds a large table
-    /// and asserts a live-shaped batch still applies in bounded time.
-    ///
-    /// `WARDEN_BENCH_DEDUP_ROWS` (default 20,000,000) sets the retained rows.
-    /// Retention keeps the derived tables true without rebuilding them, so the
-    /// property to hold is equivalence: what prune leaves behind must equal
-    /// what a full rebuild would have produced. Covers the two cases that
-    /// differ — a check still reporting across the cutoff, and one that stopped
-    /// before it and must disappear entirely.
-    #[test]
-    fn pruning_leaves_the_derived_tables_exactly_as_a_rebuild_would() {
+    fn latency_rollups_preserve_domains_dedup_and_raw_handoff() {
         let s = Storage::open(":memory:").unwrap();
-        let live = "still-reporting";
-        let gone = "stopped-before-the-cutoff";
-        let cutoff = 5_000i64;
+        let now = 100 * 24 * MILLIS_PER_HOUR;
+        let to = now;
+        let handoff = to - RAW_RETENTION_MILLIS;
+        let minute = handoff - MILLIS_PER_MINUTE;
+        let mut a = result("latency", minute + 10_000, 10);
+        a.agent_id = "domain-a".into();
+        let mut b = result("latency", minute + 20_000, 30);
+        b.agent_id = "domain-b".into();
+        let mut raw = result("latency", handoff + 1, 50);
+        raw.agent_id = "domain-a".into();
+        s.insert_results_dedup(&[(a.clone(), Status::Up), (b, Status::Up), (raw, Status::Up)])
+            .unwrap();
+        assert_eq!(s.insert_results_dedup(&[(a, Status::Up)]).unwrap(), 0);
+        s.prune_results(handoff).unwrap();
 
-        s.insert_results(&[
-            (result(live, 1_000, 10), Status::Up),
-            (result(live, 4_000, 11), Status::Up),
-            (result(live, 9_000, 12), Status::Down),
-            (result(gone, 1_000, 13), Status::Up),
-            (result(gone, 4_000, 14), Status::Up),
-        ])
-        .unwrap();
-
-        let removed = s.prune_results(cutoff).unwrap();
-        assert_eq!(removed, 4, "every row below the cutoff");
-
-        let marks = |s: &Storage| -> Vec<(String, i64, i64)> {
-            let mut stmt = s
-                .conn
-                .prepare(
-                    "SELECT CAST(check_id AS VARCHAR), max_ts, result_count
-                     FROM result_replication_watermarks ORDER BY 1",
-                )
-                .unwrap();
-            let rows = stmt
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                .unwrap();
-            rows.map(|r| r.unwrap()).collect()
-        };
-        let latest = |s: &Storage| -> Vec<(String, i64)> {
-            let mut stmt = s
-                .conn
-                .prepare(
-                    "SELECT CAST(check_id AS VARCHAR), ts_millis
-                     FROM latest_check_results ORDER BY 1",
-                )
-                .unwrap();
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-            rows.map(|r| r.unwrap()).collect()
-        };
-
-        let after_marks = marks(&s);
-        let after_latest = latest(&s);
-        s.rebuild_result_watermarks().unwrap();
-        s.rebuild_latest_check_results().unwrap();
-        assert_eq!(after_marks, marks(&s), "watermarks must match a rebuild");
+        let series = s
+            .latency_series(
+                cid("latency"),
+                minute,
+                to,
+                (to - minute) as usize / MILLIS_PER_MINUTE as usize,
+            )
+            .unwrap();
         assert_eq!(
-            after_latest,
-            latest(&s),
-            "latest results must match a rebuild"
+            series.points[0].attempts, 2,
+            "both domains survive in minute rollup"
         );
-        assert!(
-            !after_latest
-                .iter()
-                .any(|(id, _)| *id == cid(gone).to_string()),
-            "a check whose every row aged out must leave no latest row"
+        assert_eq!(series.points[0].avg_latency_ms, Some(20.0));
+        let raw_point = &series.points[1];
+        assert_eq!(raw_point.attempts, 1, "raw starts strictly after handoff");
+        assert_eq!(raw_point.avg_latency_ms, Some(50.0));
+        assert_eq!(
+            series.overall.attempts, 3,
+            "replay must not inflate rollups"
         );
     }
 
     #[test]
-    #[ignore = "capacity baseline; configure WARDEN_BENCH_* for the intended scale"]
+    fn latency_rollup_retention_and_restart_keep_long_range_queries() {
+        let path =
+            std::env::temp_dir().join(format!("warden-rollups-{}.duckdb", uuid::Uuid::now_v7()));
+        let now = 500 * 24 * MILLIS_PER_HOUR;
+        // Must be more than 90 days old (minute tier) but still inside the
+        // 13-month hour tier selected relative to this query's end.
+        let old_hour = now - 300 * 24 * MILLIS_PER_HOUR;
+        let expired_minute = now - MINUTE_ROLLUP_RETENTION_MILLIS - MILLIS_PER_MINUTE;
+        let expired_hour = now - HOUR_ROLLUP_RETENTION_MILLIS - MILLIS_PER_HOUR;
+        {
+            let s = Storage::open(path.to_str().unwrap()).unwrap();
+            s.insert_results(&[
+                (result("latency", old_hour + 1, 40), Status::Up),
+                (result("latency", expired_minute + 1, 60), Status::Up),
+                (result("latency", expired_hour + 1, 80), Status::Up),
+            ])
+            .unwrap();
+            s.prune(30, 90, now).unwrap();
+        }
+        let s = Storage::open(path.to_str().unwrap()).unwrap();
+        let rollup_count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM check_latency_hour_rollups WHERE check_id = ?",
+                duckdb::params![cid("latency")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rollup_count, 2);
+        let series = s
+            .latency_series(
+                cid("latency"),
+                old_hour - MILLIS_PER_HOUR,
+                now,
+                ((now - old_hour) / MILLIS_PER_HOUR + 1) as usize,
+            )
+            .unwrap();
+        assert_eq!(
+            series.points[1].avg_latency_ms,
+            Some(40.0),
+            "hour rollup survives restart"
+        );
+        let minute_count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM check_latency_minute_rollups WHERE bucket_start <= ?",
+                duckdb::params![expired_minute],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let hour_count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM check_latency_hour_rollups WHERE bucket_start <= ?",
+                duckdb::params![expired_hour],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(minute_count, 0, "minute retention is ninety days");
+        assert_eq!(hour_count, 0, "hour retention is thirteen months");
+        drop(s);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[ignore = "capacity baseline; configure WARDEN_BENCH_DEDUP_ROWS for the intended scale"]
     fn benchmark_replicated_dedup_against_retained_history() {
         let retained: u64 = std::env::var("WARDEN_BENCH_DEDUP_ROWS")
             .ok()
@@ -10680,20 +11114,30 @@ mod migration_tests {
         s.add_update("a-1000", IncidentState::Resolved, "back", None, 3_500)
             .unwrap();
 
-        let all = s.list_incidents(100, None).unwrap();
+        let all = s.list_incidents(100, None, None).unwrap();
         let order: Vec<String> = all.iter().map(|i| i.id.clone()).collect();
         assert_eq!(order, vec!["b-2000", "a-1000"]);
 
-        let open = s.list_incidents(100, Some(true)).unwrap();
+        let open = s.list_incidents(100, Some(true), None).unwrap();
         assert_eq!(
             open.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
             vec!["b-2000"],
             "only b is still open"
         );
 
-        let resolved = s.list_incidents(100, Some(false)).unwrap();
+        let resolved = s.list_incidents(100, Some(false), None).unwrap();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].id, "a-1000");
+        assert_eq!(
+            s.list_incidents(100, None, Some(3_501))
+                .unwrap()
+                .iter()
+                .map(|i| i.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b-2000"],
+            "old resolved incidents are hidden, even when an old outage is still open"
+        );
+        assert_eq!(s.list_incidents(100, None, Some(3_500)).unwrap().len(), 2);
 
         let for_a = s.incidents_for_check(cid("a"), 100).unwrap();
         assert_eq!(

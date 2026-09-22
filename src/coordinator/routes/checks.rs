@@ -17,13 +17,14 @@
 //! what this allows; history, alerts and incidents are keyed on the immutable
 //! id and are unaffected by it.
 //!
-//! **Erasing is a different action from deleting.**
-//! `purge_check_everything_handler` removes a check's definition and every
-//! trace it left, including pages an anonymous visitor may already have
-//! read; `purge_check_data_handler` keeps the definition and only resets its
-//! history. Conflating the two behind one button would make "start the graph
-//! over" as destructive as "stop monitoring this", so they stay separate
-//! endpoints with separate names.
+//! **Unplacing, deleting, and erasing are three distinct actions.**
+//! `unplace_check_handler` removes a definition only from this region without
+//! writing or replicating a tombstone, preserving raw results under the same
+//! immutable id for a later placement. `delete_check_handler` is the normal
+//! replicated delete. `purge_check_everything_handler` removes a check and
+//! every trace it left, while `purge_check_data_handler` keeps its definition
+//! and only resets history. These operations stay separate because their
+//! replication and retention consequences are deliberately different.
 
 use super::super::{
     error_response, internal_error, storage, Coordinator, DeletedResponse, WsEvent,
@@ -225,6 +226,41 @@ pub(in crate::coordinator) async fn update_check_handler(
         }
     }
     coord.save_check(check).await
+}
+
+/// Remove this check from this region only.
+///
+/// This deliberately does not use `write_config`: that path creates a
+/// replication tombstone, which would delete the definition in regions where
+/// the check remains placed. The coordinator operation removes the local
+/// definition and derived state but leaves `check_results` untouched, allowing
+/// the same immutable id to reconnect its history when it is placed here again.
+pub(in crate::coordinator) async fn unplace_check_handler(
+    State(coord): State<Coordinator>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(denied) = require_admin(&coord, &headers) {
+        return denied;
+    }
+    let id = match parse_check_id(&id) {
+        Ok(id) => id,
+        Err(denied) => return *denied,
+    };
+    match coord.unplace_check_local(id).await {
+        Ok(true) => {
+            let id = id.to_string();
+            info!(check = %id, "check unplaced locally");
+            Json(UnplacedResponse { unplaced: id }).into_response()
+        }
+        Ok(false) => error_response(StatusCode::NOT_FOUND, "no such check"),
+        Err(e) => internal_error(e),
+    }
+}
+
+#[derive(Serialize)]
+pub(in crate::coordinator) struct UnplacedResponse {
+    pub(in crate::coordinator) unplaced: String,
 }
 
 pub(in crate::coordinator) async fn delete_check_handler(

@@ -122,6 +122,13 @@ struct IncidentsResponse {
     incidents: Vec<IncidentDto>,
 }
 
+/// Largest incident page accepted by public list routes.
+const MAX_INCIDENT_PAGE_SIZE: usize = 1_000;
+
+fn bounded_incident_page_size(requested: Option<usize>, default: usize) -> usize {
+    requested.unwrap_or(default).min(MAX_INCIDENT_PAGE_SIZE)
+}
+
 /// Query for the incidents endpoints. `status` mirrors the incident's
 /// lifecycle, not a check's UP/DOWN/UNKNOWN: `?status=open` lists only current
 /// outages, which is any state other than resolved.
@@ -129,6 +136,9 @@ struct IncidentsResponse {
 pub(in crate::coordinator) struct IncidentQuery {
     limit: Option<usize>,
     status: Option<String>,
+    /// Epoch milliseconds. This bounds resolved incidents only; open outages
+    /// remain visible even when they began before the selected status window.
+    since: Option<i64>,
 }
 
 /// Bounds the destructive short-incident cleanup to the transient outages it
@@ -209,19 +219,21 @@ pub(in crate::coordinator) async fn incidents_handler(
     State(coord): State<Coordinator>,
     Query(q): Query<IncidentQuery>,
 ) -> Response {
-    let limit = q.limit.unwrap_or(50).min(1000);
+    let limit = bounded_incident_page_size(q.limit, 50);
     let open_only = incident_open_filter(q.status.as_deref());
     let now = chrono::Utc::now().timestamp_millis();
     match coord
         .db(move |storage| {
-            storage.list_incidents(limit, open_only).map(|rows| {
-                rows.into_iter()
-                    .map(|row| {
-                        let ack = storage.is_acknowledged(&row.id).unwrap_or(false);
-                        IncidentDto::from_row(row, now, ack)
-                    })
-                    .collect()
-            })
+            storage
+                .list_incidents(limit, open_only, q.since)
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|row| {
+                            let ack = storage.is_acknowledged(&row.id).unwrap_or(false);
+                            IncidentDto::from_row(row, now, ack)
+                        })
+                        .collect()
+                })
         })
         .await
     {
@@ -531,10 +543,21 @@ pub(in crate::coordinator) async fn incident_update_handler(
     let update_body = req.body.trim().to_string();
     match coord
         .db(move |storage| {
-            if storage.incident(&update_id)?.is_none() {
+            let Some(current) = storage.incident(&update_id)? else {
                 return Ok(None);
+            };
+            // An empty-bodied update that does not move the state carries no
+            // information, and the acknowledgement it would have recorded is
+            // already on the record. Writing one anyway lets a repeated "Ack"
+            // append the same silent row forever — which then replicates to
+            // every peer and pads a public narrative with nothing. Answer with
+            // the incident as it stands instead.
+            let redundant = update_body.is_empty()
+                && current.state == state
+                && storage.is_acknowledged(&update_id)?;
+            if !redundant {
+                storage.add_update(&update_id, state, &update_body, Some("admin"), now)?;
             }
-            storage.add_update(&update_id, state, &update_body, Some("admin"), now)?;
             let row = storage
                 .incident(&update_id)?
                 .expect("incident checked above");
@@ -574,7 +597,7 @@ pub(in crate::coordinator) async fn check_incidents_handler(
     Path(id): Path<crate::models::CheckId>,
     Query(q): Query<IncidentQuery>,
 ) -> Response {
-    let limit = q.limit.unwrap_or(20).min(1000);
+    let limit = bounded_incident_page_size(q.limit, 20);
     let now = chrono::Utc::now().timestamp_millis();
     match coord
         .db(move |storage| {
@@ -591,5 +614,20 @@ pub(in crate::coordinator) async fn check_incidents_handler(
     {
         Ok(incidents) => Json(IncidentsResponse { incidents }).into_response(),
         Err(e) => internal_error(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incident_page_size_uses_defaults_and_caps_requested_values() {
+        assert_eq!(bounded_incident_page_size(None, 50), 50);
+        assert_eq!(bounded_incident_page_size(Some(20), 50), 20);
+        assert_eq!(
+            bounded_incident_page_size(Some(MAX_INCIDENT_PAGE_SIZE + 1), 50),
+            MAX_INCIDENT_PAGE_SIZE
+        );
     }
 }

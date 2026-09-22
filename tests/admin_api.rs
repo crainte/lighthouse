@@ -68,6 +68,7 @@ async fn coordinator() -> Coordinator {
         listen: "127.0.0.1:0".into(),
         db_path: ":memory:".into(),
         admin_password: Some(PASSWORD.into()),
+        peer_token: Some("test-peer-token".into()),
         ..Default::default()
     })
     .await
@@ -208,7 +209,10 @@ async fn http_security_headers_and_cookie_policy_are_applied() {
         .await
         .unwrap();
     let headers = status.headers();
-    assert_eq!(headers["content-security-policy"], "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' ws: wss:");
+    assert_eq!(
+        headers["content-security-policy"],
+        "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' ws: wss:"
+    );
     assert_eq!(headers["x-frame-options"], "DENY");
     assert_eq!(headers["x-content-type-options"], "nosniff");
     assert_eq!(
@@ -454,6 +458,109 @@ async fn an_authenticated_admin_can_round_trip_a_check() {
         .await
         .unwrap();
     assert_eq!(res.status(), 401);
+}
+
+#[tokio::test]
+async fn unplacing_a_check_keeps_history_for_replacement_and_clears_local_state() {
+    let addr = spawn_server(coordinator().await);
+    let base = format!("http://{addr}");
+    let admin = reqwest::Client::new();
+    let session = login(&base).await;
+
+    let created: Value = admin
+        .post(format!("{base}/api/v1/admin/checks"))
+        .header(reqwest::header::COOKIE, &session)
+        .json(&check_body("regional-web", "https://regional.test/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let check_id = created["check"]["id"].as_str().unwrap().to_string();
+
+    let result = |timestamp: &str| {
+        json!({"results": [{
+            "check_id": check_id,
+            "agent_id": "agent-test",
+            "timestamp": timestamp,
+            "latency_ms": 12,
+            "status_code": 200,
+        }]})
+    };
+    let res = admin
+        .post(format!("{base}/api/v1/results"))
+        .bearer_auth(AGENT_TOKEN)
+        .json(&result("2026-01-01T00:00:00Z"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 202);
+
+    let res = admin
+        .delete(format!("{base}/api/v1/admin/checks/{check_id}/unplace"))
+        .header(reqwest::header::COOKIE, &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.json::<Value>().await.unwrap()["unplaced"], check_id);
+
+    let checks: Value = admin
+        .get(format!("{base}/api/v1/admin/checks"))
+        .header(reqwest::header::COOKIE, &session)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(checks["checks"].as_array().unwrap().is_empty());
+    let status: Value = reqwest::get(format!("{base}/api/v1/status"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(status["checks"].as_array().unwrap().is_empty());
+
+    let mut replacement = check_body("regional-web", "https://regional.test/health");
+    replacement["id"] = json!(check_id);
+    let res = admin
+        .post(format!("{base}/api/v1/admin/checks"))
+        .header(reqwest::header::COOKIE, &session)
+        .bearer_auth("test-peer-token")
+        .json(&replacement)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.json::<Value>().await.unwrap()["check"]["id"], check_id);
+
+    let history: Value = reqwest::get(format!("{base}/api/v1/checks/{check_id}/history?limit=10"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(history["history"].as_array().unwrap().len(), 1);
+
+    let res = admin
+        .post(format!("{base}/api/v1/results"))
+        .bearer_auth(AGENT_TOKEN)
+        .json(&result("2026-01-01T00:01:00Z"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 202);
+    let status: Value = reqwest::get(format!("{base}/api/v1/status"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["checks"].as_array().unwrap().len(), 1);
+    assert_eq!(status["checks"][0]["check_id"], check_id);
 }
 
 #[tokio::test]
@@ -1090,6 +1197,95 @@ async fn a_check_can_be_restricted_to_particular_agents() {
     // working rather than silently going idle.
     let anon = feed_for(None).await;
     assert!(anon.contains(&"pinned".to_string()));
+}
+
+#[tokio::test]
+async fn agent_polls_use_the_refreshed_catalogue_without_changing_assignment() {
+    let coord = coordinator().await;
+    let addr = spawn_server(coord.clone());
+    let base = format!("http://{addr}");
+    let session = login(&base).await;
+    let client = reqwest::Client::new();
+
+    let created: Value = client
+        .post(format!("{base}/api/v1/admin/checks"))
+        .header(reqwest::header::COOKIE, &session)
+        .json(&check_body("catalogued", "https://catalogue.test"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = created["check"]["id"].as_str().unwrap();
+
+    // Register both agents before checking placement, so stable assignment—not
+    // cold-start ownership—is asserted.
+    for agent in ["agent-a", "agent-b"] {
+        client
+            .get(format!("{base}/api/v1/agent/checks?agent_id={agent}"))
+            .bearer_auth(AGENT_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+    let feeds = futures_util::future::join_all(["agent-a", "agent-b"].map(|agent| {
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            client
+                .get(format!("{base}/api/v1/agent/checks?agent_id={agent}"))
+                .bearer_auth(AGENT_TOKEN)
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        }
+    }))
+    .await;
+    assert_eq!(
+        feeds
+            .iter()
+            .filter(|feed| feed["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["id"] == id))
+            .count(),
+        1,
+        "the cached catalogue must retain one-per-zone assignment"
+    );
+
+    let mut updated = created["check"].clone();
+    updated["enabled"] = Value::Bool(false);
+    client
+        .put(format!("{base}/api/v1/admin/checks/{id}"))
+        .header(reqwest::header::COOKIE, &session)
+        .json(&updated)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    for agent in ["agent-a", "agent-b"] {
+        let feed: Value = client
+            .get(format!("{base}/api/v1/agent/checks?agent_id={agent}"))
+            .bearer_auth(AGENT_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(feed["checks"].as_array().unwrap().is_empty());
+    }
 }
 
 #[tokio::test]
@@ -1854,6 +2050,95 @@ async fn scoping_a_check_to_a_region_keeps_it_out_of_the_others() {
         .expect("check present");
     assert_eq!(c["placement"]["regions"][0], "eu-west");
 }
+/// Admin reads must never disclose values that authenticate a notification
+/// delivery, while writing the response back must leave those values intact.
+#[tokio::test]
+async fn notifier_admin_reads_redact_secrets_and_put_accepts_placeholders() {
+    let coord = Coordinator::new(&CoordinatorConfig {
+        listen: "127.0.0.1:0".into(),
+        db_path: ":memory:".into(),
+        admin_password: Some(PASSWORD.into()),
+        notifiers: vec![
+            Notifier {
+                name: "hook".into(),
+                kind: NotifierKind::Webhook {
+                    url: "https://hooks.example.test/webhook-secret".into(),
+                },
+                default: true,
+            },
+            Notifier {
+                name: "slack".into(),
+                kind: NotifierKind::Slack {
+                    webhook_url: "https://hooks.example.test/slack-secret".into(),
+                },
+                default: false,
+            },
+            Notifier {
+                name: "pager".into(),
+                kind: NotifierKind::Pagerduty {
+                    routing_key: "pager-secret".into(),
+                },
+                default: false,
+            },
+            Notifier {
+                name: "mail".into(),
+                kind: NotifierKind::Email(warden::notify::MailConfig {
+                    host: "smtp.example.test".into(),
+                    port: None,
+                    username: Some("warden".into()),
+                    password: Some("smtp-secret".into()),
+                    from: "warden@example.test".into(),
+                    to: "ops@example.test".into(),
+                    tls: warden::notify::MailTls::Starttls,
+                }),
+                default: false,
+            },
+        ],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let addr = spawn_server(coord);
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let session = login(&base).await;
+
+    let read: Value = client
+        .get(format!("{base}/api/v1/admin/notifiers"))
+        .header(reqwest::header::COOKIE, &session)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let encoded = read.to_string();
+    for secret in [
+        "webhook-secret",
+        "slack-secret",
+        "pager-secret",
+        "smtp-secret",
+    ] {
+        assert!(!encoded.contains(secret), "admin GET leaked {secret}");
+    }
+    assert_eq!(read["notifiers"][0]["url"], "********");
+    assert_eq!(read["notifiers"][1]["webhook_url"], "********");
+    assert_eq!(read["notifiers"][2]["routing_key"], "********");
+    assert_eq!(read["notifiers"][3]["password"], "********");
+
+    let saved: Value = client
+        .put(format!("{base}/api/v1/admin/notifiers"))
+        .header(reqwest::header::COOKIE, &session)
+        .json(&json!({ "notifiers": read["notifiers"] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(saved["notifiers"], read["notifiers"]);
+}
+
 #[tokio::test]
 async fn a_hanging_notification_endpoint_cannot_stall_ingest() {
     // The design has the decision engine hand alerts to a notifier over a
@@ -2840,6 +3125,85 @@ async fn create_incident(base: &str, session: &str, title: &str, checks: &[Strin
         .await
         .unwrap();
     res["incident"]["id"].as_str().unwrap().to_string()
+}
+
+/// Acknowledging is posting an empty-bodied `investigating` update, and the
+/// console offers it on every render of a `detected` row. A double click, a
+/// stale list, or a relay that answers from a lagging region therefore posts it
+/// twice — and the second one recorded another silent row against the public
+/// narrative, forever, one per click. The first ack is the acknowledgement; an
+/// empty update that moves nothing afterwards must record nothing.
+#[tokio::test]
+async fn acknowledging_twice_records_one_update() {
+    let addr = spawn_server(coordinator().await);
+    let base = format!("http://{addr}");
+    let admin = reqwest::Client::new();
+    let session = login(&base).await;
+    let id = create_incident(&base, &session, "svc is down", &[]).await;
+
+    let ack = || async {
+        admin
+            .post(format!("{base}/api/v1/admin/incidents/{id}/updates"))
+            .header(reqwest::header::COOKIE, session.clone())
+            .json(&json!({ "state": "investigating", "body": "" }))
+            .send()
+            .await
+            .unwrap()
+    };
+
+    assert_eq!(ack().await.status(), reqwest::StatusCode::OK);
+    let after_first: Value = reqwest::get(format!("{base}/api/v1/incidents/{id}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let first = after_first["incident"]["updates"].as_array().unwrap().len();
+    assert_eq!(after_first["incident"]["state"], "investigating");
+    assert_eq!(after_first["incident"]["acknowledged"], true);
+
+    // Three more clicks. Each is accepted — the operator did nothing wrong —
+    // but none of them may leave a trace.
+    for _ in 0..3 {
+        assert_eq!(ack().await.status(), reqwest::StatusCode::OK);
+    }
+    let after_repeat: Value = reqwest::get(format!("{base}/api/v1/incidents/{id}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        after_repeat["incident"]["updates"]
+            .as_array()
+            .unwrap()
+            .len(),
+        first,
+        "a repeated acknowledgement must not append another empty update"
+    );
+    assert_eq!(after_repeat["incident"]["acknowledged"], true);
+
+    // A real update still lands: the guard is about empty no-ops, not about
+    // refusing to let an operator narrate an incident they already acked.
+    let res = admin
+        .post(format!("{base}/api/v1/admin/incidents/{id}/updates"))
+        .header(reqwest::header::COOKIE, session.clone())
+        .json(&json!({ "state": "investigating", "body": "nginx upstream missing" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let after_body: Value = reqwest::get(format!("{base}/api/v1/incidents/{id}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        after_body["incident"]["updates"].as_array().unwrap().len(),
+        first + 1,
+        "an authored update is not a no-op even at the same state"
+    );
 }
 
 async fn public_incident_ids(base: &str) -> Vec<String> {

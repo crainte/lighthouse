@@ -409,7 +409,57 @@ async fn a_check_created_on_one_node_appears_on_its_peer_including_the_agent_fee
 }
 
 // ---------------------------------------------------------------------------
-// 10. Delete does not resurrect (the tombstone test)
+// 10. Unplace is local, then delete does not resurrect (the tombstone test)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn unplacing_a_check_is_local_and_does_not_create_a_replication_tombstone() {
+    let b = spawn_node("b", vec![], vec![]).await;
+    let a = spawn_node("a", vec![format!("http://{}", b.addr)], vec![]).await;
+    let session_a = login(a.addr).await;
+    let session_b = login(b.addr).await;
+    gossip_step(a.addr, &session_a, b.addr).await;
+
+    let check_id = uuid::Uuid::now_v7().to_string();
+    let entry = config_entry(
+        "check",
+        &check_id,
+        1_000,
+        "a",
+        Some(check_document(&check_id, CHECK, "https://docs.test/health")),
+    );
+    apply_config(a.addr, "a", vec![entry.clone()]).await;
+    apply_config(b.addr, "a", vec![entry.clone()]).await;
+
+    let res = reqwest::Client::new()
+        .delete(format!(
+            "http://{}/api/v1/admin/checks/{check_id}/unplace",
+            a.addr
+        ))
+        .header(reqwest::header::COOKIE, &session_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert!(
+        !has_check(a.addr, &session_a, CHECK).await,
+        "unplace removes the check from its local coordinator"
+    );
+    assert!(
+        has_check(b.addr, &session_b, CHECK).await,
+        "unplace must not delete the check in another region"
+    );
+
+    apply_config(a.addr, "b", vec![entry]).await;
+    assert!(
+        has_check(a.addr, &session_a, CHECK).await,
+        "a retained peer config entry can place the same immutable id again"
+    );
+    assert!(has_check(b.addr, &session_b, CHECK).await);
+}
+
+// ---------------------------------------------------------------------------
+// 11. Delete does not resurrect (the tombstone test)
 // ---------------------------------------------------------------------------
 
 /// Deleting a check is a tombstone with an HLC, not merely a row disappearing:

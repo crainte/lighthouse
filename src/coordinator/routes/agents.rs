@@ -386,6 +386,36 @@ fn authenticate_agent(
 #[derive(Serialize)]
 struct AgentChecksResponse {
     checks: Vec<CheckConfig>,
+    /// Checks omitted because this coordinator cannot resolve their secret
+    /// references. Kept alongside the successful assignments so one regional
+    /// configuration mistake does not make an entire fleet retain stale work.
+    config_errors: Vec<AgentCheckConfigError>,
+}
+
+/// A configuration error for an omitted check, naming the missing reference
+/// but never carrying the secret value or target.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+struct AgentCheckConfigError {
+    name: String,
+    error: String,
+}
+
+fn resolve_checks_for_agent<'a>(
+    checks: impl IntoIterator<Item = &'a CheckConfig>,
+    lookup: impl Fn(&str) -> Option<String> + Copy,
+) -> (Vec<CheckConfig>, Vec<AgentCheckConfigError>) {
+    let mut resolved = Vec::new();
+    let mut config_errors = Vec::new();
+    for check in checks {
+        match check.resolve_secret_references(lookup) {
+            Ok(check) => resolved.push(check),
+            Err(error) => config_errors.push(AgentCheckConfigError {
+                name: check.name.clone(),
+                error,
+            }),
+        }
+    }
+    (resolved, config_errors)
 }
 
 /// The check list an agent should probe.
@@ -407,17 +437,20 @@ pub(in crate::coordinator) async fn agent_checks_handler(
     let Some(caller) = q.agent_id.as_deref() else {
         // An agent that will not say who it is cannot be placed. Older agents
         // predate identity, so they still get everything rather than silently
-        // going idle on upgrade.
-        return match coord.db(|storage| storage.list_checks()).await {
-            Ok(checks) => Json(AgentChecksResponse {
-                checks: checks
-                    .into_iter()
-                    .filter(|c| c.enabled && c.kind.is_agent_probed())
-                    .collect(),
-            })
-            .into_response(),
-            Err(e) => internal_error(e),
-        };
+        // going idle on upgrade. The catalogue is refreshed atomically with
+        // every accepted check config change.
+        let checks = coord.inner.check_catalogue.read();
+        let (checks, config_errors) = resolve_checks_for_agent(
+            checks
+                .iter()
+                .filter(|c| c.enabled && c.kind.is_agent_probed()),
+            |name| std::env::var(name).ok(),
+        );
+        return Json(AgentChecksResponse {
+            checks,
+            config_errors,
+        })
+        .into_response();
     };
 
     let now = chrono::Utc::now().timestamp_millis();
@@ -455,11 +488,12 @@ pub(in crate::coordinator) async fn agent_checks_handler(
         seen.retain(|_, s| now - s.at <= s.window_ms);
     }
 
-    let (checks, polls) = match coord
-        .db(|storage| Ok((storage.list_checks()?, storage.list_agent_polls()?)))
-        .await
-    {
-        Ok(value) => value,
+    // Check config is an in-memory snapshot refreshed with every accepted
+    // config entry. Only the cluster-wide agent poll rows still require a
+    // database job for placement.
+    let checks = coord.inner.check_catalogue.read().clone();
+    let polls = match coord.db(|storage| storage.list_agent_polls()).await {
+        Ok(polls) => polls,
         Err(e) => return internal_error(e),
     };
 
@@ -470,7 +504,7 @@ pub(in crate::coordinator) async fn agent_checks_handler(
     // supplies location and capabilities together.
     let fleet = placement_fleet(now, &coord.inner.seen.read(), &polls);
 
-    let mine = checks
+    let mine: Vec<crate::config::CheckConfig> = checks
         .into_iter()
         .filter(|c| c.enabled && c.kind.is_agent_probed())
         .filter(|c| {
@@ -486,9 +520,12 @@ pub(in crate::coordinator) async fn agent_checks_handler(
                 .any(|id| id == caller)
         })
         .collect();
-    // Serialized as `CheckConfig`, which is exactly what the agent parses — one
-    // type on both ends, so the probe config can't drift from the wire.
-    Json(AgentChecksResponse { checks: mine }).into_response()
+    let (checks, config_errors) = resolve_checks_for_agent(&mine, |name| std::env::var(name).ok());
+    Json(AgentChecksResponse {
+        checks,
+        config_errors,
+    })
+    .into_response()
 }
 
 /// Who is asking for a check list.
@@ -742,7 +779,8 @@ struct RevokedResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{declared_kinds, fleet_for, placement_fleet, SeenAgent};
+    use super::{declared_kinds, fleet_for, placement_fleet, resolve_checks_for_agent, SeenAgent};
+    use crate::config::CheckConfig;
     use crate::coordinator::storage::AgentPollRow;
     use crate::models::CheckKind;
     use crate::placement::Agent;
@@ -755,6 +793,36 @@ mod tests {
             region: "eu-west".into(),
             kinds: kinds.map(|k| k.to_vec()),
         }
+    }
+
+    #[test]
+    fn missing_secret_omits_only_the_affected_check() {
+        let good = CheckConfig {
+            name: "good".into(),
+            target: "https://good.test/".into(),
+            ..Default::default()
+        };
+        let missing = CheckConfig {
+            name: "needs-token".into(),
+            target: "https://missing.test/".into(),
+            headers: vec![crate::config::Header {
+                name: "Authorization".into(),
+                value: "Bearer ${MISSING_TOKEN}".into(),
+            }],
+            ..Default::default()
+        };
+
+        let (checks, errors) = resolve_checks_for_agent([&good, &missing], |_| None);
+
+        assert_eq!(checks, vec![good]);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].name, "needs-token");
+        assert_eq!(
+            errors[0].error,
+            "missing environment variable MISSING_TOKEN for check secret reference"
+        );
+        assert!(!errors[0].error.contains("Bearer"));
+        assert!(!errors[0].error.contains("missing.test"));
     }
 
     #[test]

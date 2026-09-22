@@ -1,6 +1,6 @@
 pub mod alert;
 pub mod cluster;
-mod database;
+pub mod database;
 mod fleet;
 pub mod gossip;
 pub mod hlc;
@@ -22,6 +22,7 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use database::Database;
 use fleet::{fleet_rows, unreachable_after_ms, FleetMemberDto, FleetRowDto};
+use futures_util::{stream, StreamExt};
 use parking_lot::Mutex;
 use rand::seq::SliceRandom;
 use rand::RngCore;
@@ -32,7 +33,7 @@ use routes::agents::{
 use routes::checks::{
     create_check_handler, delete_check_handler, eval_test_handler, heartbeat_handler,
     list_checks_handler, purge_check_data_handler, purge_check_everything_handler,
-    reorder_checks_handler, update_check_handler, CheckResponse,
+    reorder_checks_handler, unplace_check_handler, update_check_handler, CheckResponse,
 };
 use routes::incidents::{
     check_incidents_handler, create_incident_handler, delete_incident_handler,
@@ -120,6 +121,7 @@ impl TimingCounter {
 
 struct Timings {
     enabled: bool,
+    prune_duration_us: AtomicU64,
     local_state_wait: TimingCounter,
     local_state_hold: TimingCounter,
     replicated_state_wait: TimingCounter,
@@ -137,6 +139,7 @@ impl Timings {
             enabled: std::env::var_os("WARDEN_BENCH_TIMINGS").as_deref()
                 == Some(std::ffi::OsStr::new("1"))
                 || std::env::var("RUST_LOG").is_ok_and(|filter| filter.contains("warden_bench")),
+            prune_duration_us: AtomicU64::new(0),
             local_state_wait: TimingCounter::default(),
             local_state_hold: TimingCounter::default(),
             replicated_state_wait: TimingCounter::default(),
@@ -187,6 +190,24 @@ pub enum WsEvent {
 #[derive(Clone)]
 pub struct Coordinator {
     inner: Arc<Inner>,
+}
+
+/// Test-only control over notification dispatch. Holding this guard prevents a
+/// queued wake-up from scanning the durable notification outbox.
+#[doc(hidden)]
+pub struct NotificationDispatchGuard<'a> {
+    coordinator: &'a Coordinator,
+    _guard: tokio::sync::MutexGuard<'a, ()>,
+}
+
+impl NotificationDispatchGuard<'_> {
+    /// Scan the outbox while its normal dispatcher is paused.
+    #[doc(hidden)]
+    pub async fn retry_due(&self, now_millis: i64) -> usize {
+        self.coordinator
+            .retry_due_unlocked(now_millis, &reqwest::Client::new())
+            .await
+    }
 }
 
 /// Configured metadata for a check, looked up by its immutable id. The store
@@ -514,6 +535,14 @@ impl RepairCursors {
 struct Inner {
     database: Database,
     timings: Arc<Timings>,
+    /// Immutable alert IDs that arrived with a different payload than the local
+    /// event. The local row always wins; this makes legacy divergence visible
+    /// without turning anti-entropy retries into destructive repair.
+    alert_identity_conflicts: AtomicU64,
+    /// Raw observations a peer requested before that peer's retention horizon.
+    /// This is deliberately ephemeral like repair cursors: it is an operational
+    /// signal, never repair state, and a later sweep re-detects any gap.
+    replication_raw_data_gaps: AtomicU64,
     /// One bounded, coalescing queue per peer for `/internal/replicate`, so a
     /// busy node never aims more than one concurrent request at a receiver's
     /// single write path.
@@ -531,14 +560,14 @@ struct Inner {
     /// How long history is kept. Copied here so the retention job does not
     /// need to re-read config.
     retention: crate::config::RetentionConfig,
-    /// Alerts leave through here, never inline. Always present: the notifier
-    /// list is editable at runtime, so a channel that existed only when the
-    /// config file named one would mean the first notifier added in the admin
-    /// page never fired until a restart.
-    /// The name list is what the check asked for, resolved against the live
-    /// notifiers at send time: editing a backend must not change the meaning
-    /// of an alert already in the queue.
-    notify_tx: tokio::sync::mpsc::Sender<(alert::Transition, Vec<String>)>,
+    /// Wakes the dispatcher after a transaction commits delivery intentions.
+    /// The database outbox is authoritative; a full channel merely delays a
+    /// scan and can never discard an alert.
+    notify_tx: tokio::sync::mpsc::Sender<()>,
+    /// Serializes queue scans. A notifier completion and the periodic retry
+    /// loop may overlap, but a queued delivery must only be attempted once at
+    /// a time by this coordinator.
+    notification_dispatch: tokio::sync::Mutex<()>,
     /// Notification backends, edited in the admin page. Shared with the
     /// dispatcher task, which re-reads them per alert rather than capturing a
     /// copy at boot.
@@ -549,6 +578,10 @@ struct Inner {
     /// at runtime; ingest reads it per batch, so it stays a cached map rather
     /// than a query.
     checks: parking_lot::RwLock<std::collections::HashMap<crate::models::CheckId, CheckMeta>>,
+    /// Complete, ordered check definitions for agent polls. The database remains
+    /// authoritative, but polling agents must not queue a database job merely
+    /// to rediscover this config snapshot.
+    check_catalogue: parking_lot::RwLock<Vec<CheckConfig>>,
     rollup_defaults: crate::config::RollupDefaults,
     rollup_policies:
         parking_lot::RwLock<std::collections::HashMap<String, crate::rollup::RollupPolicy>>,
@@ -746,13 +779,10 @@ impl Coordinator {
             .await?;
         let notifiers = Arc::new(parking_lot::RwLock::new(startup.notifiers));
 
-        // The dispatcher runs beside ingest, not inside it. Bounded so a wedged
-        // endpoint cannot grow an unbounded backlog in memory; overflow drops
-        // the notification rather than the results behind it.
-        //
-        // Spawned below, once `Self` exists: a failed send is persisted to the
-        // retry queue, so the dispatcher needs the store.
-        let (notify_tx, rx) = tokio::sync::mpsc::channel::<(alert::Transition, Vec<String>)>(1024);
+        // The channel is only a wake-up hint. Every delivery intention is in
+        // the transactional outbox before this is sent, so saturation cannot
+        // lose it; the periodic retry scan will pick up a missed wake-up.
+        let (notify_tx, rx) = tokio::sync::mpsc::channel::<()>(1024);
         let auth = crate::auth::Auth::with_signing_key(
             cfg.resolved_admin_password(),
             &startup.session_key,
@@ -837,6 +867,8 @@ impl Coordinator {
             inner: Arc::new(Inner {
                 database,
                 timings: Arc::new(Timings::new()),
+                alert_identity_conflicts: AtomicU64::new(0),
+                replication_raw_data_gaps: AtomicU64::new(0),
                 replication_out: replication_out::Outbox::default(),
                 tracker: Mutex::new(tracker),
                 state_write: tokio::sync::Mutex::new(()),
@@ -844,9 +876,11 @@ impl Coordinator {
                 intermediate_states: Mutex::new(std::collections::HashMap::new()),
                 retention: cfg.retention.clone(),
                 notify_tx,
+                notification_dispatch: tokio::sync::Mutex::new(()),
                 notifiers,
                 events,
                 checks: parking_lot::RwLock::new(meta_by_id(&startup.checks, cfg.rollup_defaults)),
+                check_catalogue: parking_lot::RwLock::new(startup.checks.clone()),
                 rollup_defaults: cfg.rollup_defaults,
                 rollup_policies: parking_lot::RwLock::new(rollup_policies),
                 seen: parking_lot::RwLock::new(
@@ -967,13 +1001,10 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Drain the alert channel, sending each transition to the notifiers the
-    /// check routed it to. A failure is persisted rather than logged and
-    /// forgotten: a 502 from Slack used to lose the page outright.
-    fn spawn_dispatcher(
-        &self,
-        mut rx: tokio::sync::mpsc::Receiver<(alert::Transition, Vec<String>)>,
-    ) {
+    /// Drain durable-outbox wake-ups. The database is the queue, not this
+    /// bounded channel, so a process crash or saturated wake-up channel leaves
+    /// the committed delivery intention available to the next scan.
+    fn spawn_dispatcher(&self, mut rx: tokio::sync::mpsc::Receiver<()>) {
         let coord = self.clone();
         tokio::spawn(async move {
             // A wedged peer must not pin this sweep (or the periodic task that
@@ -989,53 +1020,32 @@ impl Coordinator {
                     return;
                 }
             };
-            while let Some((t, routed_to)) = rx.recv().await {
-                // Cloned per alert: the list is edited at runtime, and a lock
-                // must not be held across the send.
-                let all = coord.inner.notifiers.read().clone();
-                let targets = crate::notify::targets(&all, &routed_to);
-                if targets.is_empty() {
-                    // Either nothing is marked default, or the check names
-                    // notifiers that no longer exist. Both are silent
-                    // otherwise, and both mean nobody was told. Deliberately
-                    // not queued: there is nobody for a retry to reach.
-                    warn!(
-                        check = %t.check_id,
-                        routed_to = ?routed_to,
-                        "alert matched no notifier"
-                    );
-                }
-                let name = coord.check_name(t.check_id);
-                for notifier in targets {
-                    if let Err(e) = crate::notify::send(&client, notifier, &t, &name).await {
-                        warn!(error = %e, check = %t.check_id, notifier = %notifier.name, "notification failed, queued for retry");
-                        coord.enqueue_retry(&notifier.name, &t, &e).await;
-                    }
-                }
+            while rx.recv().await.is_some() {
+                // `retry_due` scans the durable outbox and bounds concurrent
+                // sends, so one slow backend cannot head-of-line block others.
+                coord
+                    .retry_due_with_client(chrono::Utc::now().timestamp_millis(), &client)
+                    .await;
             }
         });
     }
 
-    /// Persist a failed notification for another attempt.
-    async fn enqueue_retry(&self, notifier: &str, t: &alert::Transition, error: &str) {
-        let now = chrono::Utc::now().timestamp_millis();
-        let row = storage::QueuedRow {
-            notifier: notifier.to_string(),
-            check_id: t.check_id,
-            previous_state: Some(t.from),
-            current_state: t.to,
-            attempts: 1,
-            next_attempt: Some(now + backoff_ms(1)),
-            last_error: error.to_string(),
-            queued_at: now,
-        };
-        if let Err(e) = self
-            .db(move |storage| storage.enqueue_notification(&row))
-            .await
-        {
-            // Nothing left to fall back to; say so rather than implying the
-            // retry exists.
-            tracing::error!(error = %e, check = %t.check_id, notifier = %notifier, "failed to queue notification for retry");
+    /// Hold notification delivery while an integration test fills the bounded
+    /// wake-up channel. The database outbox remains writable while held.
+    #[doc(hidden)]
+    pub async fn pause_notification_dispatch_for_test(&self) -> NotificationDispatchGuard<'_> {
+        NotificationDispatchGuard {
+            coordinator: self,
+            _guard: self.inner.notification_dispatch.lock().await,
+        }
+    }
+
+    /// Fill the lossy wake-up hint. This deliberately does not touch the
+    /// durable database outbox, letting integration tests exercise saturation.
+    #[doc(hidden)]
+    pub fn saturate_notification_wake_for_test(&self) {
+        for _ in 0..=1024 {
+            let _ = self.inner.notify_tx.try_send(());
         }
     }
 
@@ -1046,6 +1056,16 @@ impl Coordinator {
     /// takes one: a test must be able to reach the next attempt without waiting
     /// out the backoff.
     pub async fn retry_due(&self, now_millis: i64) -> usize {
+        self.retry_due_with_client(now_millis, &reqwest::Client::new())
+            .await
+    }
+
+    async fn retry_due_with_client(&self, now_millis: i64, client: &reqwest::Client) -> usize {
+        let _dispatch = self.inner.notification_dispatch.lock().await;
+        self.retry_due_unlocked(now_millis, client).await
+    }
+
+    async fn retry_due_unlocked(&self, now_millis: i64, client: &reqwest::Client) -> usize {
         let due = match self
             .db(move |storage| storage.due_notifications(now_millis, RETRY_BATCH))
             .await
@@ -1059,85 +1079,94 @@ impl Coordinator {
         if due.is_empty() {
             return 0;
         }
-        let client = reqwest::Client::new();
-        let mut delivered = 0;
-        for row in due {
-            // Resolved by name against the live list, so fixing a wrong URL in
-            // the admin page fixes the queued notifications too. A notifier that
-            // has been deleted drops them: there is nobody to page, and a row
-            // that can never succeed is not a retry, it is a leak.
-            let notifier = self
-                .inner
-                .notifiers
-                .read()
-                .iter()
-                .find(|n| n.name == row.notifier)
-                .cloned();
-            let Some(notifier) = notifier else {
-                warn!(
-                    check = %row.check_id,
-                    notifier = %row.notifier,
-                    "dropping a queued notification: its notifier no longer exists"
-                );
-                self.drop_queued(&row).await;
-                continue;
-            };
-            let t = alert::Transition {
-                check_id: row.check_id,
-                from: row.previous_state.unwrap_or(NodeState::Unknown),
-                to: row.current_state,
-            };
-            let name = self.check_name(t.check_id);
-            match crate::notify::send(&client, &notifier, &t, &name).await {
-                Ok(()) => {
-                    info!(
-                        check = %row.check_id,
-                        notifier = %row.notifier,
-                        attempts = row.attempts + 1,
-                        "queued notification delivered"
-                    );
-                    self.drop_queued(&row).await;
-                    delivered += 1;
-                }
-                Err(e) => {
-                    let attempts = row.attempts + 1;
-                    // Out of attempts: keep the row with no next attempt, which
-                    // is what the admin panel reads as "nobody was paged".
-                    let next = (attempts < MAX_DELIVERY_ATTEMPTS)
-                        .then(|| now_millis + backoff_ms(attempts));
-                    if next.is_none() {
-                        warn!(
-                            check = %row.check_id,
-                            notifier = %row.notifier,
-                            attempts,
-                            error = %e,
-                            "giving up on a notification; nobody was paged for this transition"
-                        );
-                    }
-                    let next_row = storage::QueuedRow {
-                        attempts,
-                        next_attempt: next,
-                        last_error: e,
-                        ..row
-                    };
-                    if let Err(e) = self
-                        .db(move |storage| storage.enqueue_notification(&next_row))
-                        .await
-                    {
-                        tracing::error!(error = %e, "failed to reschedule a notification");
-                    }
-                }
-            }
-        }
+        let delivered = stream::iter(due)
+            .map(|row| async move { self.deliver_queued(client, row, now_millis).await })
+            .buffer_unordered(16)
+            .filter_map(|delivered| async move { delivered.then_some(()) })
+            .count()
+            .await;
         delivered
     }
 
+    async fn deliver_queued(
+        &self,
+        client: &reqwest::Client,
+        row: storage::QueuedRow,
+        now_millis: i64,
+    ) -> bool {
+        // Resolved by name against the live list, so fixing a wrong URL in
+        // the admin page fixes the queued notifications too. A notifier that
+        // has been deleted drops them: there is nobody to page, and a row
+        // that can never succeed is not a retry, it is a leak.
+        let notifier = self
+            .inner
+            .notifiers
+            .read()
+            .iter()
+            .find(|n| n.name == row.notifier)
+            .cloned();
+        let Some(notifier) = notifier else {
+            warn!(
+                check = %row.check_id,
+                notifier = %row.notifier,
+                "dropping a queued notification: its notifier no longer exists"
+            );
+            self.drop_queued(&row).await;
+            return false;
+        };
+        let t = alert::Transition {
+            check_id: row.check_id,
+            from: row.previous_state.unwrap_or(NodeState::Unknown),
+            to: row.current_state,
+        };
+        let name = self.check_name(t.check_id);
+        match crate::notify::send(client, &notifier, &t, &name).await {
+            Ok(()) => {
+                info!(
+                    check = %row.check_id,
+                    notifier = %row.notifier,
+                    attempts = row.attempts + 1,
+                    "queued notification delivered"
+                );
+                self.drop_queued(&row).await;
+                return true;
+            }
+            Err(e) => {
+                let attempts = row.attempts + 1;
+                // Out of attempts: keep the row with no next attempt, which
+                // is what the admin panel reads as "nobody was paged".
+                let next =
+                    (attempts < MAX_DELIVERY_ATTEMPTS).then(|| now_millis + backoff_ms(attempts));
+                if next.is_none() {
+                    warn!(
+                        check = %row.check_id,
+                        notifier = %row.notifier,
+                        attempts,
+                        error = %e,
+                        "giving up on a notification; nobody was paged for this transition"
+                    );
+                }
+                let next_row = storage::QueuedRow {
+                    attempts,
+                    next_attempt: next,
+                    last_error: e,
+                    ..row
+                };
+                if let Err(e) = self
+                    .db(move |storage| storage.enqueue_notification(&next_row))
+                    .await
+                {
+                    tracing::error!(error = %e, "failed to reschedule a notification");
+                }
+            }
+        }
+        false
+    }
+
     async fn drop_queued(&self, row: &storage::QueuedRow) {
-        let notifier = row.notifier.clone();
-        let check_id = row.check_id;
-        let queued_at = row.queued_at;
+        let id = row.id.clone();
         if let Err(e) = self
-            .db(move |storage| storage.delete_notification(&notifier, check_id, queued_at))
+            .db(move |storage| storage.delete_notification(&id))
             .await
         {
             tracing::error!(error = %e, "failed to clear a delivered notification");
@@ -1578,6 +1607,7 @@ impl Coordinator {
     async fn reload_checks(&self) -> Result<Vec<CheckConfig>> {
         let stored = self.db(|storage| storage.list_checks()).await?;
         *self.inner.checks.write() = meta_by_id(&stored, self.inner.rollup_defaults);
+        *self.inner.check_catalogue.write() = stored.clone();
         Ok(stored)
     }
 
@@ -1646,10 +1676,12 @@ impl Coordinator {
             self.apply_config_entries(entries.to_vec()).await?;
         if !checks.is_empty() {
             let mut cached = self.inner.checks.write();
+            let mut catalogue = self.inner.check_catalogue.write();
             for entry in checks {
                 if entry.is_tombstone() {
                     if let Ok(id) = entry.id.parse() {
                         cached.remove(&id);
+                        catalogue.retain(|check| check.id != id);
                     }
                     continue;
                 }
@@ -1660,12 +1692,22 @@ impl Coordinator {
                 {
                     Some(check) => {
                         cached.insert(check.id, check_meta(&check, self.inner.rollup_defaults));
+                        if let Some(existing) = catalogue.iter_mut().find(|c| c.id == check.id) {
+                            *existing = check;
+                        } else {
+                            catalogue.push(check);
+                        }
                     }
                     None => {
                         warn!(id = %entry.id, "config: applied check has invalid metadata document")
                     }
                 }
             }
+            catalogue.sort_by(|a, b| {
+                a.position
+                    .cmp(&b.position)
+                    .then_with(|| a.name.cmp(&b.name))
+            });
         }
         if credentials {
             self.reload_credentials().await?;
@@ -1957,6 +1999,7 @@ impl Coordinator {
         alerts_days: u64,
         now_millis: i64,
     ) -> Result<u64> {
+        let started = Instant::now();
         let cutoff = now_millis - (results_days as i64) * 86_400_000;
         let mut removed = 0u64;
         if let Some(oldest) = self.db(|storage| storage.oldest_result_ts()).await? {
@@ -1977,6 +2020,11 @@ impl Coordinator {
         removed += self
             .db(move |storage| storage.prune_metadata(results_days, alerts_days, now_millis))
             .await?;
+        self.inner.database.observe_removed_logical_rows(removed);
+        self.inner.timings.prune_duration_us.fetch_add(
+            started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
         Ok(removed)
     }
 
@@ -2161,7 +2209,7 @@ impl Coordinator {
         ts: i64,
     ) -> anyhow::Result<Vec<storage::IncidentRow>> {
         let mut resolved = Vec::new();
-        for inc in store.list_incidents(1000, Some(true))? {
+        for inc in store.list_incidents(1000, Some(true), None)? {
             if inc.origin_check.is_some() && self.try_resolve(store, &inc, ts)? {
                 if let Some(row) = store.incident(&inc.id)? {
                     resolved.push(row);
@@ -2505,6 +2553,38 @@ impl Coordinator {
             });
         }
 
+        // Resolve targets before persistence, then put one row per intended
+        // backend in the same transaction as the alert. The outbox is durable
+        // before any wake-up or network I/O can occur.
+        let all_notifiers = self.inner.notifiers.read().clone();
+        let notification_outbox: Vec<_> = transitions
+            .iter()
+            .filter(|(t, _)| alert::should_alert(t))
+            .filter_map(|(t, ts)| {
+                let routed_to = self.notify_targets(t.check_id, t.to, *ts)?;
+                let targets = crate::notify::targets(&all_notifiers, &routed_to);
+                if targets.is_empty() {
+                    warn!(check = %t.check_id, routed_to = ?routed_to, "alert matched no notifier");
+                }
+                Some(
+                    targets
+                        .into_iter()
+                        .map(|notifier| storage::QueuedRow {
+                            id: uuid::Uuid::now_v7().to_string(),
+                            notifier: notifier.name.clone(),
+                            check_id: t.check_id,
+                            previous_state: Some(t.from),
+                            current_state: t.to,
+                            attempts: 0,
+                            next_attempt: Some(*ts),
+                            last_error: String::new(),
+                            queued_at: *ts,
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .flatten()
+            .collect();
         let rows_for_replication = rows.clone();
         let leaf_updates_for_replication = leaf_updates.clone();
         let transitions_for_publish = transitions.clone();
@@ -2691,6 +2771,9 @@ impl Coordinator {
                             Err(e) => return Err(e),
                         }
                     }
+                    for delivery in &notification_outbox {
+                        store.enqueue_notification(delivery)?;
+                    }
                     let mut seen_incidents = std::collections::HashSet::new();
                     for id in incident_for.values() {
                         if seen_incidents.insert(id.as_str()) {
@@ -2723,6 +2806,9 @@ impl Coordinator {
                     return;
                 }
             };
+        self.inner
+            .database
+            .observe_logical_rows(rows_for_replication.len() as u64);
         self.inner.tracker.lock().install_checks(staged, &check_ids);
         {
             let mut cache = self.inner.intermediate_states.lock();
@@ -2748,7 +2834,7 @@ impl Coordinator {
                         gossip::Message::new(
                             t,
                             *ts,
-                            alert.map(|alert| alert.id.clone()),
+                            alert.cloned(),
                             incident_for.get(&t.check_id).cloned(),
                         )
                     })
@@ -2807,16 +2893,9 @@ impl Coordinator {
                 to: t.to,
                 timestamp: ts,
             });
-            if let Some(routed_to) = self.notify_targets(t.check_id, t.to, ts) {
-                if self
-                    .inner
-                    .notify_tx
-                    .try_send((t.clone(), routed_to))
-                    .is_err()
-                {
-                    tracing::warn!(check = %t.check_id, "notification queue full, alert not dispatched");
-                }
-            }
+            // The outbox row was committed with the alert. A full wake-up
+            // channel is harmless: `spawn_retries` will scan it later.
+            let _ = self.inner.notify_tx.try_send(());
         }
         for event in incident_events {
             let _ = self.inner.events.send(event);
@@ -2866,10 +2945,12 @@ impl Coordinator {
     async fn apply_replicated_locked(&self, batch: ReplicationBatch) -> anyhow::Result<()> {
         let state_hold_started = Instant::now();
         let beliefs = batch.beliefs.clone();
+        let origin = batch.origin.clone();
         let persisted = self
             .db(move |store| {
                 store.transaction(|store| {
                     let mut incident_events = Vec::new();
+                    let mut alert_identity_conflicts = Vec::new();
                     let mut state_changes: Vec<(
                         crate::models::CheckId,
                         Option<NodeState>,
@@ -2915,16 +2996,11 @@ impl Coordinator {
                             // arrived in: the local event stands, and every
                             // other row here still applies.
                             //
-                            // Debug, not warn: anti-entropy re-offers the same
-                            // rows every sweep for as long as the two nodes
-                            // disagree, so a warning here is a repeating log
-                            // rather than an event. The divergence itself is
-                            // tracked as an alert-identity bug, not as a
-                            // replication failure.
-                            tracing::debug!(
-                                alert = %row.id,
-                                "replicate: alert id conflicts with a different local event, keeping the local one"
-                            );
+                            // Never overwrite immutable conflicting rows. Record
+                            // the committed conflict below, outside this
+                            // transaction, so failed batches do not inflate the
+                            // health signal.
+                            alert_identity_conflicts.push(row.id.clone());
                         }
                         let inserted = applied == storage::AlertApply::Inserted;
                         // Zone and region alerts are topology narratives only. They
@@ -2966,11 +3042,11 @@ impl Coordinator {
                         })
                         .collect();
                     store.update_agent_check_states_uncommitted(&leaves)?;
-                    Ok((incident_events, state_changes))
+                    Ok((incident_events, state_changes, alert_identity_conflicts))
                 })
             })
             .await;
-        let (incident_events, state_changes) = match persisted {
+        let (incident_events, state_changes, alert_identity_conflicts) = match persisted {
             Ok(value) => value,
             Err(error) => {
                 if self.inner.timings.enabled {
@@ -2984,6 +3060,26 @@ impl Coordinator {
                 return Err(error);
             }
         };
+        if !alert_identity_conflicts.is_empty() {
+            let count = alert_identity_conflicts.len() as u64;
+            let previous = self
+                .inner
+                .alert_identity_conflicts
+                .fetch_add(count, Ordering::Relaxed);
+            if previous == 0 {
+                warn!(
+                    origin = %origin,
+                    alerts = ?alert_identity_conflicts,
+                    "replicate: alert identity conflict detected; keeping immutable local rows"
+                );
+            } else {
+                tracing::debug!(
+                    origin = %origin,
+                    count,
+                    "replicate: alert identity conflicts persist; keeping immutable local rows"
+                );
+            }
+        }
         {
             // The failure count resets, same as `gossip_handler`: this node
             // is not mid-confirmation for something the observer already
@@ -3090,6 +3186,25 @@ impl Coordinator {
                 Err(_) => true,
             }
         });
+        for theirs in &their.checks {
+            let local_max_ts = our
+                .checks
+                .binary_search_by(|ours| ours.check_id.cmp(&theirs.check_id))
+                .ok()
+                .map(|i| our.checks[i].max_ts);
+            if local_max_ts.is_none_or(|max_ts| theirs.min_ts > max_ts) {
+                self.inner
+                    .replication_raw_data_gaps
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    peer,
+                    check_id = %theirs.check_id,
+                    peer_retained_min_ts = theirs.min_ts,
+                    ?local_max_ts,
+                    "anti-entropy: peer is behind the source raw-data retention horizon; backfill is incomplete"
+                );
+            }
+        }
         let stream_pages = [
             (&their.alerts, &our.alerts),
             (&their.incidents, &our.incidents),
@@ -3287,37 +3402,54 @@ impl Coordinator {
         peer: &str,
         kind: storage::ConfigKind,
     ) {
+        const CONFIG_PAGE: usize = 1_000;
         let url = cluster::Cluster::endpoint(peer, "/internal/config");
-        let mut req = client.get(&url).query(&[("kind", kind.as_str())]);
-        if let Some(t) = &self.inner.peer_token {
-            req = req.bearer_auth(t);
-        }
-        let batch: ConfigBatch = match req.send().await {
-            Ok(r) if r.status().is_success() => match r.json().await {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(%peer, kind = kind.as_str(), error = %e, "anti-entropy: malformed config response");
+        let mut after: Option<String> = None;
+        let mut total = 0;
+        loop {
+            let mut req = client.get(&url).query(&[
+                ("kind", kind.as_str().to_string()),
+                ("limit", CONFIG_PAGE.to_string()),
+                ("after", after.clone().unwrap_or_default()),
+            ]);
+            if let Some(t) = &self.inner.peer_token {
+                req = req.bearer_auth(t);
+            }
+            let batch: ConfigBatch = match req.send().await {
+                Ok(r) if r.status().is_success() => match r.json().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(%peer, kind = kind.as_str(), error = %e, "anti-entropy: malformed config response");
+                        return;
+                    }
+                },
+                Ok(r) => {
+                    tracing::warn!(%peer, kind = kind.as_str(), status = %r.status(), "anti-entropy: config request rejected");
                     return;
                 }
-            },
-            Ok(r) => {
-                tracing::warn!(%peer, kind = kind.as_str(), status = %r.status(), "anti-entropy: config request rejected");
+                Err(e) => {
+                    tracing::warn!(%peer, kind = kind.as_str(), error = %e, "anti-entropy: config request failed");
+                    return;
+                }
+            };
+            let n = batch.entries.len();
+            if n == 0 {
+                break;
+            }
+            after = batch.entries.iter().map(|entry| entry.id.clone()).max();
+            if let Err(e) = self.apply_config_batch(&batch.entries).await {
+                tracing::warn!(%peer, kind = kind.as_str(), error = %e, "anti-entropy: failed to apply config");
                 return;
             }
-            Err(e) => {
-                tracing::warn!(%peer, kind = kind.as_str(), error = %e, "anti-entropy: config request failed");
-                return;
+            total += n;
+            if n < CONFIG_PAGE {
+                break;
             }
-        };
-        if batch.entries.is_empty() {
-            return;
+            tokio::task::yield_now().await;
         }
-        let n = batch.entries.len();
-        if let Err(e) = self.apply_config_batch(&batch.entries).await {
-            tracing::warn!(%peer, kind = kind.as_str(), error = %e, "anti-entropy: failed to apply config");
-            return;
+        if total > 0 {
+            tracing::info!(%peer, kind = kind.as_str(), entries = total, "anti-entropy: config reconciled");
         }
-        tracing::info!(%peer, kind = kind.as_str(), entries = n, "anti-entropy: config reconciled");
     }
 
     async fn backfill_results(&self, client: &reqwest::Client, peer: &str, pages: &mut usize) {
@@ -3565,6 +3697,47 @@ impl Coordinator {
             .await
     }
 
+    /// Remove a check from this coordinator only. This must not go through the
+    /// config plane: an absent local placement is not a replicated deletion.
+    /// Raw results and their replication watermarks remain intact so replacing
+    /// the same id restores its history, while all local published-state caches
+    /// are cleared so an unplaced check cannot remain visible or influence a
+    /// later placement.
+    pub(in crate::coordinator) async fn unplace_check_local(
+        &self,
+        check_id: crate::models::CheckId,
+    ) -> Result<bool> {
+        let state_wait_started = Instant::now();
+        let _state_write = self.inner.state_write.lock().await;
+        if self.inner.timings.enabled {
+            self.inner.timings.local_state_wait.observe(
+                "state_write",
+                "unplace_wait",
+                state_wait_started.elapsed(),
+            );
+        }
+        let removed = self
+            .db(move |storage| storage.unplace_check_local(check_id))
+            .await?;
+        if !removed {
+            return Ok(false);
+        }
+        self.inner.checks.write().remove(&check_id);
+        self.inner
+            .check_catalogue
+            .write()
+            .retain(|check| check.id != check_id);
+        self.inner.tracker.lock().install_checks(
+            StateTracker::new(),
+            &std::collections::HashSet::from([check_id]),
+        );
+        self.inner
+            .intermediate_states
+            .lock()
+            .retain(|(id, _), _| *id != check_id);
+        Ok(true)
+    }
+
     /// Persist one check, through the config-replication path so a peer picks
     /// it up too, and refresh the cached metadata. Shared by create and
     /// update so both paths reload identically.
@@ -3598,6 +3771,10 @@ impl Coordinator {
     /// the same way the admin API would once a session existed. Returns the
     /// id it persisted under, which is always `check.id` — this never mints
     /// a fresh identity the way the unauthenticated create path does.
+    pub async fn prune_results_for_test(&self, before: i64) -> Result<u64> {
+        self.db(move |storage| storage.prune_results(before)).await
+    }
+
     pub async fn create_check_for_test(&self, check: CheckConfig) -> crate::models::CheckId {
         let id = check.id;
         self.save_check(check).await;
@@ -3652,7 +3829,7 @@ impl Coordinator {
         &self,
         limit: usize,
     ) -> Vec<crate::coordinator::storage::IncidentRow> {
-        self.db(move |storage| storage.list_incidents(limit, None))
+        self.db(move |storage| storage.list_incidents(limit, None, None))
             .await
             .unwrap_or_default()
     }
@@ -3676,11 +3853,76 @@ impl Coordinator {
         self.inner.seen.read().get(agent_id).map(|s| s.window_ms)
     }
 
+    /// Snapshot only atomic counters and file metadata; it never sends a query
+    /// to the single DuckDB worker and therefore cannot add a scan to ingestion.
+    pub fn metrics(&self) -> Vec<crate::openmetrics::MetricSample> {
+        let database = self.inner.database.metrics_snapshot();
+        vec![
+            crate::openmetrics::MetricSample::new(
+                "warden_database_queries_total",
+                vec![],
+                database.queries_total as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_database_query_errors_total",
+                vec![],
+                database.query_errors_total as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_database_query_duration_seconds_total",
+                vec![],
+                database.query_duration_us as f64 / 1_000_000.0,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_database_logical_rows",
+                vec![],
+                database.logical_rows as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_database_file_bytes",
+                vec![],
+                database.database_bytes as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_database_wal_bytes",
+                vec![],
+                database.wal_bytes as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_retention_prune_duration_seconds_total",
+                vec![],
+                self.inner.timings.prune_duration_us.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_replication_alert_identity_conflicts_total",
+                vec![],
+                self.inner.alert_identity_conflicts.load(Ordering::Relaxed) as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_replication_raw_data_gaps_total",
+                vec![],
+                self.inner.replication_raw_data_gaps.load(Ordering::Relaxed) as f64,
+            ),
+        ]
+    }
+
     pub fn router(self) -> Router {
         Router::new()
             .route(
                 "/api/v1/results",
                 post(ingest_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+            )
+            .route(
+                "/metrics",
+                get(|State(coord): State<Coordinator>| async move {
+                    (
+                        [(
+                            header::CONTENT_TYPE,
+                            "application/openmetrics-text; version=1.0.0; charset=utf-8",
+                        )],
+                        crate::openmetrics::render(&coord.metrics()),
+                    )
+                }),
             )
             .route("/api/v1/status", get(status_handler))
             .route("/api/v1/checks/:id/history", get(history_handler))
@@ -3766,6 +4008,12 @@ impl Coordinator {
             .route(
                 "/api/v1/admin/checks/:id/everything",
                 delete(purge_check_everything_handler),
+            )
+            // Unplacing is regional: it removes only this coordinator's
+            // definition and derived state, never a replicated config tombstone.
+            .route(
+                "/api/v1/admin/checks/:id/unplace",
+                delete(unplace_check_handler),
             )
             // Ordering is its own route, ahead of the `:id` route so "order"
             // is never taken for a check id. Reordering is a bulk operation
@@ -4159,11 +4407,99 @@ mod tests {
         assert_eq!(left.len(), 7, "the retention window itself survives");
         // Idempotent: a second run has nothing left to take.
         assert_eq!(coord.prune_in_slices(7, 90, now).await.unwrap(), 0);
+        let metrics = coord.metrics();
+        assert_eq!(
+            crate::openmetrics::select(&metrics, "warden_database_logical_rows", &[])
+                .unwrap()
+                .value,
+            0.0
+        );
+        assert!(
+            crate::openmetrics::select(
+                &metrics,
+                "warden_retention_prune_duration_seconds_total",
+                &[]
+            )
+            .unwrap()
+            .value
+                > 0.0
+        );
+    }
+
+    #[tokio::test]
+    async fn replicated_alert_identity_conflicts_are_visible_in_metrics() {
+        let coord = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let check_id = crate::models::new_check_id().to_string();
+        let alert = |current_state| ReplicatedAlert {
+            id: "shared-alert-id".into(),
+            scope: "check".into(),
+            node_id: check_id.clone(),
+            previous_state: Some(NodeState::Up),
+            current_state,
+            timestamp: 1_000,
+            incident_id: None,
+        };
+        coord
+            .apply_replicated(ReplicationBatch {
+                origin: "first-peer".into(),
+                alerts: vec![alert(NodeState::Down)],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        coord
+            .apply_replicated(ReplicationBatch {
+                origin: "conflicting-peer".into(),
+                alerts: vec![alert(NodeState::Degraded)],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            crate::openmetrics::select(
+                &coord.metrics(),
+                "warden_replication_alert_identity_conflicts_total",
+                &[]
+            )
+            .unwrap()
+            .value,
+            1.0
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_snapshot_does_not_enqueue_database_work() {
+        let coord = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let before = coord.metrics();
+        let rendered = crate::openmetrics::render(&before);
+        let after = crate::openmetrics::parse(&rendered).unwrap();
+        assert_eq!(
+            crate::openmetrics::select(&before, "warden_database_queries_total", &[])
+                .unwrap()
+                .value,
+            crate::openmetrics::select(&after, "warden_database_queries_total", &[])
+                .unwrap()
+                .value,
+        );
     }
     use super::{incident_title, region_change_narrative, Coordinator};
     use crate::{
         config::{CheckConfig, CoordinatorConfig, GlobalConfig},
-        coordinator::storage::{AffectSource, IncidentCheckRow, IncidentState},
+        coordinator::{
+            routes::peer::{ReplicatedAlert, ReplicationBatch},
+            storage::{AffectSource, IncidentCheckRow, IncidentState},
+        },
         global::GlobalNode,
         models::{CheckKind, CheckResult, NodeState},
     };
@@ -4267,6 +4603,9 @@ mod tests {
         let checks = coord.inner.checks.read();
         assert!(!checks.contains_key(&first.id));
         assert_eq!(checks.get(&second.id).unwrap().name, "second");
+        let catalogue = coord.inner.check_catalogue.read();
+        assert_eq!(catalogue.len(), 1);
+        assert_eq!(catalogue[0].id, second.id);
     }
 
     #[tokio::test]

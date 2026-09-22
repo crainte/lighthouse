@@ -93,7 +93,7 @@
         </span>
 
         <span class="ot-right">
-          {#if i.state === 'detected'}
+          {#if i.state === 'detected' && !i.acknowledged}
             <button class="btn" onclick={() => onAck(i)}>Ack</button>
           {/if}
           <button class="btn" onclick={() => onEdit(i)}>Edit</button>

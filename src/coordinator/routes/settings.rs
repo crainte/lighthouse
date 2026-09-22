@@ -179,7 +179,10 @@ async fn notifiers_response(coord: &Coordinator) -> Response {
         })
         .collect();
     Json(NotifiersResponse {
-        notifiers,
+        notifiers: notifiers
+            .iter()
+            .map(crate::notify::Notifier::redacted)
+            .collect(),
         unrouted_checks: unrouted,
         undelivered,
     })
@@ -209,10 +212,21 @@ pub(in crate::coordinator) async fn update_notifiers_handler(
     if let Some(denied) = require_admin(&coord, &headers) {
         return denied;
     }
+    let existing: std::collections::HashMap<_, _> = coord
+        .inner
+        .notifiers
+        .read()
+        .iter()
+        .map(|notifier| (notifier.name.clone(), notifier.clone()))
+        .collect();
     let next: Vec<crate::notify::Notifier> = body
         .notifiers
         .into_iter()
         .map(crate::notify::Notifier::sanitized)
+        .map(|notifier| {
+            let previous = existing.get(&notifier.name);
+            notifier.preserve_redacted_secrets(previous)
+        })
         .collect();
     let mut names = std::collections::HashSet::new();
     for n in &next {

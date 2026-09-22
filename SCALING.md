@@ -106,6 +106,32 @@ New result/state/config data is generally sent incrementally, and anti-entropy c
 - Anti-entropy computes broad raw-history digests instead of maintaining incremental stream metadata.
 - There is no transport compression.
 
+### Alert identity conflict health and safe repair
+
+`warden_replication_alert_identity_conflicts_total` is a per-process counter of
+replicated alert IDs whose immutable payload differs from an existing local row.
+It is intentionally a health alarm, not a reconciliation mechanism: the
+coordinator retains the local row and continues applying the rest of the batch.
+A non-zero value means legacy divergent alert rows remain and should be alerted
+on; a rising value after a restart or deploy means the divergence is still being
+replayed. The first observed conflict is logged at warning level with the peer
+origin and alert IDs; repeated observations are debug logs to avoid an
+anti-entropy log storm.
+
+Repair only in a maintenance window, after preserving evidence. First stop or
+quiesce replication writers, record the conflicting IDs, peer origins, and both
+rows from each affected replica, and take verified checkpointed backups. Decide
+the canonical event from the original transition evidence (state history,
+incident linkage, and source coordinator logs); do not choose by arrival order.
+Then apply the chosen correction consistently to every replica while replication
+is stopped, preserving the alert ID only when the canonical event is known.
+Restart replication, let anti-entropy run, and verify that alert payloads agree
+on all peers and that the counter no longer increases. If the canonical event
+cannot be established, preserve both source records in the incident evidence,
+remove neither automatically, and restore/rebuild the affected replica from a
+verified canonical snapshot before rejoining it. Never delete or overwrite an
+immutable conflicting row merely to make the metric disappear.
+
 Required changes:
 
 - Fan out to peers concurrently with a bounded deadline.
@@ -842,6 +868,109 @@ the region entitled to it.
   with a literal `${...}` or quietly go idle. Recommended: the check reads as a
   configuration error naming the missing reference, in the same spirit as
   `missing_token_error`.
+
+## Production security and recovery boundaries
+
+This section records required deployment semantics and operator procedures. It
+is not an implementation claim: the controls and recovery automation described
+below remain production-readiness work unless the running deployment provides
+and tests them.
+
+### SSL expiry probes and TLS validation
+
+An SSL certificate-expiry probe obtains the peer certificate and reports its
+validity dates. It intentionally does **not** establish that the presented
+certificate chains to a trusted issuer or that its names match the configured
+host. Consequently, an expiry result answers only whether the observed
+certificate is near expiry; it must not be interpreted as an HTTPS trust or
+hostname-validity result. Redirects, proxies, SNI selection, and load balancer
+certificate choice must be made explicit in the probe configuration and test
+plan so operators know which peer certificate is being observed.
+
+If certificate trust and hostname validity become probe outcomes, report them
+as separate failure classes from expiry: `expired`/`expiring`, `untrusted
+chain`, and `hostname mismatch`. Do not fold an untrusted or mismatched
+certificate into an expiry failure, and do not turn the expiry probe's current
+non-validating collection path into a claim that a target is secure. The
+per-check `allow_self_signed` behavior is unresolved, so no deployment should
+rely on that option until its HTTP-client semantics and tests are implemented
+or the option is removed.
+
+### Network authority, ingress, and credentials
+
+A monitor target and a notifier webhook deliberately grant the service
+server-side network authority. An administrator who can create or modify either
+can direct probes or notifications at internal addresses, cloud metadata
+endpoints, control-plane services, or external destinations. Treat admin access
+as network-level privilege, not merely UI configuration access; restrict it to
+trusted operators, use least-privilege service identities, and audit changes to
+targets, webhooks, and credential references.
+
+For multi-tenant or hostile-input deployments, enforce egress outside the
+application until an application policy exists: deny private, loopback,
+link-local, multicast, and metadata ranges by default; constrain DNS resolution
+and rebinding; allow only approved destination CIDRs/hostnames and ports; and
+separate monitor/notifier egress from database, peer, and management networks.
+Firewall, network-policy, proxy, or dedicated egress-gateway controls should
+also bound outbound DNS, HTTP(S), SMTP, and webhook traffic. These mitigations
+are not presently represented as a complete in-application SSRF policy.
+
+Terminate public TLS at a managed ingress or reverse proxy, or configure TLS on
+the service directly. Redirect HTTP to HTTPS, protect cookies and bearer tokens
+in transit, validate the public certificate and hostname, and restrict direct
+backend listener access to the trusted proxy/network. Do not enable forwarded
+protocol, host, or client-address headers unless the immediate proxy is
+explicitly trusted and strips client-supplied copies.
+
+Until explicit trusted-proxy support exists, login rate limiting keys on the raw
+socket peer address. Behind a reverse proxy this intentionally produces a shared
+bucket for all users of that proxy; do not trust `X-Forwarded-For` as a workaround.
+Size that shared bucket and place edge rate limiting at the proxy, or deploy
+without a proxy where distinct source-IP buckets are required. When trusted
+proxy support is added, configure exact proxy CIDRs, accept forwarded client
+addresses only from those peers, and test spoofed-header rejection.
+
+Credential references keep values out of replicated check documents, but they
+do not eliminate rotation work. Rotate admin, peer, global, agent, SMTP, and
+webhook credentials with an overlap plan: provision the replacement in every
+consumer and region, reload or restart only the affected consumers, verify new
+requests authenticate, revoke the old value, and audit for failed or stale
+clients. Never place values in check documents, replication payloads, admin
+read responses, logs, backups with broad access, or screenshots. Rehearse this
+procedure before relying on it during an incident.
+
+### Checkpointed DuckDB backup, restore, and peer recovery
+
+A safe offline backup is a consistent copy made only after writes are stopped
+or the database is otherwise closed to this process, the DuckDB checkpoint has
+completed successfully, and the database and any required sidecar state are
+copied as one backup generation. Do not copy a live database file and call it a
+backup. Write the copy to separate durable storage, record version, timestamp,
+source node, file size, checksum, retention tier, and restore instructions, and
+verify its checksum after transfer. Resume service only after the checkpoint and
+copy complete; a planned maintenance window or a replica-specific offline
+backup avoids silently racing active writes.
+
+Restore into a fresh, isolated directory or replacement node rather than over a
+live database. Keep the original database untouched until the restored process
+opens it cleanly, required schema/data checks pass, known current states and
+history samples agree, and the service can ingest and query normally. Verify a
+backup on a recurring schedule with an actual restore, not only a successful
+file copy. The target schedule is 7 daily, 4 weekly, and 12 monthly snapshots;
+apply immutable/off-site storage and access controls appropriate to the loss
+scenario. This schedule is operator-managed, not a built-in scheduler.
+
+A peer that has been offline longer than raw-result retention cannot obtain a
+complete raw history through normal anti-entropy. Recovery must choose and
+record one of two explicit outcomes: restore a verified snapshot sufficiently
+recent to rejoin through retained replication history, or rejoin with a marked
+raw-data gap while retaining/repairing current state and state-transition data.
+Before returning the peer to service, verify database integrity/openability,
+backup checksum, schema compatibility, replication cursor/manifest position,
+current-state convergence, expected raw-retention boundary or declared gap,
+and ingest/query health. Do not reduce raw retention or advertise peer recovery
+as supported until this path has been exercised under the configured retention
+policy.
 
 ## Scaling milestones
 

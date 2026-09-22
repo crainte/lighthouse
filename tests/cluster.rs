@@ -787,6 +787,43 @@ async fn a_late_joiner_backfills_history_via_digest_and_backfill() {
 }
 
 #[tokio::test]
+async fn anti_entropy_signals_peer_behind_raw_retention() {
+    let a = spawn_node("a", vec![], NO_TIMEOUT).await;
+    a.coord
+        .ingest(vec![result(200, 1_000), result(200, 2_000)])
+        .await;
+    a.coord.prune_results_for_test(2_000).await.unwrap();
+
+    let retained = digest(a.addr).await;
+    let check = retained["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["check_id"] == cid_str(CHECK))
+        .unwrap();
+    assert_eq!(check["min_ts"], 2_000);
+    assert_eq!(check["max_ts"], 2_000);
+
+    let b = spawn_node("b", vec![], NO_TIMEOUT).await;
+    let session_a = login(a.addr).await;
+    gossip_step(a.addr, &session_a, b.addr).await;
+    b.coord.anti_entropy_sweep().await;
+
+    assert_eq!(history(b.addr, &cid_str(CHECK)).await.len(), 1);
+    assert_eq!(
+        warden::openmetrics::select(
+            &b.coord.metrics(),
+            "warden_replication_raw_data_gaps_total",
+            &[]
+        )
+        .unwrap()
+        .value,
+        1.0,
+        "the signal must state that receiving the retained page did not complete backfill"
+    );
+}
+
+#[tokio::test]
 async fn anti_entropy_repairs_a_historical_result_hole_below_local_high_water() {
     let a = spawn_node("a", vec![], NO_TIMEOUT).await;
     a.coord

@@ -25,6 +25,9 @@
   let results = $state<ProbeResult[]>([]);
   let loading = $state(true);
   let loadError = $state<string | null>(null);
+  // A filter request can finish after a later one. Only the newest request may
+  // update the view (including its loading/error state).
+  let latestLoad = 0;
 
   // Server-side filters: a change to any of these re-fetches. `check` is a
   // check id \u2014 the server rejects anything that does not parse as one.
@@ -47,10 +50,11 @@
   /** Fetch with the current server-side filters. Called on mount and whenever a
    *  server-side filter changes; typing in `query` does NOT call this. */
   async function load() {
+    const request = ++latestLoad;
     loading = true;
     loadError = null;
     try {
-      results = await fetchProbeResults({
+      const nextResults = await fetchProbeResults({
         check: check || undefined,
         agent: agent || undefined,
         status: status || undefined,
@@ -58,14 +62,16 @@
         zone: zone || undefined,
         limit,
       });
+      if (request === latestLoad) results = nextResults;
     } catch (e) {
+      if (request !== latestLoad) return;
       if (e instanceof AdminError && e.unauthorized) {
         onexpired();
         return;
       }
       loadError = e instanceof Error ? e.message : String(e);
     } finally {
-      loading = false;
+      if (request === latestLoad) loading = false;
     }
   }
 

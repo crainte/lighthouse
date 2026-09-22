@@ -59,7 +59,22 @@ pub(in crate::coordinator) async fn gossip_handler(
     let persisted = t.clone();
     let timestamp = msg.timestamp;
     let alert_id = msg.alert_id;
+    let canonical_alert = msg.alert;
     let message_incident = msg.incident_id;
+    if let Some(alert) = &canonical_alert {
+        let agrees = alert_id.as_deref() == Some(alert.id.as_str())
+            && alert.scope == storage::AlertScope::Check.as_str()
+            && alert.node_id == persisted.check_id.to_string()
+            && alert.previous_state == Some(persisted.from)
+            && alert.current_state == persisted.to
+            && alert.timestamp == timestamp;
+        if !agrees {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "gossip alert does not match its transition",
+            );
+        }
+    }
     let inserted = match coord
         .db(move |store| {
             store.transaction(|store| {
@@ -78,7 +93,14 @@ pub(in crate::coordinator) async fn gossip_handler(
                         .open_incident_for(persisted.check_id)?
                         .map(|incident| incident.id),
                 };
-                let inserted = if let Some(id) = alert_id {
+                let inserted = if let Some(row) = canonical_alert {
+                    let id = row.id.clone();
+                    let applied = store.upsert_alert(&row.into_row())?;
+                    if applied == storage::AlertApply::Conflict {
+                        tracing::warn!(alert = %id, "gossip: alert id conflicts with a different local event, keeping the local one");
+                    }
+                    applied == storage::AlertApply::Inserted
+                } else if let Some(id) = alert_id {
                     let applied = store.upsert_alert(&storage::AlertRow {
                         id: id.clone(),
                         scope: storage::AlertScope::Check,
@@ -178,7 +200,7 @@ pub struct ReplicatedBelief {
 /// being owned by a different concern, and `AlertScope` travels as its
 /// string form so this type does not need `storage` to grow a derive it
 /// otherwise has no use for.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicatedAlert {
     pub id: String,
     pub scope: String,
@@ -385,6 +407,7 @@ impl From<&storage::StreamDigest> for StreamDigestDto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckDigestDto {
     pub check_id: String,
+    pub min_ts: i64,
     pub max_ts: i64,
     pub count: i64,
 }
@@ -393,6 +416,7 @@ impl From<&storage::CheckDigest> for CheckDigestDto {
     fn from(d: &storage::CheckDigest) -> Self {
         CheckDigestDto {
             check_id: d.check_id.to_string(),
+            min_ts: d.min_ts,
             max_ts: d.max_ts,
             count: d.count,
         }
@@ -451,22 +475,27 @@ pub(in crate::coordinator) async fn digest_handler(
     }
 }
 
-/// Which config kind a reconciler is asking for. Absent means every kind,
-/// which is what a node rejoining after a long absence wants.
+/// Config kind to reconcile. Pagination is scoped to one kind.
 #[derive(Debug, Deserialize)]
 pub(in crate::coordinator) struct ConfigEntriesQuery {
     kind: Option<storage::ConfigKind>,
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default = "default_config_entries_limit")]
+    limit: usize,
 }
 
-/// `GET /internal/config`: every config entry of a kind, tombstones included,
-/// as the pull half of the config plane. The POST on this path is the push
-/// half; this is what a peer calls when a digest tells it the push never
-/// arrived.
-///
-/// Unpaged, unlike `/internal/backfill`. Config is bounded by how many checks
-/// an operator has written, not by how long the cluster has been running, so
-/// there is no growth here for a cursor to protect against — and a partial
-/// config is worse than a slow one.
+const CONFIG_ENTRIES_PAGE: usize = 1_000;
+
+fn default_config_entries_limit() -> usize {
+    CONFIG_ENTRIES_PAGE
+}
+
+/// `GET /internal/config`: one bounded page of config entries, tombstones
+/// included, as the pull half of the config plane. Check documents are
+/// projected directly from storage instead of issuing a read per id. The POST
+/// on this path is the push half; this is what a peer calls when a digest tells
+/// it the push never arrived.
 pub(in crate::coordinator) async fn config_entries_handler(
     State(coord): State<Coordinator>,
     headers: HeaderMap,
@@ -475,18 +504,13 @@ pub(in crate::coordinator) async fn config_entries_handler(
     if let Some(denied) = require_peer(&coord, &headers) {
         return denied;
     }
-    let kinds: Vec<storage::ConfigKind> = match q.kind {
-        Some(k) => vec![k],
-        None => storage::ConfigKind::ALL.to_vec(),
+    let Some(kind) = q.kind else {
+        return error_response(StatusCode::BAD_REQUEST, "config kind is required");
     };
+    let limit = q.limit.clamp(1, CONFIG_ENTRIES_PAGE);
+    let after = q.after;
     let entries = match coord
-        .db(move |storage| {
-            let mut out = Vec::new();
-            for kind in kinds {
-                out.append(&mut storage.config_entries(kind)?);
-            }
-            Ok(out)
-        })
+        .db(move |storage| storage.config_entries_page(kind, after.as_deref(), limit))
         .await
     {
         Ok(entries) => entries,

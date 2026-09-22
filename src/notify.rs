@@ -50,6 +50,18 @@ fn is_http(url: &str) -> bool {
     url.starts_with("http://") || url.starts_with("https://")
 }
 
+/// Value sent to admin clients for a configured secret. Sending it back on an
+/// update means "leave the stored value alone", not "replace it with stars".
+pub const REDACTED_SECRET: &str = "********";
+
+fn redacted_secret(value: &str) -> String {
+    if value.is_empty() {
+        String::new()
+    } else {
+        REDACTED_SECRET.into()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum NotifierKind {
@@ -147,6 +159,68 @@ impl Notifier {
             },
             default: self.default,
         }
+    }
+
+    /// Copy this notifier without exposing credentials through an admin read.
+    pub fn redacted(&self) -> Self {
+        let mut redacted = self.clone();
+        redacted.kind = match &self.kind {
+            NotifierKind::Webhook { url } => NotifierKind::Webhook {
+                url: redacted_secret(url),
+            },
+            NotifierKind::Ntfy { topic, base_url } => NotifierKind::Ntfy {
+                topic: topic.clone(),
+                base_url: base_url.as_deref().map(redacted_secret),
+            },
+            NotifierKind::Slack { webhook_url } => NotifierKind::Slack {
+                webhook_url: redacted_secret(webhook_url),
+            },
+            NotifierKind::Pagerduty { routing_key } => NotifierKind::Pagerduty {
+                routing_key: redacted_secret(routing_key),
+            },
+            NotifierKind::Email(m) => NotifierKind::Email(MailConfig {
+                password: m.password.as_deref().map(redacted_secret),
+                ..m.clone()
+            }),
+        };
+        redacted
+    }
+
+    /// Retain a secret that an admin client received as a redacted placeholder.
+    /// A different notifier kind cannot inherit credentials just because it has
+    /// the same routing name.
+    pub fn preserve_redacted_secrets(mut self, existing: Option<&Self>) -> Self {
+        let Some(existing) = existing else {
+            return self;
+        };
+        match (&mut self.kind, &existing.kind) {
+            (NotifierKind::Webhook { url }, NotifierKind::Webhook { url: old })
+                if url == REDACTED_SECRET =>
+            {
+                *url = old.clone()
+            }
+            (NotifierKind::Ntfy { base_url, .. }, NotifierKind::Ntfy { base_url: old, .. })
+                if base_url.as_deref() == Some(REDACTED_SECRET) =>
+            {
+                *base_url = old.clone()
+            }
+            (NotifierKind::Slack { webhook_url }, NotifierKind::Slack { webhook_url: old })
+                if webhook_url == REDACTED_SECRET =>
+            {
+                *webhook_url = old.clone()
+            }
+            (
+                NotifierKind::Pagerduty { routing_key },
+                NotifierKind::Pagerduty { routing_key: old },
+            ) if routing_key == REDACTED_SECRET => *routing_key = old.clone(),
+            (NotifierKind::Email(mail), NotifierKind::Email(old))
+                if mail.password.as_deref() == Some(REDACTED_SECRET) =>
+            {
+                mail.password = old.password.clone();
+            }
+            _ => {}
+        }
+        self
     }
 
     /// Rejections are read in the notifier form, so they say what to fix.
@@ -580,6 +654,84 @@ mod tests {
         assert_eq!(m.password, None);
         assert_eq!(m.from, "warden@example.com");
         n.validate().unwrap();
+    }
+
+    #[test]
+    fn redaction_hides_notifier_secrets_and_a_placeholder_preserves_them() {
+        let cases = [
+            (
+                webhook("hook", "https://example.com/secret"),
+                webhook("hook", "https://example.com/replaced"),
+            ),
+            (
+                Notifier {
+                    name: "slack".into(),
+                    kind: NotifierKind::Slack {
+                        webhook_url: "https://hooks.example.com/secret".into(),
+                    },
+                    default: true,
+                },
+                Notifier {
+                    name: "slack".into(),
+                    kind: NotifierKind::Slack {
+                        webhook_url: "https://hooks.example.com/replaced".into(),
+                    },
+                    default: true,
+                },
+            ),
+            (
+                Notifier {
+                    name: "pager".into(),
+                    kind: NotifierKind::Pagerduty {
+                        routing_key: "secret-key".into(),
+                    },
+                    default: true,
+                },
+                Notifier {
+                    name: "pager".into(),
+                    kind: NotifierKind::Pagerduty {
+                        routing_key: "replacement-key".into(),
+                    },
+                    default: true,
+                },
+            ),
+        ];
+        for (stored, replacement) in cases {
+            let redacted = stored.redacted();
+            assert!(
+                !serde_json::to_string(&redacted).unwrap().contains("secret"),
+                "admin reads must not disclose a secret"
+            );
+            assert_eq!(
+                redacted.preserve_redacted_secrets(Some(&stored)),
+                stored,
+                "the redacted value means unchanged"
+            );
+            assert_eq!(
+                replacement.clone().preserve_redacted_secrets(Some(&stored)),
+                replacement,
+                "a non-placeholder explicitly replaces the secret"
+            );
+        }
+
+        let stored = Notifier {
+            name: "mail".into(),
+            kind: NotifierKind::Email(MailConfig {
+                host: "smtp.example.com".into(),
+                port: None,
+                username: Some("warden".into()),
+                password: Some("smtp secret".into()),
+                from: "warden@example.com".into(),
+                to: "ops@example.com".into(),
+                tls: MailTls::Starttls,
+            }),
+            default: true,
+        };
+        let redacted = stored.redacted();
+        assert!(!serde_json::to_string(&redacted)
+            .unwrap()
+            .contains("smtp secret"));
+        assert_eq!(redacted.preserve_redacted_secrets(Some(&stored)), stored);
     }
 
     /// A notifier written before routing existed has neither a name nor a

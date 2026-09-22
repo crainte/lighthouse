@@ -34,7 +34,14 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize)]
 struct StatusResponse {
+    /// The requested, bounded page of visible checks. Chart endpoints accept the
+    /// same scope/page/limit tuple and therefore return series for precisely
+    /// these rows rather than an unbounded superset.
     checks: Vec<CheckStatusDto>,
+    page: usize,
+    limit: usize,
+    total_checks: usize,
+    has_more: bool,
     /// Fleet liveness, aggregated. Public on purpose, and aggregated for the
     /// same reason `/api/v1/agents` is not: a region row says whether
     /// monitoring is healthy without publishing the agent ids, zones and
@@ -193,6 +200,15 @@ impl AlertDto {
     }
 }
 
+/// Largest page accepted by public list routes. This keeps a malformed or
+/// intentionally huge `limit` from turning a status-page request into an
+/// unbounded database read.
+const MAX_LIST_PAGE_SIZE: usize = 1_000;
+
+fn bounded_page_size(requested: Option<usize>, default: usize) -> usize {
+    requested.unwrap_or(default).min(MAX_LIST_PAGE_SIZE)
+}
+
 #[derive(Deserialize)]
 pub(in crate::coordinator) struct LimitQuery {
     limit: Option<usize>,
@@ -218,6 +234,15 @@ pub(in crate::coordinator) struct ResultsQuery {
 }
 
 #[derive(Deserialize)]
+pub(in crate::coordinator) struct StatusQuery {
+    /// A named section, or omitted for the primary page (loose + inline checks).
+    section: Option<String>,
+    /// Zero-based page within the selected scope.
+    page: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
 pub(in crate::coordinator) struct DaysQuery {
     days: Option<usize>,
     /// How many segments to split the window into; the strip keeps a constant
@@ -225,6 +250,9 @@ pub(in crate::coordinator) struct DaysQuery {
     buckets: Option<usize>,
     /// Scope the request to one section. See [`in_scope`].
     section: Option<String>,
+    /// Must match the status request's bounded page.
+    page: Option<usize>,
+    limit: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -342,6 +370,9 @@ pub(in crate::coordinator) struct HoursQuery {
     to: Option<i64>,
     /// Scope the request to one section. See [`in_scope`].
     section: Option<String>,
+    /// Must match the status request's bounded page.
+    page: Option<usize>,
+    limit: Option<usize>,
 }
 
 /// Whether a check belongs in a chart request scoped to `scope`.
@@ -367,11 +398,22 @@ fn in_scope(sections: &[storage::Section], scope: Option<&str>, group: Option<&s
     }
 }
 
+fn page_slice<T>(items: &mut Vec<T>, page: usize, limit: usize) -> (usize, bool) {
+    let total = items.len();
+    let start = page.saturating_mul(limit).min(total);
+    let end = start.saturating_add(limit).min(total);
+    let has_more = end < total;
+    items.drain(..start);
+    items.truncate(end - start);
+    (total, has_more)
+}
+
 // ---- Handlers ----
 
 pub(in crate::coordinator) async fn status_handler(
     State(coord): State<Coordinator>,
     headers: HeaderMap,
+    Query(q): Query<StatusQuery>,
 ) -> Response {
     let now = chrono::Utc::now().timestamp_millis();
     // The status page is public; raw probe errors name resolved addresses and
@@ -455,9 +497,28 @@ pub(in crate::coordinator) async fn status_handler(
                 .collect();
             checks.extend(pending);
             let sections = section_rollups(&coord, &checks);
+            let scope = q.section;
+            let (page, limit) = (q.page.unwrap_or(0), bounded_page_size(q.limit, 100));
+            let section_rows = match coord.db(|storage| storage.list_sections()).await {
+                Ok(sections) => sections,
+                Err(e) => return internal_error(e),
+            };
+            checks
+                .retain(|check| in_scope(&section_rows, scope.as_deref(), check.group.as_deref()));
+            checks.sort_by(|a, b| {
+                a.position
+                    .cmp(&b.position)
+                    .then_with(|| a.name.cmp(&b.name))
+                    .then_with(|| a.check_id.cmp(&b.check_id))
+            });
+            let (total_checks, has_more) = page_slice(&mut checks, page, limit);
             let agents = fleet_health(&coord, now).await;
             Json(StatusResponse {
                 checks,
+                page,
+                limit,
+                total_checks,
+                has_more,
                 agents,
                 maintenance: announced_maintenance(&coord, now),
                 sections,
@@ -514,7 +575,7 @@ pub(in crate::coordinator) async fn history_handler(
     Query(q): Query<LimitQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let limit = q.limit.unwrap_or(100).min(1000);
+    let limit = bounded_page_size(q.limit, 100);
     // An unrecognised value filters nothing rather than silently returning empty.
     let status = q.status.as_deref().and_then(|s| match s {
         "up" => Some(Status::Up),
@@ -562,7 +623,7 @@ pub(in crate::coordinator) async fn results_handler(
     if let Some(rejection) = require_admin(&coord, &headers) {
         return rejection;
     }
-    let limit = q.limit.unwrap_or(200).min(1000);
+    let limit = bounded_page_size(q.limit, 200);
     // An unrecognised value filters nothing rather than silently returning empty.
     let status = q.status.as_deref().and_then(|s| match s {
         "up" => Some(Status::Up),
@@ -573,7 +634,7 @@ pub(in crate::coordinator) async fn results_handler(
     let check_id = match q.check.as_deref().map(|s| s.parse::<CheckId>()) {
         Some(Ok(id)) => Some(id),
         Some(Err(_)) => {
-            return error_response(StatusCode::BAD_REQUEST, "check must be a valid check id")
+            return error_response(StatusCode::BAD_REQUEST, "check must be a valid check id");
         }
         None => None,
     };
@@ -773,26 +834,50 @@ pub(in crate::coordinator) async fn uptime_strips_handler(
     // Resolved metadata, not the persisted override: a check inherits the
     // coordinator default when its own setting is absent, exactly as the
     // single-check route does.
-    let candidates: Vec<(CheckId, bool, Option<String>)> = {
+    let candidates: Vec<(CheckId, bool, Option<String>, i32, String)> = {
         let by_id = coord.inner.checks.read();
         by_id
             .iter()
             .filter(|(_, meta)| meta.visible)
-            .map(|(id, meta)| (*id, meta.degraded_is_downtime, meta.group.clone()))
+            .map(|(id, meta)| {
+                (
+                    *id,
+                    meta.degraded_is_downtime,
+                    meta.group.clone(),
+                    meta.position,
+                    meta.name.clone(),
+                )
+            })
             .collect()
     };
     let scope = q.section;
+    let page = q.page.unwrap_or(0);
+    let limit = bounded_page_size(q.limit, 100);
     match coord
         // Sections are read inside this closure rather than in their own call:
         // scoping needs them before the scan, and a second `db` hop would put
         // an extra job on the single database worker for a handful of rows.
         .db(move |storage| {
             let sections = storage.list_sections()?;
-            let wanted: Vec<(CheckId, bool)> = candidates
+            let mut wanted: Vec<(CheckId, bool, i32, String)> = candidates
                 .into_iter()
-                .filter(|(_, _, group)| in_scope(&sections, scope.as_deref(), group.as_deref()))
-                .map(|(id, degraded_is_downtime, _)| (id, degraded_is_downtime))
+                .filter(|(_, _, group, _, _)| {
+                    in_scope(&sections, scope.as_deref(), group.as_deref())
+                })
+                .map(|(id, degraded_is_downtime, _, position, name)| {
+                    (id, degraded_is_downtime, position, name)
+                })
                 .collect();
+            wanted.sort_by(|a, b| {
+                a.2.cmp(&b.2)
+                    .then_with(|| a.3.cmp(&b.3))
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            let mut wanted: Vec<(CheckId, bool)> = wanted
+                .into_iter()
+                .map(|(id, downtime, _, _)| (id, downtime))
+                .collect();
+            page_slice(&mut wanted, page, limit);
             storage.uptime_strips(&wanted, days, buckets, now)
         })
         .await
@@ -842,23 +927,32 @@ pub(in crate::coordinator) async fn latency_points_handler(
             (now - hours * 3_600_000, now)
         }
     };
-    let candidates: Vec<(CheckId, Option<String>)> = {
+    let candidates: Vec<(CheckId, Option<String>, i32, String)> = {
         let by_id = coord.inner.checks.read();
         by_id
             .iter()
             .filter(|(_, meta)| meta.visible && meta.latency_graph)
-            .map(|(id, meta)| (*id, meta.group.clone()))
+            .map(|(id, meta)| (*id, meta.group.clone(), meta.position, meta.name.clone()))
             .collect()
     };
     let scope = q.section;
+    let page = q.page.unwrap_or(0);
+    let limit = bounded_page_size(q.limit, 100);
     match coord
         .db(move |storage| {
             let sections = storage.list_sections()?;
-            let wanted: Vec<CheckId> = candidates
+            let mut wanted: Vec<(CheckId, i32, String)> = candidates
                 .into_iter()
-                .filter(|(_, group)| in_scope(&sections, scope.as_deref(), group.as_deref()))
-                .map(|(id, _)| id)
+                .filter(|(_, group, _, _)| in_scope(&sections, scope.as_deref(), group.as_deref()))
+                .map(|(id, _, position, name)| (id, position, name))
                 .collect();
+            wanted.sort_by(|a, b| {
+                a.1.cmp(&b.1)
+                    .then_with(|| a.2.cmp(&b.2))
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            let mut wanted: Vec<CheckId> = wanted.into_iter().map(|(id, _, _)| id).collect();
+            page_slice(&mut wanted, page, limit);
             storage.latency_points_for(&wanted, from, to, buckets)
         })
         .await
@@ -892,7 +986,7 @@ pub(in crate::coordinator) async fn alerts_handler(
     State(coord): State<Coordinator>,
     Query(q): Query<LimitQuery>,
 ) -> Response {
-    let limit = q.limit.unwrap_or(50).min(1000);
+    let limit = bounded_page_size(q.limit, 50);
     let rows = coord.db(move |storage| storage.recent_alerts(limit)).await;
     match rows {
         Ok(rows) => {
@@ -921,6 +1015,16 @@ mod tests {
             collapsed: false,
             display,
         }
+    }
+
+    #[test]
+    fn list_page_size_uses_defaults_and_caps_requested_values() {
+        assert_eq!(bounded_page_size(None, 50), 50);
+        assert_eq!(bounded_page_size(Some(200), 50), 200);
+        assert_eq!(
+            bounded_page_size(Some(MAX_LIST_PAGE_SIZE + 1), 50),
+            MAX_LIST_PAGE_SIZE
+        );
     }
 
     #[test]

@@ -84,23 +84,23 @@ Prioritized action items from the production-readiness review. Existing items fr
 
 ### Placement-scoped configuration
 
-Design settled in `SCALING.md`; three decisions still open there. Nothing here
-is started.
+Design settled in `SCALING.md`. Secret references and the regional local-only
+unplace primitive are implemented; authoritative global reconciliation is not.
 
 - [ ] **Phase 1** — global holds the catalogue and placement durably, replicated between global nodes, reusing the coordinator's config plane (HLC entries, per-kind digests, cursored backfill, cluster membership). Fixes the existing gap that `fan_out_write` applies partially and nothing reconciles it.
 - [ ] **Phase 2** — per-region reconciliation against the set placement implies, with an `unplace` verb that drops the local definition, keeps the check id, and never writes a tombstone. A tombstone would replicate and delete the check in the region still probing it.
 - [ ] **Phase 3** — deliver probe detail only to placed regions; regional status pages list only what the region holds. Closes the disclosure (a target with an embedded credential currently sits in every region) and cuts per-region config cost.
 - [ ] **Phase 4** — run the global as three nodes.
 - [ ] **Phase 5** — cross-region dependency attribution at the global tier, the only place both ends of the edge are visible. Distinct from `RollupPolicy`, which describes state folding rather than causation.
-- [ ] Clear a check's published state on unplace so a region stops asserting a state it no longer observes; keep raw results, which reconnect by id on re-placement.
-- [ ] **Phase 0** — reference secrets in check documents rather than carrying them, following the existing `token_env` convention: the region resolves a named credential at hand-off to its own agents, the admin UI renders the reference, and an unresolved reference reads as a configuration error naming it. This is what lets the global tier hold and move whole documents while values stay in the region that probes with them, and it turns placement-scoped distribution from a security control into an optimisation. Do this before Phase 1.
+- [x] Clear a check's published state on unplace so a region stops asserting a state it no longer observes; keep raw results, which reconnect by id on re-placement.
+- [x] **Phase 0** — reference secrets in check documents rather than carrying them, following the existing `token_env` convention: the region resolves a named credential at hand-off to its own agents, the admin UI renders the reference, and an unresolved reference reads as a configuration error naming it. This is what lets the global tier hold and move whole documents while values stay in the region that probes with them, and it turns placement-scoped distribution from a security control into an optimisation. Do this before Phase 1.
 
 ### Config-plane provisioning cost
 
 Measured during the passing 10,000-check gate; provisioning-time, not steady-state.
 
-- [ ] Batch `apply_config_entries` writes instead of one upsert per entry (up to ~4.6 s on the database worker per batch while provisioning 10,000 checks).
-- [ ] Page or project `config_entries` for peers; a full read of 10,000 check documents costs ~2.2 s on the worker.
+- [x] Batch `apply_config_entries` writes instead of one upsert per entry (up to ~4.6 s on the database worker per batch while provisioning 10,000 checks).
+- [x] Page or project `config_entries` for peers; a full read of 10,000 check documents costs ~2.2 s on the worker.
 
 ### Alert identity
 
@@ -112,8 +112,8 @@ Measured during the passing 10,000-check gate; provisioning-time, not steady-sta
 - [x] Retention costs what it removes rather than what it keeps: the two full rebuilds after the delete are replaced by targeted maintenance (176 ms versus 7,552 ms on a daily window at 40M rows), and the delete is sliced across 24 jobs so the worker interleaves.
 - [x] The global dashboard showed "Collecting latency data…" for every check: `/api/v1/uptime` and `/api/v1/latency-points` are fleet-wide *data* reads, but the global relay treated them as singleton config reads and answered from one region, which holds no results for checks its own agents do not probe. Both now fan out to every region and merge per check.
 - [ ] The full status page is 134.7 MB over 3 requests at 10,000 checks (p95 509 ms). Paginate or filter the dashboard; the monitoring cardinality is supportable, the single-page rendering of it is not.
-- [ ] `agent_checks_handler` runs `list_checks()` on the database worker for every agent poll, though the coordinator already caches check metadata in memory. Cost is `agents / poll_secs × O(checks)` on the one worker.
-- [ ] The notification dispatcher is a single serial loop with a 10 s per-send timeout, fed by a 1,024-slot channel whose `try_send` drops on overflow — a slow notifier delays every other alert, and an overflow loses alerts with no retry row written.
+- [x] `agent_checks_handler` runs `list_checks()` on the database worker for every agent poll, though the coordinator already caches check metadata in memory. Cost is `agents / poll_secs × O(checks)` on the one worker.
+- [x] The notification dispatcher is a single serial loop with a 10 s per-send timeout, fed by a 1,024-slot channel whose `try_send` drops on overflow — a slow notifier delays every other alert, and an overflow loses alerts with no retry row written.
 
 ### Storage maintenance
 
@@ -121,13 +121,13 @@ Measured during the passing 10,000-check gate; provisioning-time, not steady-sta
   - [ ] Evaluate an index or storage strategy for `check_results(check_id, ts_millis)`.
   - [ ] Evaluate indexes for alert, incident, and state-history lookup patterns.
   - [ ] Confirm index behavior and write cost with the bundled DuckDB version.
-- [ ] Make retention and cleanup operations transactional where partial completion can expose inconsistent state.
+- [x] Make retention and cleanup operations transactional where partial completion can expose inconsistent state.
 - [ ] Implement minute/hour latency rollups, query resolution switching, and raw/rollup boundary semantics before reducing raw retention.
 - [ ] Replace monolithic raw-result deletes with a benchmarked, crash-safe time-partition lifecycle that drops expired partitions only after rollup coverage is complete.
 - [ ] Define retention-aware peer recovery for nodes behind raw retention: snapshot restore, explicit raw-data gaps, or extended catch-up storage.
 - [x] Run large retention deletes outside Tokio worker threads and avoid holding the main storage lock for the full operation (sliced across 24 database jobs; the worker already runs off the Tokio threads).
 - [ ] Add explicit checkpoint/file-size maintenance after large pruning operations if benchmarks show it is needed.
-- [ ] Monitor logical row counts, DuckDB file size, prune duration, query duration, and database errors.
+- [x] Monitor logical row counts, DuckDB file size, prune duration, query duration, and database errors.
 - [ ] Cap route/list page sizes consistently; the internal anti-entropy backfill endpoint is capped, but user-facing route pagination still needs explicit limits.
 - [ ] Replace the correlated state-history prune query with a bounded/windowed approach if production benchmarks show poor scaling.
 - [ ] Create and test documented backup and restore procedures.
@@ -135,52 +135,52 @@ Measured during the passing 10,000-check gate; provisioning-time, not steady-sta
 
 ### TLS and probe behavior
 
-- [ ] Resolve the dead `allow_self_signed` option.
-  - [ ] Either implement a per-check HTTP TLS client honoring the option or remove the option from config and UI.
-  - [ ] Add tests for trusted, self-signed, expired, and hostname-mismatched certificates.
-- [ ] Document SSL certificate-check semantics.
-  - [ ] Explain that the expiry probe captures certificate dates without normal chain validation.
-  - [ ] Decide whether certificate trust and hostname validity should be independently reportable failures.
-- [ ] Document that monitor targets and notifier webhooks provide intentional server-side network access.
-  - [ ] State that admin access is network-level privilege.
-  - [ ] Consider optional private-network/allow-list policies for multi-tenant or hostile deployments.
+- [x] Resolve the dead `allow_self_signed` option.
+  - [x] Either implement a per-check HTTP TLS client honoring the option or remove the option from config and UI.
+  - [x] Add tests for trusted, self-signed, expired, and hostname-mismatched certificates.
+- [x] Document SSL certificate-check semantics.
+  - [x] Explain that the expiry probe captures certificate dates without normal chain validation.
+  - [x] Decide whether certificate trust and hostname validity should be independently reportable failures.
+- [x] Document that monitor targets and notifier webhooks provide intentional server-side network access.
+  - [x] State that admin access is network-level privilege.
+  - [x] Consider optional private-network/allow-list policies for multi-tenant or hostile deployments.
 
 ### Authentication and secrets
 
-- [ ] Redact notifier secrets in admin read responses.
-  - [ ] Return placeholders or presence flags for SMTP passwords, routing keys, and webhook secrets.
-  - [ ] Preserve existing secrets unless an update explicitly replaces them.
+- [x] Redact notifier secrets in admin read responses.
+  - [x] Return placeholders or presence flags for SMTP passwords, routing keys, and webhook secrets.
+  - [x] Preserve existing secrets unless an update explicitly replaces them.
 - [ ] Add explicit trusted-proxy support if per-client login rate limiting is required behind a reverse proxy.
-  - [ ] Keep the current raw peer-IP behavior as the safe default.
-  - [ ] Document shared proxy rate-limit buckets until trusted-proxy support exists.
-- [ ] Document TLS termination and transport-security requirements for production deployments.
-- [ ] Confirm operational secret rotation procedures for admin, peer, global, and agent credentials.
+  - [x] Keep the current raw peer-IP behavior as the safe default.
+  - [x] Document shared proxy rate-limit buckets until trusted-proxy support exists.
+- [x] Document TLS termination and transport-security requirements for production deployments.
+- [x] Confirm operational secret rotation procedures for admin, peer, global, and agent credentials.
 
 ### Frontend correctness
 
-- [ ] Prevent stale filter responses in `ProbeResultsAdmin.svelte`.
-  - [ ] Add cancellation or monotonically increasing request IDs.
-- [ ] Prevent overlapping/out-of-order polling in `ClusterAdmin.svelte`.
-  - [ ] Add an in-flight guard or schedule the next poll after the current one finishes.
-- [ ] Consolidate duplicate initial session checks in `App.svelte`.
-- [ ] Show acknowledgement failures to the operator instead of only logging them to the console.
-- [ ] Add an `aria-live` announcement for important live status changes.
-- [ ] Make "Past Incidents" respect the status page's selected time window.
-  - [ ] Symptom: selecting `24h` still lists incidents from 11 days ago. The range switch
+- [x] Prevent stale filter responses in `ProbeResultsAdmin.svelte`.
+  - [x] Add cancellation or monotonically increasing request IDs.
+- [x] Prevent overlapping/out-of-order polling in `ClusterAdmin.svelte`.
+  - [x] Add an in-flight guard or schedule the next poll after the current one finishes.
+- [x] Consolidate duplicate initial session checks in `App.svelte`.
+- [x] Show acknowledgement failures to the operator instead of only logging them to the console.
+- [x] Add an `aria-live` announcement for important live status changes.
+- [x] Make "Past Incidents" respect the status page's selected time window.
+  - [x] Symptom: selecting `24h` still lists incidents from 11 days ago. The range switch
         only drives the charts — `setDays()` in `App.svelte` calls `loadCharts()` and
         nothing else, and `fetchIncidents()` sends only `?limit=`.
-  - [ ] Add a `since` (epoch ms) parameter to `IncidentQuery` in
+  - [x] Add a `since` (epoch ms) parameter to `IncidentQuery` in
         `coordinator/routes/incidents.rs` and a bound to `Storage::list_incidents`, so the
         window is applied in SQL rather than by shipping full history to the browser. The
         global relay forwards the query string as-is, so it needs no change.
-  - [ ] Keep unresolved incidents visible regardless of `since`: the window bounds resolved
+  - [x] Keep unresolved incidents visible regardless of `since`: the window bounds resolved
         incidents only, so an ongoing outage older than the window is never hidden from the
         status page.
-  - [ ] Refetch incidents from `setDays()`, and keep the admin console's list unwindowed —
+  - [x] Refetch incidents from `setDays()`, and keep the admin console's list unwindowed —
         `App.svelte` currently feeds one `incidents` array to both `IncidentsList` (admin)
         and `PastIncidents` (public), so a windowed shared fetch would truncate the console
         too.
-  - [ ] Cover it with a test that a resolved incident outside the window is absent while an
+  - [x] Cover it with a test that a resolved incident outside the window is absent while an
         open one outside it is still returned.
 
 ### Status sub-pages
@@ -229,13 +229,13 @@ be worse than what exists today.
         page's cost — the bound is available, not automatic. `SectionsAdmin` warns above
         `INLINE_WARN_AT` checks rather than silently overriding the choice.
 
-Follow-ups, deliberately not done here:
+Follow-ups implemented in P1:
 
-- [ ] Navigating from a section page into a check and back refetches that section's
+- [x] Navigating from a section page into a check and back refetches that section's
       charts. Two bounded requests, not a fan-out, so it is a fair price for maps that
       hold exactly the current scope at the current window and nothing stale — but a
       last-loaded-scope guard would remove it if the round trip is ever felt.
-- [ ] A section page has no rollup banner of its own; it just repeats the primary page's
+- [x] A section page has no rollup banner of its own; it just repeats the primary page's
       per-check rows under a heading. The state is already computed and shipped, so this
       is presentation only.
 

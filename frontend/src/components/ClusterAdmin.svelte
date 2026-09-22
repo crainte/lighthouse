@@ -18,6 +18,9 @@
   let expired = $state(false);
   let view = $state<'graph' | 'table'>('graph');
   let graphDetail = $state<string | null>(null);
+  // Polling must not overlap: a slow request should make an interval tick a
+  // no-op rather than allowing an older response to overwrite a newer one.
+  let refreshInFlight = false;
 
   function selectGraphItem(event: KeyboardEvent | MouseEvent, detail: string) {
     if (event instanceof KeyboardEvent && event.key !== 'Enter' && event.key !== ' ') return;
@@ -122,12 +125,15 @@
   }
 
   async function refresh() {
+    if (refreshInFlight) return;
+    refreshInFlight = true;
     try {
       cluster = await fetchCluster();
       loadError = null;
     } catch (e) {
       loadError = fail(e);
     } finally {
+      refreshInFlight = false;
       loading = false;
     }
   }

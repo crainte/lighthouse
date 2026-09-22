@@ -239,8 +239,13 @@ fn require_push_token(node: &GlobalNode, headers: &HeaderMap) -> Option<Response
 #[derive(Serialize)]
 struct StatusResponse {
     checks: Vec<CheckStatusDto>,
+    page: usize,
+    limit: usize,
+    total_checks: usize,
+    has_more: bool,
     agents: Vec<FleetRowDto>,
     maintenance: Vec<serde_json::Value>,
+    sections: Vec<serde_json::Value>,
 }
 
 /// Matches the coordinator's public `CheckStatusDto` field-for-field, so the
@@ -280,13 +285,21 @@ struct FleetRowDto {
     total: u32,
 }
 
-async fn status_handler(State(node): State<GlobalNode>) -> Response {
+async fn status_handler(State(node): State<GlobalNode>, uri: Uri) -> Response {
     let now = chrono::Utc::now().timestamp_millis();
-    let checks = node
+    let page = query_usize(uri.query(), "page").unwrap_or(0);
+    let limit = query_usize(uri.query(), "limit").unwrap_or(100).min(1_000);
+    let section = query_value(uri.query(), "section");
+    let mut checks = node
         .inner
         .cache
         .aggregate(now)
         .into_iter()
+        .filter(|check| {
+            section
+                .as_deref()
+                .is_none_or(|want| check.group.as_deref() == Some(want))
+        })
         .map(|c| CheckStatusDto {
             check_id: c.check_id,
             name: c.name,
@@ -301,7 +314,19 @@ async fn status_handler(State(node): State<GlobalNode>) -> Response {
             latency_graph: c.latency_graph,
             position: c.position,
         })
-        .collect();
+        .collect::<Vec<_>>();
+    checks.sort_by(|a, b| {
+        a.position
+            .cmp(&b.position)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.check_id.cmp(&b.check_id))
+    });
+    let total_checks = checks.len();
+    let start = page.saturating_mul(limit).min(total_checks);
+    let end = start.saturating_add(limit).min(total_checks);
+    let has_more = end < total_checks;
+    checks.drain(..start);
+    checks.truncate(end - start);
     let agents = node
         .inner
         .cache
@@ -327,8 +352,13 @@ async fn status_handler(State(node): State<GlobalNode>) -> Response {
         .collect();
     Json(StatusResponse {
         checks,
+        page,
+        limit,
+        total_checks,
+        has_more,
         agents,
         maintenance: Vec::new(),
+        sections: Vec::new(),
     })
     .into_response()
 }
@@ -988,11 +1018,17 @@ async fn relay_merge(
     regions: &[(String, Vec<String>)],
     authed: bool,
 ) -> Response {
-    let pq = uri
-        .path_and_query()
-        .map(|p| p.as_str())
-        .unwrap_or(uri.path())
-        .to_string();
+    // Batched chart pages are selected from the global aggregate below. Do not
+    // let every region apply its own page first: regional order and membership
+    // differ, so that double pagination can omit every globally selected id.
+    let pq = if matches!(uri.path(), "/api/v1/uptime" | "/api/v1/latency-points") {
+        chart_relay_path(uri)
+    } else {
+        uri.path_and_query()
+            .map(|p| p.as_str())
+            .unwrap_or(uri.path())
+            .to_string()
+    };
     if regions.is_empty() {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1033,9 +1069,99 @@ async fn relay_merge(
         }
     }
     match merge_responses(uri.path(), uri.query(), merged) {
-        Ok(response) => response.into_response(),
+        Ok(mut response) => {
+            if matches!(uri.path(), "/api/v1/uptime" | "/api/v1/latency-points") {
+                filter_chart_page(node, uri, &mut response.0);
+            }
+            response.into_response()
+        }
         Err(message) => error_response(StatusCode::BAD_GATEWAY, &message),
     }
+}
+
+/// Remove status-page selectors before fanning a batched chart request out.
+/// The global aggregate supplies the one authoritative page after merging.
+fn chart_relay_path(uri: &Uri) -> String {
+    let query = uri.query().map(|query| {
+        query
+            .split('&')
+            .filter(|pair| {
+                !matches!(
+                    pair.split_once('=').map(|(key, _)| key),
+                    Some("page" | "limit" | "section")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("&")
+    });
+    // A global page is capped at 1,000 rows. Ask each region for that full
+    // candidate set so a regional default page (100) cannot hide ids selected
+    // by a later global page.
+    match query.as_deref() {
+        Some("") | None => format!("{}?limit=1000", uri.path()),
+        Some(query) => format!("{}?{query}&limit=1000", uri.path()),
+    }
+}
+
+/// Keep chart entries to precisely the ids rendered by the global status page.
+fn filter_chart_page(node: &GlobalNode, uri: &Uri, response: &mut serde_json::Value) {
+    let page = query_usize(uri.query(), "page").unwrap_or(0);
+    let limit = query_usize(uri.query(), "limit").unwrap_or(100).min(1_000);
+    let section = query_value(uri.query(), "section");
+    let mut checks = node
+        .inner
+        .cache
+        .aggregate(chrono::Utc::now().timestamp_millis());
+    checks.retain(|check| {
+        section
+            .as_deref()
+            .is_none_or(|want| check.group.as_deref() == Some(want))
+    });
+    checks.sort_by(|a, b| {
+        a.position
+            .cmp(&b.position)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.check_id.cmp(&b.check_id))
+    });
+    let start = page.saturating_mul(limit).min(checks.len());
+    let end = start.saturating_add(limit).min(checks.len());
+    let wanted: Vec<String> = checks[start..end]
+        .iter()
+        .map(|check| check.check_id.to_string())
+        .collect();
+    filter_chart_entries(response, &wanted);
+}
+
+fn filter_chart_entries(response: &mut serde_json::Value, wanted: &[String]) {
+    if let Some(entries) = response
+        .get_mut("checks")
+        .and_then(|value| value.as_array_mut())
+    {
+        entries.retain(|entry| {
+            entry
+                .get("check_id")
+                .and_then(|id| id.as_str())
+                .is_some_and(|id| wanted.iter().any(|wanted| wanted == id))
+        });
+        entries.sort_by_key(|entry| {
+            entry
+                .get("check_id")
+                .and_then(|id| id.as_str())
+                .and_then(|id| wanted.iter().position(|wanted| wanted == id))
+                .unwrap_or(usize::MAX)
+        });
+    }
+}
+
+fn query_usize(query: Option<&str>, name: &str) -> Option<usize> {
+    query_value(query, name)?.parse().ok()
+}
+
+fn query_value(query: Option<&str>, name: &str) -> Option<String> {
+    query?.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == name).then(|| percent_decode_str(value).decode_utf8_lossy().into_owned())
+    })
 }
 
 async fn fetch_region_json(
@@ -1736,6 +1862,33 @@ mod tests {
         assert_eq!(checks[0]["buckets"][0]["total"], 20);
         assert_eq!(checks[0]["name"], "web");
         assert_eq!(merged["days"], 1);
+    }
+
+    #[test]
+    fn chart_page_filter_keeps_the_global_page_after_multi_region_merge() {
+        // More than one regional page: ids 100..199 would never be returned if
+        // each region were sent page=1 before the global merge. The selected
+        // page is instead applied once to the merged global ids.
+        let wanted: Vec<String> = (100..200).map(|id| format!("check-{id:03}")).collect();
+        let mut merged = serde_json::json!({"checks": (0..202).rev().map(|id| {
+            serde_json::json!({"check_id": format!("check-{id:03}")})
+        }).collect::<Vec<_>>()});
+        filter_chart_entries(&mut merged, &wanted);
+        let checks = merged["checks"].as_array().unwrap();
+        assert_eq!(checks.len(), 100);
+        assert_eq!(checks.first().unwrap()["check_id"], "check-100");
+        assert_eq!(checks.last().unwrap()["check_id"], "check-199");
+    }
+
+    #[test]
+    fn chart_relays_do_not_forward_regional_page_selectors() {
+        let uri: Uri = "/api/v1/uptime?days=30&page=1&limit=100&section=edge&buckets=90"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            chart_relay_path(&uri),
+            "/api/v1/uptime?days=30&buckets=90&limit=1000"
+        );
     }
 
     #[test]

@@ -37,6 +37,9 @@ cron = "0.12"
 # reqwest already pulls rustls in, so this adds the handshake plumbing only.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# The per-check HTTPS verifier uses the same public roots as reqwest, then may
+# retry only an otherwise-valid chain against the certificates it presented.
+webpki-roots = "1"
 x509-parser = "0.16"
 # Agent credentials are hashed before storage, so a leaked database yields no
 # working secrets. A single SHA-256 is right here: these are 256-bit random

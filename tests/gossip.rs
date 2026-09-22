@@ -275,6 +275,45 @@ async fn gossip_and_batch_replication_are_idempotent_in_either_order() {
 }
 
 #[tokio::test]
+async fn gossip_preserves_the_sender_alert_payload_when_incident_views_differ() {
+    let (_sink, sink_addr) = alert_sink().await;
+    let coord = coordinator(sink_addr, vec![]).await;
+    let addr = serve(coord.router()).await;
+    let alert_id = Uuid::now_v7().to_string();
+    let canonical = serde_json::json!({
+        "id": alert_id,
+        "scope": "check",
+        "node_id": cid(CHECK).to_string(),
+        "previous_state": "up",
+        "current_state": "down",
+        "timestamp": 2_000,
+        "incident_id": "sender-incident",
+    });
+    let gossip = serde_json::json!({
+        "alert_id": alert_id,
+        "alert": canonical,
+        "check_id": cid(CHECK),
+        "from": "up",
+        "to": "down",
+        "timestamp": 2_000,
+        "incident_id": "receiver-incident",
+    });
+    let batch = serde_json::json!({
+        "origin": "observer",
+        "alerts": [canonical],
+    });
+
+    post_peer(addr, "/internal/gossip", &gossip).await;
+    post_peer(addr, "/internal/replicate", &batch).await;
+
+    let alerts = get_json(&format!("http://{addr}/api/v1/alerts")).await;
+    assert_eq!(alerts["alerts"].as_array().unwrap().len(), 1);
+    assert_eq!(alerts["alerts"][0]["id"], alert_id);
+    assert_eq!(alerts["alerts"][0]["incident_id"], "sender-incident");
+    assert_eq!(alerts["alerts"][0]["node_id"], cid(CHECK).to_string());
+}
+
+#[tokio::test]
 async fn replication_failure_rolls_back_alerts_results_and_beliefs() {
     let (_sink, sink_addr) = alert_sink().await;
     let coord = coordinator(sink_addr, vec![]).await;

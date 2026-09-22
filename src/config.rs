@@ -775,6 +775,85 @@ pub struct Header {
     pub value: String,
 }
 
+/// Expand `${NAME}` references from this coordinator's environment. Check
+/// documents carry names, not credentials: values are deliberately resolved
+/// only immediately before a regional coordinator hands work to its agents.
+///
+/// The resolver reports the missing *name*, never a value or the surrounding
+/// target/header, so the error is safe to expose as a configuration problem.
+pub fn resolve_secret_references(
+    value: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    let mut resolved = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        resolved.push_str(&rest[..start]);
+        let after_open = &rest[start + 2..];
+        let Some(end) = after_open.find('}') else {
+            return Err("invalid secret reference; expected ${NAME}".into());
+        };
+        let name = &after_open[..end];
+        if name.is_empty()
+            || !name.chars().enumerate().all(|(i, c)| {
+                if i == 0 {
+                    c == '_' || c.is_ascii_alphabetic()
+                } else {
+                    c == '_' || c.is_ascii_alphanumeric()
+                }
+            })
+        {
+            return Err("invalid secret reference; expected ${NAME}".into());
+        }
+        let Some(secret) = lookup(name) else {
+            return Err(format!(
+                "missing environment variable {name} for check secret reference"
+            ));
+        };
+        resolved.push_str(&secret);
+        rest = &after_open[end + 1..];
+    }
+    resolved.push_str(rest);
+    Ok(resolved)
+}
+
+fn has_secret_reference(value: &str) -> bool {
+    value.contains("${")
+}
+
+fn target_has_url_userinfo(target: &str) -> bool {
+    let Some(scheme) = target.find("://") else {
+        return false;
+    };
+    let authority = &target[scheme + 3..];
+    authority
+        .split(['/', '?', '#'])
+        .next()
+        .is_some_and(|authority| authority.contains('@'))
+}
+
+fn has_sensitive_query_value(target: &str) -> bool {
+    let Some((_, query_and_fragment)) = target.split_once('?') else {
+        return false;
+    };
+    let query = query_and_fragment.split('#').next().unwrap_or_default();
+    query.split('&').any(|part| {
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        matches!(
+            key.to_ascii_lowercase().as_str(),
+            "access_token"
+                | "api_key"
+                | "apikey"
+                | "auth"
+                | "key"
+                | "password"
+                | "passwd"
+                | "secret"
+                | "token"
+        ) && !has_secret_reference(value)
+    })
+}
+
 /// Whether a set of assertions all have to hold, or just one of them.
 /// Shared by DNS expected values and multi-host checks so "any/all" means the
 /// same thing wherever it appears.
@@ -991,7 +1070,8 @@ pub struct CheckConfig {
     /// check shows as an outage until its first result lands.
     #[serde(default)]
     pub default_status: DefaultStatus,
-    /// Headers sent with an HTTP probe.
+    /// Headers sent with an HTTP probe. Values may contain `${NAME}` references,
+    /// resolved only by the regional coordinator when assigning an agent.
     #[serde(default)]
     pub headers: Vec<Header>,
     /// Accept an untrusted TLS certificate. Off by default: silently trusting a
@@ -1262,6 +1342,39 @@ impl CheckConfig {
         Duration::from_secs(self.timeout_secs)
     }
 
+    /// Resolve this document for one region's agents. The stored/admin form
+    /// remains references, preventing credentials from crossing regions or
+    /// returning through the admin API.
+    pub fn resolve_secret_references(
+        &self,
+        lookup: impl Fn(&str) -> Option<String> + Copy,
+    ) -> Result<Self, String> {
+        let mut resolved = self.clone();
+        resolved.target = resolve_secret_references(&self.target, lookup)?;
+        resolved.hosts = self
+            .hosts
+            .iter()
+            .map(|host| resolve_secret_references(host, lookup))
+            .collect::<Result<_, _>>()?;
+        resolved.headers = self
+            .headers
+            .iter()
+            .map(|header| {
+                Ok(Header {
+                    name: header.name.clone(),
+                    value: resolve_secret_references(&header.value, lookup)?,
+                })
+            })
+            .collect::<Result<_, String>>()?;
+        Ok(resolved)
+    }
+
+    /// Resolve references against this region's coordinator process environment
+    /// at agent hand-off. Kept separate from storage and admin serialization.
+    pub fn resolve_for_agent(&self) -> Result<Self, String> {
+        self.resolve_secret_references(|name| std::env::var(name).ok())
+    }
+
     fn schedule_gap_secs(&self) -> Result<u64, String> {
         let schedule = self.schedule()?;
         let mut upcoming = schedule.upcoming(chrono::Utc);
@@ -1334,10 +1447,33 @@ impl CheckConfig {
             if header.name.trim().is_empty() {
                 return Err("a header with no name cannot be sent".into());
             }
+            if matches!(
+                header.name.to_ascii_lowercase().as_str(),
+                "authorization"
+                    | "proxy-authorization"
+                    | "x-api-key"
+                    | "x-auth-token"
+                    | "x-access-token"
+            ) && !has_secret_reference(&header.value)
+            {
+                return Err(
+                    "authentication header values must use a ${NAME} secret reference".into(),
+                );
+            }
         }
         // Every target has to satisfy the kind's shape, not just the first —
         // otherwise an added host silently fails forever.
         for target in self.all_targets() {
+            if target_has_url_userinfo(target) {
+                return Err(
+                    "target URL userinfo must use a ${NAME} secret reference in a header".into(),
+                );
+            }
+            if has_sensitive_query_value(target) {
+                return Err(
+                    "sensitive target query values must use a ${NAME} secret reference".into(),
+                );
+            }
             match self.kind {
                 CheckKind::Http => {
                     if !(target.starts_with("http://") || target.starts_with("https://")) {
@@ -1714,6 +1850,69 @@ mod tests {
             err.to_string().contains("checks"),
             "the error should name the rejected field: {err}"
         );
+    }
+
+    #[test]
+    fn check_secret_references_resolve_without_mutating_document() {
+        let check = CheckConfig {
+            name: "private API".into(),
+            target: "https://${API_HOST}/health?token=${API_TOKEN}".into(),
+            headers: vec![Header {
+                name: "Authorization".into(),
+                value: "Bearer ${API_TOKEN}".into(),
+            }],
+            ..Default::default()
+        };
+        let resolved = check
+            .resolve_secret_references(|name| match name {
+                "API_HOST" => Some("api.internal".into()),
+                "API_TOKEN" => Some("credential".into()),
+                _ => None,
+            })
+            .expect("all references resolve");
+        assert_eq!(
+            resolved.target,
+            "https://api.internal/health?token=credential"
+        );
+        assert_eq!(resolved.headers[0].value, "Bearer credential");
+        assert!(
+            check.target.contains("${API_TOKEN}"),
+            "stored document stays a reference"
+        );
+    }
+
+    #[test]
+    fn missing_check_secret_names_the_environment_variable_not_a_value() {
+        let err = resolve_secret_references("Bearer ${MISSING_TOKEN}", |_| None)
+            .expect_err("missing reference must fail hand-off");
+        assert_eq!(
+            err,
+            "missing environment variable MISSING_TOKEN for check secret reference"
+        );
+        assert!(!err.contains("Bearer"));
+    }
+
+    #[test]
+    fn check_validation_rejects_inline_sensitive_values() {
+        let mut check = CheckConfig {
+            name: "private API".into(),
+            target: "https://user:password@example.com/health".into(),
+            ..Default::default()
+        };
+        assert!(check.validate().unwrap_err().contains("userinfo"));
+
+        check.target = "https://example.com/health?api_key=literal".into();
+        assert!(check.validate().unwrap_err().contains("query values"));
+
+        check.target = "https://example.com/health".into();
+        check.headers = vec![Header {
+            name: "Authorization".into(),
+            value: "Bearer literal".into(),
+        }];
+        assert!(check.validate().unwrap_err().contains("secret reference"));
+
+        check.headers[0].value = "Bearer ${API_TOKEN}".into();
+        check.validate().expect("reference is safe to store");
     }
 
     fn openmetrics_check() -> CheckConfig {

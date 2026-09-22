@@ -49,12 +49,19 @@ async fn serve(app: Router) -> SocketAddr {
 
 /// An alert endpoint that records what it was sent.
 async fn alert_sink() -> (Sink, SocketAddr) {
+    delayed_alert_sink(Duration::ZERO).await
+}
+
+/// A webhook backend that accepts a request only after `delay`. This makes a
+/// slow recipient observable without relying on networking outside the test.
+async fn delayed_alert_sink(delay: Duration) -> (Sink, SocketAddr) {
     let sink: Sink = Arc::new(Mutex::new(Vec::new()));
     let app = Router::new()
         .route(
             "/",
             post(
-                |State(s): State<Sink>, Json(body): Json<Value>| async move {
+                move |State(s): State<Sink>, Json(body): Json<Value>| async move {
+                    tokio::time::sleep(delay).await;
                     s.lock().push(body);
                     StatusCode::OK
                 },
@@ -475,7 +482,7 @@ async fn notifier_fields_are_trimmed_before_they_are_stored() {
     )
     .await;
     assert_eq!(code, 200, "{body}");
-    assert_eq!(body["notifiers"][0]["url"], "https://hooks.example.com/x");
+    assert_eq!(body["notifiers"][0]["url"], "********");
     assert_eq!(
         body["notifiers"][0]["name"], "oncall",
         "the routing key too"
@@ -778,6 +785,110 @@ async fn a_notification_that_fails_is_queued_and_retried_until_it_lands() {
     assert!(
         undelivered(&base, &session).await.is_empty(),
         "delivered means gone: there is no 'sent' row to accumulate"
+    );
+}
+
+/// The channel only wakes the dispatcher and is intentionally bounded. Once it
+/// is full, a committed alert must still be in the durable outbox for a later
+/// `retry_due` scan to deliver.
+#[tokio::test]
+async fn simultaneous_transitions_for_one_check_keep_distinct_outbox_rows() {
+    let (sink, sink_addr) = alert_sink().await;
+    let coord = coordinator().await;
+    let addr = serve(coord.clone().router()).await;
+    let base = format!("http://{addr}");
+    let session = login(&base).await;
+    let (code, body) =
+        put_notifiers(&base, &session, json!([webhook("oncall", sink_addr, true)])).await;
+    assert_eq!(code, 200, "{body}");
+
+    let paused = coord.pause_notification_dispatch_for_test().await;
+    coord.saturate_notification_wake_for_test();
+    coord.ingest(vec![result(LOUD, 200, 1_000)]).await;
+    // Two real transitions on the same check at the same millisecond used to
+    // share the queue primary key, letting the recovery replace the outage.
+    coord.ingest(vec![result(LOUD, 500, 2_000)]).await;
+    coord.ingest(vec![result(LOUD, 200, 2_000)]).await;
+
+    let queued = undelivered(&base, &session).await;
+    assert_eq!(queued.len(), 2, "both transitions remain owed: {queued:?}");
+    let states: std::collections::BTreeSet<_> = queued
+        .iter()
+        .map(|row| row["to"].as_str().unwrap())
+        .collect();
+    assert_eq!(states, std::collections::BTreeSet::from(["down", "up"]));
+
+    assert_eq!(paused.retry_due(2_000).await, 2);
+    assert_eq!(
+        sink.lock().len(),
+        2,
+        "both queued transitions were delivered"
+    );
+    assert!(undelivered(&base, &session).await.is_empty());
+}
+
+/// The channel only wakes the dispatcher and is intentionally bounded. Once it
+/// is full, a committed alert must still be in the durable outbox for a later
+/// `retry_due` scan to deliver.
+#[tokio::test]
+async fn a_dropped_dispatch_wake_still_delivers_from_the_durable_outbox() {
+    let (sink, sink_addr) = alert_sink().await;
+    let coord = coordinator().await;
+    let addr = serve(coord.clone().router()).await;
+    let base = format!("http://{addr}");
+    let session = login(&base).await;
+    let (code, body) =
+        put_notifiers(&base, &session, json!([webhook("oncall", sink_addr, true)])).await;
+    assert_eq!(code, 200, "{body}");
+
+    let paused = coord.pause_notification_dispatch_for_test().await;
+    coord.saturate_notification_wake_for_test();
+    take_down(&coord, LOUD).await;
+    settle().await;
+    assert!(sink.lock().is_empty(), "the saturated wake cannot dispatch");
+    assert_eq!(undelivered(&base, &session).await.len(), 1);
+
+    assert_eq!(
+        paused
+            .retry_due(chrono::Utc::now().timestamp_millis())
+            .await,
+        1,
+        "the retry scan reads the committed outbox row, not the wake channel"
+    );
+    assert_eq!(sink.lock().len(), 1);
+    assert!(undelivered(&base, &session).await.is_empty());
+}
+
+/// Independent notifier deliveries must not wait for the slowest recipient.
+#[tokio::test]
+async fn a_slow_notifier_does_not_block_a_fast_notifier_in_the_same_retry_scan() {
+    let (slow, slow_addr) = delayed_alert_sink(Duration::from_secs(2)).await;
+    let (fast, fast_addr) = alert_sink().await;
+    let coord = coordinator().await;
+    let addr = serve(coord.clone().router()).await;
+    let base = format!("http://{addr}");
+    let session = login(&base).await;
+    let (code, body) = put_notifiers(
+        &base,
+        &session,
+        json!([
+            webhook("slow", slow_addr, true),
+            webhook("fast", fast_addr, true),
+        ]),
+    )
+    .await;
+    assert_eq!(code, 200, "{body}");
+
+    take_down(&coord, LOUD).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        fast.lock().len(),
+        1,
+        "the fast backend is not head-of-line blocked"
+    );
+    assert!(
+        slow.lock().is_empty(),
+        "the slow backend is still in flight"
     );
 }
 

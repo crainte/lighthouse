@@ -357,6 +357,41 @@ fn is_label_name_char(b: u8) -> bool {
 /// Missing selection is [`MetricError::NotFound`]; more than one match is
 /// [`MetricError::Ambiguous`]. Neither is treated as a zero — an unmatched
 /// selection is a failed observation, per the design.
+/// Render samples in the Prometheus text/OpenMetrics-compatible exposition
+/// format. Metric names and labels are emitted from trusted program constants;
+/// label values are escaped so a filesystem path or error text cannot corrupt a
+/// scrape.
+pub fn render(samples: &[MetricSample]) -> String {
+    let mut body = String::new();
+    for sample in samples {
+        body.push_str(&sample.name);
+        if !sample.labels.is_empty() {
+            body.push('{');
+            for (index, (name, value)) in sample.labels.iter().enumerate() {
+                if index != 0 {
+                    body.push(',');
+                }
+                body.push_str(name);
+                body.push_str("=\"");
+                for ch in value.chars() {
+                    match ch {
+                        '\\' => body.push_str("\\\\"),
+                        '\n' => body.push_str("\\n"),
+                        '"' => body.push_str("\\\""),
+                        _ => body.push(ch),
+                    }
+                }
+                body.push('"');
+            }
+            body.push('}');
+        }
+        body.push(' ');
+        body.push_str(&sample.value.to_string());
+        body.push('\n');
+    }
+    body
+}
+
 pub fn select<'a>(
     samples: &'a [MetricSample],
     name: &str,
@@ -384,6 +419,17 @@ mod tests {
         kv.iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn render_round_trips_labels_and_special_values() {
+        let samples = vec![MetricSample::new(
+            "warden_database_queries_total",
+            pairs(&[("result", "error\n\\\"")]),
+            f64::INFINITY,
+        )];
+        let body = render(&samples);
+        assert_eq!(parse(&body).unwrap(), samples);
     }
 
     #[test]

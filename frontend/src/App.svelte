@@ -219,9 +219,16 @@
     return m ? { name: 'detail', checkId: decodeURIComponent(m[1]) } : { name: 'home' };
   }
 
+  const STATUS_PAGE_SIZE = 100;
+  let statusPage = $state(0);
+  let statusTotal = $state(0);
+  let statusHasMore = $state(false);
   let checks = $state<Check[]>([]);
   let alerts = $state<Alert[]>([]);
-  let incidents = $state<Incident[]>([]);
+  // The public list follows the selected status window while the admin console
+  // retains full history for incident management.
+  let publicIncidents = $state<Incident[]>([]);
+  let adminIncidents = $state<Incident[]>([]);
   // Fleet liveness as the coordinator chose to publish it: regions, or pinned
   // agents. Deliberately not `/api/v1/agents` — that needs a session, and this
   // page is anonymous, so fetching it here failed the whole load with a 401.
@@ -242,6 +249,10 @@
   let sparkline = $state<Record<string, LatencyPoint[]>>({});
   let loading = $state(true);
   let error = $state<string | null>(null);
+  let acknowledgementError = $state<string | null>(null);
+  // A screen-reader-only account of websocket state transitions. The visible
+  // badges update too, but those are easy to miss while reading another row.
+  let liveAnnouncement = $state('');
   let wsStatus = $state<WsStatus>('connecting');
   // Bumped to tell an open CheckDetail page to refetch its own uptime, latency,
   // history and incidents — on a live state change for the check it's showing,
@@ -267,6 +278,7 @@
   // Until the session probe answers, "logged out" is a guess — and on #/admin
   // acting on that guess flashes a sign-in prompt at someone already signed in.
   let sessionChecked = $state(false);
+  let sessionRequest: Promise<void> | null = null;
   let adminView = $state<'none' | 'login'>('none');
 
   // Tracks whether we pushed our own entry, so the in-app Back button never
@@ -361,11 +373,13 @@
    *  endpoint: an authored update on a `detected` incident IS the ack, so the
    *  button posts an `investigating` update with an empty body. */
   async function acknowledge(incident: Incident) {
+    acknowledgementError = null;
     try {
       const updated = await addIncidentUpdate(incident.id, 'investigating', '');
-      incidents = incidents.map((i) => (i.id === updated.id ? updated : i));
+      adminIncidents = adminIncidents.map((i) => (i.id === updated.id ? updated : i));
+      publicIncidents = publicIncidents.map((i) => (i.id === updated.id ? updated : i));
     } catch (e) {
-      console.error('acknowledge failed', e);
+      acknowledgementError = e instanceof Error ? e.message : String(e);
     }
   }
 
@@ -379,9 +393,12 @@
    *  incident it just made, so Affects and Updates become available and the
    *  page can be reloaded or linked. */
   function onIncidentSaved(saved: Incident) {
-    incidents = incidents.some((i) => i.id === saved.id)
-      ? incidents.map((i) => (i.id === saved.id ? saved : i))
-      : [saved, ...incidents];
+    adminIncidents = adminIncidents.some((i) => i.id === saved.id)
+      ? adminIncidents.map((i) => (i.id === saved.id ? saved : i))
+      : [saved, ...adminIncidents];
+    publicIncidents = publicIncidents.some((i) => i.id === saved.id)
+      ? publicIncidents.map((i) => (i.id === saved.id ? saved : i))
+      : [saved, ...publicIncidents];
     if (view.name === 'admin' && view.incident?.id !== saved.id) {
       history.replaceState(null, '', `#/admin/incidents/${encodeURIComponent(saved.id)}`);
       view = { name: 'admin', panel: 'incidents', incident: { id: saved.id } };
@@ -423,11 +440,14 @@
   // page, which excludes every paged section. The maps are REPLACED rather than
   // merged: they then always hold exactly the current view's charts at the
   // current window, so no entry can survive at a stale range after `setDays`.
-  async function loadCharts(window: number, scope: string | null) {
+  async function loadCharts(window: number, scope: string | null, page = statusPage) {
     const [strips, lines] = await Promise.all([
-      fetchUptimeStrips(window, STRIP_SEGMENTS, scope),
-      fetchLatencyPoints(window * 24, STRIP_SEGMENTS, scope),
+      fetchUptimeStrips(window, STRIP_SEGMENTS, scope, page, STATUS_PAGE_SIZE),
+      fetchLatencyPoints(window * 24, STRIP_SEGMENTS, scope, page, STATUS_PAGE_SIZE),
     ]);
+    // A response for a page or range already left must not replace the charts
+    // now on screen.
+    if (days !== window || chartScope !== scope) return;
     uptime = Object.fromEntries(strips.checks.map((u) => [u.check_id, u]));
     sparkline = Object.fromEntries(lines.checks.map((l) => [l.check_id, l.points]));
   }
@@ -437,6 +457,32 @@
   // at each of the several places either can change, where a missed one leaves
   // an opened section permanently blank.
   const chartScope = $derived(view.name === 'group' ? view.sectionName : null);
+  const statusScope = $derived(view.name === 'group' ? view.sectionName : null);
+
+  async function loadStatusPage(page: number) {
+    const s = await fetchStatus(statusScope, page, STATUS_PAGE_SIZE);
+    if (statusScope !== (view.name === 'group' ? view.sectionName : null)) return;
+    checks = s.checks;
+    statusPage = s.page;
+    statusTotal = s.total_checks;
+    statusHasMore = s.has_more;
+    sectionRollups = s.sections;
+    fleet = s.agents;
+    maintenance = s.maintenance;
+  }
+
+  function setStatusPage(page: number) {
+    if (page < 0 || (page === statusPage && !loading)) return;
+    void loadStatusPage(page)
+      .then(() => loadCharts(days, statusScope, page))
+      .catch(() => {
+        // Retain the currently coherent status and charts when a page fails.
+      });
+  }
+  // Returning from a check page restores the same scope and range. Keep those
+  // maps instead of repeating two bounded chart requests for that round trip.
+  let lastLoadedChartScope = $state<string | null | undefined>(undefined);
+  let lastLoadedChartDays = $state<number | null>(null);
 
   $effect(() => {
     // A check or incident page renders no list and fetches its own charts, so
@@ -444,10 +490,18 @@
     if (view.name !== 'home' && view.name !== 'group') return;
     const scope = chartScope;
     const window = days;
-    loadCharts(window, scope).catch(() => {
-      // Leave the last known charts up; status, alerts and incidents are
-      // loaded separately and a failure here must not blank the page.
-    });
+    if (lastLoadedChartScope === scope && lastLoadedChartDays === window) return;
+    loadCharts(window, scope)
+      .then(() => {
+        if (chartScope === scope && days === window) {
+          lastLoadedChartScope = scope;
+          lastLoadedChartDays = window;
+        }
+      })
+      .catch(() => {
+        // Leave the last known charts up; status, alerts and incidents are
+        // loaded separately and a failure here must not blank the page.
+      });
   });
 
   // Refetch one check's uptime strip and (if it opted in) its latency graph,
@@ -483,10 +537,19 @@
     statusTimer = setTimeout(async () => {
       statusTimer = null;
       try {
-        const [s, a, inc] = await Promise.all([fetchStatus(), fetchAlerts(), fetchIncidents()]);
+        const [s, a, publicInc, adminInc] = await Promise.all([
+          fetchStatus(statusScope, statusPage, STATUS_PAGE_SIZE),
+          fetchAlerts(),
+          fetchIncidents(50, Date.now() - days * 24 * 60 * 60 * 1000),
+          fetchIncidents(),
+        ]);
         checks = s.checks;
+        statusPage = s.page;
+        statusTotal = s.total_checks;
+        statusHasMore = s.has_more;
         alerts = a.alerts;
-        incidents = inc.incidents;
+        publicIncidents = publicInc.incidents;
+        adminIncidents = adminInc.incidents;
         fleet = s.agents;
         maintenance = s.maintenance;
       } catch {
@@ -516,10 +579,19 @@
   // page isn't left stale. Reuses the initial load path without the spinner.
   async function resync() {
     try {
-      const [s, a, inc] = await Promise.all([fetchStatus(), fetchAlerts(), fetchIncidents()]);
+      const [s, a, publicInc, adminInc] = await Promise.all([
+        fetchStatus(statusScope, statusPage, STATUS_PAGE_SIZE),
+        fetchAlerts(),
+        fetchIncidents(50, Date.now() - days * 24 * 60 * 60 * 1000),
+        fetchIncidents(),
+      ]);
       checks = s.checks;
+      statusPage = s.page;
+      statusTotal = s.total_checks;
+      statusHasMore = s.has_more;
       alerts = a.alerts;
-      incidents = inc.incidents;
+      publicIncidents = publicInc.incidents;
+      adminIncidents = adminInc.incidents;
       fleet = s.agents;
       maintenance = s.maintenance;
       sectionRollups = s.sections;
@@ -529,12 +601,23 @@
     }
   }
 
-  // Only the per-check charts depend on the window, so nothing reloads status,
-  // alerts or agents here. The refetch itself is left to the effect above,
-  // which already watches `days`.
+  // The selected window bounds resolved incidents as well as the charts; open
+  // incidents remain present because the server deliberately does not apply the
+  // bound to them. The admin list is always fetched without this parameter.
+  async function loadPublicIncidents(window: number) {
+    const since = Date.now() - window * 24 * 60 * 60 * 1000;
+    const fetched = await fetchIncidents(50, since);
+    // A slower response for a previously selected range must not overwrite the
+    // list for the range now visible on screen.
+    if (days === window) publicIncidents = fetched.incidents;
+  }
+
   function setDays(next: number) {
     if (next === days) return;
     days = next;
+    void loadPublicIncidents(next).catch(() => {
+      // Keep the last known public list if its refetch fails.
+    });
     try {
       localStorage.setItem(RANGE_STORAGE_KEY, String(next));
     } catch {}
@@ -577,7 +660,14 @@
   // Splitting here keeps the markup from testing `display` twice and getting
   // the two branches out of step.
   const inlineGroups = $derived(monitorGroups.filter((g) => g.display === 'inline'));
-  const pagedGroups = $derived(monitorGroups.filter((g) => g.display === 'page'));
+  // Page sections are represented by rollups on the primary scope, not their
+  // child rows. Keep their tiles here so bounded status pages do not make an
+  // unopened section disappear.
+  const pagedGroups = $derived(
+    sections
+      .filter((section) => section.display === 'page')
+      .map((section) => ({ name: section.name, checks: [] as Check[], collapsed: section.collapsed })),
+  );
 
   // The section whose own page is open, resolved against the status list. An
   // empty `checks` here is a real state — a section can be emptied while its
@@ -589,30 +679,64 @@
       name,
       checks: ordered.filter((c) => c.group === name),
       known: sections.some((s) => s.name === name),
+      rollup: sectionRollups.find((r) => r.name === name),
     };
+  });
+
+  const groupRollupBanner = $derived.by(() => {
+    const rollup = groupPage?.rollup;
+    if (!rollup) return null;
+    const tone = rollup.status === 'up' ? 'operational' : rollup.status === 'down' ? 'major' : 'degraded';
+    const label =
+      rollup.status === 'up'
+        ? 'All monitors operational'
+        : rollup.status === 'down'
+          ? 'Section outage'
+          : rollup.status === 'degraded'
+            ? 'Degraded section performance'
+            : 'Section status unknown';
+    return { ...rollup, tone, label };
   });
 
   // Everything without a group is listed loose, so a check can never be hidden
   // by a config typo.
   const generalChecks = $derived(ordered.filter((c) => !c.group));
 
-  // The page-wide live surface. Fed by the same `incidents` array the websocket
-  // keeps current, so one opening or resolving lands here without a reload.
-  const openGlobals = $derived(openGlobalIncidents(incidents));
+  // The page-wide live surface is derived from the windowed public list, which
+  // always includes open incidents even when their start predates the window.
+  const openGlobals = $derived(openGlobalIncidents(publicIncidents));
+
+  // Section URLs remain deep-linkable; changing scope always starts at page one
+  // and requests matching charts with the exact same scope/page tuple.
+  $effect(() => {
+    if (view.name !== 'home' && view.name !== 'group') return;
+    const scope = statusScope;
+    statusPage = 0;
+    void loadStatusPage(0)
+      .then(() => loadCharts(days, scope, 0))
+      .catch(() => {
+        // The normal load error path remains responsible for initial failures.
+      });
+  });
 
   async function load() {
     loading = true;
     error = null;
     try {
-      const [s, a, inc, sec] = await Promise.all([
-        fetchStatus(),
+      const [s, a, publicInc, adminInc, sec] = await Promise.all([
+        fetchStatus(statusScope, statusPage, STATUS_PAGE_SIZE),
         fetchAlerts(),
+        fetchIncidents(50, Date.now() - days * 24 * 60 * 60 * 1000),
         fetchIncidents(),
         fetchPublicSections(),
       ]);
       checks = s.checks;
+      statusPage = s.page;
+      statusTotal = s.total_checks;
+      statusHasMore = s.has_more;
       alerts = a.alerts;
-      incidents = inc.incidents;
+      publicIncidents = publicInc.incidents;
+      adminIncidents = adminInc.incidents;
       fleet = s.agents;
       maintenance = s.maintenance;
       sections = sec;
@@ -631,35 +755,43 @@
   // 401 to learn from, so `authenticated` would stay true from page load and
   // keep serving admin screens to an expired session. Re-verify on entering
   // admin and on every panel switch rather than inferring it from failures.
-  $effect(() => {
-    if (view.name !== 'admin') return;
-    void view.panel;
-    fetchSession()
+  // The mount and initial admin-route paths can overlap, so share their one
+  // request rather than probing the same cookie twice.
+  function checkSession(): Promise<void> {
+    if (sessionRequest) return sessionRequest;
+    sessionRequest = fetchSession()
       .then((s) => {
         authenticated = s.authenticated;
         nodeMode = s.mode;
-        if (!s.authenticated) adminView = 'login';
+        if (!s.authenticated && view.name === 'admin') adminView = 'login';
       })
-      .finally(() => (sessionChecked = true));
+      .finally(() => {
+        sessionChecked = true;
+        sessionRequest = null;
+      });
+    return sessionRequest;
+  }
+
+  $effect(() => {
+    if (view.name !== 'admin') return;
+    void view.panel;
+    void checkSession();
   });
 
   onMount(() => {
     load();
     // Cookie-only: the server is the sole authority on whether we're signed in.
-    fetchSession()
-      .then((s) => {
-        authenticated = s.authenticated;
-        nodeMode = s.mode;
-      })
-      .finally(() => (sessionChecked = true));
+    void checkSession();
     const conn = connectWs({
       onStatus: (s) => (wsStatus = s),
       onStateChange: (msg) => {
         // Optimistic: flip the badge (and the "All Systems Operational" banner,
         // which is derived from `checks`) and prepend the alert immediately for
         // instant feedback. Reducers are pure and unit-tested in live.test.ts.
+        const check = checks.find((c) => c.check_id === msg.check_id);
         checks = applyStateChange(checks, msg);
         alerts = prependAlert(alerts, msg);
+        liveAnnouncement = `${check?.name ?? 'Monitor'} changed from ${msg.from} to ${msg.to}.`;
         // Then reconcile against the server: the event carries no latency,
         // status code, error, uptime_24h or fleet health, and the charts are
         // frozen at page-load values until refetched.
@@ -669,7 +801,8 @@
         if (view.name === 'detail' && view.checkId === msg.check_id) detailRefresh += 1;
       },
       onIncident: (msg) => {
-        incidents = applyIncidentEvent(incidents, msg);
+        adminIncidents = applyIncidentEvent(adminIncidents, msg);
+        publicIncidents = applyIncidentEvent(publicIncidents, msg);
       },
       // A reconnect may have skipped events while the socket was down, so pull
       // status, alerts, incidents and every chart back into sync — including an
@@ -697,6 +830,13 @@
 </script>
 
 <div class="app" class:wide={view.name === 'admin'} class:admin-app={view.name === 'admin'}>
+  <div
+    aria-live="polite"
+    aria-atomic="true"
+    style="position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0"
+  >
+    {liveAnnouncement}
+  </div>
   <!-- The console owns the whole viewport, brand included, so the status page
        header is suppressed there rather than stacked above a second brand. -->
   {#if view.name !== 'admin'}
@@ -726,8 +866,8 @@
     {@const editing = view.edit ?? null}
     {@const incEditing = view.incident ?? null}
     {@const meta = ADMIN_PANELS.find((p) => p.id === panel)}
-    {@const openCount = incidents.filter((i) => i.state !== 'resolved').length}
-    {@const unacked = incidents.filter((i) => i.state === 'detected').length}
+    {@const openCount = adminIncidents.filter((i) => i.state !== 'resolved').length}
+    {@const unacked = adminIncidents.filter((i) => i.state === 'detected').length}
     <div class="admin-shell">
       <nav class="admin-nav" aria-label="admin sections">
         <div class="nav-brand">
@@ -826,8 +966,14 @@
           {:else if panel === 'alerts'}
             <AlertsList {alerts} {checks} onOpenIncident={openIncidentEditor} />
           {:else if panel === 'incidents'}
+            {#if acknowledgementError}
+              <div class="notice error" role="alert">
+                Failed to acknowledge incident: {acknowledgementError}
+                <button class="link" onclick={() => (acknowledgementError = null)}>Dismiss</button>
+              </div>
+            {/if}
             <IncidentsList
-              {incidents}
+              incidents={adminIncidents}
               {checks}
               onEdit={(i) => openIncidentEditor(i.id)}
               onAck={acknowledge}
@@ -864,6 +1010,18 @@
   {:else if view.name === 'group' && groupPage}
     <button class="link" onclick={goBack}>← Back</button>
     <section class="section">
+      {#if groupRollupBanner}
+        <div class="banner {groupRollupBanner.tone}">
+          <span class="banner-icon" aria-hidden="true">
+            {#if groupRollupBanner.status === 'up'}✓{:else}!{/if}
+          </span>
+          <span class="banner-text">
+            {groupRollupBanner.label} · {groupRollupBanner.checks} {groupRollupBanner.checks === 1 ? 'monitor' : 'monitors'}
+            {#if groupRollupBanner.down > 0} · {groupRollupBanner.down} down{/if}
+            {#if groupRollupBanner.degraded > 0} · {groupRollupBanner.degraded} degraded{/if}
+          </span>
+        </div>
+      {/if}
       <div class="section-bar">
         <h2 class="section-title">{groupPage.name}</h2>
         <div class="range-switch" role="group" aria-label="chart window">
@@ -881,22 +1039,29 @@
               check={c}
               uptime={uptime[c.check_id]}
               sparkline={sparkline[c.check_id] ?? null}
-              incident={openIncidentForCheck(incidents, c.check_id)}
+              incident={openIncidentForCheck(publicIncidents, c.check_id)}
               onselect={openDetail}
               onbarclick={(id, b) => (dayModal = { checkId: id, bucket: b })}
             />
           {/each}
         </div>
-      {:else}
-        <div class="notice">
-          {groupPage.known
-            ? 'This section has no checks in it.'
-            : 'No such section. It may have been renamed or deleted.'}
-        </div>
-      {/if}
-    </section>
-  {:else}
-    <OverallBanner {checks} />
+       {:else}
+         <div class="notice">
+           {groupPage.known
+             ? 'This section has no checks in it.'
+             : 'No such section. It may have been renamed or deleted.'}
+         </div>
+       {/if}
+       {#if statusTotal > STATUS_PAGE_SIZE}
+         <nav class="pagination" aria-label="monitor pages">
+           <button class="btn" disabled={statusPage === 0} onclick={() => setStatusPage(statusPage - 1)}>Previous</button>
+           <span>Showing {statusPage * STATUS_PAGE_SIZE + 1}–{Math.min((statusPage + 1) * STATUS_PAGE_SIZE, statusTotal)} of {statusTotal}</span>
+           <button class="btn" disabled={!statusHasMore} onclick={() => setStatusPage(statusPage + 1)}>Next</button>
+         </nav>
+       {/if}
+     </section>
+   {:else}
+     <OverallBanner {checks} />
 
     {#if maintenance.length}
       <div class="mbanners">
@@ -953,7 +1118,7 @@
           <SectionTile
             name={g.name}
             rollup={sectionRollups.find((r) => r.name === g.name)}
-            count={g.checks.length}
+            count={sectionRollups.find((r) => r.name === g.name)?.checks ?? 0}
             onopen={openGroup}
           />
         {/each}
@@ -970,17 +1135,24 @@
                 check={c}
                 uptime={uptime[c.check_id]}
                 sparkline={sparkline[c.check_id] ?? null}
-                incident={openIncidentForCheck(incidents, c.check_id)}
+                incident={openIncidentForCheck(publicIncidents, c.check_id)}
                 onselect={openDetail}
                 onbarclick={(id, b) => (dayModal = { checkId: id, bucket: b })}
               />
             {/each}
           </CollapsibleGroup>
         {/each}
-      </div>
-    </section>
+       </div>
+       {#if statusTotal > STATUS_PAGE_SIZE}
+         <nav class="pagination" aria-label="monitor pages">
+           <button class="btn" disabled={statusPage === 0} onclick={() => setStatusPage(statusPage - 1)}>Previous</button>
+           <span>Showing {statusPage * STATUS_PAGE_SIZE + 1}–{Math.min((statusPage + 1) * STATUS_PAGE_SIZE, statusTotal)} of {statusTotal}</span>
+           <button class="btn" disabled={!statusHasMore} onclick={() => setStatusPage(statusPage + 1)}>Next</button>
+         </nav>
+       {/if}
+      </section>
 
-    {#if fleet.length}
+      {#if fleet.length}
       <section class="section">
         <h2 class="section-title">Monitoring Agents</h2>
         <div class="components">
@@ -999,7 +1171,7 @@
 
     <section class="section">
       <h2 class="section-title">Past Incidents</h2>
-      <PastIncidents {incidents} {checks} onOpen={openIncident} />
+       <PastIncidents incidents={publicIncidents} {checks} onOpen={openIncident} />
     </section>
   {/if}
 </div>

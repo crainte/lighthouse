@@ -15,8 +15,10 @@
 //! sweep. Add a periodic `/api/v1/status` pull between peers if silent
 //! divergence ever matters more than the code it costs.
 
-use crate::coordinator::state::Transition;
-use crate::models::NodeState;
+use crate::{
+    coordinator::{routes::peer::ReplicatedAlert, state::Transition},
+    models::NodeState,
+};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::warn;
@@ -40,6 +42,10 @@ const GOSSIP_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct Message {
     #[serde(default)]
     pub alert_id: Option<String>,
+    /// The immutable event payload for `alert_id`, carried by new senders so a
+    /// receiver never rebuilds the same id from its own incident assignment.
+    #[serde(default)]
+    pub alert: Option<ReplicatedAlert>,
     pub check_id: crate::models::CheckId,
     pub from: NodeState,
     pub to: NodeState,
@@ -59,11 +65,12 @@ impl Message {
     pub fn new(
         t: &Transition,
         timestamp: i64,
-        alert_id: Option<String>,
+        alert: Option<ReplicatedAlert>,
         incident_id: Option<String>,
     ) -> Self {
         Self {
-            alert_id,
+            alert_id: alert.as_ref().map(|alert| alert.id.clone()),
+            alert,
             check_id: t.check_id,
             from: t.from,
             to: t.to,

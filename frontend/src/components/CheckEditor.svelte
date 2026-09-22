@@ -643,6 +643,23 @@ count: c.placement?.count ?? c.placement?.per_zone ?? 1,
     );
   }
 
+  function secretReferenceError(target: string, headers: { name: string; value: string }[]): string | null {
+    const hasReference = (value: string) => value.includes('${');
+    const authority = target.match(/^[a-z]+:\/\/([^/?#]*)/i)?.[1] ?? '';
+    if (authority.includes('@')) return 'URL userinfo is not allowed; use an authentication header with a ${NAME} reference.';
+    const query = target.split('?')[1]?.split('#')[0] ?? '';
+    for (const part of query.split('&')) {
+      const [key, value = ''] = part.split('=', 2);
+      if (/^(access_token|api_key|apikey|auth|key|password|passwd|secret|token)$/i.test(key) && !hasReference(value))
+        return 'Sensitive query values must use a ${NAME} reference.';
+    }
+    for (const header of headers) {
+      if (/^(authorization|proxy-authorization|x-api-key|x-auth-token|x-access-token)$/i.test(header.name.trim()) && !hasReference(header.value))
+        return 'Authentication header values must use a ${NAME} reference.';
+    }
+    return null;
+  }
+
   async function save() {
     if (saving) return;
     savedNote = null;
@@ -650,6 +667,8 @@ count: c.placement?.count ?? c.placement?.per_zone ?? 1,
     if (!n) return (saveError = 'Name is required.');
     const k = draft.type;
     if (k !== 'heartbeat' && !draft.target.trim()) return (saveError = 'Target is required.');
+    const secretError = secretReferenceError(draft.target.trim(), k === 'http' ? draft.headers : []);
+    if (secretError) return (saveError = secretError);
     if (k !== 'heartbeat' && !whole(draft.timeout_secs, 1))
       return (saveError = 'Timeout must be a whole number of seconds, at least 1.');
     if (k === 'icmp' && !whole(draft.ping.count, 1))
@@ -975,7 +994,8 @@ per_zone: draft.placement.count ?? 1,
         {#if kind === 'http'}
           <label class="field wide">
             <span class="field-label">Target URL</span>
-            <input class="mono" bind:value={draft.target} placeholder="https://example.com/health" />
+            <input class="mono" bind:value={draft.target} placeholder="https://example.com/health?token=${API_TOKEN}" />
+            <span class="field-note">Use ${'{NAME}'} for credentials; it resolves only in the probing region.</span>
           </label>
 
           <label class="field">
