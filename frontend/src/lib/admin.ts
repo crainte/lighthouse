@@ -290,9 +290,23 @@ export async function logout(): Promise<void> {
   await send("POST", "/api/v1/logout");
 }
 
+/** The whole catalogue, gathered a bounded page at a time.
+ *
+ *  Half the console treats this as a lookup table — dependency pickers,
+ *  section assignment, the maintenance-window chooser — so the array is the
+ *  contract and paging is an implementation detail. What is *not* negotiable
+ *  is the size of any one request: the coordinator answers from a single
+ *  database worker, and one request for ten thousand check documents makes
+ *  every other request, including result ingest, wait behind it. */
 export async function fetchAdminChecks(): Promise<AdminCheck[]> {
-  const r = await request<{ checks: AdminCheck[] }>("/api/v1/admin/checks");
-  return r.checks;
+  const checks: AdminCheck[] = [];
+  for (let page = 0; ; page += 1) {
+    const r = await request<{ checks: AdminCheck[]; has_more: boolean }>(
+      `/api/v1/admin/checks?page=${page}`,
+    );
+    checks.push(...r.checks);
+    if (!r.has_more || r.checks.length === 0) return checks;
+  }
 }
 
 export function fetchRegionTree(): Promise<RegionTreeResponse> {

@@ -234,6 +234,20 @@ async fn cluster_view(addr: SocketAddr, session: &str) -> Value {
         .unwrap()
 }
 
+/// `GET /api/v1/admin/raw-data-gaps`: standing raw-data gaps this node has
+/// recorded about its peers.
+async fn raw_data_gaps(addr: SocketAddr, session: &str) -> Value {
+    reqwest::Client::new()
+        .get(format!("http://{addr}/api/v1/admin/raw-data-gaps"))
+        .header(reqwest::header::COOKIE, session)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
 /// `POST /internal/cluster/ping`, authenticated, returning the reply body.
 async fn post_ping(addr: SocketAddr, body: &Value) -> Value {
     let res = reqwest::Client::new()
@@ -820,6 +834,170 @@ async fn anti_entropy_signals_peer_behind_raw_retention() {
         .value,
         1.0,
         "the signal must state that receiving the retained page did not complete backfill"
+    );
+}
+
+/// Retention-aware peer recovery (item B) is more than a counter: the same
+/// condition `anti_entropy_signals_peer_behind_raw_retention` exercises must
+/// also leave a durable, attributable row an operator can read — which check,
+/// which peer, and what range is unrecoverable by ordinary anti-entropy.
+#[tokio::test]
+async fn a_raw_data_gap_is_recorded_and_readable_from_the_admin_route() {
+    let a = spawn_node("a", vec![], NO_TIMEOUT).await;
+    a.coord
+        .ingest(vec![result(200, 1_000), result(200, 2_000)])
+        .await;
+    a.coord.prune_results_for_test(2_000).await.unwrap();
+
+    let b = spawn_node("b", vec![], NO_TIMEOUT).await;
+    let session_a = login(a.addr).await;
+    gossip_step(a.addr, &session_a, b.addr).await;
+    b.coord.anti_entropy_sweep().await;
+
+    let session_b = login(b.addr).await;
+    let gaps = raw_data_gaps(b.addr, &session_b).await;
+    let rows = gaps["gaps"].as_array().unwrap();
+    let gap = rows
+        .iter()
+        .find(|g| g["check_id"] == cid_str(CHECK))
+        .unwrap_or_else(|| panic!("B should have recorded a gap for {CHECK}: {gaps}"));
+    assert_eq!(
+        gap["to_ts"], 2_000,
+        "the gap must name where the source's retained history actually begins"
+    );
+    assert_eq!(gaps["total"], 1);
+
+    // Redetecting the same standing gap on a second sweep must refresh the
+    // one row rather than accumulate another — see `record_raw_data_gap`.
+    b.coord.anti_entropy_sweep().await;
+    let gaps_again = raw_data_gaps(b.addr, &session_b).await;
+    assert_eq!(
+        gaps_again["total"], 1,
+        "a standing gap redetected every sweep must not grow the table: {gaps_again}"
+    );
+}
+
+/// Rollup anti-entropy (item A): a peer whose raw retention has already
+/// dropped a window can still recover the minute/hour summaries for it,
+/// because rollups now replicate on their own instead of only ever being a
+/// side effect of raw-result replication.
+#[tokio::test]
+async fn a_peer_missing_a_rollup_window_recovers_it_through_a_sweep() {
+    let a = spawn_node("a", vec![], NO_TIMEOUT).await;
+    a.coord
+        .ingest(vec![result(200, 1_000), result(500, 61_000)])
+        .await;
+    // Raw is pruned entirely — A now has zero raw rows for this check, only
+    // the minute (and hour) rollups derived from them before the prune. This
+    // is exactly the condition item A exists for: ordinary raw backfill has
+    // nothing left to offer, because the source has nothing left either.
+    a.coord.prune_results_for_test(i64::MAX).await.unwrap();
+    assert!(
+        history(a.addr, &cid_str(CHECK)).await.is_empty(),
+        "the setup must actually remove A's raw history, or this is not testing gap recovery"
+    );
+    let a_rollups = a.coord.minute_rollups_for_test().await.unwrap();
+    assert_eq!(
+        a_rollups.len(),
+        2,
+        "A should still hold one minute bucket per result: {a_rollups:?}"
+    );
+
+    let b = spawn_node("b", vec![], NO_TIMEOUT).await;
+    let session_a = login(a.addr).await;
+    gossip_step(a.addr, &session_a, b.addr).await;
+
+    // A raw-result sweep alone would find nothing to pull; only the rollup
+    // stream can recover this. `anti_entropy_sweep` runs both from one call.
+    b.coord.anti_entropy_sweep().await;
+
+    let b_rollups = b.coord.minute_rollups_for_test().await.unwrap();
+    assert_eq!(
+        b_rollups.len(),
+        a_rollups.len(),
+        "B should have recovered every bucket A still holds: {b_rollups:?}"
+    );
+    for a_row in &a_rollups {
+        let b_row = b_rollups
+            .iter()
+            .find(|r| r.bucket_start == a_row.bucket_start && r.agent_id == a_row.agent_id)
+            .unwrap_or_else(|| panic!("B is missing A's bucket at {}", a_row.bucket_start));
+        assert_eq!(b_row.attempts, a_row.attempts);
+        assert_eq!(b_row.up, a_row.up);
+        assert_eq!(b_row.latency_sum, a_row.latency_sum);
+    }
+}
+
+/// An alert is immutable, so two replicas holding the same id with different
+/// payloads never agree and their digests never converge. That is a health
+/// alarm, not a repair task — but it must not also be an unbounded cost.
+/// Discarding the backfill cursor on reaching a peer's tail made every
+/// subsequent sweep replay that peer's whole alert stream, forever. Parking at
+/// the tail turns the same stuck stream into one empty page per sweep, which
+/// the conflict counter shows by standing still.
+#[tokio::test]
+async fn anti_entropy_stops_replaying_a_stream_that_cannot_converge() {
+    let a = spawn_node("a", vec![], NO_TIMEOUT).await;
+    let b = spawn_node("b", vec![], NO_TIMEOUT).await;
+    let shared = |current_state: &str, node_id: String| {
+        json!({
+            "id": format!("{}-3000-down", cid_str(CHECK)),
+            "scope": "check",
+            "node_id": node_id,
+            "previous_state": "up",
+            "current_state": current_state,
+            "timestamp": 3_000,
+            "incident_id": null,
+        })
+    };
+    // The divergence this reproduces: one id, two bodies. B's names a check A
+    // has never heard of, which is exactly what a node-local identity rewrite
+    // used to produce. B also holds an alert of its own, so the two stream
+    // digests differ in a direction backfill can never close — which is what
+    // makes B keep asking.
+    let other = Uuid::now_v7().to_string();
+    let b_only = json!({
+        "id": format!("{}-4000-up", cid_str(CHECK)),
+        "scope": "check",
+        "node_id": cid_str(CHECK),
+        "previous_state": "down",
+        "current_state": "up",
+        "timestamp": 4_000,
+        "incident_id": null,
+    });
+    for (node, rows) in [
+        (a.addr, vec![shared("down", cid_str(CHECK))]),
+        (b.addr, vec![shared("down", other), b_only]),
+    ] {
+        assert!(
+            replicate(node, &json!({ "origin": "seed", "alerts": rows }))
+                .await
+                .is_success()
+        );
+    }
+
+    let session_a = login(a.addr).await;
+    gossip_step(a.addr, &session_a, b.addr).await;
+    let conflicts = |node: &Node| {
+        warden::openmetrics::select(
+            &node.coord.metrics(),
+            "warden_replication_alert_identity_conflicts_total",
+            &[],
+        )
+        .unwrap()
+        .value
+    };
+
+    b.coord.anti_entropy_sweep().await;
+    let after_first = conflicts(&b);
+    assert_eq!(after_first, 1.0, "the divergent row must be reported once");
+    for _ in 0..3 {
+        b.coord.anti_entropy_sweep().await;
+    }
+    assert_eq!(
+        conflicts(&b),
+        after_first,
+        "a stuck stream must not be re-walked from the beginning every sweep"
     );
 }
 

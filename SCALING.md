@@ -227,7 +227,8 @@ coordinator enforces:
 | State transitions | The raw-results window; the latest/open span per check is retained |
 | Alerts and resolved incidents | 90 days by default (`retention.alerts_days`); open incidents are retained |
 | Current state | Retained while the check exists |
-| Minute/hour latency rollups | Not stored yet |
+| Minute latency rollups | 90 days, derived from raw on ingest and replicated on their own anti-entropy stream |
+| Hourly latency rollups | 13 months, same derivation and replication as the minute tier |
 | WAL | DuckDB recovery state; no independent age-based retention promise |
 | Backups | No built-in scheduler or retention; checkpointed offline copies are operator-managed |
 
@@ -247,6 +248,28 @@ Raw retention supports detailed diagnosis. State transitions support exact time-
 uptime without retaining every successful probe. Rollups support bounded long-range
 latency queries. The backup schedule is an operational starting point, not a built-in
 Warden guarantee.
+
+Minute/hour rollups replicate through their own digest and cursored backfill
+(`/internal/backfill/latency-minute`, `-hour`), the same shape as the alert/incident/
+tombstone streams, rather than only ever arriving as a side effect of raw-result
+replication. This closes the gap that used to make a rollup unrecoverable once a peer
+had been offline longer than raw retention: with no raw rows left to derive it from and
+nothing shipping the summary itself, 60+ days of already-summarized history was lost on
+that replica for good. A rollup row is a growing upsert, not an append-only event, so its
+digest carries running totals of `attempts`/`up`/`latency_sum` alongside a count and the
+newest bucket, and a backfilled row is merged with `GREATEST` per counter rather than
+summed — the only combination that stays correct no matter how many times the same page
+is replayed. See `storage::RollupDigest` and `rollup_merge_from_backfill_sql`.
+
+What this changes about peer recovery: raw observations older than the source's own
+retention horizon are still gone for good — nothing anti-entropy does can un-delete a row
+neither replica holds, and that condition is now recorded as a durable, attributable
+`raw_data_gaps` row (readable at `GET /api/v1/admin/raw-data-gaps`) instead of only a log
+line and a counter. What is no longer lost is the *summarized* latency history for that
+same window: the minute/hour rollups covering it replicate independently of the raw rows
+they were built from, so a peer that missed the raw retention window can still recover
+"what latency looked like" for it, even though it can never recover "what every individual
+probe returned." The loss is bounded to raw probe-level detail, not the whole history.
 
 Capacity is driven by independent observation domains, not colocated agent replicas:
 
@@ -287,7 +310,43 @@ storage growth exceeds the accepted production envelope after rollups and partit
 
 A peer offline longer than raw retention cannot recover complete raw history through
 ordinary anti-entropy and must be restored from a snapshot/backup or explicitly accept a
-gap.
+gap. There is no snapshot-restore tooling yet, so today this means the gap: `raw_data_gaps`
+records exactly which check and time range anti-entropy could not close, and the same
+window's minute/hour rollups — which do replicate on their own — keep its summarized
+latency history recoverable even though the raw observations behind it are not. See
+"Data retention tiers" above.
+
+### Pre-1.0 database policy
+
+No in-place schema or identity migrations are supported before 1.0. A database
+written by an older build is rebuilt, not migrated.
+
+This is not the general "wire formats and storage shapes change freely"
+stance restated — it is a narrower, specific problem. Check identity is
+cluster-shared state: every node's copy of `checks`, `alerts`, results, and
+history has to agree on what a given check *is*. A migration run node-locally
+on startup cannot establish that agreement — each node converts its own
+database on its own schedule, so replicas disagree about identity for as long
+as the rollout takes, and anti-entropy has no way to reconcile "this is the
+same check under two different ids" on its own.
+
+Derived identifiers make a node-local migration actively unsafe rather than
+merely temporarily inconsistent. An alert id is `<check_id>-<ts>-<state>`,
+so it names its check twice: once in the id and once in the body. A migration
+that rewrites `alerts.node_id` (the body) without also rewriting `alerts.id`
+leaves a row whose id names the old check and whose body names the new one.
+`upsert_alert` treats an alert as immutable once its id exists and refuses to
+overwrite it, so two replicas that picked different ids for the same
+logical alert never converge — anti-entropy re-offers the same page every
+sweep, forever. This was measured in the live three-node dev cluster: 127
+alert rows with identical ids and different `node_id` per node, all
+permanently conflicting.
+
+The supported answer is a rebuild: stop the node, remove its database file,
+restart it. It re-replicates current configuration from its peers and
+re-accumulates history from the retention window forward. That is cheap and
+correct precisely because the project has no released state to preserve yet;
+once it does, this policy is the thing that will need to change.
 
 ## UUIDv7 implementation plan
 
@@ -549,21 +608,33 @@ interrupted run leaves a consistent database with more to remove tomorrow.
 
 ### Measured status, page, and global-push cardinality
 
-`benchmark_status_and_global_push_production_cardinality` at 10,000 checks and four
-regions:
+`benchmark_status_and_global_push_production_cardinality` at 10,000 checks and three
+regions, re-measured against the paginated read path (`src/page.rs`,
+`MAX_PAGE_SIZE = 1,000`; `?section=`/`?page=`/`?limit=` on `/api/v1/status`,
+`/api/v1/uptime`, and `/api/v1/latency-points`):
 
 | Path | p95 | Bytes |
 |---|---:|---:|
-| Regional `/api/v1/status` | 56 ms | 2.39 MB |
-| Full status **page** (3 requests) | 509 ms | 134.7 MB |
-| Global push (per region, per interval) | 101 ms | 2.14 MB |
-| Global `/api/v1/status` | 34 ms | 2.15 MB |
+| Regional `/api/v1/status` (default page, 100 checks) | 53 ms | 23.7 KB |
+| Full status **page** (3 requests, default 100-check page) | 66 ms | 1.28 MB |
+| Full status page at the page ceiling (3 requests, 1,000-check page) | 102 ms | 12.8 MB |
+| Global push (per region, per interval) | 90 ms | 2.04 MB |
+| Global `/api/v1/status` (default page, 100 checks) | 13 ms | 20.9 KB |
 
-The status page is the outlier by two orders of magnitude: 134.7 MB is uptime strips and
-latency points for 10,000 checks, and no browser should be asked to take that. The
-supported dashboard cardinality is therefore far below the supported *monitoring*
-cardinality — treat a 10,000-check deployment as one that needs paginated or filtered
-views, not one where the whole estate renders on one page.
+This replaces the earlier unpaginated measurement of 509 ms / 134.7 MB for a full page
+load at this cardinality (see "Read path: the status page is not the status endpoint"
+below for what changed). The dashboard's own page size
+(`STATUS_PAGE_SIZE` in `frontend/src/App.svelte`) is 100, so the second row — 1.28 MB,
+a 99% reduction — is what a browser actually requests today. The third row is the
+ceiling every list route enforces regardless of what a client asks for
+(`crate::page::MAX_PAGE_SIZE`); even a client that deliberately requests the largest
+page the server allows costs an order of magnitude less than the old unbounded read,
+and the response says explicitly, via `total_checks`/`has_more`, that there is more to
+page through rather than silently truncating. The supported dashboard cardinality is no
+longer far below the supported *monitoring* cardinality — a 10,000-check deployment
+renders its default view in low hundreds of KB, and pagination or per-section filtering
+is now how an operator reaches the rest, not a workaround for a page that cannot load at
+all.
 
 Still unmeasured, and therefore outside a full 10,000-check support claim:
 representative multi-protocol targets, three and five observation domains, 30-day
@@ -656,6 +727,104 @@ This is baseline characterization only. It does not validate live probe traffic,
 network replication, online backups, rollup resolution switching, or partition expiry;
 those are required before a supported-envelope claim.
 
+### Indexing evaluated and rejected at measured scale
+
+The only indexes in the schema before this evaluation were two `UNIQUE` indexes that
+exist purely as constraint-violation triggers in transaction-rollback tests
+(`one_check_per_ts`, `reject_alert`) — not for read performance. Everything else,
+including `check_results`, has none beyond what DuckDB builds automatically for
+`PRIMARY KEY`/`UNIQUE` columns. This was a gap worth measuring, not assuming either
+way: the bundled DuckDB is v1.5.4 (`duckdb = "1.10504.0"` in `Cargo.lock`), and its ART
+indexes changed behavior significantly from the earlier versions the "indexes rebuild at
+startup" folklore is based on — they are now serialized to disk and lazily deserialized,
+so per DuckDB's own docs "having an index will not cause any slowdowns when opening an
+existing database." `benchmark_check_results_check_id_ts_index_tradeoff` and
+`benchmark_alert_incident_lookup_index_tradeoff` (both ignored) confirm that directly
+rather than trust the docs unread, and measure the three candidates the TODO named.
+
+**`check_results(check_id, ts_millis)`** — the candidate for `Storage::history` and
+`Storage::latency_series`'s per-check filter. Measured at 80.64M rows (2,000 checks × 14
+raw days × 30 s cadence), two runs:
+
+| | No index | With index |
+|---|---:|---:|
+| Database file | 2.27 GB | 6.00 GB (2.6×) |
+| Bulk seed (80.64M rows) | 126–131 s | 214–267 s (1.7–2.1×) |
+| Reopen (closed, checkpointed) | 8.6–9.4 s | 8.5–9.0 s |
+| `history` p50 / p95 | 6 / 7–64 ms | 5–6 / 7 ms |
+| `latency_series` p50 / p95 | 13 / 17–20 ms | 13 / 15–17 ms |
+| Sustained `persist_ingest` (20 rounds × 2,000 rows on top of the backlog) | 16.7k–35.6k rows/s | 20.5k–34.4k rows/s |
+
+Reopen time is identical with or without the index, confirming the lazy-deserialization
+claim for this DuckDB build — that specific old assumption is false here, and an index
+is not a startup-cost concern at this scale. But the other half of the folklore holds:
+the index costs 1.7–2.6× the storage and materially slows bulk writes, both highly
+reproducible across runs. What it does *not* do, reproducibly, is speed up the reads it
+was meant for — `history`/`latency_series` p50s are identical with or without it, and
+the p95 spread (7–64 ms without an index) is noise from cache/row-group state between
+runs, not a stable tail the index removes (the second run's no-index p95 was 7 ms, the
+same as with the index). The reason is `Storage::history`'s own time bound: DuckDB's
+automatic per-row-group zone map on `ts_millis` — monotonically appended, so highly
+selective — already prunes most of the table before `check_id` is ever evaluated, at
+these row counts, whether an index exists or not. **Decision: do not add it.** It has a
+real, reproducible cost and no reproducible benefit at the row counts measured, which
+cover roughly 9% of the single-domain 30-day envelope in "Current single-table capacity
+baseline" above. The measurement that would reverse this: `history`/`latency_series`
+p95 measured against a table near that full envelope (800M+ rows) exceeding an
+operator-relevant bound *and* not fixable by narrowing the query window — sustained
+ingest has roughly 37× headroom over the steady-state requirement per the capacity
+envelope below, so a write-side regression alone would not be disqualifying; it is the
+combination of file-size cost and absent read benefit that decides this.
+
+**`alerts(ts_millis)`** (`recent_alerts`, `alerts_since`, the retention delete) and
+**`incident_checks(check_id)`** (`open_incident_for`, `incidents_for_check`, whose
+declared `PRIMARY KEY (incident_id, check_id)` does not lead with the column those
+queries filter on) were both measured together, seeded at a deliberately pessimistic
+upper bound — every check across a 10,000-check fleet flapping roughly daily for the
+full 90-day default `alerts_days` retention (900,000 alerts, 45,000 incidents):
+
+| | No index | With index |
+|---|---:|---:|
+| Database file | 66.9 MB | 118.5 MB (1.8×) |
+| Bulk seed | 2.7–4.0 s | 5.7–5.8 s (1.5–2.1×) |
+| Reopen | 69–77 ms | 67–80 ms |
+| `recent_alerts` p95 | 5–9 ms | 6–10 ms |
+| `alerts_since` p95 | 7 ms | 8 ms |
+| `open_incident_for` p95 | 2–3 ms | 3–4 ms |
+| `incidents_for_check` p95 | 8–9 ms | 11 ms |
+| `insert_alert` (2,000 single-row calls) | 102–103 rows/s | 102–103 rows/s |
+
+Both tables are bounded by `alerts_days` retention rather than raw observation volume —
+even this pessimistic seed is two orders of magnitude smaller than `check_results` — and
+a full scan over tens of thousands to under a million rows is already single-digit
+milliseconds. The read differences across both variants are within run-to-run noise in
+either direction; the file-size and bulk-write cost are consistent and one-sided; and
+`insert_alert`'s single-row write cost is identical with the index present or absent,
+because it is bound by DuckDB's per-statement commit overhead rather than by ART
+maintenance — a separate, unaddressed cost this evaluation did not set out to fix.
+**Decision: do not add either index.** The measurement that would reverse this is
+`alerts_days` retention being raised by an order of magnitude or more (multi-million-row
+alerts table) while `recent_alerts`/`alerts_since` p95 exceeds an operator-relevant
+bound.
+
+**`state_history`** is not a candidate at all: its declared `PRIMARY KEY (check_id,
+since)` already leads with `check_id`, which is every filter this codebase issues
+against it (`record_state`, `state_spans`, and the retention anti-join). DuckDB builds
+an ART for every `PRIMARY KEY` automatically, so the index this TODO item asks about
+already exists. `list_status` and `uptime_strips` scan the table unfiltered by
+`check_id` because they want every check in one pass; a `check_id`-leading index cannot
+help a query that does not filter on it, so there is nothing to add there either.
+
+Run either tradeoff benchmark with `WARDEN_BENCH_CHECKS`/`WARDEN_BENCH_DAYS`/
+`WARDEN_BENCH_OBSERVATION_SECS`/`WARDEN_BENCH_INGEST_ROUNDS` or
+`WARDEN_BENCH_ALERTS`/`WARDEN_BENCH_INCIDENTS`/`WARDEN_BENCH_CHECK_POOL`/
+`WARDEN_BENCH_ALERT_WRITE_ROUNDS` respectively:
+
+```bash
+rtk cargo test benchmark_check_results_check_id_ts_index_tradeoff -- --ignored --nocapture
+rtk cargo test benchmark_alert_incident_lookup_index_tradeoff -- --ignored --nocapture
+```
+
 ### Sustained coordinator-ingest benchmark
 
 The ignored `benchmark_sustained_coordinator_ingest` test sends healthy observations
@@ -685,12 +854,13 @@ WARDEN_BENCH_CHECKS=10000 WARDEN_BENCH_REGIONS=3 WARDEN_BENCH_SAMPLES=20 \
 rtk cargo test benchmark_status_and_global_push_production_cardinality -- --ignored --nocapture
 ```
 
-It reports regional/global status p95 and response bytes, full status-page p95 and bytes,
-plus global-push p95 and payload bytes. Optional
-`WARDEN_BENCH_MAX_REGIONAL_STATUS_P95_MS`, `WARDEN_BENCH_MAX_STATUS_PAGE_P95_MS`,
-`WARDEN_BENCH_MAX_STATUS_PAGE_BYTES`, `WARDEN_BENCH_MAX_GLOBAL_PUSH_P95_MS`,
-`WARDEN_BENCH_MAX_GLOBAL_STATUS_P95_MS`, and `WARDEN_BENCH_MAX_PUSH_BYTES` variables
-enforce local acceptance ceilings. The global
+It reports regional/global status p95 and response bytes, full status-page p95 and bytes
+at both the dashboard's default page size and the route's `MAX_PAGE_SIZE` ceiling, plus
+global-push p95 and payload bytes. Optional `WARDEN_BENCH_MAX_REGIONAL_STATUS_P95_MS`,
+`WARDEN_BENCH_MAX_STATUS_PAGE_P95_MS`, `WARDEN_BENCH_MAX_STATUS_PAGE_BYTES`,
+`WARDEN_BENCH_MAX_STATUS_PAGE_MAX_P95_MS`, `WARDEN_BENCH_MAX_STATUS_PAGE_MAX_BYTES`,
+`WARDEN_BENCH_MAX_GLOBAL_PUSH_P95_MS`, `WARDEN_BENCH_MAX_GLOBAL_STATUS_P95_MS`, and
+`WARDEN_BENCH_MAX_PUSH_BYTES` variables enforce local acceptance ceilings. The global
 push route has an explicit 16 MiB limit so supported 10,000-check snapshots are not
 rejected by Axum's 2 MiB default. This validates cardinality, not sustained concurrent
 load or the full production capacity envelope.
@@ -811,11 +981,70 @@ describe how children fold into a parent's *state*. Dependency describes
 
 | Phase | Work |
 |---|---|
-| 1 | Global holds the catalogue and placement durably, replicated between global nodes using the coordinator's existing config plane |
-| 2 | Per-region reconciliation against the set placement implies, with an explicit unplace verb distinct from delete |
-| 3 | Probe detail is delivered only to placed regions; regional pages show only what they hold |
-| 4 | Global runs as three nodes |
-| 5 | Cross-region dependency attribution at the global tier |
+| 1 | Done. Global holds the catalogue and placement durably, replicated between global nodes using the coordinator's existing config plane |
+| 2 | Done. Per-region reconciliation against the set placement implies, driving the existing local-only unplace verb — never delete — for whatever a region should no longer hold |
+| 3 | Done. Probe detail is delivered only to placed regions; regional pages show only what they hold |
+| 4 | Done. Global runs as three nodes |
+| 5 | Done. Cross-region dependency attribution at the global tier |
+
+Phase 1 landed with its scope deliberately narrower than "every `ConfigKind`":
+the global store is authoritative for checks and sections only, the two kinds
+that are "the catalogue" in the sense this document's example is about, and
+that carry no secret a region must keep to itself. Notifiers, credentials and
+rollup policies stay on the pre-Phase-1 all-region fan-out — see
+`global::store`'s module doc for why each is a deliberate exclusion rather
+than an oversight, and widen the authoritative set in Phase 2/3 rather than
+inventing a second mechanism.
+
+Phases 2 and 3 landed together, in `global::reconcile`: only `ConfigKind::Check`
+is placement-scoped — sections carry no per-check rule and stay on the old
+whole-kind push, which the module doc explains is deliberate rather than an
+oversight left for later. Two things had to change together for this to be
+subset-correct rather than merely subset-shaped:
+
+- **The digest.** Comparing a *whole-catalogue* check digest against a region
+  holding only its placed subset would report "behind" forever and re-page
+  every check on every sweep — the amplification this document opens with,
+  reintroduced one level up. `Storage::config_digest_for_region` computes the
+  same count/max-stamp shape restricted to checks a region's placement
+  admits, via a `check_placement_regions` projection maintained in
+  `upsert_check` exactly the way the existing flat columns are — never a
+  `config` JSON parse — so a converged region costs one digest comparison per
+  sweep, not a catalogue read. Tombstones stay unscoped in that digest: an
+  outright delete must reach every region regardless of placement, since
+  nothing records a check's *past* placement to scope a delete against.
+- **The repair.** A digest mismatch on the Check kind no longer triggers
+  `push_kind`'s whole-table resend. `reconcile_checks` instead diffs two id
+  sets — `Storage::check_ids_for_region` (this node's desired set) against
+  `/internal/global/check-ids` (what the region actually holds, primary keys
+  only) — and converges both directions: ids missing are pushed, ids the
+  region should no longer hold are unplaced through the existing
+  `DELETE /api/v1/admin/checks/:id/unplace` route, never deleted. `push_now`,
+  the best-effort push right after an admin write, filters the same way
+  before a region ever sees a check document, so a check placed to one region
+  is never even transiently written to another's store.
+
+Phase 3 fell out of Phase 2 rather than needing its own code: `status_handler`
+and the admin check list already filter through `coord.inner.checks`/
+`storage.list_checks()`, which now only contain what reconciliation placed
+here, so a region's pages were already scoped to what it holds the moment it
+stopped holding anything else. The global dashboard is unaffected — it merges
+per-region pushes (`global::cache::aggregate`) keyed by check id, so a check
+placed in exactly one region still appears exactly once globally, same as
+before.
+
+Phase 5 landed as a read-side pass over what `relay_merge` already builds for
+`/api/v1/incidents` and `/api/v1/checks/:id/incidents`: same-check incidents
+from different regions are folded into one group when their
+`[started_at, resolved_at ?? now]` windows overlap, and a dependent's group is
+attributed to an overlapping cross-region upstream group via `depends_on`,
+which now rides along on `CheckSummary` for exactly this. Neither writes
+anything — a regional incident record, and the flat `incidents` array both
+already relayed from, are untouched; `group_and_attribute` in
+`global::incidents` only adds a `"groups"` array alongside them. See that
+module's doc comment for the exact window and attribution rules, and its
+tests for both the "seconds apart, one group" and "later outage, new group"
+cases the rule has to get right.
 
 No migration or version-gating work is planned: the project is unreleased, so
 wire formats and storage shapes change freely.
@@ -922,13 +1151,17 @@ backend listener access to the trusted proxy/network. Do not enable forwarded
 protocol, host, or client-address headers unless the immediate proxy is
 explicitly trusted and strips client-supplied copies.
 
-Until explicit trusted-proxy support exists, login rate limiting keys on the raw
-socket peer address. Behind a reverse proxy this intentionally produces a shared
-bucket for all users of that proxy; do not trust `X-Forwarded-For` as a workaround.
-Size that shared bucket and place edge rate limiting at the proxy, or deploy
-without a proxy where distinct source-IP buckets are required. When trusted
-proxy support is added, configure exact proxy CIDRs, accept forwarded client
-addresses only from those peers, and test spoofed-header rejection.
+Login rate limiting keys on the raw socket peer address by default, and still
+does behind a reverse proxy that is not declared: every user of that proxy
+shares one bucket, and `X-Forwarded-For` is not trusted as a workaround. Set
+`trusted_proxies` (`[coordinator]`/`[global]`, exact IPs or CIDRs) to change
+that — `crate::security::client_ip` then reads the forwarded header from the
+immediate peer only when it is in that list, walking it from the right and
+skipping entries that are themselves trusted proxies, so a client cannot
+prepend a fake hop ahead of what the real chain appended. The default is
+unchanged (empty list, header ignored) whether or not this is configured, so
+an operator who does not set it keeps exactly the shared-bucket behaviour
+above. See `security::tests` and `admin_api::a_trusted_proxys_forwarded_for_is_honoured_per_client`.
 
 Credential references keep values out of replicated check documents, but they
 do not eliminate rotation work. Rotate admin, peer, global, agent, SMTP, and
@@ -959,6 +1192,30 @@ backup on a recurring schedule with an actual restore, not only a successful
 file copy. The target schedule is 7 daily, 4 weekly, and 12 monthly snapshots;
 apply immutable/off-site storage and access controls appropriate to the loss
 scenario. This schedule is operator-managed, not a built-in scheduler.
+
+`warden backup --config warden.toml --output <path>` and
+`warden restore --from <backup> --into <path>` are the built-in procedure for
+the two paragraphs above, run as a separate CLI invocation rather than an
+admin HTTP route: streaming a multi-gigabyte database through an admin session
+is the wrong shape for an operator action this size, and a backup command that
+opens `coordinator.db_path` directly gets DuckDB's own single-writer file lock
+for free as the enforcement of "stop writes first" — it fails immediately
+against a coordinator that still holds the file, rather than needing an
+in-process pause it would otherwise have to invent. `backup` checkpoints the
+source, copies the file (and its WAL sidecar, if one is still present because
+the checkpoint and the copy raced a write), reopens the copy to prove it is
+queryable rather than merely present, and writes a manifest recording version,
+timestamp, source node, file size, and checksum beside it. It refuses to
+overwrite an existing destination: a backup generation is immutable once
+written. `restore` copies a backup into a fresh destination, verifies the
+manifest checksum before trusting it, and reopens the result to read raw
+result counts, current-state rows, and the oldest retained result — the same
+"opens cleanly and reads back what it should" check `restore` always asks for,
+run automatically instead of by hand. It refuses to write over an existing
+path for the same reason SCALING.md tells an operator not to: restore into a
+replacement location, never over a live database. Neither command drives the
+7/4/12 schedule, the durable-storage placement, or the peer-level checks
+below; those remain operator- and cluster-level responsibilities.
 
 A peer that has been offline longer than raw-result retention cannot obtain a
 complete raw history through normal anti-entropy. Recovery must choose and

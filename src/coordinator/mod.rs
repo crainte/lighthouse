@@ -1,4 +1,5 @@
 pub mod alert;
+pub mod backup;
 pub mod cluster;
 pub mod database;
 mod fleet;
@@ -10,6 +11,7 @@ pub mod state;
 pub mod storage;
 
 use crate::config::{CheckConfig, CoordinatorConfig};
+use crate::configplane::{self, ConfigBatch};
 use crate::credential::AgentCredential;
 use crate::models::{eval, CheckKind, CheckResult, NodeState, Status};
 use crate::rollup::{rollup, RollupPolicy};
@@ -25,7 +27,6 @@ use fleet::{fleet_rows, unreachable_after_ms, FleetMemberDto, FleetRowDto};
 use futures_util::{stream, StreamExt};
 use parking_lot::Mutex;
 use rand::seq::SliceRandom;
-use rand::RngCore;
 use routes::agents::{
     agent_checks_handler, agents_handler, ingest_handler, list_agent_credentials_handler,
     mint_agent_credential_handler, purge_agent_handler, revoke_agent_credential_handler,
@@ -43,13 +44,16 @@ use routes::incidents::{
 pub use routes::incidents::{IncidentCheckDto, IncidentDto, IncidentUpdateDto};
 use routes::peer::{
     alerts_backfill_handler, backfill_handler, cluster_ping_handler, cluster_view_handler,
-    config_entries_handler, config_handler, digest_handler, gossip_handler,
+    config_entries_handler, config_handler, digest_handler, global_check_ids_handler,
+    global_config_digest_handler, global_config_handler, gossip_handler,
     incident_tombstones_backfill_handler, incidents_backfill_handler,
-    read_config_entry_for_replication, replicate_handler, results_backfill_handler, ConfigBatch,
+    latency_hour_backfill_handler, latency_minute_backfill_handler, raw_data_gaps_handler,
+    read_config_entry_for_replication, replicate_handler, results_backfill_handler, RollupBatch,
+    RollupRowDto,
 };
 pub use routes::peer::{
-    CheckDigestDto, ConfigDigestDto, DigestResponse, ReplicatedAlert, ReplicatedBelief,
-    ReplicatedResult, ReplicationBatch, StreamDigestDto,
+    CheckDigestDto, DigestResponse, ReplicatedAlert, ReplicatedBelief, ReplicatedResult,
+    ReplicationBatch, RollupDigestDto, StreamDigestDto,
 };
 use routes::policies::{
     delete_rollup_policy_handler, list_rollup_policies_handler, region_tree_handler,
@@ -75,7 +79,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use storage::Storage;
 use tokio::sync::broadcast;
@@ -455,6 +459,67 @@ struct StartupData {
     rollup_policies: Vec<storage::RollupPolicyRow>,
 }
 
+/// A position in a peer's ordered alert/incident/tombstone stream, plus
+/// whether the walk that produced it reached the peer's tail.
+///
+/// The distinction exists because a stream can fail to converge for reasons
+/// backfill cannot fix — an immutable row that differs between replicas is
+/// refused rather than overwritten, so the digests disagree permanently. A
+/// cursor discarded on reaching the tail would restart that stream from the
+/// beginning on every sweep and replay the peer's entire history forever.
+/// Keeping the tail costs one empty page instead. The full rescan that would
+/// find a row inserted *below* the tail still happens, at
+/// `STREAM_RESCAN_INTERVAL` rather than at the sweep interval.
+#[derive(Clone)]
+struct StreamCursor {
+    position: (i64, String),
+    completed_at: Option<Instant>,
+}
+
+impl StreamCursor {
+    fn walking(position: (i64, String)) -> Self {
+        Self {
+            position,
+            completed_at: None,
+        }
+    }
+
+    fn completed(position: (i64, String)) -> Self {
+        Self {
+            position,
+            completed_at: Some(Instant::now()),
+        }
+    }
+
+    /// A completed walk is worth repeating from the beginning only once the
+    /// backoff has elapsed; until then, resume from the tail.
+    fn stale(&self) -> bool {
+        self.completed_at
+            .is_some_and(|at| at.elapsed() >= STREAM_RESCAN_INTERVAL)
+    }
+}
+
+/// Whether `theirs` might hold a rollup bucket, or a fuller total for one,
+/// that `ours` does not.
+///
+/// A rollup digest has no single scalar position to compare the way an
+/// append-only stream's `(max_millis, max_id)` does — see
+/// `storage::RollupDigest` — so there is no one field whose ordering settles
+/// the question. Instead: if any field of `theirs` exceeds the same field of
+/// `ours`, this side is missing something (a whole bucket if `count` is
+/// ahead, more of a bucket's raw detail otherwise) and a pull is worth
+/// making. A false positive here — pulling when nothing was actually
+/// missing — costs one page that `apply_minute_rollups`/`apply_hour_rollups`
+/// merge as a no-op; a false negative would leave a real gap unrecovered, so
+/// this leans toward pulling.
+fn rollup_behind(theirs: &RollupDigestDto, ours: &RollupDigestDto) -> bool {
+    theirs.count > ours.count
+        || theirs.max_bucket_start > ours.max_bucket_start
+        || theirs.attempts_sum > ours.attempts_sum
+        || theirs.up_sum > ours.up_sum
+        || theirs.latency_sum_sum > ours.latency_sum_sum
+}
+
 #[derive(Default)]
 struct RepairCursors {
     /// Cursors are meaningful only for the peer that produced them. Switching
@@ -462,15 +527,25 @@ struct RepairCursors {
     /// history can skip rows unique to another peer.
     peer: Option<String>,
     results: Option<(i64, String, String)>,
-    alerts: Option<(i64, String)>,
-    incidents: Option<(i64, String)>,
-    incident_tombstones: Option<(i64, String)>,
+    alerts: Option<StreamCursor>,
+    incidents: Option<StreamCursor>,
+    incident_tombstones: Option<StreamCursor>,
+    /// Rollup backfill cursors. The position packs `check_id` and `agent_id`
+    /// into the `String` half of `StreamCursor::position` as `"id\0agent"`,
+    /// the same trick `incident_tombstones` uses for its own two-part id — a
+    /// rollup bucket's real key is `(bucket_start, check_id, agent_id)`, and
+    /// this avoids giving `StreamCursor` a third field just for these two
+    /// streams.
+    latency_minute_rollups: Option<StreamCursor>,
+    latency_hour_rollups: Option<StreamCursor>,
     /// Digest observed when the cursors were last used. Retention can make a
     /// cursor point past a peer's new history, so a lower snapshot restarts it.
     checks_snapshot: Vec<CheckDigestDto>,
     alerts_snapshot: Option<(i64, String, i64)>,
     incidents_snapshot: Option<(i64, String, i64)>,
     tombstones_snapshot: Option<(i64, String, i64)>,
+    latency_minute_snapshot: Option<(i64, i64, i64, i64, i64)>,
+    latency_hour_snapshot: Option<(i64, i64, i64, i64, i64)>,
 }
 
 impl RepairCursors {
@@ -483,11 +558,21 @@ impl RepairCursors {
         }
     }
 
+    /// Whether a repair is mid-walk, which pins the next sweep to the same
+    /// peer. A cursor parked at a peer's tail is explicitly not in progress:
+    /// pinning on one would stop the sweep rotating between peers for as long
+    /// as a stream stayed divergent.
     fn in_progress(&self) -> bool {
         self.results.is_some()
-            || self.alerts.is_some()
-            || self.incidents.is_some()
-            || self.incident_tombstones.is_some()
+            || [
+                &self.alerts,
+                &self.incidents,
+                &self.incident_tombstones,
+                &self.latency_minute_rollups,
+                &self.latency_hour_rollups,
+            ]
+            .into_iter()
+            .any(|c| c.as_ref().is_some_and(|c| c.completed_at.is_none()))
     }
 
     fn refresh_digest(&mut self, digest: &DigestResponse) {
@@ -525,10 +610,48 @@ impl RepairCursors {
         }) {
             self.results = None;
         }
+        // A rollup digest has no single "position" to compare against the
+        // way an append-only stream's `(max_millis, max_id)` does — see
+        // `storage::RollupDigest` — so regression here means any one of its
+        // fields going backwards, most plausibly retention pruning the
+        // peer's oldest buckets out from under an in-progress walk.
+        let rollup = |d: &RollupDigestDto| {
+            (
+                d.max_bucket_start,
+                d.count,
+                d.attempts_sum,
+                d.up_sum,
+                d.latency_sum_sum,
+            )
+        };
+        let rollup_decreased = |before: &(i64, i64, i64, i64, i64),
+                                now: &(i64, i64, i64, i64, i64)| {
+            now.0 < before.0
+                || now.1 < before.1
+                || now.2 < before.2
+                || now.3 < before.3
+                || now.4 < before.4
+        };
+        if self
+            .latency_minute_snapshot
+            .as_ref()
+            .is_some_and(|before| rollup_decreased(before, &rollup(&digest.latency_minute_rollups)))
+        {
+            self.latency_minute_rollups = None;
+        }
+        if self
+            .latency_hour_snapshot
+            .as_ref()
+            .is_some_and(|before| rollup_decreased(before, &rollup(&digest.latency_hour_rollups)))
+        {
+            self.latency_hour_rollups = None;
+        }
         self.checks_snapshot = digest.checks.clone();
         self.alerts_snapshot = Some(stream(&digest.alerts));
         self.incidents_snapshot = Some(stream(&digest.incidents));
         self.tombstones_snapshot = Some(stream(&digest.incident_tombstones));
+        self.latency_minute_snapshot = Some(rollup(&digest.latency_minute_rollups));
+        self.latency_hour_snapshot = Some(rollup(&digest.latency_hour_rollups));
     }
 }
 
@@ -602,6 +725,10 @@ struct Inner {
     seen: parking_lot::RwLock<std::collections::HashMap<String, SeenAgent>>,
     auth: crate::auth::Auth,
     secure_cookies: bool,
+    /// Reverse proxies trusted to supply `X-Forwarded-For` for login rate
+    /// limiting. Empty means every peer is trusted for nothing, which is
+    /// today's behaviour: rate limiting keys on the raw connecting address.
+    trusted_proxies: crate::security::TrustedProxies,
     /// Minted agent credentials by id. Cached because every ingest matches
     /// against them; rebuilt on mint and revoke so a revocation bites at once.
     credentials: parking_lot::RwLock<std::collections::HashMap<String, AgentCredential>>,
@@ -739,17 +866,18 @@ impl Coordinator {
         let startup = database
             .call(move |storage| {
                 let reported_fleet = storage.list_agents(now).unwrap_or_default();
-                let status_agents = load_or_seed(storage, AGENTS_DISPLAY_KEY, &status_agents_seed);
-                let notifiers = load_or_seed(storage, NOTIFIERS_KEY, &notifiers_seed);
-                let maintenance = load_or_seed(storage, MAINTENANCE_KEY, &Vec::new());
+                let status_agents =
+                    configplane::load_or_seed(storage, AGENTS_DISPLAY_KEY, &status_agents_seed);
+                let notifiers = configplane::load_or_seed(storage, NOTIFIERS_KEY, &notifiers_seed);
+                let maintenance = configplane::load_or_seed(storage, MAINTENANCE_KEY, &Vec::new());
                 storage.seed_sections_from_checks()?;
                 let checks = storage.list_checks()?;
                 let node_id = configured_node_id
-                    .unwrap_or_else(|| load_or_generate(storage, NODE_ID_KEY, 16));
+                    .unwrap_or_else(|| configplane::load_or_generate(storage, NODE_ID_KEY, 16));
                 storage.set_incident_node_id(&node_id);
                 let session_key = match startup_peer_token {
                     Some(token) => token.into_bytes(),
-                    None => load_or_generate(storage, SESSION_KEY_KEY, 32).into_bytes(),
+                    None => configplane::load_or_generate(storage, SESSION_KEY_KEY, 32).into_bytes(),
                 };
                 let cluster_members = storage.list_cluster_members().unwrap_or_default();
                 let credentials = storage.list_agent_credentials().unwrap_or_default();
@@ -817,6 +945,8 @@ impl Coordinator {
         if let Some((url, _, secs)) = &global_push {
             info!(url = %url, push_secs = secs, region = %cfg.region, "global push enabled");
         }
+        let trusted_proxies = crate::security::TrustedProxies::parse(&cfg.trusted_proxies)
+            .map_err(|e| anyhow::anyhow!("coordinator.trusted_proxies: {e}"))?;
         let credentials = startup.credentials;
         let live = credentials.iter().filter(|c| !c.revoked()).count();
         if live == 0 {
@@ -909,6 +1039,7 @@ impl Coordinator {
                 ),
                 auth,
                 secure_cookies: cfg.secure_cookies,
+                trusted_proxies,
                 credentials: parking_lot::RwLock::new(
                     credentials.into_iter().map(|c| (c.id.clone(), c)).collect(),
                 ),
@@ -1337,6 +1468,7 @@ impl Coordinator {
                 group: meta.group.clone(),
                 latency_graph: meta.latency_graph,
                 position: meta.position,
+                depends_on: meta.depends_on.clone(),
             });
         }
         // Configured-but-unreported checks still belong on the global page,
@@ -1361,6 +1493,7 @@ impl Coordinator {
                 group: meta.group.clone(),
                 latency_graph: meta.latency_graph,
                 position: meta.position,
+                depends_on: meta.depends_on.clone(),
             });
         }
         let region_health = summaries
@@ -3203,6 +3336,30 @@ impl Coordinator {
                     ?local_max_ts,
                     "anti-entropy: peer is behind the source raw-data retention horizon; backfill is incomplete"
                 );
+                // Durable, not just a counter and a log line: an operator
+                // needs to know *which* checks have holes and over what
+                // range, and a restart must not lose that a gap was ever
+                // seen. `record_raw_data_gap` upserts on `(check_id, peer)`,
+                // so a standing gap redetected every sweep does not grow this
+                // table without bound.
+                if let (Ok(check_id), from_ts, to_ts, observed_at) = (
+                    theirs.check_id.parse::<crate::models::CheckId>(),
+                    local_max_ts.unwrap_or(0),
+                    theirs.min_ts,
+                    chrono::Utc::now().timestamp_millis(),
+                ) {
+                    let peer = peer.clone();
+                    let gap = storage::RawDataGapRow {
+                        check_id,
+                        peer,
+                        from_ts,
+                        to_ts,
+                        observed_at,
+                    };
+                    if let Err(error) = self.db(move |s| s.record_raw_data_gap(&gap)).await {
+                        tracing::warn!(%error, "anti-entropy: failed to record a raw-data gap");
+                    }
+                }
             }
         }
         let stream_pages = [
@@ -3229,6 +3386,22 @@ impl Coordinator {
             pages -= pages.saturating_sub(stream_pages) - result_pages;
         }
         self.reconcile_streams(&client, &peer, &their, &our, &mut pages)
+            .await;
+        // Rollup anti-entropy (item A) deliberately gets no reserved share of
+        // `pages`, only whatever `reconcile_streams` above left behind.
+        // Alerts/incidents/tombstones are reserved a page each because they
+        // are everyday, bounded-size streams that must keep converging even
+        // while a large result repair is running. A rollup catch-up is the
+        // opposite shape: it is exactly as large as raw-result catch-up can
+        // be (see `storage::RollupDigest`'s doc comment on table size) and it
+        // only exists at all for the rare case of a peer already behind raw
+        // retention — the common case is that `derived_results_sql` already
+        // keeps rollups converged as a side effect of ordinary result
+        // replication, so this path finding nothing to do costs nothing.
+        // Reserving pages for it ahead of results would let a large rollup
+        // catch-up starve the everyday result/alert/incident convergence this
+        // sweep exists for first.
+        self.reconcile_rollup_streams(&client, &peer, &their, &our, &mut pages)
             .await;
         // Config is bounded by configured objects rather than retained event
         // history and is applied in one atomic config transaction.
@@ -3261,6 +3434,16 @@ impl Coordinator {
                 self.set_stream_repair_cursor(peer, path, None);
                 continue;
             }
+            // Still divergent after a completed walk. Resuming from the tail
+            // finds anything the peer has appended since; only a full rescan
+            // finds a row inserted below it, so that is what the backoff buys
+            // back — once per interval rather than once per sweep.
+            if self
+                .stream_repair_cursor(peer, path)
+                .is_some_and(|c| c.stale())
+            {
+                self.set_stream_repair_cursor(peer, path, None);
+            }
             self.backfill_stream(client, peer, path, pages).await;
         }
     }
@@ -3273,16 +3456,10 @@ impl Coordinator {
         pages: &mut usize,
     ) {
         let url = cluster::Cluster::endpoint(peer, &format!("/internal/backfill/{path}"));
-        let mut cursor = {
-            let mut cursors = self.inner.repair_cursors.lock();
-            cursors.for_peer(peer);
-            match path {
-                "alerts" => cursors.alerts.clone(),
-                "incidents" => cursors.incidents.clone(),
-                _ => cursors.incident_tombstones.clone(),
-            }
-            .unwrap_or((i64::MIN, String::new()))
-        };
+        let mut cursor = self
+            .stream_repair_cursor(peer, path)
+            .map(|c| c.position)
+            .unwrap_or((i64::MIN, String::new()));
         while *pages > 0 {
             let mut query = vec![
                 ("since", cursor.0.to_string()),
@@ -3322,14 +3499,14 @@ impl Coordinator {
                 _ => batch.deleted_incidents.len(),
             };
             if len == 0 {
-                self.set_stream_repair_cursor(peer, path, None);
+                self.set_stream_repair_cursor(peer, path, Some(StreamCursor::completed(cursor)));
                 return;
             }
             let page_started = Instant::now();
             match self.apply_replicated_repair(batch).await {
                 Ok(true) => {}
                 Ok(false) | Err(_) => {
-                    self.set_stream_repair_cursor(peer, path, Some(cursor));
+                    self.set_stream_repair_cursor(peer, path, Some(StreamCursor::walking(cursor)));
                     return;
                 }
             }
@@ -3342,11 +3519,15 @@ impl Coordinator {
                 );
             }
             if len < ANTI_ENTROPY_PAGE {
-                self.set_stream_repair_cursor(peer, path, None);
+                self.set_stream_repair_cursor(
+                    peer,
+                    path,
+                    Some(StreamCursor::completed(next.unwrap_or(cursor))),
+                );
                 return;
             }
             let Some(next) = next else {
-                self.set_stream_repair_cursor(peer, path, Some(cursor));
+                self.set_stream_repair_cursor(peer, path, Some(StreamCursor::walking(cursor)));
                 return;
             };
             if next <= cursor {
@@ -3355,19 +3536,207 @@ impl Coordinator {
                 return;
             }
             cursor = next;
-            self.set_stream_repair_cursor(peer, path, Some(cursor.clone()));
+            self.set_stream_repair_cursor(peer, path, Some(StreamCursor::walking(cursor.clone())));
             tokio::task::yield_now().await;
         }
-        self.set_stream_repair_cursor(peer, path, Some(cursor));
+        self.set_stream_repair_cursor(peer, path, Some(StreamCursor::walking(cursor)));
     }
 
-    fn set_stream_repair_cursor(&self, peer: &str, path: &str, cursor: Option<(i64, String)>) {
+    fn set_stream_repair_cursor(&self, peer: &str, path: &str, cursor: Option<StreamCursor>) {
         let mut cursors = self.inner.repair_cursors.lock();
         cursors.for_peer(peer);
         match path {
             "alerts" => cursors.alerts = cursor,
             "incidents" => cursors.incidents = cursor,
             _ => cursors.incident_tombstones = cursor,
+        }
+    }
+
+    fn stream_repair_cursor(&self, peer: &str, path: &str) -> Option<StreamCursor> {
+        let mut cursors = self.inner.repair_cursors.lock();
+        cursors.for_peer(peer);
+        match path {
+            "alerts" => cursors.alerts.clone(),
+            "incidents" => cursors.incidents.clone(),
+            _ => cursors.incident_tombstones.clone(),
+        }
+    }
+
+    /// Rollup anti-entropy (item A). Structured like `reconcile_streams`
+    /// rather than folded into it: a rollup digest is compared with
+    /// `rollup_behind` instead of stream ordering, and its wire batch is
+    /// `RollupBatch` rather than `ReplicationBatch`, so sharing the loop body
+    /// would mean branching on `path` for the comparison too, not just for
+    /// routing — at that point two short loops read more plainly than one
+    /// with two shapes folded into it.
+    async fn reconcile_rollup_streams(
+        &self,
+        client: &reqwest::Client,
+        peer: &str,
+        their: &DigestResponse,
+        our: &DigestResponse,
+        pages: &mut usize,
+    ) {
+        for (path, theirs, ours) in [
+            (
+                "latency-minute",
+                &their.latency_minute_rollups,
+                &our.latency_minute_rollups,
+            ),
+            (
+                "latency-hour",
+                &their.latency_hour_rollups,
+                &our.latency_hour_rollups,
+            ),
+        ] {
+            if *pages == 0 {
+                return;
+            }
+            if !rollup_behind(theirs, ours) {
+                self.set_rollup_repair_cursor(peer, path, None);
+                continue;
+            }
+            // Same backoff as `reconcile_streams`: a completed walk resumes
+            // from the tail every sweep, and only rescans from the beginning
+            // once `STREAM_RESCAN_INTERVAL` has passed, so a peer whose
+            // digest keeps looking ahead (its live bucket keeps growing)
+            // does not pay for a full walk on every single sweep.
+            if self
+                .rollup_repair_cursor(peer, path)
+                .is_some_and(|c| c.stale())
+            {
+                self.set_rollup_repair_cursor(peer, path, None);
+            }
+            self.backfill_rollup_stream(client, peer, path, pages).await;
+        }
+    }
+
+    async fn backfill_rollup_stream(
+        &self,
+        client: &reqwest::Client,
+        peer: &str,
+        path: &str,
+        pages: &mut usize,
+    ) {
+        let url = cluster::Cluster::endpoint(peer, &format!("/internal/backfill/{path}"));
+        let mut cursor = self
+            .rollup_repair_cursor(peer, path)
+            .map(|c| c.position)
+            .unwrap_or((i64::MIN, String::new()));
+        while *pages > 0 {
+            let (since_check_id, since_agent_id) =
+                cursor.1.split_once('\0').unwrap_or(("", cursor.1.as_str()));
+            let query = [
+                ("since", cursor.0.to_string()),
+                ("since_check_id", since_check_id.to_string()),
+                ("since_agent_id", since_agent_id.to_string()),
+                ("limit", ANTI_ENTROPY_PAGE.to_string()),
+            ];
+            let mut req = client.get(&url).query(&query);
+            if let Some(t) = &self.inner.peer_token {
+                req = req.bearer_auth(t);
+            }
+            let batch: RollupBatch = match req.send().await {
+                Ok(r) if r.status().is_success() => match r.json().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(%peer, path, error = %e, "anti-entropy: malformed rollup backfill response");
+                        return;
+                    }
+                },
+                Ok(r) => {
+                    tracing::warn!(%peer, path, status = %r.status(), "anti-entropy: rollup backfill request rejected");
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(%peer, path, error = %e, "anti-entropy: rollup backfill request failed");
+                    return;
+                }
+            };
+            let len = batch.rows.len();
+            if len == 0 {
+                self.set_rollup_repair_cursor(peer, path, Some(StreamCursor::completed(cursor)));
+                return;
+            }
+            let next = batch
+                .rows
+                .last()
+                .map(|r| (r.bucket_start, format!("{}\0{}", r.check_id, r.agent_id)));
+            let page_started = Instant::now();
+            if let Err(error) = self.apply_rollup_backfill(path, batch).await {
+                tracing::warn!(%peer, path, %error, "anti-entropy: failed to apply a rollup backfill page");
+                self.set_rollup_repair_cursor(peer, path, Some(StreamCursor::walking(cursor)));
+                return;
+            }
+            *pages -= 1;
+            if self.inner.timings.enabled {
+                self.inner.timings.anti_entropy_page.observe(
+                    "anti_entropy",
+                    "rollup_page",
+                    page_started.elapsed(),
+                );
+            }
+            if len < ANTI_ENTROPY_PAGE {
+                self.set_rollup_repair_cursor(
+                    peer,
+                    path,
+                    Some(StreamCursor::completed(next.unwrap_or(cursor))),
+                );
+                return;
+            }
+            let Some(next) = next else {
+                self.set_rollup_repair_cursor(peer, path, Some(StreamCursor::walking(cursor)));
+                return;
+            };
+            if next <= cursor {
+                tracing::warn!(%peer, path, "anti-entropy: rollup backfill cursor did not advance");
+                self.set_rollup_repair_cursor(peer, path, None);
+                return;
+            }
+            cursor = next;
+            self.set_rollup_repair_cursor(peer, path, Some(StreamCursor::walking(cursor.clone())));
+            tokio::task::yield_now().await;
+        }
+        self.set_rollup_repair_cursor(peer, path, Some(StreamCursor::walking(cursor)));
+    }
+
+    /// Merge one backfilled rollup page. Never routed through
+    /// `apply_replicated`/`apply_replicated_repair`: those hold
+    /// `state_write` because they touch the tracker, current state and
+    /// alerts, none of which a rollup row is. Rollups are pure storage, so
+    /// this only ever takes the database worker.
+    async fn apply_rollup_backfill(&self, path: &str, batch: RollupBatch) -> anyhow::Result<()> {
+        let rows = batch
+            .rows
+            .into_iter()
+            .map(RollupRowDto::into_row)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let minute = path == "latency-minute";
+        self.db(move |storage| {
+            if minute {
+                storage.apply_minute_rollups(&rows)
+            } else {
+                storage.apply_hour_rollups(&rows)
+            }
+        })
+        .await
+    }
+
+    fn set_rollup_repair_cursor(&self, peer: &str, path: &str, cursor: Option<StreamCursor>) {
+        let mut cursors = self.inner.repair_cursors.lock();
+        cursors.for_peer(peer);
+        match path {
+            "latency-minute" => cursors.latency_minute_rollups = cursor,
+            _ => cursors.latency_hour_rollups = cursor,
+        }
+    }
+
+    fn rollup_repair_cursor(&self, peer: &str, path: &str) -> Option<StreamCursor> {
+        let mut cursors = self.inner.repair_cursors.lock();
+        cursors.for_peer(peer);
+        match path {
+            "latency-minute" => cursors.latency_minute_rollups.clone(),
+            _ => cursors.latency_hour_rollups.clone(),
         }
     }
 
@@ -3378,77 +3747,39 @@ impl Coordinator {
         their: &DigestResponse,
         our: &DigestResponse,
     ) {
-        for theirs in &their.config {
-            let ours = our.config.iter().find(|c| c.kind == theirs.kind);
-            let (our_hlc, our_count) = match ours {
-                Some(c) => (c.max_hlc.clone(), c.count),
-                None => (None, 0),
-            };
-            let ahead = match (&theirs.max_hlc, &our_hlc) {
-                (Some(t), Some(o)) => t > o,
-                (Some(_), None) => true,
-                (None, _) => false,
-            };
-            if !ahead && theirs.count == our_count {
-                continue;
-            }
-            self.backfill_config(client, peer, theirs.kind).await;
+        for kind in configplane::kinds_behind(&their.config, &our.config) {
+            self.backfill_config(client, peer, kind).await;
         }
     }
 
+    /// Pulls one config kind from `peer` until its tail, applying each page
+    /// through `apply_config_batch` — the walk itself is `backfill_config_kind`,
+    /// shared with the global tier's own peer anti-entropy; what differs here
+    /// is the apply, which also refreshes in-memory registries.
     async fn backfill_config(
         &self,
         client: &reqwest::Client,
         peer: &str,
         kind: storage::ConfigKind,
     ) {
-        const CONFIG_PAGE: usize = 1_000;
         let url = cluster::Cluster::endpoint(peer, "/internal/config");
-        let mut after: Option<String> = None;
-        let mut total = 0;
-        loop {
-            let mut req = client.get(&url).query(&[
-                ("kind", kind.as_str().to_string()),
-                ("limit", CONFIG_PAGE.to_string()),
-                ("after", after.clone().unwrap_or_default()),
-            ]);
-            if let Some(t) = &self.inner.peer_token {
-                req = req.bearer_auth(t);
+        let peer_token = self.inner.peer_token.clone();
+        let result = configplane::backfill_config_kind(
+            client,
+            &url,
+            peer_token.as_deref(),
+            kind,
+            |entries| async move { self.apply_config_batch(&entries).await },
+        )
+        .await;
+        match result {
+            Ok(0) => {}
+            Ok(total) => {
+                tracing::info!(%peer, kind = kind.as_str(), entries = total, "anti-entropy: config reconciled");
             }
-            let batch: ConfigBatch = match req.send().await {
-                Ok(r) if r.status().is_success() => match r.json().await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::warn!(%peer, kind = kind.as_str(), error = %e, "anti-entropy: malformed config response");
-                        return;
-                    }
-                },
-                Ok(r) => {
-                    tracing::warn!(%peer, kind = kind.as_str(), status = %r.status(), "anti-entropy: config request rejected");
-                    return;
-                }
-                Err(e) => {
-                    tracing::warn!(%peer, kind = kind.as_str(), error = %e, "anti-entropy: config request failed");
-                    return;
-                }
-            };
-            let n = batch.entries.len();
-            if n == 0 {
-                break;
+            Err(e) => {
+                tracing::warn!(%peer, kind = kind.as_str(), error = %e, "anti-entropy: config pull failed");
             }
-            after = batch.entries.iter().map(|entry| entry.id.clone()).max();
-            if let Err(e) = self.apply_config_batch(&batch.entries).await {
-                tracing::warn!(%peer, kind = kind.as_str(), error = %e, "anti-entropy: failed to apply config");
-                return;
-            }
-            total += n;
-            if n < CONFIG_PAGE {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        if total > 0 {
-            tracing::info!(%peer, kind = kind.as_str(), entries = total, "anti-entropy: config reconciled");
         }
     }
 
@@ -3775,10 +4106,36 @@ impl Coordinator {
         self.db(move |storage| storage.prune_results(before)).await
     }
 
+    /// Every minute rollup this node holds, for asserting on rollup
+    /// anti-entropy directly rather than only through digest equality.
+    pub async fn minute_rollups_for_test(&self) -> Result<Vec<storage::RollupRow>> {
+        self.db(|storage| storage.minute_rollups_since(i64::MIN, None, None, 10_000))
+            .await
+    }
+
     pub async fn create_check_for_test(&self, check: CheckConfig) -> crate::models::CheckId {
         let id = check.id;
         self.save_check(check).await;
         id
+    }
+
+    /// The whole catalogue this coordinator currently holds, for asserting
+    /// convergence from outside — a global node's reconciliation landed, a
+    /// peer's `/internal/config` push applied — without standing up the
+    /// admin API's session and HTTP layers just to read a list back.
+    pub async fn list_checks_for_test(&self) -> Vec<CheckConfig> {
+        self.db(|storage| storage.list_checks())
+            .await
+            .unwrap_or_default()
+    }
+
+    /// This node's own config digest, for asserting an unplace left no
+    /// tombstone behind — a tombstone would show up here as the Check kind's
+    /// count staying at 1 rather than falling to 0.
+    pub async fn config_digest_for_test(&self) -> Vec<storage::ConfigDigest> {
+        self.db(|storage| storage.config_digest())
+            .await
+            .unwrap_or_default()
     }
 
     /// Test-only bulk provisioning through the production LWW/config replication
@@ -4099,6 +4456,17 @@ impl Coordinator {
                 "/internal/backfill/incident-tombstones",
                 get(incident_tombstones_backfill_handler),
             )
+            // Rollup anti-entropy (item A): the only way a peer recovers
+            // minute/hour latency summaries for a window it no longer holds
+            // raw observations for. See `storage::RollupDigest`.
+            .route(
+                "/internal/backfill/latency-minute",
+                get(latency_minute_backfill_handler),
+            )
+            .route(
+                "/internal/backfill/latency-hour",
+                get(latency_hour_backfill_handler),
+            )
             // Config-plane push: checks, sections, settings, credentials —
             // last-writer-wins by HLC, applied locally, never observer-owned
             // the way a result is. See `config_handler`.
@@ -4108,6 +4476,26 @@ impl Coordinator {
                     .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
                     .get(config_entries_handler),
             )
+            // The global tier's own push of the catalogue, gated by the same
+            // shared secret a `[coordinator.global]` block already presents
+            // for admin fan-out — a region that trusts the global node to
+            // drive an admin write trusts it to durably distribute one too.
+            // See `global::reconcile`: this is what a global node retries
+            // against instead of failing an operator's write when this
+            // region was briefly unreachable.
+            .route(
+                "/internal/global/config",
+                post(global_config_handler).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+            )
+            .route(
+                "/internal/global/config-digest",
+                get(global_config_digest_handler),
+            )
+            // Just the ids this region holds for the Check kind — the
+            // scoped-digest repair path's "what do you actually have" read,
+            // made only when a mismatch is already suspected. See
+            // `global::reconcile::reconcile_checks`.
+            .route("/internal/global/check-ids", get(global_check_ids_handler))
             // Cluster membership. Peer-gated like every other /internal/*
             // route: pinging is how a peer rewrites what this node believes
             // about liveness, so an agent must never be able to call it.
@@ -4115,6 +4503,10 @@ impl Coordinator {
             // The admin-facing membership view. Admin-gated, not peer-gated:
             // this is read by a human in the browser, not by another node.
             .route("/api/v1/cluster", get(cluster_view_handler))
+            // Retention-aware peer recovery (item B): standing raw-data gaps
+            // this node has recorded, so an operator can see which checks
+            // have holes and over what range instead of only a counter.
+            .route("/api/v1/admin/raw-data-gaps", get(raw_data_gaps_handler))
             // Admin JSON is deliberately bounded even when unauthenticated: the
             // limit is enforced before handlers parse or authenticate a body.
             .layer(DefaultBodyLimit::max(1024 * 1024))
@@ -4136,7 +4528,7 @@ const MAINTENANCE_KEY: &str = "maintenance.windows";
 /// Keys under which values generated once and reused forever live — not seeded
 /// from the config file the way the settings above are, but from randomness,
 /// via `load_or_generate`.
-const NODE_ID_KEY: &str = "cluster.node_id";
+pub(crate) const NODE_ID_KEY: &str = "cluster.node_id";
 const SESSION_KEY_KEY: &str = "cluster.session_key";
 /// Rows per `/internal/backfill` page during an anti-entropy sweep. Bounded
 /// so one very-behind check cannot hold `apply_replicated` — and the yield
@@ -4146,6 +4538,12 @@ const ANTI_ENTROPY_PAGE: usize = 500;
 /// lifecycle streams. Local ingest takes the state-write lock before every
 /// repair page, so it wins whenever both are ready.
 const ANTI_ENTROPY_PAGES_PER_SWEEP: usize = 4;
+/// How long a stream walked to its peer's tail keeps that tail before starting
+/// over from the beginning. Only a full walk can find a row a peer acquired
+/// *below* the position we already passed, so the restart has to keep
+/// happening; doing it every sweep is what turns a stream that cannot converge
+/// into a permanent replay of the peer's whole history.
+const STREAM_RESCAN_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 /// How often the retry job looks for due notifications. Also the finest
 /// backoff granularity there is, which is why the first retry waits exactly
@@ -4166,52 +4564,6 @@ const RETRY_BATCH: usize = 100;
 fn backoff_ms(attempts: i32) -> i64 {
     let steps = attempts.clamp(1, MAX_DELIVERY_ATTEMPTS) - 1;
     RETRY_TICK.as_millis() as i64 * (1 << steps)
-}
-
-/// A value with no config-file counterpart to seed from — its seed is
-/// randomness itself. Generated once, persisted as hex, and reused on every
-/// subsequent boot, so identity (`NODE_ID_KEY`) and the session signing key
-/// (`SESSION_KEY_KEY`) are both stable across a restart without an operator
-/// having to set anything.
-fn load_or_generate(storage: &Storage, key: &str, len: usize) -> String {
-    if let Ok(Some(v)) = storage.get_setting(key) {
-        if !v.trim().is_empty() {
-            return v;
-        }
-    }
-    let mut buf = vec![0u8; len];
-    rand::thread_rng().fill_bytes(&mut buf);
-    let generated = crate::auth::hex(&buf);
-    if let Err(e) = storage.put_setting(key, &generated) {
-        warn!(error = %e, key, "could not persist generated value");
-    }
-    generated
-}
-
-/// A stored setting, seeded from the config file the first time it is missing.
-///
-/// A stored document that no longer parses — hand-edited, or a field removed in
-/// a later version — falls back to the file rather than refusing to boot:
-/// losing a preference is recoverable, a coordinator that will not start is not.
-fn load_or_seed<T>(storage: &Storage, key: &str, from_file: &T) -> T
-where
-    T: Clone + serde::Serialize + serde::de::DeserializeOwned,
-{
-    match storage.get_setting(key) {
-        Ok(Some(json)) => match serde_json::from_str(&json) {
-            Ok(stored) => return stored,
-            Err(e) => warn!(error = %e, key, "stored setting is unreadable, using the config file"),
-        },
-        Ok(None) => {
-            if let Ok(json) = serde_json::to_string(from_file) {
-                if let Err(e) = storage.put_setting(key, &json) {
-                    warn!(error = %e, key, "could not seed setting");
-                }
-            }
-        }
-        Err(e) => warn!(error = %e, key, "could not read setting"),
-    }
-    from_file.clone()
 }
 
 /// Fleet liveness for the public status page.
@@ -4608,6 +4960,105 @@ mod tests {
         assert_eq!(catalogue[0].id, second.id);
     }
 
+    /// SCALING.md "History survives unplacement": unplace drops the local
+    /// definition and clears published state, but raw results are keyed by
+    /// id and untouched. Re-placing the same id — exactly what a global
+    /// reconciliation push does, `Storage::upsert_check` under a fresh
+    /// document — must bring the check back with its history intact rather
+    /// than starting a fresh, empty one.
+    #[tokio::test]
+    async fn unplace_then_replace_restores_history_by_id() {
+        let coord = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let check = coord
+            .create_check_for_test(CheckConfig {
+                name: "web".into(),
+                target: "https://example.invalid".into(),
+                ..Default::default()
+            })
+            .await;
+        coord
+            .ingest(vec![CheckResult {
+                check_id: check,
+                agent_id: "agent".into(),
+                zone: "zone".into(),
+                region: "region".into(),
+                kind: CheckKind::Http,
+                timestamp: chrono::DateTime::from_timestamp_millis(1_000).unwrap(),
+                latency_ms: 5,
+                status_code: Some(200),
+                body_matched: None,
+                error: None,
+                failure: None,
+                body: None,
+                headers: None,
+                metric: None,
+                metrics: None,
+            }])
+            .await;
+        let before = coord
+            .recent_results(
+                super::storage::ResultsFilter {
+                    check_id: Some(check),
+                    ..Default::default()
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 1, "the observation landed");
+
+        assert!(coord.unplace_check_local(check).await.unwrap());
+        assert!(
+            coord.list_checks_for_test().await.is_empty(),
+            "the definition is gone locally"
+        );
+        let during = coord
+            .recent_results(
+                super::storage::ResultsFilter {
+                    check_id: Some(check),
+                    ..Default::default()
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(during.len(), 1, "raw history is untouched by unplacing");
+
+        // Re-placement, same id, exactly the shape a global reconciliation
+        // push applies.
+        coord
+            .create_checks_for_test(vec![CheckConfig {
+                id: check,
+                name: "web".into(),
+                target: "https://example.invalid".into(),
+                ..Default::default()
+            }])
+            .await
+            .unwrap();
+        assert_eq!(coord.list_checks_for_test().await.len(), 1);
+        let after = coord
+            .recent_results(
+                super::storage::ResultsFilter {
+                    check_id: Some(check),
+                    ..Default::default()
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "history reconnects by id with no plumbing on re-placement"
+        );
+        assert_eq!(after[0].status_code, Some(200));
+    }
+
     #[tokio::test]
     async fn failed_ingest_does_not_publish_uncommitted_state() {
         let coord = Coordinator::new(&CoordinatorConfig {
@@ -4846,18 +5297,42 @@ mod tests {
         let global_addr = serve(
             GlobalNode::new(&GlobalConfig {
                 token: Some(token.into()),
+                db_path: ":memory:".into(),
                 ..Default::default()
             })
+            .await
+            .unwrap()
             .router(),
         )
         .await;
         let client = reqwest::Client::new();
+        // `DEFAULT_PAGE_SIZE` mirrors the frontend's own `STATUS_PAGE_SIZE`
+        // (`frontend/src/App.svelte`): this is the page a real dashboard load
+        // asks for, not the raw endpoint's ceiling. The `_max` URLs separately
+        // measure that ceiling — `crate::page::MAX_PAGE_SIZE` — so the report
+        // carries both "what a browser does" and "what a single request can
+        // still be made to cost".
+        const DEFAULT_PAGE_SIZE: usize = 100;
         let regional_url = format!("http://{regional_addr}/api/v1/status");
         let uptime_url = format!("http://{regional_addr}/api/v1/uptime?days=30&buckets=90");
         let latency_url =
             format!("http://{regional_addr}/api/v1/latency-points?hours=720&buckets=90");
+        let regional_max_url = format!(
+            "http://{regional_addr}/api/v1/status?limit={}",
+            crate::page::MAX_PAGE_SIZE
+        );
+        let uptime_max_url = format!(
+            "http://{regional_addr}/api/v1/uptime?days=30&buckets=90&limit={}",
+            crate::page::MAX_PAGE_SIZE
+        );
+        let latency_max_url = format!(
+            "http://{regional_addr}/api/v1/latency-points?hours=720&buckets=90&limit={}",
+            crate::page::MAX_PAGE_SIZE
+        );
         let global_url = format!("http://{global_addr}/api/v1/status");
         let push_url = format!("http://{global_addr}/internal/global/state");
+        let page_len = check_count.min(DEFAULT_PAGE_SIZE);
+        let max_page_len = check_count.min(crate::page::MAX_PAGE_SIZE);
 
         let warm = client.get(&regional_url).send().await.unwrap();
         assert_eq!(warm.status(), reqwest::StatusCode::OK);
@@ -4871,7 +5346,11 @@ mod tests {
             regional_ms.push(started.elapsed().as_millis());
             regional_bytes = body.len();
             let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(value["checks"].as_array().unwrap().len(), check_count);
+            assert_eq!(value["checks"].as_array().unwrap().len(), page_len);
+            assert_eq!(
+                value["total_checks"].as_u64().unwrap() as usize,
+                check_count
+            );
         }
 
         let warm = tokio::join!(
@@ -4901,18 +5380,71 @@ mod tests {
             page_ms.push(started.elapsed().as_millis());
             page_bytes = status.len() + uptime.len() + latency.len();
             assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&status).unwrap()["total_checks"]
+                    .as_u64()
+                    .unwrap() as usize,
+                check_count
+            );
+            assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&uptime).unwrap()["checks"]
                     .as_array()
                     .unwrap()
                     .len(),
-                check_count
+                page_len
             );
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&latency).unwrap()["checks"]
                     .as_array()
                     .unwrap()
                     .len(),
-                check_count
+                page_len
+            );
+        }
+
+        // The ceiling case: a client that explicitly asks for the largest page
+        // the server will still hand out (`MAX_PAGE_SIZE`), which is what the
+        // old unbounded read effectively did for every check at once. This is
+        // not what the dashboard requests, but it is the worst a single
+        // request can still cost, and that number belongs in the same report.
+        let warm = tokio::join!(
+            client.get(&regional_max_url).send(),
+            client.get(&uptime_max_url).send(),
+            client.get(&latency_max_url).send(),
+        );
+        assert!(warm.0.unwrap().status().is_success());
+        assert!(warm.1.unwrap().status().is_success());
+        assert!(warm.2.unwrap().status().is_success());
+        let mut page_max_ms = Vec::with_capacity(sample_count);
+        let mut page_max_bytes = 0;
+        for _ in 0..sample_count {
+            let started = Instant::now();
+            let (status, uptime, latency) = tokio::join!(
+                client.get(&regional_max_url).send(),
+                client.get(&uptime_max_url).send(),
+                client.get(&latency_max_url).send(),
+            );
+            let (status, uptime, latency) = (status.unwrap(), uptime.unwrap(), latency.unwrap());
+            assert!(status.status().is_success());
+            assert!(uptime.status().is_success());
+            assert!(latency.status().is_success());
+            let (status, uptime, latency) =
+                tokio::join!(status.bytes(), uptime.bytes(), latency.bytes());
+            let (status, uptime, latency) = (status.unwrap(), uptime.unwrap(), latency.unwrap());
+            page_max_ms.push(started.elapsed().as_millis());
+            page_max_bytes = status.len() + uptime.len() + latency.len();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&uptime).unwrap()["checks"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                max_page_len
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&latency).unwrap()["checks"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                max_page_len
             );
         }
 
@@ -4950,22 +5482,32 @@ mod tests {
             global_ms.push(started.elapsed().as_millis());
             global_bytes = body.len();
             let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(value["checks"].as_array().unwrap().len(), check_count);
+            assert_eq!(value["checks"].as_array().unwrap().len(), page_len);
+            assert_eq!(
+                value["total_checks"].as_u64().unwrap() as usize,
+                check_count
+            );
             assert_eq!(value["agents"].as_array().unwrap().len(), region_count);
         }
 
         let regional_p95 = percentile(&mut regional_ms, 95);
         let page_p95 = percentile(&mut page_ms, 95);
+        let page_max_p95 = percentile(&mut page_max_ms, 95);
         let push_p95 = percentile(&mut push_ms, 95);
         let global_p95 = percentile(&mut global_ms, 95);
         assert_ceiling("WARDEN_BENCH_MAX_REGIONAL_STATUS_P95_MS", regional_p95);
         assert_ceiling("WARDEN_BENCH_MAX_STATUS_PAGE_P95_MS", page_p95);
         assert_ceiling("WARDEN_BENCH_MAX_STATUS_PAGE_BYTES", page_bytes as u128);
+        assert_ceiling("WARDEN_BENCH_MAX_STATUS_PAGE_MAX_P95_MS", page_max_p95);
+        assert_ceiling(
+            "WARDEN_BENCH_MAX_STATUS_PAGE_MAX_BYTES",
+            page_max_bytes as u128,
+        );
         assert_ceiling("WARDEN_BENCH_MAX_GLOBAL_PUSH_P95_MS", push_p95);
         assert_ceiling("WARDEN_BENCH_MAX_GLOBAL_STATUS_P95_MS", global_p95);
         assert_ceiling("WARDEN_BENCH_MAX_PUSH_BYTES", push_bytes as u128);
         println!(
-            "checks={check_count} regions={region_count} samples={sample_count} regional_status_p95_ms={regional_p95} regional_status_bytes={regional_bytes} status_page_p95_ms={page_p95} status_page_bytes={page_bytes} status_page_requests=3 global_push_p95_ms={push_p95} push_bytes={push_bytes} global_status_p95_ms={global_p95} global_status_bytes={global_bytes}"
+            "checks={check_count} regions={region_count} samples={sample_count} page_size={page_len} regional_status_p95_ms={regional_p95} regional_status_bytes={regional_bytes} status_page_p95_ms={page_p95} status_page_bytes={page_bytes} status_page_requests=3 status_page_max_p95_ms={page_max_p95} status_page_max_bytes={page_max_bytes} status_page_max_size={max_page_len} global_push_p95_ms={push_p95} push_bytes={push_bytes} global_status_p95_ms={global_p95} global_status_bytes={global_bytes}"
         );
     }
 

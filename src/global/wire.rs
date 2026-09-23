@@ -78,6 +78,14 @@ pub struct CheckSummary {
     pub latency_graph: bool,
     #[serde(default)]
     pub position: i32,
+    /// Upstream checks this one is configured to defer to, mirroring
+    /// `CheckConfig::depends_on`. Carried so the global tier can attribute a
+    /// dependent's incident to a cross-region upstream (Phase 5 of placement-
+    /// scoped configuration in `SCALING.md`) without holding the catalogue
+    /// itself. `#[serde(default)]` for back-compat with a coordinator that
+    /// predates the field, same as every other optional addition here.
+    #[serde(default)]
+    pub depends_on: Vec<CheckId>,
 }
 
 /// The global node's acknowledgement of a push. Trivial today; a struct so the

@@ -46,6 +46,26 @@ struct AgentsResponse {
     /// configured them. Distinct from the list above because the remedy is
     /// different: those agents are not missing, they are out of date.
     checks_no_agent_can_run: Vec<String>,
+    /// How many checks each list found, which is not how many it names.
+    ///
+    /// The agent roster is bounded by the fleet, but these two are bounded by
+    /// the catalogue: a region that loses its agents orphans every check it
+    /// holds, and naming ten thousand of them in a diagnostic banner helps
+    /// nobody and costs the same as the status page it is warning about. The
+    /// count is the signal; the names are a sample.
+    checks_with_no_live_agent_total: usize,
+    checks_no_agent_can_run_total: usize,
+}
+
+/// Names carried by the two fleet-health lists before they become a count.
+/// Enough to recognise a pattern — one zone, one kind — without becoming a
+/// second copy of the check list.
+const FLEET_DIAGNOSTIC_SAMPLE: usize = 50;
+
+fn sample(mut names: Vec<String>) -> Vec<String> {
+    names.sort_unstable();
+    names.truncate(FLEET_DIAGNOSTIC_SAMPLE);
+    names
 }
 
 #[derive(Serialize)]
@@ -289,8 +309,10 @@ pub(in crate::coordinator) async fn agents_handler(
         .collect();
     Json(AgentsResponse {
         agents,
-        checks_with_no_live_agent: orphaned,
-        checks_no_agent_can_run: unrunnable,
+        checks_with_no_live_agent_total: orphaned.len(),
+        checks_no_agent_can_run_total: unrunnable.len(),
+        checks_with_no_live_agent: sample(orphaned),
+        checks_no_agent_can_run: sample(unrunnable),
     })
     .into_response()
 }

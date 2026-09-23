@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod auth;
 pub mod config;
+pub mod configplane;
 pub mod coordinator;
 pub mod credential;
 pub mod global;
@@ -8,6 +9,7 @@ pub mod maintenance;
 pub mod models;
 pub mod notify;
 pub mod openmetrics;
+pub mod page;
 pub mod placement;
 pub mod rollup;
 pub mod script;

@@ -123,6 +123,64 @@ async fn login(base: &str) -> String {
     set.split(';').next().unwrap().to_string()
 }
 
+/// `limit` arrives from the network and the database is a single worker, so a
+/// caller must not be able to opt out of the page bound. The console still
+/// gets the whole catalogue; it pays for it one bounded request at a time.
+#[tokio::test]
+async fn the_admin_check_list_caps_its_page_and_pages_to_the_end() {
+    let coord = coordinator().await;
+    let addr = spawn_server(coord);
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let session = login(&base).await;
+    for i in 0..5 {
+        client
+            .post(format!("{base}/api/v1/admin/checks"))
+            .header(reqwest::header::COOKIE, &session)
+            .json(&check_body(
+                &format!("check-{i}"),
+                &format!("https://example.com/{i}"),
+            ))
+            .send()
+            .await
+            .unwrap();
+    }
+    let page = |query: &str| {
+        let (client, base, session) = (client.clone(), base.clone(), session.clone());
+        let query = query.to_string();
+        async move {
+            client
+                .get(format!("{base}/api/v1/admin/checks?{query}"))
+                .header(reqwest::header::COOKIE, session)
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        }
+    };
+
+    let first = page("page=0&limit=2").await;
+    assert_eq!(first["checks"].as_array().unwrap().len(), 2);
+    assert_eq!(first["total"], 5);
+    assert_eq!(first["has_more"], true);
+
+    let last = page("page=2&limit=2").await;
+    assert_eq!(last["checks"].as_array().unwrap().len(), 1);
+    assert_eq!(last["has_more"], false);
+
+    let past_end = page("page=99&limit=2").await;
+    assert!(past_end["checks"].as_array().unwrap().is_empty());
+    assert_eq!(past_end["total"], 5, "paging past the end is not an error");
+
+    // An over-cap request is clamped rather than refused: the caller gets a
+    // legal page, not a 400 telling it a number it never chose was too big.
+    let huge = page("limit=100000").await;
+    assert_eq!(huge["checks"].as_array().unwrap().len(), 5);
+    assert_eq!(huge["has_more"], false);
+}
+
 /// "Nothing was measured" and "nothing was up" must not be the same answer.
 /// A check configured here but never observed — placed in another region, or
 /// simply new — reports `uptime_24h: null`; one that *was* observed reports a
@@ -3467,4 +3525,92 @@ async fn erasing_a_check_removes_everything_it_produced() {
     .await
     .unwrap();
     assert!(history["history"].as_array().unwrap().is_empty());
+}
+
+/// Login rate limiting keys on the raw peer address unless a proxy is
+/// explicitly trusted — see `crate::security::client_ip`. This is the
+/// end-to-end version of `security::tests`: the point is not the header
+/// parser, it is that the handler wires it up at all.
+#[tokio::test]
+async fn a_spoofed_forwarded_for_header_is_ignored_without_a_trusted_proxy() {
+    let addr = spawn_server(coordinator().await);
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // Five failed attempts, each claiming a different attacker-chosen
+    // client IP. Nothing here is a configured trusted proxy, so every
+    // attempt is still billed to the real peer (127.0.0.1), and it locks out
+    // regardless of what the header says.
+    for i in 0..5 {
+        let res = client
+            .post(format!("{base}/api/v1/login"))
+            .header("X-Forwarded-For", format!("203.0.113.{i}"))
+            .json(&json!({ "password": "wrong" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 401);
+    }
+    let res = client
+        .post(format!("{base}/api/v1/login"))
+        .header("X-Forwarded-For", "203.0.113.99")
+        .json(&json!({ "password": PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        429,
+        "the raw peer is rate limited no matter what X-Forwarded-For claims"
+    );
+}
+
+#[tokio::test]
+async fn a_trusted_proxys_forwarded_for_is_honoured_per_client() {
+    let coord = Coordinator::new(&CoordinatorConfig {
+        listen: "127.0.0.1:0".into(),
+        db_path: ":memory:".into(),
+        admin_password: Some(PASSWORD.into()),
+        trusted_proxies: vec!["127.0.0.1".into()],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let addr = spawn_server(coord);
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // Five failed attempts from one claimed client behind the trusted proxy
+    // locks that client out...
+    for _ in 0..5 {
+        let res = client
+            .post(format!("{base}/api/v1/login"))
+            .header("X-Forwarded-For", "203.0.113.10")
+            .json(&json!({ "password": "wrong" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 401);
+    }
+    let locked_out = client
+        .post(format!("{base}/api/v1/login"))
+        .header("X-Forwarded-For", "203.0.113.10")
+        .json(&json!({ "password": PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(locked_out.status(), 429);
+
+    // ...but a different client is a separate bucket and logs in on the
+    // first correct attempt, even arriving through an extra hop (127.0.0.1
+    // again) that is itself trusted and so is skipped rather than mistaken
+    // for the client.
+    let other_client = client
+        .post(format!("{base}/api/v1/login"))
+        .header("X-Forwarded-For", "203.0.113.11, 127.0.0.1")
+        .json(&json!({ "password": PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other_client.status(), 200);
 }

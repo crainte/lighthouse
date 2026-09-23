@@ -228,25 +228,28 @@ async fn post_peer(addr: SocketAddr, path: &str, body: &Value) {
 async fn gossip_and_batch_replication_are_idempotent_in_either_order() {
     let (_sink, sink_addr) = alert_sink().await;
     let alert_id = Uuid::now_v7().to_string();
+    let row = serde_json::json!({
+        "id": alert_id,
+        "scope": "check",
+        "node_id": cid(CHECK).to_string(),
+        "previous_state": "up",
+        "current_state": "down",
+        "timestamp": 2_000,
+        "incident_id": null,
+    });
+    // Both transports carry the same immutable row. That is the whole reason
+    // gossip carries `alert` rather than a bare id: an id alone leaves the
+    // receiver to pair it with an identity of its own choosing, and two
+    // transports pairing it differently is a conflict no upsert can settle.
     let gossip = serde_json::json!({
         "alert_id": alert_id,
+        "alert": row,
         "check_id": cid(CHECK),
         "from": "up",
         "to": "down",
         "timestamp": 2_000,
     });
-    let batch = serde_json::json!({
-        "origin": "observer",
-        "alerts": [{
-            "id": alert_id,
-            "scope": "check",
-            "node_id": cid(CHECK).to_string(),
-            "previous_state": "up",
-            "current_state": "down",
-            "timestamp": 2_000,
-            "incident_id": null,
-        }],
-    });
+    let batch = serde_json::json!({ "origin": "observer", "alerts": [row] });
 
     for paths in [
         ["/internal/gossip", "/internal/replicate"],
@@ -272,6 +275,43 @@ async fn gossip_and_batch_replication_are_idempotent_in_either_order() {
         assert_eq!(alerts["alerts"][0]["id"], alert_id);
         assert_eq!(peer_status(addr).await, "down");
     }
+}
+
+/// A sender that offers only an alert id has told the receiver what to call an
+/// event, not what the event was. The receiver used to take that id and attach
+/// its own `check_id` to it, which is fine right up until the two nodes
+/// disagree about a check's identity — then the same id names one check on one
+/// replica and another check on the next, and `upsert_alert` refuses both
+/// forever because an alert is immutable. So the id is ignored and the alert is
+/// minted locally: derived from content, it matches every peer that agrees
+/// about the check, and is visibly local on one that does not.
+#[tokio::test]
+async fn gossip_does_not_adopt_a_bare_alert_id_from_a_peer() {
+    let (_sink, sink_addr) = alert_sink().await;
+    let coord = coordinator(sink_addr, vec![]).await;
+    let addr = serve(coord.router()).await;
+    let foreign_id = format!("{}-2000-down", Uuid::now_v7());
+
+    post_peer(
+        addr,
+        "/internal/gossip",
+        &serde_json::json!({
+            "alert_id": foreign_id,
+            "check_id": cid(CHECK),
+            "from": "up",
+            "to": "down",
+            "timestamp": 2_000,
+        }),
+    )
+    .await;
+
+    let alerts = get_json(&format!("http://{addr}/api/v1/alerts")).await;
+    assert_eq!(alerts["alerts"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        alerts["alerts"][0]["id"],
+        format!("{}-2000-down", cid(CHECK))
+    );
+    assert_eq!(alerts["alerts"][0]["node_id"], cid(CHECK).to_string());
 }
 
 #[tokio::test]

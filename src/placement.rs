@@ -88,8 +88,18 @@ impl Placement {
     /// Whether an agent's location is eligible at all, before fan-out.
     fn admits(&self, agent: &Agent) -> bool {
         let zone_ok = self.zones.is_empty() || self.zones.contains(&agent.zone);
-        let region_ok = self.regions.is_empty() || self.regions.contains(&agent.region);
-        zone_ok && region_ok
+        zone_ok && self.admits_region(&agent.region)
+    }
+
+    /// The region half of `admits`, standing on its own because deciding
+    /// where a check's *definition* should be distributed
+    /// (`global::reconcile`) only ever has a region to ask about — an agent,
+    /// let alone its zone, does not exist yet at that point. Kept here rather
+    /// than duplicated so the two questions ("does this region get the
+    /// document" and "does this agent get to run it") can never disagree
+    /// about what "every region" means.
+    pub fn admits_region(&self, region: &str) -> bool {
+        self.regions.is_empty() || self.regions.iter().any(|r| r == region)
     }
 }
 
@@ -427,5 +437,22 @@ mod tests {
             max < min * 2,
             "load should be roughly even, got min={min} max={max}"
         );
+    }
+
+    #[test]
+    fn admits_region_treats_an_empty_list_as_every_region() {
+        let p = Placement::default();
+        assert!(p.admits_region("us"));
+        assert!(p.admits_region("tw"));
+    }
+
+    #[test]
+    fn admits_region_narrows_to_the_named_regions() {
+        let p = Placement {
+            regions: vec!["us".into()],
+            ..Placement::default()
+        };
+        assert!(p.admits_region("us"));
+        assert!(!p.admits_region("tw"));
     }
 }

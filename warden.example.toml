@@ -93,6 +93,14 @@ degraded_is_downtime = false
 # request to decide this, because clients can forge those headers.
 # secure_cookies = true
 
+# Reverse proxies allowed to supply X-Forwarded-For, as bare IPs or CIDRs.
+# Empty (the default) means login rate limiting keys on the raw connecting
+# socket, so every client behind an undeclared proxy shares one bucket — and
+# the header is never read, so a client cannot forge its way out of that
+# bucket either. Set this to the proxy's own address(es), not the clients',
+# when you need rate limiting to key on the real client IP instead.
+# trusted_proxies = ["10.0.0.0/8"]
+
 # Regional clustering. Irrelevant to a standalone install — `peers` empty (the
 # default) is what makes it standalone — so everything below is commented out.
 # Setting `peers` turns on membership, replication and anti-entropy against

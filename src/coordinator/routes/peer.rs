@@ -16,9 +16,10 @@
 //! membership and is gated by `require_admin` instead, because it is a human
 //! in a browser asking, not a peer — see its own doc comment.
 
-use super::super::{alert, cluster, error_response, gossip, hlc, internal_error};
+use super::super::{alert, cluster, error_response, gossip, internal_error};
 use super::super::{storage, Coordinator, WsEvent};
 use super::session::{bearer, require_admin};
+use crate::configplane::{ConfigBatch, ConfigDigestDto};
 use crate::models::{CheckResult, NodeState, Status};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -93,23 +94,19 @@ pub(in crate::coordinator) async fn gossip_handler(
                         .open_incident_for(persisted.check_id)?
                         .map(|incident| incident.id),
                 };
+                // Either the sender's whole immutable row, or nothing of the
+                // sender's identity at all. A bare `alert_id` used to be
+                // accepted and paired with this node's own `check_id`, which
+                // silently produced a row whose id names one check and whose
+                // body names another as soon as two nodes disagreed about a
+                // check's id. `upsert_alert` treats alerts as immutable, so
+                // that row could never converge and anti-entropy re-offered it
+                // every sweep. Minting locally instead yields the same
+                // content-derived id on every node that agrees about the
+                // check, and a plainly local alert on one that does not.
                 let inserted = if let Some(row) = canonical_alert {
                     let id = row.id.clone();
                     let applied = store.upsert_alert(&row.into_row())?;
-                    if applied == storage::AlertApply::Conflict {
-                        tracing::warn!(alert = %id, "gossip: alert id conflicts with a different local event, keeping the local one");
-                    }
-                    applied == storage::AlertApply::Inserted
-                } else if let Some(id) = alert_id {
-                    let applied = store.upsert_alert(&storage::AlertRow {
-                        id: id.clone(),
-                        scope: storage::AlertScope::Check,
-                        node_id: persisted.check_id.to_string(),
-                        previous_state: Some(persisted.from),
-                        current_state: persisted.to,
-                        timestamp,
-                        incident_id,
-                    })?;
                     if applied == storage::AlertApply::Conflict {
                         tracing::warn!(alert = %id, "gossip: alert id conflicts with a different local event, keeping the local one");
                     }
@@ -291,17 +288,6 @@ pub(in crate::coordinator) async fn replicate_handler(
     }
 }
 
-/// The config plane's push, `POST /internal/config`'s body: a batch of
-/// last-writer-wins entries, from either a peer's own admin edit
-/// (`Coordinator::replicate_config`) or a reconciler replaying what it
-/// knows a peer wrote. `origin` is informational only, mirroring
-/// `ReplicationBatch::origin` — nothing here re-broadcasts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(in crate::coordinator) struct ConfigBatch {
-    pub(in crate::coordinator) origin: String,
-    pub(in crate::coordinator) entries: Vec<storage::ConfigEntry>,
-}
-
 /// `POST /internal/config`: applies a batch of config entries — checks,
 /// sections, settings, credentials — through the one HLC-arbitrated write
 /// path (`Storage::apply_config_entry`), then refreshes whichever in-memory
@@ -323,6 +309,88 @@ pub(in crate::coordinator) async fn config_handler(
     }
     match coord.apply_config_batch(&batch.entries).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// Gate for `/internal/global/*`: the shared secret a `[coordinator.global]`
+/// block presents, the same value `is_peer_request` (in `routes::checks`)
+/// already accepts for admin fan-out. A region that trusts the global node to
+/// drive an admin write on an operator's behalf trusts it to durably
+/// distribute one too — this is not a second, weaker credential, it is the
+/// same one used for a second purpose.
+fn require_global_trust(coord: &Coordinator, headers: &HeaderMap) -> Option<Response> {
+    use subtle::ConstantTimeEq;
+    let ok = match (coord.inner.admin_trust_token.as_deref(), bearer(headers)) {
+        (Some(expected), Some(got)) => bool::from(got.as_bytes().ct_eq(expected.as_bytes())),
+        _ => false,
+    };
+    (!ok).then(|| error_response(StatusCode::UNAUTHORIZED, "global authentication required"))
+}
+
+/// `POST /internal/global/config`: the global tier's push of the catalogue it
+/// holds authoritatively (SCALING.md "Placement-scoped configuration" Phase
+/// one) — the same `apply_config_batch` a regional peer's `/internal/config`
+/// push uses, so a document that arrives this way is indistinguishable from
+/// one a regional admin edit produced. What differs is only the gate: a
+/// global node is not one of this region's peers, so it authenticates with
+/// the cross-region trust token instead of `peer_token`.
+pub(in crate::coordinator) async fn global_config_handler(
+    State(coord): State<Coordinator>,
+    headers: HeaderMap,
+    Json(batch): Json<ConfigBatch>,
+) -> Response {
+    if let Some(denied) = require_global_trust(&coord, &headers) {
+        return denied;
+    }
+    match coord.apply_config_batch(&batch.entries).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// `GET /internal/global/config-digest`: this region's config-only digest, for
+/// a global node's reconciliation sweep to compare against its own and decide
+/// which kinds are worth pushing rather than resending the whole catalogue
+/// every sweep. Narrower than `/internal/digest`: a global node has no
+/// results, alerts or rollups to compare, and computing them here just to
+/// discard them would cost the database worker for nothing.
+pub(in crate::coordinator) async fn global_config_digest_handler(
+    State(coord): State<Coordinator>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(denied) = require_global_trust(&coord, &headers) {
+        return denied;
+    }
+    match coord.db(|storage| storage.config_digest()).await {
+        Ok(digests) => Json(
+            digests
+                .iter()
+                .map(ConfigDigestDto::from)
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// `GET /internal/global/check-ids`: every check id this region currently
+/// holds. Once placement scoping means a region's Check kind is a *subset*
+/// of the global catalogue (SCALING.md "Placement-scoped configuration",
+/// Phase 2), a whole-kind digest mismatch no longer says which ids are
+/// missing or which are excess — only that the two sides disagree. This is
+/// the cheap read (primary keys only, no `config` JSON parse) a global node
+/// makes to find out, and only when the digest already says a check-kind
+/// mismatch exists, never on every sweep.
+pub(in crate::coordinator) async fn global_check_ids_handler(
+    State(coord): State<Coordinator>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(denied) = require_global_trust(&coord, &headers) {
+        return denied;
+    }
+    match coord.db(|storage| storage.check_ids()).await {
+        Ok(ids) => Json(ids).into_response(),
         Err(e) => internal_error(e),
     }
 }
@@ -365,26 +433,6 @@ pub(in crate::coordinator) fn read_config_entry_for_replication(
     }
 }
 
-/// One config kind's contribution to a digest, on the wire. Mirrors
-/// `storage::ConfigDigest`. `max_hlc` is `None` for a kind with no rows and
-/// no tombstones, which is distinct from a kind whose newest stamp is zero.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConfigDigestDto {
-    pub kind: storage::ConfigKind,
-    pub max_hlc: Option<hlc::Hlc>,
-    pub count: i64,
-}
-
-impl From<&storage::ConfigDigest> for ConfigDigestDto {
-    fn from(d: &storage::ConfigDigest) -> Self {
-        ConfigDigestDto {
-            kind: d.kind,
-            max_hlc: d.max_hlc.clone(),
-            count: d.count,
-        }
-    }
-}
-
 /// One check's contribution to a digest, on the wire. Mirrors
 /// `storage::CheckDigest`, which has no `Serialize` of its own.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -402,6 +450,88 @@ impl From<&storage::StreamDigest> for StreamDigestDto {
             count: d.count,
         }
     }
+}
+
+/// One rollup table's contribution to a digest, on the wire. Mirrors
+/// `storage::RollupDigest` — see its doc comment for why it carries more than
+/// a max and a count.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RollupDigestDto {
+    pub max_bucket_start: i64,
+    pub count: i64,
+    pub attempts_sum: i64,
+    pub up_sum: i64,
+    pub latency_sum_sum: i64,
+}
+
+impl From<&storage::RollupDigest> for RollupDigestDto {
+    fn from(d: &storage::RollupDigest) -> Self {
+        Self {
+            max_bucket_start: d.max_bucket_start,
+            count: d.count,
+            attempts_sum: d.attempts_sum,
+            up_sum: d.up_sum,
+            latency_sum_sum: d.latency_sum_sum,
+        }
+    }
+}
+
+/// One rollup row, on the wire. Mirrors `storage::RollupRow` — the
+/// `/internal/backfill/latency-minute`/`-hour` response shape, and the body
+/// `apply_minute_rollups`/`apply_hour_rollups` consume.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RollupRowDto {
+    pub check_id: String,
+    pub agent_id: String,
+    pub bucket_start: i64,
+    pub attempts: i64,
+    pub up: i64,
+    pub latency_sum: i64,
+    pub latency_min: Option<i64>,
+    pub latency_max: Option<i64>,
+}
+
+impl From<&storage::RollupRow> for RollupRowDto {
+    fn from(r: &storage::RollupRow) -> Self {
+        Self {
+            check_id: r.check_id.to_string(),
+            agent_id: r.agent_id.clone(),
+            bucket_start: r.bucket_start,
+            attempts: r.attempts,
+            up: r.up,
+            latency_sum: r.latency_sum,
+            latency_min: r.latency_min,
+            latency_max: r.latency_max,
+        }
+    }
+}
+
+impl RollupRowDto {
+    pub(in crate::coordinator) fn into_row(self) -> anyhow::Result<storage::RollupRow> {
+        Ok(storage::RollupRow {
+            check_id: self.check_id.parse()?,
+            agent_id: self.agent_id,
+            bucket_start: self.bucket_start,
+            attempts: self.attempts,
+            up: self.up,
+            latency_sum: self.latency_sum,
+            latency_min: self.latency_min,
+            latency_max: self.latency_max,
+        })
+    }
+}
+
+/// `GET /internal/backfill/latency-minute`'s and `-hour`'s response: a page
+/// of rollup rows plus who answered. Its own shape rather than
+/// `ReplicationBatch`'s, because rollups never travel through
+/// `/internal/replicate` — they are derived locally from replicated raw
+/// results (`derived_results_sql`) everywhere except the retention-gap
+/// recovery this backs, so giving them a field on the general-purpose push
+/// batch would invite a second, redundant path for writing the same rows.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RollupBatch {
+    pub origin: String,
+    pub rows: Vec<RollupRowDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -436,6 +566,14 @@ pub struct DigestResponse {
     pub alerts: StreamDigestDto,
     pub incidents: StreamDigestDto,
     pub incident_tombstones: StreamDigestDto,
+    /// Defaulted so a node running an older build — one that predates rollup
+    /// anti-entropy — still deserializes: it degrades to "this peer has
+    /// nothing", which never blocks the rest of the sweep and simply means
+    /// rollup recovery waits for both sides to upgrade.
+    #[serde(default)]
+    pub latency_minute_rollups: RollupDigestDto,
+    #[serde(default)]
+    pub latency_hour_rollups: RollupDigestDto,
     /// The config plane's half. Without this a node that was down through an
     /// edit never learns about it: the immediate push already happened and
     /// nothing else would ever mention the row again.
@@ -451,6 +589,8 @@ impl DigestResponse {
             alerts: StreamDigestDto::from(&d.alerts),
             incidents: StreamDigestDto::from(&d.incidents),
             incident_tombstones: StreamDigestDto::from(&d.incident_tombstones),
+            latency_minute_rollups: RollupDigestDto::from(&d.latency_minute_rollups),
+            latency_hour_rollups: RollupDigestDto::from(&d.latency_hour_rollups),
             config: d.config.iter().map(ConfigDigestDto::from).collect(),
         }
     }
@@ -666,6 +806,104 @@ pub(in crate::coordinator) async fn results_backfill_handler(
     }
 }
 
+/// Query for `GET /internal/backfill/latency-minute` and `-hour`. Same
+/// composite-cursor shape as `ResultsBackfillQuery`, cursored on
+/// `(bucket_start, check_id, agent_id)` instead of `(ts_millis, check_id,
+/// agent_id)`.
+#[derive(Debug, Deserialize)]
+pub(in crate::coordinator) struct RollupBackfillQuery {
+    since: i64,
+    since_check_id: Option<String>,
+    since_agent_id: Option<String>,
+    limit: usize,
+}
+
+/// Shared by `latency_minute_backfill_handler` and
+/// `latency_hour_backfill_handler`: parse the composite cursor, bound the
+/// page, and load through `fetch`. The two differ only in which storage
+/// method they pass as `fetch`.
+async fn rollup_backfill(
+    coord: &Coordinator,
+    q: RollupBackfillQuery,
+    fetch: impl FnOnce(
+            &storage::Storage,
+            i64,
+            Option<crate::models::CheckId>,
+            Option<&str>,
+            usize,
+        ) -> anyhow::Result<Vec<storage::RollupRow>>
+        + Send
+        + 'static,
+) -> Response {
+    let since_check_id = match q.since_check_id.as_deref().filter(|id| !id.is_empty()) {
+        Some(id) => match id.parse() {
+            Ok(id) => Some(id),
+            Err(_) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "since_check_id must be a valid UUID",
+                )
+            }
+        },
+        None => None,
+    };
+    let since_agent_id = q.since_agent_id.filter(|id| !id.is_empty());
+    let limit = q.limit.min(super::super::ANTI_ENTROPY_PAGE);
+    match coord
+        .db(move |storage| {
+            fetch(
+                storage,
+                q.since,
+                since_check_id,
+                since_agent_id.as_deref(),
+                limit,
+            )
+        })
+        .await
+    {
+        Ok(rows) => Json(RollupBatch {
+            origin: coord.inner.node_id.clone(),
+            rows: rows.iter().map(RollupRowDto::from).collect(),
+        })
+        .into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// `GET /internal/backfill/latency-minute`: paged minute-rollup rows across
+/// all checks, the pull half of item A's rollup anti-entropy — see
+/// `storage::RollupDigest` for why rollups need their own stream instead of
+/// riding along with raw-result backfill.
+pub(in crate::coordinator) async fn latency_minute_backfill_handler(
+    State(coord): State<Coordinator>,
+    headers: HeaderMap,
+    Query(q): Query<RollupBackfillQuery>,
+) -> Response {
+    if let Some(denied) = require_peer(&coord, &headers) {
+        return denied;
+    }
+    rollup_backfill(&coord, q, |s, since, id, agent, limit| {
+        s.minute_rollups_since(since, id, agent, limit)
+    })
+    .await
+}
+
+/// `GET /internal/backfill/latency-hour`: the hour-rollup counterpart to
+/// `latency_minute_backfill_handler`.
+pub(in crate::coordinator) async fn latency_hour_backfill_handler(
+    State(coord): State<Coordinator>,
+    headers: HeaderMap,
+    Query(q): Query<RollupBackfillQuery>,
+) -> Response {
+    if let Some(denied) = require_peer(&coord, &headers) {
+        return denied;
+    }
+    rollup_backfill(&coord, q, |s, since, id, agent, limit| {
+        s.hour_rollups_since(since, id, agent, limit)
+    })
+    .await
+}
+
 /// `GET /internal/backfill`: paged raw rows for one check, with the composite
 /// `(since, since_agent_id)` cursor exclusive — the pull counterpart to
 /// `/internal/replicate`'s push, and the same
@@ -799,6 +1037,79 @@ pub(in crate::coordinator) async fn cluster_view_handler(
         link_stale_after_ms,
     })
     .into_response()
+}
+
+/// One standing raw-data gap, on the wire. Mirrors `storage::RawDataGapRow`.
+#[derive(Debug, Serialize)]
+pub struct RawDataGapDto {
+    pub check_id: String,
+    pub peer: String,
+    pub from_ts: i64,
+    pub to_ts: i64,
+    pub observed_at: i64,
+}
+
+impl From<&storage::RawDataGapRow> for RawDataGapDto {
+    fn from(g: &storage::RawDataGapRow) -> Self {
+        Self {
+            check_id: g.check_id.to_string(),
+            peer: g.peer.clone(),
+            from_ts: g.from_ts,
+            to_ts: g.to_ts,
+            observed_at: g.observed_at,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(in crate::coordinator) struct RawDataGapsQuery {
+    page: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub(in crate::coordinator) struct RawDataGapsResponse {
+    gaps: Vec<RawDataGapDto>,
+    total: usize,
+    has_more: bool,
+}
+
+/// `GET /api/v1/admin/raw-data-gaps`: every check with a standing hole in its
+/// raw history that ordinary anti-entropy cannot close (`anti_entropy_sweep`
+/// writes these; see `storage::RawDataGapRow`), for an operator deciding
+/// whether a gap needs a snapshot restore or is small enough to accept.
+///
+/// Admin-gated like `cluster_view_handler`, not peer-gated: this reports what
+/// *this* node has already recorded about *other* nodes falling behind, it
+/// does not ask a peer for anything, so there is nothing here for a peer
+/// credential to authenticate.
+///
+/// Once minute/hour rollups replicate on their own (item A), a row here means
+/// specifically that raw probe-level detail is gone for that window — the
+/// summarized latency history for it can still recover through rollup
+/// anti-entropy. See SCALING.md's "Data retention tiers".
+pub(in crate::coordinator) async fn raw_data_gaps_handler(
+    State(coord): State<Coordinator>,
+    headers: HeaderMap,
+    Query(q): Query<RawDataGapsQuery>,
+) -> Response {
+    if let Some(denied) = require_admin(&coord, &headers) {
+        return denied;
+    }
+    let limit = crate::page::bounded(q.limit, 100);
+    let page = q.page.unwrap_or(0);
+    match coord.db(|storage| storage.list_raw_data_gaps()).await {
+        Ok(mut gaps) => {
+            let (total, has_more) = crate::page::take(&mut gaps, page, limit);
+            Json(RawDataGapsResponse {
+                gaps: gaps.iter().map(RawDataGapDto::from).collect(),
+                total,
+                has_more,
+            })
+            .into_response()
+        }
+        Err(e) => internal_error(e),
+    }
 }
 
 /// Gate for `/internal/gossip`. Peers are infrastructure rather than agents, so

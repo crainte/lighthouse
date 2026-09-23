@@ -87,6 +87,11 @@ export interface AgentsResponse {
    *  said it cannot probe that kind. Distinct from the list above because the
    *  remedy differs: those agents are not missing, they are out of date. */
   checks_no_agent_can_run: string[];
+  /** How many checks each list found. The arrays above are a sample capped
+   *  server-side: losing a region's agents orphans every check it holds, and
+   *  naming all of them costs as much as the page being warned about. */
+  checks_with_no_live_agent_total: number;
+  checks_no_agent_can_run_total: number;
 }
 
 /** Agent liveness on the public page. An agent answering is healthy even if
@@ -339,8 +344,46 @@ export interface Incident {
   updates?: IncidentUpdate[];
 }
 
+/** One region's incident inside a group, preserved in full — which region,
+ *  when it detected the outage, and whether it has recovered there. Only the
+ *  global node's merge produces these; a regional coordinator's own
+ *  `/api/v1/incidents` answer never sets `groups` at all. */
+export interface IncidentGroupRegion {
+  region: string;
+  id: string;
+  title: string;
+  state: IncidentState;
+  started_at: number;
+  resolved_at: number | null;
+}
+
+/** A hint, not a merge: the dependent keeps its own row and regions. */
+export interface IncidentAttribution {
+  check_id: string;
+  region: string;
+  incident_id: string;
+}
+
+/** One outage of one check, folded from however many regions' incidents
+ *  describe it — the global tier's read-side fix for a multi-region check
+ *  opening one incident per probing region. See `SCALING.md`, "Cross-region
+ *  dependency belongs to the global tier". */
+export interface IncidentGroup {
+  id: string;
+  origin_check: string | null;
+  title: string;
+  state: IncidentState;
+  started_at: number;
+  /** `null` while any region in the group is still down. */
+  resolved_at: number | null;
+  regions: IncidentGroupRegion[];
+  attributed_to?: IncidentAttribution;
+}
+
 export interface IncidentsResponse {
   incidents: Incident[];
+  /** Present only on a global node's merged answer. */
+  groups?: IncidentGroup[];
 }
 
 export function fetchIncidents(limit = 50, since?: number): Promise<IncidentsResponse> {

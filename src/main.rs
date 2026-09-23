@@ -17,9 +17,22 @@ struct Cli {
     /// Run mode.
     #[arg(value_enum)]
     mode: Mode,
-    /// Path to config file (TOML).
+    /// Path to config file (TOML). Read for every mode but `restore`, which
+    /// takes its paths explicitly because the whole point is never to touch
+    /// a configured, possibly-live database.
     #[arg(short, long, default_value = "warden.toml")]
     config: PathBuf,
+    /// `backup` only: where to write the checkpointed snapshot. Must not
+    /// already exist — a backup generation is immutable once written.
+    #[arg(long)]
+    output: Option<PathBuf>,
+    /// `restore` only: the backup file to restore from.
+    #[arg(long)]
+    from: Option<PathBuf>,
+    /// `restore` only: the fresh path to restore into. Must not already
+    /// exist; restore into a replacement location, never over a live database.
+    #[arg(long)]
+    into: Option<PathBuf>,
 }
 
 /// `--version` output. Leaked because clap wants a `&'static str` and the
@@ -39,6 +52,14 @@ enum Mode {
     /// Cross-region aggregator: caches region state pushes, serves the global
     /// dashboard, routes drill-downs to regions. Holds no raw data.
     Global,
+    /// Checkpoint `coordinator.db_path` and copy it to `--output`. Run this
+    /// against a stopped coordinator (or a replica not otherwise in use):
+    /// DuckDB allows one writer, so this either gets an exclusive view of the
+    /// file or fails rather than racing live writes.
+    Backup,
+    /// Copy `--from` into `--into` and verify it opens and reads cleanly.
+    /// Never writes over an existing path.
+    Restore,
 }
 
 impl Mode {
@@ -48,6 +69,8 @@ impl Mode {
             Mode::Agent => "agent",
             Mode::Coordinator => "coordinator",
             Mode::Global => "global",
+            Mode::Backup => "backup",
+            Mode::Restore => "restore",
         }
     }
 }
@@ -74,7 +97,59 @@ async fn main() -> Result<()> {
         Mode::Agent => run_agent(cfg).await,
         Mode::Coordinator => run_coordinator(cfg).await,
         Mode::Global => run_global(cfg).await,
+        Mode::Backup => run_backup(&cfg, cli.output),
+        Mode::Restore => run_restore(cli.from, cli.into),
     }
+}
+
+/// `warden backup --output <path>`: checkpoint `coordinator.db_path` and
+/// copy it there. Synchronous — there is no server to run alongside it, and
+/// the whole operation is expected to complete and exit.
+fn run_backup(cfg: &Config, output: Option<PathBuf>) -> Result<()> {
+    let output = output.ok_or_else(|| anyhow::anyhow!("backup mode requires --output <path>"))?;
+    let manifest = warden::coordinator::backup::create(&cfg.coordinator.db_path, &output)?;
+    tracing::info!(
+        source = %manifest.source_path,
+        source_node = %manifest.source_node,
+        destination = %output.display(),
+        database_bytes = manifest.database_bytes,
+        sha256 = %manifest.sha256,
+        "backup complete"
+    );
+    println!(
+        "backup written to {} ({} bytes, sha256 {})",
+        output.display(),
+        manifest.database_bytes,
+        manifest.sha256
+    );
+    Ok(())
+}
+
+/// `warden restore --from <backup> --into <fresh path>`: copy and verify,
+/// never opening or touching a live database. Reports what it found so an
+/// operator can compare it against SCALING.md's restore checklist before
+/// putting the result into service.
+fn run_restore(from: Option<PathBuf>, into: Option<PathBuf>) -> Result<()> {
+    let from = from.ok_or_else(|| anyhow::anyhow!("restore mode requires --from <backup path>"))?;
+    let into = into.ok_or_else(|| anyhow::anyhow!("restore mode requires --into <fresh path>"))?;
+    let report = warden::coordinator::backup::restore(&from, &into)?;
+    tracing::info!(
+        destination = %into.display(),
+        checksum_verified = report.checksum_verified,
+        raw_results = report.raw_results,
+        current_states = report.current_states,
+        oldest_result_ts = ?report.oldest_result_ts,
+        "restore complete"
+    );
+    println!(
+        "restored to {} (checksum_verified={}, raw_results={}, current_states={}, oldest_result_ts={:?})",
+        into.display(),
+        report.checksum_verified,
+        report.raw_results,
+        report.current_states,
+        report.oldest_result_ts
+    );
+    Ok(())
 }
 
 /// Standalone: agent produces results into an in-process channel that
@@ -128,11 +203,17 @@ async fn run_coordinator(cfg: Config) -> Result<()> {
     serve(coord, &cfg.coordinator.listen).await
 }
 
-/// Global: no storage, no probing. Caches state summaries pushed by regional
-/// coordinators and serves the aggregated dashboard.
+/// Global: no probing. Holds the catalogue durably (SCALING.md
+/// "Placement-scoped configuration") and caches state summaries pushed by
+/// regional coordinators; serves the aggregated dashboard.
 async fn run_global(cfg: Config) -> Result<()> {
     cfg.global.validate()?;
-    let node = GlobalNode::new(&cfg.global);
+    let node = GlobalNode::new(&cfg.global).await?;
+    // Membership heartbeat and catalogue anti-entropy against peer global
+    // nodes, plus catalogue reconciliation against every known region. A
+    // no-op loop where clustering or regions are not configured, like the
+    // coordinator's own `spawn_cluster`.
+    node.spawn_background();
     let listen = cfg.global.listen.clone();
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     tracing::info!(%listen, "global coordinator listening");

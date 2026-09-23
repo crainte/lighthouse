@@ -200,15 +200,6 @@ impl AlertDto {
     }
 }
 
-/// Largest page accepted by public list routes. This keeps a malformed or
-/// intentionally huge `limit` from turning a status-page request into an
-/// unbounded database read.
-const MAX_LIST_PAGE_SIZE: usize = 1_000;
-
-fn bounded_page_size(requested: Option<usize>, default: usize) -> usize {
-    requested.unwrap_or(default).min(MAX_LIST_PAGE_SIZE)
-}
-
 #[derive(Deserialize)]
 pub(in crate::coordinator) struct LimitQuery {
     limit: Option<usize>,
@@ -398,16 +389,6 @@ fn in_scope(sections: &[storage::Section], scope: Option<&str>, group: Option<&s
     }
 }
 
-fn page_slice<T>(items: &mut Vec<T>, page: usize, limit: usize) -> (usize, bool) {
-    let total = items.len();
-    let start = page.saturating_mul(limit).min(total);
-    let end = start.saturating_add(limit).min(total);
-    let has_more = end < total;
-    items.drain(..start);
-    items.truncate(end - start);
-    (total, has_more)
-}
-
 // ---- Handlers ----
 
 pub(in crate::coordinator) async fn status_handler(
@@ -498,7 +479,7 @@ pub(in crate::coordinator) async fn status_handler(
             checks.extend(pending);
             let sections = section_rollups(&coord, &checks);
             let scope = q.section;
-            let (page, limit) = (q.page.unwrap_or(0), bounded_page_size(q.limit, 100));
+            let (page, limit) = (q.page.unwrap_or(0), crate::page::bounded(q.limit, 100));
             let section_rows = match coord.db(|storage| storage.list_sections()).await {
                 Ok(sections) => sections,
                 Err(e) => return internal_error(e),
@@ -511,7 +492,7 @@ pub(in crate::coordinator) async fn status_handler(
                     .then_with(|| a.name.cmp(&b.name))
                     .then_with(|| a.check_id.cmp(&b.check_id))
             });
-            let (total_checks, has_more) = page_slice(&mut checks, page, limit);
+            let (total_checks, has_more) = crate::page::take(&mut checks, page, limit);
             let agents = fleet_health(&coord, now).await;
             Json(StatusResponse {
                 checks,
@@ -575,7 +556,7 @@ pub(in crate::coordinator) async fn history_handler(
     Query(q): Query<LimitQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let limit = bounded_page_size(q.limit, 100);
+    let limit = crate::page::bounded(q.limit, 100);
     // An unrecognised value filters nothing rather than silently returning empty.
     let status = q.status.as_deref().and_then(|s| match s {
         "up" => Some(Status::Up),
@@ -623,7 +604,7 @@ pub(in crate::coordinator) async fn results_handler(
     if let Some(rejection) = require_admin(&coord, &headers) {
         return rejection;
     }
-    let limit = bounded_page_size(q.limit, 200);
+    let limit = crate::page::bounded(q.limit, 200);
     // An unrecognised value filters nothing rather than silently returning empty.
     let status = q.status.as_deref().and_then(|s| match s {
         "up" => Some(Status::Up),
@@ -852,7 +833,7 @@ pub(in crate::coordinator) async fn uptime_strips_handler(
     };
     let scope = q.section;
     let page = q.page.unwrap_or(0);
-    let limit = bounded_page_size(q.limit, 100);
+    let limit = crate::page::bounded(q.limit, 100);
     match coord
         // Sections are read inside this closure rather than in their own call:
         // scoping needs them before the scan, and a second `db` hop would put
@@ -877,7 +858,7 @@ pub(in crate::coordinator) async fn uptime_strips_handler(
                 .into_iter()
                 .map(|(id, downtime, _, _)| (id, downtime))
                 .collect();
-            page_slice(&mut wanted, page, limit);
+            crate::page::take(&mut wanted, page, limit);
             storage.uptime_strips(&wanted, days, buckets, now)
         })
         .await
@@ -937,7 +918,7 @@ pub(in crate::coordinator) async fn latency_points_handler(
     };
     let scope = q.section;
     let page = q.page.unwrap_or(0);
-    let limit = bounded_page_size(q.limit, 100);
+    let limit = crate::page::bounded(q.limit, 100);
     match coord
         .db(move |storage| {
             let sections = storage.list_sections()?;
@@ -952,7 +933,7 @@ pub(in crate::coordinator) async fn latency_points_handler(
                     .then_with(|| a.0.cmp(&b.0))
             });
             let mut wanted: Vec<CheckId> = wanted.into_iter().map(|(id, _, _)| id).collect();
-            page_slice(&mut wanted, page, limit);
+            crate::page::take(&mut wanted, page, limit);
             storage.latency_points_for(&wanted, from, to, buckets)
         })
         .await
@@ -986,7 +967,7 @@ pub(in crate::coordinator) async fn alerts_handler(
     State(coord): State<Coordinator>,
     Query(q): Query<LimitQuery>,
 ) -> Response {
-    let limit = bounded_page_size(q.limit, 50);
+    let limit = crate::page::bounded(q.limit, 50);
     let rows = coord.db(move |storage| storage.recent_alerts(limit)).await;
     match rows {
         Ok(rows) => {
@@ -1015,16 +996,6 @@ mod tests {
             collapsed: false,
             display,
         }
-    }
-
-    #[test]
-    fn list_page_size_uses_defaults_and_caps_requested_values() {
-        assert_eq!(bounded_page_size(None, 50), 50);
-        assert_eq!(bounded_page_size(Some(200), 50), 200);
-        assert_eq!(
-            bounded_page_size(Some(MAX_LIST_PAGE_SIZE + 1), 50),
-            MAX_LIST_PAGE_SIZE
-        );
     }
 
     #[test]

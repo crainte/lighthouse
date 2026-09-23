@@ -60,10 +60,12 @@ pub(in crate::coordinator) fn bearer(headers: &HeaderMap) -> Option<&str> {
 pub(in crate::coordinator) async fn login_handler(
     State(coord): State<Coordinator>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Response {
     let now = chrono::Utc::now().timestamp_millis();
-    match coord.inner.auth.login(&body.password, peer.ip(), now) {
+    let client_ip = crate::security::client_ip(peer.ip(), &headers, &coord.inner.trusted_proxies);
+    match coord.inner.auth.login(&body.password, client_ip, now) {
         Ok(token) => {
             // The Secure attribute is an explicit deployment setting, never
             // inferred from Forwarded/X-Forwarded-Proto headers supplied by an

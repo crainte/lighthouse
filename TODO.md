@@ -84,15 +84,14 @@ Prioritized action items from the production-readiness review. Existing items fr
 
 ### Placement-scoped configuration
 
-Design settled in `SCALING.md`. Secret references and the regional local-only
-unplace primitive are implemented; authoritative global reconciliation is not.
+Design settled in `SCALING.md`. All five phases are implemented.
 
-- [ ] **Phase 1** — global holds the catalogue and placement durably, replicated between global nodes, reusing the coordinator's config plane (HLC entries, per-kind digests, cursored backfill, cluster membership). Fixes the existing gap that `fan_out_write` applies partially and nothing reconciles it.
-- [ ] **Phase 2** — per-region reconciliation against the set placement implies, with an `unplace` verb that drops the local definition, keeps the check id, and never writes a tombstone. A tombstone would replicate and delete the check in the region still probing it.
-- [ ] **Phase 3** — deliver probe detail only to placed regions; regional status pages list only what the region holds. Closes the disclosure (a target with an embedded credential currently sits in every region) and cuts per-region config cost.
-- [ ] **Phase 4** — run the global as three nodes.
-- [ ] **Phase 5** — cross-region dependency attribution at the global tier, the only place both ends of the edge are visible. Distinct from `RollupPolicy`, which describes state folding rather than causation.
-  - [ ] Group a multi-region check's per-region incidents on the global tier. Observed in the global Compose stack: `dns` and `ntfy` place to every region, so `us` and `tw` each open their own incident for one outage — `…-1790119380023` (us, 16:23:00) beside `…-1790119440028` (tw, 16:24:00), both titled "dns is down". `unifi` and `upstream`, pinned to `us`, never duplicate, which is what identifies the cause: an incident id is `<check_id>-<detection_ts>`, and two regions detecting seconds apart mint two ids for one event. Regions keeping their own incident is the design and must not change; the missing piece is that the global lists them as unrelated rows and both regions page independently. The read-side fix is to fold incidents sharing an `origin_check` over overlapping lifetimes into one row naming the affected regions — presentation only, so it cannot corrupt a regional incident. Deduplicating the *notification* is the part that needs this phase's attribution rather than a merged view.
+- [x] **Phase 1** — global holds the catalogue and placement durably, replicated between global nodes, reusing the coordinator's config plane (HLC entries, per-kind digests, cursored backfill, cluster membership). Fixes the existing gap that `fan_out_write` applies partially and nothing reconciles it. Scope: checks and sections are authoritative on the global store; notifiers, credentials and rollup policies stay on the pre-existing all-region fan-out until Phase 2/3 widen it — see `global::store`'s module doc.
+- [x] **Phase 2** — per-region reconciliation against the set placement implies, with an `unplace` verb that drops the local definition, keeps the check id, and never writes a tombstone. A tombstone would replicate and delete the check in the region still probing it. `global::reconcile::reconcile_checks` diffs placement-scoped id sets (`Storage::check_ids_for_region` against `/internal/global/check-ids`) rather than re-paging the whole kind, so a converged region costs one digest comparison per sweep; `Storage::config_digest_for_region` is what makes that digest comparison subset-correct instead of comparing a whole-catalogue digest against a region that legitimately holds less of it.
+- [x] **Phase 3** — deliver probe detail only to placed regions; regional status pages list only what the region holds. Closes the disclosure (a target with an embedded credential currently sits in every region) and cuts per-region config cost. Fell out of Phase 2: a region's status page and admin check list already read from what it locally holds, which reconciliation now scopes to placement; the global dashboard is unaffected since it merges per-region pushes keyed by check id.
+- [x] **Phase 4** — run the global as three nodes.
+- [x] **Phase 5** — cross-region dependency attribution at the global tier, the only place both ends of the edge are visible. Distinct from `RollupPolicy`, which describes state folding rather than causation.
+  - [x] Group a multi-region check's per-region incidents on the global tier. Observed in the global Compose stack: `dns` and `ntfy` place to every region, so `us` and `tw` each open their own incident for one outage — `…-1790119380023` (us, 16:23:00) beside `…-1790119440028` (tw, 16:24:00), both titled "dns is down". `unifi` and `upstream`, pinned to `us`, never duplicate, which is what identifies the cause: an incident id is `<check_id>-<detection_ts>`, and two regions detecting seconds apart mint two ids for one event. Regions keeping their own incident is the design and must not change; the missing piece is that the global lists them as unrelated rows and both regions page independently. The read-side fix is to fold incidents sharing an `origin_check` over overlapping lifetimes into one row naming the affected regions — presentation only, so it cannot corrupt a regional incident. Deduplicating the *notification* is the part that needs this phase's attribution rather than a merged view. Implemented as `global::incidents::group_and_attribute`: `relay_merge` adds a `"groups"` array alongside the existing flat `"incidents"` list on `/api/v1/incidents` and `/api/v1/checks/:id/incidents`, folding same-`origin_check` incidents whose `[started_at, resolved_at ?? now]` windows overlap and attributing a dependent's group to an overlapping cross-region upstream group via `depends_on` (now carried on `CheckSummary`). Nothing is written back to a region; the admin and public UIs (`IncidentsList.svelte`, `PastIncidents.svelte`) render the fold as an expandable row with per-region detail and an attribution line, falling back to the un-grouped view when `groups` is absent (every regional dashboard).
 - [x] Clear a check's published state on unplace so a region stops asserting a state it no longer observes; keep raw results, which reconnect by id on re-placement.
 - [x] **Phase 0** — reference secrets in check documents rather than carrying them, following the existing `token_env` convention: the region resolves a named credential at hand-off to its own agents, the admin UI renders the reference, and an unresolved reference reads as a configuration error naming it. This is what lets the global tier hold and move whole documents while values stay in the region that probes with them, and it turns placement-scoped distribution from a security control into an optimisation. Do this before Phase 1.
 
@@ -105,34 +104,73 @@ Measured during the passing 10,000-check gate; provisioning-time, not steady-sta
 
 ### Alert identity
 
-- [ ] Fix alert ids that name a different check on different nodes. Observed in the global Compose stack: id `01a08215-de63-…-1788912120134-down` is stored against check `01a08215-de63-…` on `coordinator-us-b`/`-us-c` and against check `018f0000-…` (`upstream`) on `coordinator-us-a`. Both nodes believe their own row, so `upsert_alert` reports a conflict, the alert stream never converges, and anti-entropy re-offers the same page every sweep. Likely the originating-alert-id pass-through combined with dependency/upstream incident joining; a conflicting alert is now skipped rather than failing the whole replication batch, which contains the damage but does not resolve it.
+- [x] Fix alert ids that name a different check on different nodes. Root-caused against the
+      live stack rather than guessed: `canonicalize_random_legacy_check_ids` rewrote
+      `alerts.node_id` but not `alerts.id`, which embeds the check id, and it ran per node
+      inside a replicated cluster — self-marking complete on an empty `checks` table. One
+      replica rewrote half of a derived identity pair and its peers did not. Measured: 127
+      alert rows across `us-a`/`us-b`/`us-c` sharing an id with disagreeing bodies, which
+      `upsert_alert` refuses forever because an alert is immutable.
+  - [x] Delete the legacy check-identity migration subsystem (871 lines). Identity is
+        cluster-shared state and a node may not rewrite it locally; the project is
+        unreleased, so the supported answer is a rebuild. Recorded as the pre-1.0 database
+        policy in `SCALING.md`.
+  - [x] Stop the gossip fallback adopting a bare `alert_id` and pairing it with a locally
+        resolved `check_id`. A peer now sends the whole immutable row or nothing, and the
+        receiver mints its own content-derived id instead.
+  - [x] Bound the amplification: a stream walked to its peer's tail keeps that tail rather
+        than restarting from the beginning every sweep. A permanently divergent stream is a
+        health alarm, not a reason to replay a peer's whole history — measured at 4 replays
+        per 4 sweeps before, 1 after.
 
 ### Limits measured during the 10,000-check gate
 
 - [x] Replicated dedup no longer scales with retained history: splitting the batch on the per-check high-water mark keeps the live path off the history table entirely (17 ms at 20M rows, 16 ms at 40M). Only repair reaches the anti-join.
 - [x] Retention costs what it removes rather than what it keeps: the two full rebuilds after the delete are replaced by targeted maintenance (176 ms versus 7,552 ms on a daily window at 40M rows), and the delete is sliced across 24 jobs so the worker interleaves.
 - [x] The global dashboard showed "Collecting latency data…" for every check: `/api/v1/uptime` and `/api/v1/latency-points` are fleet-wide *data* reads, but the global relay treated them as singleton config reads and answered from one region, which holds no results for checks its own agents do not probe. Both now fan out to every region and merge per check.
-- [ ] The full status page is 134.7 MB over 3 requests at 10,000 checks (p95 509 ms). Paginate or filter the dashboard; the monitoring cardinality is supportable, the single-page rendering of it is not.
+- [x] The full status page is 134.7 MB over 3 requests at 10,000 checks (p95 509 ms). Paginate or filter the dashboard; the monitoring cardinality is supportable, the single-page rendering of it is not. Fixed: `/api/v1/status`, `/api/v1/uptime`, and `/api/v1/latency-points` are bounded through `src/page.rs` (`MAX_PAGE_SIZE = 1,000`, shared by regional and global handlers), and `frontend/src/App.svelte` requests a 100-check page by default. Re-measured with `benchmark_status_and_global_push_production_cardinality` at 10,000 checks/3 regions: a default-page load is 66 ms / 1.28 MB (was 509 ms / 134.7 MB); a client that deliberately asks for the largest page the server allows (1,000 checks) is 102 ms / 12.8 MB. Verified two related paths that could have reopened the same problem and found both already bounded: `status_handler` appends pending/never-reported checks before paging, but the page slice (`crate::page::take`) is applied after that append, so the response is still capped at `limit`; and the global tier's `status_handler`/`filter_chart_page` (`src/global/mod.rs`) apply the identical bound when merging across regions, asking each region for a capped 1,000-row candidate set rather than everything. See SCALING.md "Measured status, page, and global-push cardinality".
 - [x] `agent_checks_handler` runs `list_checks()` on the database worker for every agent poll, though the coordinator already caches check metadata in memory. Cost is `agents / poll_secs × O(checks)` on the one worker.
 - [x] The notification dispatcher is a single serial loop with a 10 s per-send timeout, fed by a 1,024-slot channel whose `try_send` drops on overflow — a slow notifier delays every other alert, and an overflow loses alerts with no retry row written.
 
 ### Storage maintenance
 
-- [ ] Review and add appropriate physical organization/indexing for common queries.
-  - [ ] Evaluate an index or storage strategy for `check_results(check_id, ts_millis)`.
-  - [ ] Evaluate indexes for alert, incident, and state-history lookup patterns.
-  - [ ] Confirm index behavior and write cost with the bundled DuckDB version.
+- [x] Review and add appropriate physical organization/indexing for common queries. Evaluated, not assumed: benchmarked with DuckDB v1.5.4 (bundled by `duckdb = "1.10504.0"`) rather than adopting the "ART rebuilds at startup" folklore unread — reopen time is measured identical with or without an index, matching DuckDB's persisted/lazy-loaded ART storage. Decision for every candidate is not to add it; see SCALING.md "Indexing evaluated and rejected at measured scale" for the numbers and the threshold that would reverse each one.
+  - [x] Evaluate an index or storage strategy for `check_results(check_id, ts_millis)`. Measured (`benchmark_check_results_check_id_ts_index_tradeoff`) at 80.64M rows: 1.7–2.6× the storage and 1.7–2.1× slower bulk writes, no reproducible `history`/`latency_series` benefit — DuckDB's automatic zone map on the monotonically-appended `ts_millis` already prunes the table before `check_id` is evaluated. Not added.
+  - [x] Evaluate indexes for alert, incident, and state-history lookup patterns. `alerts(ts_millis)` and `incident_checks(check_id)` measured (`benchmark_alert_incident_lookup_index_tradeoff`) at a pessimistic 900K-alert/45K-incident seed: 1.5–2.1× slower bulk writes, no reproducible read benefit at that (already small, retention-bounded) scale. Neither added. `state_history` needs nothing added: its `PRIMARY KEY (check_id, since)` already leads with the only column every lookup against it filters on.
+  - [x] Confirm index behavior and write cost with the bundled DuckDB version. Confirmed empirically rather than assumed: reopen duration is unaffected by the presence of an index (lazy ART deserialization), while bulk-load and per-row write cost are measurably and reproducibly higher with one, on both benchmarks above.
 - [x] Make retention and cleanup operations transactional where partial completion can expose inconsistent state.
-- [ ] Implement minute/hour latency rollups, query resolution switching, and raw/rollup boundary semantics before reducing raw retention.
-- [ ] Replace monolithic raw-result deletes with a benchmarked, crash-safe time-partition lifecycle that drops expired partitions only after rollup coverage is complete.
-- [ ] Define retention-aware peer recovery for nodes behind raw retention: snapshot restore, explicit raw-data gaps, or extended catch-up storage.
+- [x] Implement minute/hour latency rollups, query resolution switching, and raw/rollup boundary semantics before reducing raw retention. Rollups also now replicate on their own anti-entropy stream (digest + cursored backfill), so a peer behind raw retention can still recover summarized latency history for a window it holds no raw rows for.
+- [x] Gate raw-result deletes on rollup coverage. Retention now pulls its horizon back to
+      the start of the oldest minute that raw data claims and the rollups do not, so a
+      failed rollup write stalls retention instead of destroying history nothing summarized.
+      A stall is visible in the monitored database-size metric; silent loss is visible in
+      nothing.
+- [ ] Physical time-partitioning of `check_results` is deliberately **not** built. SCALING.md's
+      own gate requires it only "when a full-scale retention run cannot drop one expiry unit
+      within the maintenance budget", and the measured run is 176 ms sliced across 24 jobs.
+      DuckDB has no native partitioning, so this would mean table-per-day behind a union view,
+      touching every ingest, dedup, digest, backfill and query path. Promote this when a daily
+      retention slice exceeds the maintenance budget or requires excessive temporary space.
+- [x] Define retention-aware peer recovery for nodes behind raw retention: a standing gap is recorded durably (`raw_data_gaps`, admin-readable at `GET /api/v1/admin/raw-data-gaps`) rather than only logged and counted. No snapshot-restore tooling exists yet, so recovery today is the explicit-gap outcome, bounded to raw probe-level detail — the same window's rollups recover through their own replication (see above).
 - [x] Run large retention deletes outside Tokio worker threads and avoid holding the main storage lock for the full operation (sliced across 24 database jobs; the worker already runs off the Tokio threads).
-- [ ] Add explicit checkpoint/file-size maintenance after large pruning operations if benchmarks show it is needed.
+- [x] Add explicit checkpoint/file-size maintenance after large pruning operations if benchmarks show it is needed. Benchmarked (`benchmark_checkpoint_after_prune`) instead of assumed: at 1,000 checks/30 raw days, pruning one day (2.88M of 86.4M rows) leaves ~23 MB of WAL; an explicit `CHECKPOINT` costs 431 ms (over the single-worker slow-call threshold) and shrinks nothing — the file never gets smaller, and a second checkpoint is byte-identical to the first. DuckDB already applies the WAL automatically once its own threshold trips, before an explicit call would even run. Not added to the prune path; the threshold that would change this answer is `wal_bytes` growing unbounded between prunes in production, which the existing file-size metric already watches for.
 - [x] Monitor logical row counts, DuckDB file size, prune duration, query duration, and database errors.
-- [ ] Cap route/list page sizes consistently; the internal anti-entropy backfill endpoint is capped, but user-facing route pagination still needs explicit limits.
-- [ ] Replace the correlated state-history prune query with a bounded/windowed approach if production benchmarks show poor scaling.
-- [ ] Create and test documented backup and restore procedures.
-- [ ] Add restart/recovery tests using a persistent production-sized database.
+- [x] Cap route/list page sizes consistently. Three separate copies of the same 1,000 ceiling
+      (`bounded_page_size`, `MAX_INCIDENT_PAGE_SIZE`, an ad-hoc `.min(1_000)` on the global
+      relay) are now one `src/page.rs`. Defaults stay with the routes, since a status page and
+      an incident list disagree about a sensible first screen; the ceiling does not.
+  - [x] `/api/v1/admin/checks` and the agents route were genuinely unbounded. The check list is
+        paged and the console pages to the end, so the array stays the contract while no single
+        request can ask the one database worker for ten thousand documents.
+  - [x] The agents route's orphaned/unrunnable lists are bounded by the catalogue, not the
+        fleet: they now carry a count plus a capped sample.
+- [x] Replace the correlated state-history prune query with an anti-join over one grouped pass.
+      Measured first, and the premise turned out to be wrong: DuckDB decorrelates the old form,
+      so on 3M spans the two measure 2.4 s against 2.2 s whether the rows are spread over 10,000
+      checks or concentrated in 100 flapping ones. Kept for saying what it means, not for the
+      10%. See `benchmark_state_history_prune`.
+- [x] Create and test documented backup and restore procedures: `warden backup --output <path>` and `warden restore --from <backup> --into <path>` (`src/coordinator/backup.rs`, wired into `main.rs` beside the other run modes). Backup checkpoints the source, copies it plus its manifest, and reopens the copy to prove it is queryable before calling the job done; restore verifies the manifest checksum, refuses to write over an existing path, and reopens the result. Documented in SCALING.md's "Checkpointed DuckDB backup, restore, and peer recovery" section; exercised by `coordinator::backup::tests` and manually against a real coordinator process (backup refused while the coordinator held the file open, confirming DuckDB's own lock — not application logic — enforces "stop writes first").
+- [x] Add restart/recovery tests using a persistent production-sized database. `restart_recovers_committed_rows_and_backup_restore_preserves_them` (fast, always-on) and `benchmark_restart_recovery_at_production_scale` (`#[ignore]`d, `WARDEN_BENCH_*`-sized) in `src/coordinator/storage.rs` both close the database uncleanly via `std::mem::forget` — skipping DuckDB's own connection shutdown rather than a graceful `drop`, the closest an in-process test can safely get to a killed process — then reopen it and assert committed rows, replication watermarks, and rollups all survive, and that a subsequent backup/restore round trip preserves the same three. At 1,000 checks/30 days/86.4M rows: reopen (WAL replay) 8.6 s, backup 23.3 s, restore 10.1 s.
 
 ### TLS and probe behavior
 
@@ -151,7 +189,7 @@ Measured during the passing 10,000-check gate; provisioning-time, not steady-sta
 - [x] Redact notifier secrets in admin read responses.
   - [x] Return placeholders or presence flags for SMTP passwords, routing keys, and webhook secrets.
   - [x] Preserve existing secrets unless an update explicitly replaces them.
-- [ ] Add explicit trusted-proxy support if per-client login rate limiting is required behind a reverse proxy.
+- [x] Add explicit trusted-proxy support if per-client login rate limiting is required behind a reverse proxy. `trusted_proxies` (`[coordinator]`/`[global]`, bare IPs or CIDRs, empty by default) in `src/config.rs`; resolution lives in `crate::security::TrustedProxies`/`client_ip` (`src/security.rs`) rather than duplicating the trust notion `secure_cookies` already reserves for a forwarded-protocol decision this project has deliberately not added. When the immediate peer is trusted, `client_ip` reads `X-Forwarded-For` from the right, skipping entries that are themselves trusted proxies, and stops at the first that is not — the direction that closes the classic spoof of prepending a fake hop ahead of what the real chain appended. `login_handler` in both `coordinator/routes/session.rs` and `global/mod.rs` resolve through it before calling `Auth::login`, so rate limiting keys on the real client once a proxy is declared. Default (empty list) is unchanged: the peer address, header ignored outright. Tests: `security::tests` (unit: spoofed-from-untrusted-peer ignored, trusted-proxy header honoured, multi-hop chain, all-trusted-hops and malformed-hop fallbacks, empty-config default, CIDR/IPv4-vs-IPv6 matching) and `admin_api::a_spoofed_forwarded_for_header_is_ignored_without_a_trusted_proxy` / `a_trusted_proxys_forwarded_for_is_honoured_per_client` (end-to-end over real HTTP, including a trusted multi-hop chain).
   - [x] Keep the current raw peer-IP behavior as the safe default.
   - [x] Document shared proxy rate-limit buckets until trusted-proxy support exists.
 - [x] Document TLS termination and transport-security requirements for production deployments.

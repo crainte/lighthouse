@@ -112,3 +112,15 @@ export function openIncidentForCheck(incidents: Incident[], checkId: string): In
   }
   return best;
 }
+
+/// A global node stamps every incident id it relays as `"<region>:<local>"`
+/// (see `composite_incident_id` in `src/global/mod.rs`) so an editor targets
+/// the right region without a separate lookup. `id` is a check id (a UUID,
+/// which never contains `:`) followed by `-<detection_ts>`, so splitting on
+/// the first colon is unambiguous. A regional dashboard's own ids carry no
+/// prefix at all, so this reads as `""` there — callers treat that as "no
+/// region to show", not an error.
+export function regionFromIncidentId(id: string): string {
+  const i = id.indexOf(':');
+  return i === -1 ? '' : id.slice(0, i);
+}

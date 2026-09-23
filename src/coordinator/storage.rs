@@ -5,7 +5,6 @@ use crate::models::{CheckId, CheckKind, CheckResult, NodeState, Status};
 use anyhow::{bail, Result};
 use duckdb::{Connection, Statement};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as ShaDigest, Sha256};
 use std::collections::BTreeMap;
 
 const MILLIS_PER_MINUTE: i64 = 60_000;
@@ -564,6 +563,24 @@ pub struct Section {
     pub display: SectionDisplay,
 }
 
+impl Section {
+    /// Section names appear as headings and are matched against
+    /// `checks.group_name`, so an empty or absurd one is rejected at the
+    /// boundary. Shared by the coordinator's own admin API (`routes::sections`)
+    /// and the global tier's (`global::store`): both accept the same
+    /// submission from the same admin console.
+    pub fn valid_name(name: &str) -> Result<String, String> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err("section name is required".into());
+        }
+        if trimmed.chars().count() > 60 {
+            return Err("section name must be 60 characters or fewer".into());
+        }
+        Ok(trimmed.to_string())
+    }
+}
+
 /// Express a plain interval as the equivalent cron, for migrating rows written
 /// when checks had an `interval_secs` instead of a schedule.
 fn seconds_to_cron(secs: u64) -> String {
@@ -724,6 +741,72 @@ pub struct StreamDigest {
     pub count: i64,
 }
 
+/// A rollup table's contribution to a digest.
+///
+/// `StreamDigest` works for alerts/incidents/tombstones because those rows
+/// are append-only: a row is written once and its identity and payload never
+/// change again, so the newest timestamp plus a count is enough to tell two
+/// replicas apart. A rollup row is not append-only — it is an upsert keyed on
+/// `(check_id, agent_id, bucket_start)` whose `attempts`/`up`/`latency_sum`
+/// keep growing for as long as its bucket accepts new raw observations.
+/// Two peers can agree on `max_bucket_start` and `count` while their
+/// counters disagree (one missed a batch of raw rows that landed in a bucket
+/// both already hold), and a digest that could not see that would report
+/// them converged when they are not.
+///
+/// `attempts_sum`/`up_sum`/`latency_sum_sum` are running totals across every
+/// row in the table, maintained incrementally alongside the rollup rows
+/// themselves (see `rollup_merge_from_raw_sql` and
+/// `rollup_merge_from_backfill_sql`) rather than recomputed by scanning the
+/// table on every digest. They work as a cheap checksum because every one of
+/// them is a sum of non-negative contributions: each raw observation adds a
+/// fixed, positive amount to exactly one bucket's counters exactly once, so
+/// the totals are monotonic and independent of how writes were batched.
+/// A bucket missing on one side therefore leaves at least one total strictly
+/// smaller there — there is no way for two replicas holding different data to
+/// coincidentally produce the same triple the way, say, two different
+/// checksums of equal length could collide by construction. It is not
+/// cryptographic, and does not need to be: like every other digest in this
+/// module it exists to decide whether a backfill pull is worth making, not to
+/// prove equality.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RollupDigest {
+    pub max_bucket_start: i64,
+    pub count: i64,
+    pub attempts_sum: i64,
+    pub up_sum: i64,
+    pub latency_sum_sum: i64,
+}
+
+/// One rollup bucket, on the wire and as the unit `apply_minute_rollups` /
+/// `apply_hour_rollups` merge. Shared by the minute and hour tables — they
+/// differ only in bucket width, never in shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RollupRow {
+    pub check_id: CheckId,
+    pub agent_id: String,
+    pub bucket_start: i64,
+    pub attempts: i64,
+    pub up: i64,
+    pub latency_sum: i64,
+    pub latency_min: Option<i64>,
+    pub latency_max: Option<i64>,
+}
+
+/// One standing raw-data gap: this node's retained history for `check_id`
+/// ends at `from_ts`, `peer`'s begins at `to_ts`, and nothing between them is
+/// held by either side. `observed_at` is when the condition was last seen,
+/// not when it started — the gap is redetected every sweep it persists, and
+/// each detection refreshes this row rather than appending a new one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RawDataGapRow {
+    pub check_id: CheckId,
+    pub peer: String,
+    pub from_ts: i64,
+    pub to_ts: i64,
+    pub observed_at: i64,
+}
+
 /// Which config table an entry belongs to. `kind` on `ConfigEntry` and
 /// `config_tombstones`, and the discriminant a digest groups by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -819,6 +902,8 @@ pub struct Digest {
     pub alerts: StreamDigest,
     pub incidents: StreamDigest,
     pub incident_tombstones: StreamDigest,
+    pub latency_minute_rollups: RollupDigest,
+    pub latency_hour_rollups: RollupDigest,
     pub config: Vec<ConfigDigest>,
 }
 
@@ -948,32 +1033,6 @@ pub struct AgentPollRow {
     pub kinds: Option<String>,
 }
 
-/// Every table/column outside `checks` that stores a check's identity.
-const DEPENDENT_CHECK_COLUMNS: [(&str, &str); 7] = [
-    ("check_results", "check_id"),
-    ("current_state", "check_id"),
-    ("agent_check_state", "check_id"),
-    ("state_history", "check_id"),
-    ("incident_checks", "check_id"),
-    ("notification_queue", "check_id"),
-    ("incidents", "origin_check"),
-];
-
-/// Whether `table.column` exists and still holds text. False for a column
-/// already converted to native `UUID`, which is what makes the identity
-/// migration idempotent table by table rather than all-or-nothing.
-fn column_is_varchar(conn: &Connection, table: &str, column: &str) -> Result<bool> {
-    let mut stmt = conn.prepare(
-        "SELECT data_type FROM information_schema.columns
-         WHERE table_name = ? AND column_name = ?",
-    )?;
-    let mut rows = stmt.query_map(duckdb::params![table, column], |r| r.get::<_, String>(0))?;
-    Ok(matches!(
-        rows.next().transpose()?.as_deref(),
-        Some("VARCHAR")
-    ))
-}
-
 fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?",
@@ -989,668 +1048,6 @@ fn table_column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
     let rows = stmt.query_map(duckdb::params![table], |r| r.get::<_, String>(0))?;
     rows.collect::<std::result::Result<_, _>>()
         .map_err(Into::into)
-}
-
-/// `(name, data_type, nullable)` for every column of `table`, in declaration
-/// order — enough to reconstruct an equivalent `CREATE TABLE` for the
-/// recreate-and-swap migration below, without hardcoding which optional
-/// columns a given database has already had ALTERed onto it.
-fn table_columns(conn: &Connection, table: &str) -> Result<Vec<(String, String, bool)>> {
-    let mut stmt = conn.prepare(
-        "SELECT column_name, data_type, is_nullable FROM information_schema.columns
-         WHERE table_name = ? ORDER BY ordinal_position",
-    )?;
-    let rows = stmt.query_map(duckdb::params![table], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)? == "YES",
-        ))
-    })?;
-    rows.collect::<std::result::Result<_, _>>()
-        .map_err(Into::into)
-}
-
-/// Recreate `table` with its `check_id` column (VARCHAR name) converted to a
-/// native `UUID`, resolving old values against `check_id_map`. DuckDB refuses
-/// `ALTER COLUMN ... SET DATA TYPE` on a column carrying a PRIMARY KEY/UNIQUE
-/// constraint, so any table whose primary key includes `check_id` has to be
-/// rebuilt rather than altered in place — every other column is carried over
-/// unchanged, discovered from `information_schema` so this does not need to
-/// know about columns ALTERed onto an older database after this code was
-/// written.
-///
-/// Verified row-count-preserving: `check_id_map` is built to cover every
-/// distinct value this migration will ever join against (including checks
-/// deleted before the upgrade), so the join must not drop rows. A mismatch
-/// aborts rather than silently discarding history.
-fn recreate_with_uuid_check_id(conn: &Connection, table: &str, pk: &[&str]) -> Result<()> {
-    let cols = table_columns(conn, table)?;
-    let mut coldefs = Vec::new();
-    let mut selects = Vec::new();
-    for (name, data_type, nullable) in &cols {
-        let nn = if *nullable { "" } else { " NOT NULL" };
-        if name == "check_id" {
-            coldefs.push(format!("check_id UUID{nn}"));
-            selects.push("m.id AS check_id".to_string());
-        } else {
-            coldefs.push(format!("{name} {data_type}{nn}"));
-            selects.push(format!("t.{name}"));
-        }
-    }
-    coldefs.push(format!("PRIMARY KEY ({})", pk.join(", ")));
-    let staging = format!("{table}__uuid_migration");
-    conn.execute_batch(&format!(
-        "DROP TABLE IF EXISTS {staging}; CREATE TABLE {staging} ({});",
-        coldefs.join(", ")
-    ))?;
-    conn.execute(
-        &format!(
-            "INSERT INTO {staging} SELECT {} FROM {table} t JOIN check_id_map m ON m.name = t.check_id",
-            selects.join(", ")
-        ),
-        [],
-    )?;
-    let before: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
-    let after: i64 =
-        conn.query_row(&format!("SELECT COUNT(*) FROM {staging}"), [], |r| r.get(0))?;
-    if before != after {
-        bail!(
-            "check-identity migration would drop rows converting {table}.check_id to UUID \
-             ({before} -> {after}); refusing to touch the database"
-        );
-    }
-    conn.execute_batch(&format!(
-        "DROP TABLE {table}; ALTER TABLE {staging} RENAME TO {table};"
-    ))?;
-    Ok(())
-}
-
-fn retype_check_id_column(conn: &Connection, table: &str, column: &str) -> Result<()> {
-    let cols = table_columns(conn, table)?;
-    let mut coldefs = Vec::new();
-    let mut selects = Vec::new();
-    for (name, data_type, nullable) in &cols {
-        let nn = if *nullable { "" } else { " NOT NULL" };
-        if name == column {
-            coldefs.push(format!("{name} UUID{nn}"));
-            selects.push(format!("m.id AS {name}"));
-        } else {
-            coldefs.push(format!("{name} {data_type}{nn}"));
-            selects.push(format!("t.{name}"));
-        }
-    }
-    let staging = format!("{table}__uuid_migration");
-    conn.execute_batch(&format!(
-        "DROP TABLE IF EXISTS {staging}; CREATE TABLE {staging} ({});",
-        coldefs.join(", ")
-    ))?;
-    conn.execute(
-        &format!(
-            "INSERT INTO {staging} SELECT {} FROM {table} t LEFT JOIN check_id_map m ON m.name = t.{column}",
-            selects.join(", ")
-        ),
-        [],
-    )?;
-    let before: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
-    let after: i64 =
-        conn.query_row(&format!("SELECT COUNT(*) FROM {staging}"), [], |r| r.get(0))?;
-    if before != after {
-        bail!(
-            "check-identity migration would drop rows converting {table}.{column} to UUID ({before} -> {after})"
-        );
-    }
-    conn.execute_batch(&format!(
-        "DROP TABLE {table}; ALTER TABLE {staging} RENAME TO {table};"
-    ))?;
-    Ok(())
-}
-
-/// Schema-migration marker for the migration-only deterministic legacy ids.
-const LEGACY_CHECK_IDS_CANONICALIZED: &str = "legacy_check_ids_canonicalized_v1";
-
-/// Stable UUIDv7 for a legacy name-keyed check. This is deliberately migration-only:
-/// new checks must use `models::new_check_id()` / `Uuid::now_v7()` instead.
-fn deterministic_legacy_check_id(name: &str) -> CheckId {
-    let mut bytes = [0u8; 16];
-    // Fixed 48-bit timestamp makes this a valid but stable UUIDv7, not a clock value.
-    bytes[..6].copy_from_slice(&0x018f_0000_0000u64.to_be_bytes()[2..]);
-    bytes[6..].copy_from_slice(&Sha256::digest(name.as_bytes())[..10]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x70;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    CheckId::from_bytes(bytes)
-}
-
-fn legacy_id_marker_exists(conn: &Connection) -> Result<bool> {
-    if !table_exists(conn, "schema_migrations")? {
-        return Ok(false);
-    }
-    Ok(conn.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE name = ?",
-        duckdb::params![LEGACY_CHECK_IDS_CANONICALIZED],
-        |r| r.get::<_, i64>(0),
-    )? > 0)
-}
-
-fn mark_legacy_ids_canonicalized(conn: &Connection) -> Result<()> {
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_migrations (name VARCHAR PRIMARY KEY)")?;
-    conn.execute(
-        "INSERT INTO schema_migrations VALUES (?) ON CONFLICT DO NOTHING",
-        duckdb::params![LEGACY_CHECK_IDS_CANONICALIZED],
-    )?;
-    Ok(())
-}
-
-/// One-time, in-place conversion of check identity from the mutable `name`
-/// to an immutable UUIDv7 `id`, preserving every row and every relationship
-/// that referenced a check by name. See `SCALING.md`'s "UUIDv7 implementation
-/// plan" and `uptime-monitor-design.md`.
-///
-/// No-ops on a brand-new database (the `CREATE TABLE` block right after this
-/// call already declares the UUID-native schema) and on one this code has
-/// already migrated (detected by `checks.id` already existing) — so this is
-/// safe to run unconditionally on every boot.
-fn migrate_check_identity_inner(conn: &Connection) -> Result<()> {
-    let checks_cols = if table_exists(conn, "checks")? {
-        table_column_names(conn, "checks")?
-    } else {
-        Vec::new()
-    };
-    // A `checks` table still keyed by `name` is the usual trigger, but a
-    // database can also hold check-keyed history with no surviving definitions
-    // (every check deleted, or a partial older schema). Those `check_id`
-    // columns are just as name-shaped and must convert too, so the check is
-    // "does anything here still key a check by text?" rather than "does
-    // `checks.id` exist?".
-    let legacy_checks = table_exists(conn, "checks")? && !checks_cols.iter().any(|c| c == "id");
-    let mut legacy_dependents = false;
-    for (table, column) in DEPENDENT_CHECK_COLUMNS {
-        if column_is_varchar(conn, table, column)? {
-            legacy_dependents = true;
-            break;
-        }
-    }
-    if !legacy_checks && !legacy_dependents {
-        // A fresh database is marked before its UUID-native schema is created.
-        // An unmarked database with surviving UUID checks is a deployed version
-        // that minted legacy ids randomly and needs the follow-up below.
-        if !table_exists(conn, "checks")? || legacy_id_marker_exists(conn)? {
-            mark_legacy_ids_canonicalized(conn)?;
-            return Ok(());
-        }
-        return canonicalize_random_legacy_check_ids(conn);
-    }
-
-    tracing::info!("check identity migration: converting name-keyed checks to UUIDv7 in place");
-
-    // 1. Every distinct string this database has ever used as a check
-    // identifier, including checks deleted before this upgrade whose results,
-    // alerts or state history still linger — those get a stable synthetic id
-    // too, so their existing rows stay joinable to each other even though
-    // there is no longer (and never will be again) a `checks` row for them.
-    let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    if legacy_checks {
-        let mut stmt = conn.prepare("SELECT name FROM checks")?;
-        for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
-            names.insert(row?);
-        }
-    }
-    for (table, column) in DEPENDENT_CHECK_COLUMNS {
-        if !column_is_varchar(conn, table, column)? {
-            continue;
-        }
-        let mut stmt = conn.prepare(&format!(
-            "SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL"
-        ))?;
-        for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
-            names.insert(row?);
-        }
-    }
-    if table_exists(conn, "alerts")? {
-        let mut stmt = conn.prepare("SELECT DISTINCT node_id FROM alerts WHERE scope = 'check'")?;
-        for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
-            names.insert(row?);
-        }
-    }
-    if table_exists(conn, "config_tombstones")? {
-        let mut stmt =
-            conn.prepare("SELECT DISTINCT id FROM config_tombstones WHERE kind = 'check'")?;
-        for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
-            names.insert(row?);
-        }
-    }
-
-    // 2. Mint one UUIDv7 per distinct name, staged so every subsequent step is
-    // a set-based join instead of a per-row Rust loop against tables that may
-    // hold millions of results.
-    conn.execute_batch("CREATE TABLE check_id_map (name VARCHAR PRIMARY KEY, id UUID NOT NULL)")?;
-    {
-        let mut stmt = conn.prepare("INSERT INTO check_id_map VALUES (?, ?)")?;
-        for name in &names {
-            stmt.execute(duckdb::params![name, deterministic_legacy_check_id(name)])?;
-        }
-    }
-
-    // 3. `checks` itself: add `id`, populate it, then swap the primary key
-    // from `name` to `id` by rebuilding the table — DuckDB has no `ALTER
-    // TABLE ... DROP CONSTRAINT` / `ADD PRIMARY KEY` to do this column by
-    // column. Every existing column (including whichever of `visible`,
-    // `eval`, `position`, `agents`, `config` an older database has or has not
-    // already had ALTERed on) is carried over as-is via `table_columns`.
-    if legacy_checks {
-        let cols = table_columns(conn, "checks")?;
-        let mut coldefs = vec!["id UUID PRIMARY KEY".to_string()];
-        let mut selects = vec!["m.id".to_string()];
-        for (name, data_type, nullable) in &cols {
-            if name == "name" {
-                coldefs.push("name VARCHAR NOT NULL UNIQUE".to_string());
-            } else {
-                let nn = if *nullable { "" } else { " NOT NULL" };
-                coldefs.push(format!("{name} {data_type}{nn}"));
-            }
-            selects.push(format!("t.{name}"));
-        }
-        conn.execute_batch(&format!(
-            "CREATE TABLE checks__uuid_migration ({});",
-            coldefs.join(", ")
-        ))?;
-        conn.execute(
-            &format!(
-                "INSERT INTO checks__uuid_migration SELECT {} FROM checks t \
-                 JOIN check_id_map m ON m.name = t.name",
-                selects.join(", ")
-            ),
-            [],
-        )?;
-        conn.execute_batch(
-            "DROP TABLE checks; ALTER TABLE checks__uuid_migration RENAME TO checks;",
-        )?;
-    }
-
-    // 4. Every other table that keys on `check_id`. Each is converted only if
-    // it is still text-keyed, so a database that failed partway through an
-    // earlier attempt (or predates one of these tables) converts exactly the
-    // tables that still need it.
-    if column_is_varchar(conn, "check_results", "check_id")? {
-        retype_check_id_column(conn, "check_results", "check_id")?;
-    }
-    if column_is_varchar(conn, "incidents", "origin_check")? {
-        retype_check_id_column(conn, "incidents", "origin_check")?;
-    }
-    if column_is_varchar(conn, "current_state", "check_id")? {
-        recreate_with_uuid_check_id(conn, "current_state", &["check_id"])?;
-    }
-    if column_is_varchar(conn, "agent_check_state", "check_id")? {
-        recreate_with_uuid_check_id(conn, "agent_check_state", &["check_id", "agent_id"])?;
-    }
-    if column_is_varchar(conn, "state_history", "check_id")? {
-        recreate_with_uuid_check_id(conn, "state_history", &["check_id", "since"])?;
-    }
-    if column_is_varchar(conn, "incident_checks", "check_id")? {
-        recreate_with_uuid_check_id(conn, "incident_checks", &["incident_id", "check_id"])?;
-    }
-    if column_is_varchar(conn, "notification_queue", "check_id")? {
-        recreate_with_uuid_check_id(
-            conn,
-            "notification_queue",
-            &["notifier", "check_id", "queued_at"],
-        )?;
-    }
-
-    // `alerts.node_id` stays VARCHAR — it names an agent, zone or region for
-    // every scope but `Check`, so it cannot become a UUID column. Only the
-    // check-scoped rows are rewritten, to the check's id as text, so alert
-    // lookups keyed on the new identity still find them.
-    if table_exists(conn, "alerts")? {
-        conn.execute(
-            "UPDATE alerts a SET node_id = m.id::VARCHAR FROM check_id_map m \
-             WHERE a.scope = 'check' AND a.node_id = m.name",
-            [],
-        )?;
-    }
-
-    // Config-replication tombstones for a check deleted before this upgrade:
-    // rewritten where the deleted check's id is still known from lingering
-    // data above, left as an orphan (harmless — nothing can collide with a
-    // UUID) otherwise.
-    if table_exists(conn, "config_tombstones")? {
-        conn.execute(
-            "UPDATE config_tombstones t SET id = m.id::VARCHAR FROM check_id_map m \
-             WHERE t.kind = 'check' AND t.id = m.name",
-            [],
-        )?;
-    }
-
-    // 5. Every check's stored `config` document: inject the matching `id` and
-    // remap `depends_on` from names to ids, dropping a dependency on a check
-    // name that no longer resolves (renamed or deleted before the upgrade —
-    // nothing sane to point it at any more).
-    if legacy_checks && checks_cols.iter().any(|column| column == "config") {
-        let name_to_id: std::collections::HashMap<String, uuid::Uuid> = {
-            let mut stmt = conn.prepare("SELECT name, id FROM checks")?;
-            stmt.query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, uuid::Uuid>(1)?))
-            })?
-            .collect::<std::result::Result<_, _>>()?
-        };
-        let rows: Vec<(uuid::Uuid, String)> = {
-            let mut stmt =
-                conn.prepare("SELECT id, config FROM checks WHERE config IS NOT NULL")?;
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<std::result::Result<_, _>>()?
-        };
-        for (id, raw) in rows {
-            let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&raw) else {
-                continue;
-            };
-            let Some(obj) = doc.as_object_mut() else {
-                continue;
-            };
-            obj.insert("id".into(), serde_json::Value::String(id.to_string()));
-            if let Some(serde_json::Value::Array(deps)) = obj.get("depends_on") {
-                let remapped: Vec<serde_json::Value> = deps
-                    .iter()
-                    .filter_map(|v| v.as_str())
-                    .filter_map(|n| name_to_id.get(n))
-                    .map(|id| serde_json::Value::String(id.to_string()))
-                    .collect();
-                obj.insert("depends_on".into(), serde_json::Value::Array(remapped));
-            }
-            let new_raw = serde_json::to_string(&doc)?;
-            conn.execute(
-                "UPDATE checks SET config = ? WHERE id = ?",
-                duckdb::params![new_raw, id],
-            )?;
-        }
-    }
-
-    // 6. The one settings document that embeds check identifiers outside the
-    // `checks` table: maintenance windows. Best-effort — a window covering a
-    // check with no trace left anywhere (fully purged before this upgrade)
-    // has nothing to remap to and is dropped from that window's list, same
-    // as an unresolvable `depends_on` entry above.
-    if table_exists(conn, "settings")? {
-        let row: Option<String> = conn
-            .query_row(
-                "SELECT value FROM settings WHERE key = 'maintenance.windows'",
-                [],
-                |r| r.get(0),
-            )
-            .ok();
-        if let Some(raw) = row {
-            if let Ok(serde_json::Value::Array(mut windows)) =
-                serde_json::from_str::<serde_json::Value>(&raw)
-            {
-                let id_by_name: std::collections::HashMap<String, uuid::Uuid> = {
-                    let mut stmt = conn.prepare("SELECT name, id FROM check_id_map")?;
-                    stmt.query_map([], |r| {
-                        Ok((r.get::<_, String>(0)?, r.get::<_, uuid::Uuid>(1)?))
-                    })?
-                    .collect::<std::result::Result<_, _>>()?
-                };
-                for window in windows.iter_mut() {
-                    let Some(obj) = window.as_object_mut() else {
-                        continue;
-                    };
-                    if let Some(serde_json::Value::Array(checks)) = obj.get("checks") {
-                        let remapped: Vec<serde_json::Value> = checks
-                            .iter()
-                            .filter_map(|v| v.as_str())
-                            .filter_map(|n| id_by_name.get(n))
-                            .map(|id| serde_json::Value::String(id.to_string()))
-                            .collect();
-                        obj.insert("checks".into(), serde_json::Value::Array(remapped));
-                    }
-                }
-                let new_raw = serde_json::to_string(&serde_json::Value::Array(windows))?;
-                conn.execute(
-                    "UPDATE settings SET value = ? WHERE key = 'maintenance.windows'",
-                    duckdb::params![new_raw],
-                )?;
-            }
-        }
-    }
-
-    conn.execute_batch("DROP TABLE check_id_map;")?;
-    mark_legacy_ids_canonicalized(conn)?;
-    tracing::info!(checks = names.len(), "check identity migration complete");
-    Ok(())
-}
-
-/// Canonicalize UUIDs written by the previously shipped name migration, which
-/// used random UUIDv7 values independently on each node. This only runs for an
-/// unmarked, non-empty UUID schema; fresh schemas are marked before they can
-/// accept a check, so future random UUIDv7 ids are never candidates.
-fn canonicalize_random_legacy_check_ids(conn: &Connection) -> Result<()> {
-    let checks: Vec<(CheckId, String)> = {
-        let mut stmt = conn.prepare("SELECT id, name FROM checks")?;
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<std::result::Result<_, _>>()?
-    };
-    if checks.is_empty() {
-        mark_legacy_ids_canonicalized(conn)?;
-        return Ok(());
-    }
-    conn.execute_batch(
-        "CREATE TABLE check_uuid_remap (old_id UUID PRIMARY KEY, id UUID NOT NULL UNIQUE, name VARCHAR NOT NULL UNIQUE)",
-    )?;
-    {
-        let mut stmt = conn.prepare("INSERT INTO check_uuid_remap VALUES (?, ?, ?)")?;
-        for (old_id, name) in &checks {
-            stmt.execute(duckdb::params![
-                old_id,
-                deterministic_legacy_check_id(name),
-                name
-            ])?;
-        }
-    }
-    let mapped: i64 = conn.query_row("SELECT COUNT(*) FROM check_uuid_remap", [], |r| r.get(0))?;
-    if mapped != checks.len() as i64 {
-        bail!("deterministic legacy check-id collision; refusing to merge checks");
-    }
-
-    // PK-bearing tables must be rebuilt. The mapping is injective and every
-    // insert is checked against the source count, so no relationship can vanish.
-    for (table, pk) in [
-        ("current_state", vec!["check_id"]),
-        ("agent_check_state", vec!["check_id", "agent_id"]),
-        ("state_history", vec!["check_id", "since"]),
-        ("incident_checks", vec!["incident_id", "check_id"]),
-        (
-            "notification_queue",
-            vec!["notifier", "check_id", "queued_at"],
-        ),
-    ] {
-        if !table_exists(conn, table)? {
-            continue;
-        }
-        let cols = table_columns(conn, table)?;
-        let defs: Vec<String> = cols
-            .iter()
-            .map(|(name, ty, nullable)| {
-                format!("{name} {ty}{}", if *nullable { "" } else { " NOT NULL" })
-            })
-            .chain(std::iter::once(format!("PRIMARY KEY ({})", pk.join(", "))))
-            .collect();
-        let select: Vec<String> = cols
-            .iter()
-            .map(|(name, _, _)| {
-                if name == "check_id" {
-                    "COALESCE(m.id, t.check_id) AS check_id".into()
-                } else {
-                    format!("t.{name}")
-                }
-            })
-            .collect();
-        let staging = format!("{table}__legacy_id_canonicalization");
-        conn.execute_batch(&format!("CREATE TABLE {staging} ({});", defs.join(", ")))?;
-        conn.execute(&format!("INSERT INTO {staging} SELECT {} FROM {table} t LEFT JOIN check_uuid_remap m ON m.old_id = t.check_id", select.join(", ")), [])?;
-        let before: i64 =
-            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
-        let after: i64 =
-            conn.query_row(&format!("SELECT COUNT(*) FROM {staging}"), [], |r| r.get(0))?;
-        if before != after {
-            bail!(
-                "legacy check-id canonicalization would drop rows in {table} ({before} -> {after})"
-            );
-        }
-        conn.execute_batch(&format!(
-            "DROP TABLE {table}; ALTER TABLE {staging} RENAME TO {table};"
-        ))?;
-    }
-    for (table, column) in [("check_results", "check_id"), ("incidents", "origin_check")] {
-        if table_exists(conn, table)? {
-            conn.execute(&format!("UPDATE {table} t SET {column} = m.id FROM check_uuid_remap m WHERE t.{column} = m.old_id"), [])?;
-        }
-    }
-    if table_exists(conn, "alerts")? {
-        conn.execute("UPDATE alerts a SET node_id = m.id::VARCHAR FROM check_uuid_remap m WHERE a.scope = 'check' AND a.node_id = m.old_id::VARCHAR", [])?;
-    }
-    if table_exists(conn, "config_tombstones")? {
-        conn.execute("UPDATE config_tombstones t SET id = m.id::VARCHAR FROM check_uuid_remap m WHERE t.kind = 'check' AND t.id = m.old_id::VARCHAR", [])?;
-    }
-    // `checks.id` is itself a primary key, so rebuild rather than UPDATE it.
-    let check_columns = table_columns(conn, "checks")?;
-    let defs: Vec<String> = check_columns
-        .iter()
-        .map(|(name, ty, nullable)| {
-            if name == "name" {
-                "name VARCHAR NOT NULL UNIQUE".into()
-            } else {
-                format!("{name} {ty}{}", if *nullable { "" } else { " NOT NULL" })
-            }
-        })
-        .chain(std::iter::once("PRIMARY KEY (id)".into()))
-        .collect();
-    let select: Vec<String> = check_columns
-        .iter()
-        .map(|(name, _, _)| {
-            if name == "id" {
-                "m.id AS id".into()
-            } else {
-                format!("c.{name}")
-            }
-        })
-        .collect();
-    conn.execute_batch(&format!(
-        "CREATE TABLE checks__legacy_id_canonicalization ({});",
-        defs.join(", ")
-    ))?;
-    conn.execute(&format!("INSERT INTO checks__legacy_id_canonicalization SELECT {} FROM checks c JOIN check_uuid_remap m ON m.old_id = c.id", select.join(", ")), [])?;
-    let rebuilt: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM checks__legacy_id_canonicalization",
-        [],
-        |r| r.get(0),
-    )?;
-    if rebuilt != checks.len() as i64 {
-        bail!(
-            "legacy check-id canonicalization would drop checks ({} -> {rebuilt})",
-            checks.len()
-        );
-    }
-    conn.execute_batch(
-        "DROP TABLE checks; ALTER TABLE checks__legacy_id_canonicalization RENAME TO checks;",
-    )?;
-
-    // Config documents and maintenance windows carry UUIDs as text, so rewrite
-    // them in Rust rather than relying on database-specific JSON mutation.
-    let id_by_old: std::collections::HashMap<String, String> = checks
-        .iter()
-        .map(|(old, name)| {
-            (
-                old.to_string(),
-                deterministic_legacy_check_id(name).to_string(),
-            )
-        })
-        .collect();
-    let rows: Vec<(CheckId, String)> = conn
-        .prepare("SELECT id, config FROM checks WHERE config IS NOT NULL")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<std::result::Result<_, _>>()?;
-    for (id, raw) in rows {
-        let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            continue;
-        };
-        let Some(obj) = doc.as_object_mut() else {
-            continue;
-        };
-        obj.insert("id".into(), serde_json::Value::String(id.to_string()));
-        if let Some(serde_json::Value::Array(deps)) = obj.get("depends_on") {
-            let remapped = deps
-                .iter()
-                .filter_map(|v| v.as_str())
-                .map(|v| id_by_old.get(v).cloned().unwrap_or_else(|| v.into()))
-                .map(serde_json::Value::String)
-                .collect();
-            obj.insert("depends_on".into(), serde_json::Value::Array(remapped));
-        }
-        conn.execute(
-            "UPDATE checks SET config = ? WHERE id = ?",
-            duckdb::params![serde_json::to_string(&doc)?, id],
-        )?;
-    }
-    if table_exists(conn, "settings")? {
-        let raw: Option<String> = conn
-            .query_row(
-                "SELECT value FROM settings WHERE key = 'maintenance.windows'",
-                [],
-                |r| r.get(0),
-            )
-            .ok();
-        if let Some(raw) = raw {
-            if let Ok(serde_json::Value::Array(mut windows)) =
-                serde_json::from_str::<serde_json::Value>(&raw)
-            {
-                for window in &mut windows {
-                    if let Some(obj) = window.as_object_mut() {
-                        if let Some(serde_json::Value::Array(ids)) = obj.get("checks") {
-                            obj.insert(
-                                "checks".into(),
-                                serde_json::Value::Array(
-                                    ids.iter()
-                                        .filter_map(|v| v.as_str())
-                                        .map(|v| {
-                                            serde_json::Value::String(
-                                                id_by_old
-                                                    .get(v)
-                                                    .cloned()
-                                                    .unwrap_or_else(|| v.into()),
-                                            )
-                                        })
-                                        .collect(),
-                                ),
-                            );
-                        }
-                    }
-                }
-                conn.execute(
-                    "UPDATE settings SET value = ? WHERE key = 'maintenance.windows'",
-                    duckdb::params![serde_json::to_string(&windows)?],
-                )?;
-            }
-        }
-    }
-    conn.execute_batch("DROP TABLE check_uuid_remap")?;
-    mark_legacy_ids_canonicalized(conn)?;
-    tracing::info!(
-        checks = checks.len(),
-        "canonicalized random legacy check UUIDs"
-    );
-    Ok(())
-}
-
-fn migrate_check_identity(conn: &Connection) -> Result<()> {
-    conn.execute_batch("BEGIN")?;
-    match migrate_check_identity_inner(conn) {
-        Ok(()) => {
-            conn.execute_batch("COMMIT")?;
-            Ok(())
-        }
-        Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(error)
-        }
-    }
 }
 
 /// Replace the timestamp-derived delivery key with an immutable one. Existing
@@ -1711,32 +1108,8 @@ const AGENT_STATE_MERGE_SQL: &str = "INSERT INTO agent_check_state
 /// surviving rows rather than everything it was offered.
 fn derived_results_sql(staged: &str) -> String {
     format!(
-        "INSERT INTO check_latency_minute_rollups
-         SELECT check_id, agent_id, (ts_millis // {MILLIS_PER_MINUTE}) * {MILLIS_PER_MINUTE},
-                COUNT(*), COUNT(*) FILTER (WHERE status = 'up'),
-                COALESCE(SUM(latency_ms) FILTER (WHERE status = 'up'), 0),
-                MIN(latency_ms) FILTER (WHERE status = 'up'),
-                MAX(latency_ms) FILTER (WHERE status = 'up')
-         FROM {staged} GROUP BY 1, 2, 3
-         ON CONFLICT (check_id, agent_id, bucket_start) DO UPDATE SET
-             attempts = check_latency_minute_rollups.attempts + excluded.attempts,
-             up = check_latency_minute_rollups.up + excluded.up,
-             latency_sum = check_latency_minute_rollups.latency_sum + excluded.latency_sum,
-             latency_min = LEAST(check_latency_minute_rollups.latency_min, excluded.latency_min),
-             latency_max = GREATEST(check_latency_minute_rollups.latency_max, excluded.latency_max);
-         INSERT INTO check_latency_hour_rollups
-         SELECT check_id, agent_id, (ts_millis // {MILLIS_PER_HOUR}) * {MILLIS_PER_HOUR},
-                COUNT(*), COUNT(*) FILTER (WHERE status = 'up'),
-                COALESCE(SUM(latency_ms) FILTER (WHERE status = 'up'), 0),
-                MIN(latency_ms) FILTER (WHERE status = 'up'),
-                MAX(latency_ms) FILTER (WHERE status = 'up')
-         FROM {staged} GROUP BY 1, 2, 3
-         ON CONFLICT (check_id, agent_id, bucket_start) DO UPDATE SET
-             attempts = check_latency_hour_rollups.attempts + excluded.attempts,
-             up = check_latency_hour_rollups.up + excluded.up,
-             latency_sum = check_latency_hour_rollups.latency_sum + excluded.latency_sum,
-             latency_min = LEAST(check_latency_hour_rollups.latency_min, excluded.latency_min),
-             latency_max = GREATEST(check_latency_hour_rollups.latency_max, excluded.latency_max);
+        "{minute}
+         {hour}
          INSERT INTO result_replication_watermarks
          SELECT check_id, MIN(ts_millis), MAX(ts_millis), COUNT(*) FROM {staged} GROUP BY check_id
          ON CONFLICT (check_id) DO UPDATE SET
@@ -1759,7 +1132,140 @@ fn derived_results_sql(staged: &str) -> String {
              failure = excluded.failure
          WHERE excluded.ts_millis > latest_check_results.ts_millis
             OR (excluded.ts_millis = latest_check_results.ts_millis
-                AND excluded.agent_id > latest_check_results.agent_id);"
+                AND excluded.agent_id > latest_check_results.agent_id);",
+        minute = rollup_merge_from_raw_sql(
+            "check_latency_minute_rollups",
+            "check_latency_minute_rollups",
+            MILLIS_PER_MINUTE,
+            staged
+        ),
+        hour = rollup_merge_from_raw_sql(
+            "check_latency_hour_rollups",
+            "check_latency_hour_rollups",
+            MILLIS_PER_HOUR,
+            staged
+        ),
+    )
+}
+
+/// Bucket `staged` raw rows into one row per `(check_id, agent_id,
+/// bucket_start)`, `bucket_ms` wide. The shared shape behind both
+/// `rollup_merge_from_raw_sql` and `rebuild_latency_rollups` — one place that
+/// decides what a bucket's columns mean.
+fn bucketed_raw_rows_sql(staged: &str, bucket_ms: i64) -> String {
+    format!(
+        "SELECT check_id, agent_id, (ts_millis // {bucket_ms}) * {bucket_ms} AS bucket_start,
+                COUNT(*) AS attempts, COUNT(*) FILTER (WHERE status = 'up') AS up,
+                COALESCE(SUM(latency_ms) FILTER (WHERE status = 'up'), 0) AS latency_sum,
+                MIN(latency_ms) FILTER (WHERE status = 'up') AS latency_min,
+                MAX(latency_ms) FILTER (WHERE status = 'up') AS latency_max
+         FROM {staged} GROUP BY 1, 2, 3"
+    )
+}
+
+/// Fold newly-inserted raw rows in `staged` into rollup `table`, maintaining
+/// `rollup_replication_watermarks` for `stream` in the same statement batch.
+///
+/// The watermark insert runs *before* the rollup upsert below it and reads
+/// `table` as it stood before this batch touched it, so `row_count` only
+/// grows for a `(check_id, agent_id, bucket_start)` this table did not
+/// already hold — merging into an existing bucket must not inflate the
+/// digest's notion of how many buckets exist.
+///
+/// Summing `attempts`/`up`/`latency_sum` straight into both the watermark and
+/// the rollup row is sound here specifically because `staged` holds rows this
+/// node has never folded into a rollup before: `derived_results_sql`'s own
+/// contract is that `staged` names exactly the rows just inserted into
+/// `check_results`, and a raw row is inserted at most once, ever (dedup runs
+/// before this is called, both for local ingest and for replicated results).
+/// There is no replay of `staged` to be idempotent against — replaying would
+/// mean inserting the same raw row into `check_results` twice, which is the
+/// bug this merge is trusting elsewhere not to happen. Compare
+/// `rollup_merge_from_backfill_sql`, which cannot make that assumption about
+/// a page received from a peer and uses `GREATEST` instead of addition for
+/// exactly that reason.
+fn rollup_merge_from_raw_sql(table: &str, stream: &str, bucket_ms: i64, staged: &str) -> String {
+    let bucketed = bucketed_raw_rows_sql(staged, bucket_ms);
+    format!(
+        "INSERT INTO rollup_replication_watermarks
+             (stream, max_bucket_start, row_count, attempts_sum, up_sum, latency_sum_sum)
+         SELECT '{stream}', COALESCE(MAX(b.bucket_start), 0),
+                COUNT(*) FILTER (WHERE r.check_id IS NULL),
+                COALESCE(SUM(b.attempts), 0), COALESCE(SUM(b.up), 0), COALESCE(SUM(b.latency_sum), 0)
+         FROM ({bucketed}) b
+         LEFT JOIN {table} r
+           ON r.check_id = b.check_id AND r.agent_id = b.agent_id AND r.bucket_start = b.bucket_start
+         HAVING COUNT(*) > 0
+         ON CONFLICT (stream) DO UPDATE SET
+             max_bucket_start = GREATEST(rollup_replication_watermarks.max_bucket_start, excluded.max_bucket_start),
+             row_count = rollup_replication_watermarks.row_count + excluded.row_count,
+             attempts_sum = rollup_replication_watermarks.attempts_sum + excluded.attempts_sum,
+             up_sum = rollup_replication_watermarks.up_sum + excluded.up_sum,
+             latency_sum_sum = rollup_replication_watermarks.latency_sum_sum + excluded.latency_sum_sum;
+         INSERT INTO {table}
+         SELECT * FROM ({bucketed}) b
+         ON CONFLICT (check_id, agent_id, bucket_start) DO UPDATE SET
+             attempts = {table}.attempts + excluded.attempts,
+             up = {table}.up + excluded.up,
+             latency_sum = {table}.latency_sum + excluded.latency_sum,
+             latency_min = LEAST({table}.latency_min, excluded.latency_min),
+             latency_max = GREATEST({table}.latency_max, excluded.latency_max);"
+    )
+}
+
+/// Merge `staged` rollup rows received from a peer's backfill page into
+/// rollup `table`, maintaining `rollup_replication_watermarks` for `stream`
+/// alongside them.
+///
+/// This is deliberately not the same arithmetic as
+/// `rollup_merge_from_raw_sql`. A backfilled row is not a delta of raw
+/// observations this node has not counted yet — it is a peer's *total* for a
+/// bucket, and this node has no way to tell whether that total overlaps with
+/// what it already holds (both could have derived the same bucket from raw
+/// independently, or one could be a strict superset of the other after a
+/// retention gap). Summing them could double-count; the only combination
+/// that is always safe is to keep whichever side's counters are larger,
+/// field by field. `GREATEST` is commutative, associative and idempotent —
+/// applying the same page once, twice, or interleaved with another peer's
+/// page all converge on the same row, which is exactly what "receiving the
+/// same page twice must not inflate `attempts`" requires. `latency_min`/
+/// `latency_max` already used `LEAST`/`GREATEST` for the same reason, before
+/// this function existed.
+///
+/// The one thing this trades away: if this node's own raw-derived total for
+/// a live bucket is briefly ahead of the peer's on some fields and behind on
+/// others (only possible for a bucket still accepting new raw on both sides),
+/// `GREATEST` keeps the larger of each rather than one side's whole row. That
+/// is a non-issue for the buckets this function exists to recover — closed,
+/// out-of-raw-retention buckets that no longer change — and merely harmless
+/// for a live one, which the raw-derived path keeps advancing regardless.
+fn rollup_merge_from_backfill_sql(table: &str, stream: &str, staged: &str) -> String {
+    format!(
+        "INSERT INTO rollup_replication_watermarks
+             (stream, max_bucket_start, row_count, attempts_sum, up_sum, latency_sum_sum)
+         SELECT '{stream}', COALESCE(MAX(s.bucket_start), 0),
+                COUNT(*) FILTER (WHERE r.check_id IS NULL),
+                COALESCE(SUM(GREATEST(s.attempts, COALESCE(r.attempts, 0)) - COALESCE(r.attempts, 0)), 0),
+                COALESCE(SUM(GREATEST(s.up, COALESCE(r.up, 0)) - COALESCE(r.up, 0)), 0),
+                COALESCE(SUM(GREATEST(s.latency_sum, COALESCE(r.latency_sum, 0)) - COALESCE(r.latency_sum, 0)), 0)
+         FROM {staged} s
+         LEFT JOIN {table} r
+           ON r.check_id = s.check_id AND r.agent_id = s.agent_id AND r.bucket_start = s.bucket_start
+         HAVING COUNT(*) > 0
+         ON CONFLICT (stream) DO UPDATE SET
+             max_bucket_start = GREATEST(rollup_replication_watermarks.max_bucket_start, excluded.max_bucket_start),
+             row_count = rollup_replication_watermarks.row_count + excluded.row_count,
+             attempts_sum = rollup_replication_watermarks.attempts_sum + excluded.attempts_sum,
+             up_sum = rollup_replication_watermarks.up_sum + excluded.up_sum,
+             latency_sum_sum = rollup_replication_watermarks.latency_sum_sum + excluded.latency_sum_sum;
+         INSERT INTO {table}
+         SELECT * FROM {staged}
+         ON CONFLICT (check_id, agent_id, bucket_start) DO UPDATE SET
+             attempts = GREATEST({table}.attempts, excluded.attempts),
+             up = GREATEST({table}.up, excluded.up),
+             latency_sum = GREATEST({table}.latency_sum, excluded.latency_sum),
+             latency_min = LEAST({table}.latency_min, excluded.latency_min),
+             latency_max = GREATEST({table}.latency_max, excluded.latency_max);"
     )
 }
 
@@ -1775,16 +1281,22 @@ struct ConfigStamps {
 impl Storage {
     /// Open (or create) the database at `path` and ensure the schema exists.
     /// `path` may be ":memory:" for tests.
+    ///
+    /// A database created before native-UUID check identity is not opened
+    /// and upgraded in place — it is unsupported and must be rebuilt. Check
+    /// identity is cluster-shared state (every node's copy of `checks`,
+    /// `alerts`, results and history must agree on what a given check *is*),
+    /// so a migration run node-locally on `open` cannot converge it: each
+    /// node would mint or remap ids independently and disagree with its
+    /// peers forever after, which is exactly what the name-keyed-to-UUID
+    /// migration this project shipped and then removed did in practice. See
+    /// SCALING.md's "Pre-1.0 database policy".
     pub fn open(path: &str) -> Result<Self> {
         let conn = if path == ":memory:" {
             Connection::open_in_memory()?
         } else {
             Connection::open(path)?
         };
-        // Convert a pre-UUID database in place before anything below assumes
-        // the new shape. No-ops on a fresh database and on one already
-        // migrated. See `migrate_check_identity`.
-        migrate_check_identity(&conn)?;
         // `agent_polls` is the other schema change this project makes by
         // recreation rather than by ALTER, because it shipped with a column
         // missing and with no writer: there is no row anywhere to migrate.
@@ -1861,6 +1373,40 @@ impl Storage {
                 min_ts       BIGINT NOT NULL,
                 max_ts       BIGINT NOT NULL,
                 result_count BIGINT NOT NULL
+            );
+            -- One row per rollup table ('check_latency_minute_rollups' or
+            -- '..._hour_rollups'), maintained on every write instead of scanned
+            -- on every digest — the same reason `result_replication_watermarks`
+            -- exists instead of aggregating `check_results` per sweep, and more
+            -- pointed here: a rollup bucket lives for the whole retention tier
+            -- (90 days/13 months), so the table this summarizes is not small.
+            -- See `RollupDigest` for why a rollup needs more than max/count to
+            -- be compared safely.
+            CREATE TABLE IF NOT EXISTS rollup_replication_watermarks (
+                stream           VARCHAR PRIMARY KEY,
+                max_bucket_start BIGINT NOT NULL,
+                row_count        BIGINT NOT NULL,
+                attempts_sum     BIGINT NOT NULL,
+                up_sum           BIGINT NOT NULL,
+                latency_sum_sum  BIGINT NOT NULL
+            );
+            -- A durable record of `anti_entropy_sweep` finding a peer whose
+            -- retained raw history starts after ours ends: nothing anti-entropy
+            -- can do closes that hole in raw detail, so it is written down
+            -- rather than only logged and counted. `(check_id, peer)` is the
+            -- key rather than an append-only id, because the same standing gap
+            -- is redetected every sweep it persists and a row per sweep would
+            -- grow without bound; each detection instead refreshes the one row
+            -- for that pairing. See SCALING.md's Data retention tiers section for
+            -- what recovery does and does not mean once minute/hour rollups
+            -- replicate on their own (item A alongside this table).
+            CREATE TABLE IF NOT EXISTS raw_data_gaps (
+                check_id    UUID    NOT NULL,
+                peer        VARCHAR NOT NULL,
+                from_ts     BIGINT  NOT NULL,
+                to_ts       BIGINT  NOT NULL,
+                observed_at BIGINT  NOT NULL,
+                PRIMARY KEY (check_id, peer)
             );
             -- The event log: one row per confirmed state transition.
             -- `incident_id` is stamped as the row is written, because
@@ -2036,6 +1582,21 @@ impl Storage {
                 -- every node therefore picks the same winner without asking.
                 updated_at  BIGINT  NOT NULL,
                 updated_by  VARCHAR
+            );
+            -- One row per region a check's `placement.regions` explicitly
+            -- names, projected from `checks.config` the same way the flat
+            -- columns above are — so deciding which checks a region's
+            -- placement admits is a join, never a per-check JSON parse. A
+            -- check with no rows here has an empty `placement.regions`,
+            -- which `Placement` already treats as every region; queries
+            -- follow that same rule. See SCALING.md's Placement-scoped
+            -- configuration section, Phase 2: this is what lets a region's
+            -- desired set be computed without reading every check document
+            -- on every reconciliation sweep.
+            CREATE TABLE IF NOT EXISTS check_placement_regions (
+                check_id UUID    NOT NULL,
+                region   VARCHAR NOT NULL,
+                PRIMARY KEY (check_id, region)
             );
             -- Status-page sections. A row here, rather than just a string on
             -- each check, so a section can be created empty, renamed, and
@@ -2345,6 +1906,7 @@ impl Storage {
         }
         store.backfill_result_replication_watermarks()?;
         store.backfill_latency_rollups()?;
+        store.backfill_rollup_watermarks()?;
         store.rebuild_stream_watermarks()?;
         // Staging tables live for the life of this connection, so every write
         // path can assume them. Created here rather than inside the writers:
@@ -2431,6 +1993,38 @@ impl Storage {
         Ok(out)
     }
 
+    /// Every id `checks` currently holds. Reads only the primary key — no
+    /// `config` JSON parse — so a peer's "what do you have" reconciliation
+    /// query (`global::reconcile::reconcile_checks`) costs nothing like
+    /// `list_checks()`'s per-document scan, and stays cheap however many
+    /// checks are held.
+    pub fn check_ids(&self) -> Result<Vec<CheckId>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM checks ORDER BY id")?;
+        let rows = stmt.query_map([], |r| r.get::<_, CheckId>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Ids `region`'s placement admits — the desired set a global node
+    /// computes locally, then diffs against what the region itself reports
+    /// holding (`check_ids`, fetched over `/internal/global/check-ids`) to
+    /// find what to push and what to unplace. See `check_placement_regions`'s
+    /// table comment for the "no rows means every region" rule this mirrors.
+    pub fn check_ids_for_region(&self, region: &str) -> Result<Vec<CheckId>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id FROM checks c
+             WHERE NOT EXISTS (
+                       SELECT 1 FROM check_placement_regions r WHERE r.check_id = c.id
+                   )
+                OR EXISTS (
+                       SELECT 1 FROM check_placement_regions r
+                       WHERE r.check_id = c.id AND r.region = ?
+                   )
+             ORDER BY c.id",
+        )?;
+        let rows = stmt.query_map(duckdb::params![region], |r| r.get::<_, CheckId>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     /// Create or replace a check by id — the immutable identity, never the
     /// mutable `name`, so an edit that only renames a check still updates the
     /// same row instead of leaving a stale one behind under the old name.
@@ -2470,6 +2064,29 @@ impl Storage {
                 now_millis,
             ],
         )?;
+        self.project_placement_regions(c.id, &c.placement.regions)?;
+        Ok(())
+    }
+
+    /// Rewrites `check_placement_regions` for one check from its placement's
+    /// `regions` list, the same delete-then-insert shape `upsert_check` uses
+    /// for the row itself. An empty list leaves no rows behind, matching
+    /// `Placement`'s "empty means every region" rule so a reader never has to
+    /// special-case "no rows yet" against "explicitly no regions".
+    fn project_placement_regions(&self, check_id: CheckId, regions: &[String]) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM check_placement_regions WHERE check_id = ?",
+            duckdb::params![check_id],
+        )?;
+        // Deduplicated so a placement that (however it happened) names the
+        // same region twice cannot violate the table's primary key.
+        let unique: std::collections::BTreeSet<&String> = regions.iter().collect();
+        for region in unique {
+            self.conn.execute(
+                "INSERT INTO check_placement_regions (check_id, region) VALUES (?, ?)",
+                duckdb::params![check_id, region],
+            )?;
+        }
         Ok(())
     }
 
@@ -2567,6 +2184,10 @@ impl Storage {
                 "DELETE FROM agent_check_state WHERE check_id = ?",
                 duckdb::params![check_id],
             )?;
+            store.conn.execute(
+                "DELETE FROM check_placement_regions WHERE check_id = ?",
+                duckdb::params![check_id],
+            )?;
             Ok(true)
         })
     }
@@ -2577,6 +2198,10 @@ impl Storage {
         let n = self
             .conn
             .execute("DELETE FROM checks WHERE id = ?", duckdb::params![check_id])?;
+        self.conn.execute(
+            "DELETE FROM check_placement_regions WHERE check_id = ?",
+            duckdb::params![check_id],
+        )?;
         Ok(n > 0)
     }
 
@@ -2785,6 +2410,52 @@ impl Storage {
                     MAX(latency_ms) FILTER (WHERE status = 'up')
              FROM check_results GROUP BY 1, 2, 3;"
         ))?;
+        // The rollup tables were just replaced wholesale, so whatever the
+        // watermark previously held (likely all zeros — this path only runs
+        // for an old database that had no rollups at all) is now wrong.
+        self.rebuild_rollup_watermarks()
+    }
+
+    /// Recompute `rollup_replication_watermarks` from the rollup tables
+    /// themselves. Unlike the incremental maintenance in
+    /// `rollup_merge_from_raw_sql`/`rollup_merge_from_backfill_sql`, this
+    /// scans both tables in full, so it only runs when the watermark is known
+    /// to be wrong or absent — see `backfill_rollup_watermarks` — never on
+    /// every write or every restart.
+    fn rebuild_rollup_watermarks(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "DELETE FROM rollup_replication_watermarks
+                 WHERE stream IN ('check_latency_minute_rollups', 'check_latency_hour_rollups');
+             INSERT INTO rollup_replication_watermarks
+             SELECT 'check_latency_minute_rollups', COALESCE(MAX(bucket_start), 0), COUNT(*),
+                    COALESCE(SUM(attempts), 0), COALESCE(SUM(up), 0), COALESCE(SUM(latency_sum), 0)
+             FROM check_latency_minute_rollups;
+             INSERT INTO rollup_replication_watermarks
+             SELECT 'check_latency_hour_rollups', COALESCE(MAX(bucket_start), 0), COUNT(*),
+                    COALESCE(SUM(attempts), 0), COALESCE(SUM(up), 0), COALESCE(SUM(latency_sum), 0)
+             FROM check_latency_hour_rollups;",
+        )?;
+        Ok(())
+    }
+
+    /// Ensure `rollup_replication_watermarks` holds a row for both rollup
+    /// tables, computing them the expensive way exactly once: a database that
+    /// already has rollups from before this watermark existed would otherwise
+    /// digest as empty forever, which does not lose data (a peer would just
+    /// offer to backfill rows this node already has, and merging them back in
+    /// is a no-op) but would make every anti-entropy sweep against it pull
+    /// pointlessly. Once seeded, every future write maintains the watermark
+    /// incrementally, so this never scans the rollup tables again.
+    fn backfill_rollup_watermarks(&self) -> Result<()> {
+        let seeded: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM rollup_replication_watermarks
+             WHERE stream IN ('check_latency_minute_rollups', 'check_latency_hour_rollups')",
+            [],
+            |row| row.get(0),
+        )?;
+        if seeded < 2 {
+            self.rebuild_rollup_watermarks()?;
+        }
         Ok(())
     }
 
@@ -2821,6 +2492,29 @@ impl Storage {
             duckdb::params![stream],
             |row| Ok(StreamDigest { max_millis: row.get(0)?, max_id: row.get(1)?, count: row.get(2)? }),
         ).map_err(Into::into)
+    }
+
+    /// Read `rollup_replication_watermarks` for one rollup table. The row
+    /// always exists once `backfill_rollup_watermarks` has run at open — see
+    /// its doc comment — so this is a point lookup, never a scan of the
+    /// rollup table it summarizes.
+    fn rollup_digest(&self, stream: &str) -> Result<RollupDigest> {
+        self.conn
+            .query_row(
+                "SELECT max_bucket_start, row_count, attempts_sum, up_sum, latency_sum_sum
+                 FROM rollup_replication_watermarks WHERE stream = ?",
+                duckdb::params![stream],
+                |row| {
+                    Ok(RollupDigest {
+                        max_bucket_start: row.get(0)?,
+                        count: row.get(1)?,
+                        attempts_sum: row.get(2)?,
+                        up_sum: row.get(3)?,
+                        latency_sum_sum: row.get(4)?,
+                    })
+                },
+            )
+            .map_err(Into::into)
     }
 
     fn backfill_latest_check_results(&self) -> Result<()> {
@@ -4377,6 +4071,7 @@ impl Storage {
     /// too, so the entry must go. That is a one-row-per-check delete, not a
     /// window function over the whole history.
     pub(crate) fn prune_results(&self, before: i64) -> Result<u64> {
+        let before = self.rollup_covered_horizon(before)?;
         self.conn
             .execute_batch("DELETE FROM prune_results_counts; DELETE FROM prune_results_min_ts;")?;
         self.conn.execute(
@@ -4415,6 +4110,52 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
         Ok(removed)
     }
 
+    /// How far retention may actually delete, given what has been summarized.
+    ///
+    /// Raw results are the only copy of a latency observation until a rollup
+    /// covers it. Deleting on a clock alone assumes the rollup write always
+    /// succeeded, and the one time that assumption is wrong is the one time it
+    /// matters: a bug or a partial restore leaves a window with no raw rows
+    /// and no summary of them either, and nothing afterwards can tell the
+    /// difference between that and a window where nothing was measured.
+    ///
+    /// So the horizon is pulled back to the start of the oldest minute that
+    /// raw data claims and the rollups do not. That is deliberately
+    /// conservative — it stalls retention rather than losing history, and a
+    /// stall is visible in the database-size metric that is already monitored,
+    /// while silent loss is visible in nothing.
+    ///
+    /// Only minute rollups are consulted. Hour rollups are derived from the
+    /// same ingest and cover a superset of the window, so a minute gap is the
+    /// first thing to appear and the strictest thing to wait for.
+    fn rollup_covered_horizon(&self, requested: i64) -> Result<i64> {
+        let uncovered: Option<i64> = self.conn.query_row(
+            "SELECT MIN(raw.bucket_start) FROM (
+                 SELECT check_id, agent_id,
+                        ts_millis // ? * ? AS bucket_start
+                 FROM check_results WHERE ts_millis < ?
+             ) raw
+             ANTI JOIN check_latency_minute_rollups rolled
+               ON rolled.check_id = raw.check_id
+              AND rolled.agent_id = raw.agent_id
+              AND rolled.bucket_start = raw.bucket_start",
+            duckdb::params![MILLIS_PER_MINUTE, MILLIS_PER_MINUTE, requested],
+            |row| row.get(0),
+        )?;
+        match uncovered {
+            Some(bucket) if bucket < requested => {
+                tracing::warn!(
+                    horizon = requested,
+                    uncovered_from = bucket,
+                    "retention: raw results are not yet covered by a minute rollup; \
+                     holding the prune horizon back rather than deleting unsummarized history"
+                );
+                Ok(bucket)
+            }
+            _ => Ok(requested),
+        }
+    }
+
     /// The oldest raw result held, or `None` when there are none. Cheap: a
     /// minimum over a column written in ascending order.
     pub fn oldest_result_ts(&self) -> Result<Option<i64>> {
@@ -4427,25 +4168,73 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
         Ok(oldest)
     }
 
+    /// Deliberately issues no `CHECKPOINT` of its own. `benchmark_checkpoint_after_prune`
+    /// measured one at production scale (1,000 checks, 30 raw days, a
+    /// one-day/2.88M-row prune): the file never shrinks — two checkpoints
+    /// back to back are byte-identical — and DuckDB has already applied the
+    /// prune's ~23 MB of WAL by the time an explicit call would run, once its
+    /// own automatic threshold trips. Adding one here would only spend
+    /// hundreds of milliseconds (431 ms measured, past the single-worker
+    /// slow-call threshold) restating work DuckDB already did, for a file
+    /// size that would not change. Revisit if `wal_bytes` is ever observed
+    /// growing without bound between prunes in production — that would mean
+    /// DuckDB's own threshold is not tripping on this workload — not before.
     pub fn prune(&self, results_days: u64, alerts_days: u64, now_millis: i64) -> Result<u64> {
         let results_before = now_millis - (results_days as i64) * 86_400_000;
         let mut removed = self.prune_results(results_before)?;
         // Rollups outlive raw observations. Their cutoffs are independent of
         // the configurable raw window, so reducing raw retention cannot erase
         // the summaries that make old latency views meaningful.
-        removed += self.conn.execute(
-            "DELETE FROM check_latency_minute_rollups WHERE bucket_start + ? <= ?",
-            duckdb::params![
-                MILLIS_PER_MINUTE,
-                now_millis - MINUTE_ROLLUP_RETENTION_MILLIS
-            ],
-        )? as u64;
-        removed += self.conn.execute(
-            "DELETE FROM check_latency_hour_rollups WHERE bucket_start + ? <= ?",
-            duckdb::params![MILLIS_PER_HOUR, now_millis - HOUR_ROLLUP_RETENTION_MILLIS],
-        )? as u64;
+        removed += self.prune_rollups(
+            "check_latency_minute_rollups",
+            MILLIS_PER_MINUTE,
+            now_millis - MINUTE_ROLLUP_RETENTION_MILLIS,
+        )?;
+        removed += self.prune_rollups(
+            "check_latency_hour_rollups",
+            MILLIS_PER_HOUR,
+            now_millis - HOUR_ROLLUP_RETENTION_MILLIS,
+        )?;
         removed += self.prune_metadata(results_days, alerts_days, now_millis)?;
         Ok(removed)
+    }
+
+    /// Delete rollup rows fully expired against `before`, taking their
+    /// contribution back out of `rollup_replication_watermarks` in the same
+    /// pass. `row_count`/`attempts_sum`/`up_sum`/`latency_sum_sum` are
+    /// maintained incrementally everywhere else in this file specifically so
+    /// a digest never has to scan the rollup tables; a prune that deleted rows
+    /// without also subtracting them here would leave that watermark counting
+    /// rows that no longer exist, permanently overstating this node to every
+    /// peer it digests against. `max_bucket_start` is untouched: pruning only
+    /// ever removes the oldest buckets, so the newest one cannot be among them.
+    fn prune_rollups(&self, table: &str, bucket_ms: i64, before: i64) -> Result<u64> {
+        let (count, attempts, up, latency_sum): (i64, i64, i64, i64) = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*), COALESCE(SUM(attempts), 0), COALESCE(SUM(up), 0),
+                        COALESCE(SUM(latency_sum), 0)
+                 FROM {table} WHERE bucket_start + ? <= ?"
+            ),
+            duckdb::params![bucket_ms, before],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        if count == 0 {
+            return Ok(0);
+        }
+        self.conn.execute(
+            &format!("DELETE FROM {table} WHERE bucket_start + ? <= ?"),
+            duckdb::params![bucket_ms, before],
+        )?;
+        self.conn.execute(
+            "UPDATE rollup_replication_watermarks SET
+                 row_count = row_count - ?,
+                 attempts_sum = attempts_sum - ?,
+                 up_sum = up_sum - ?,
+                 latency_sum_sum = latency_sum_sum - ?
+             WHERE stream = ?",
+            duckdb::params![count, attempts, up, latency_sum, table],
+        )?;
+        Ok(count as u64)
     }
 
     /// Everything retention removes apart from raw results: the event log,
@@ -4509,17 +4298,38 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
         // describe. The *open* span is kept regardless of age: it is not
         // history, it is what the check reads as right now, and deleting it
         // would make a long-stable check look unknown.
+        // Written as an anti-join against one grouped pass rather than the
+        // correlated `<> (SELECT MAX(since) ... WHERE h.check_id = ...)` it
+        // replaced. Worth saying plainly that the correlated form was not the
+        // quadratic disaster it reads as: DuckDB decorrelates it, and on 3M
+        // spans the two measure 2.4 s against 2.2 s whether those spans are
+        // spread over 10,000 checks or concentrated in 100 flapping ones. This
+        // form is kept for saying what it means, not for the 10%. See
+        // `benchmark_state_history_prune`.
         removed += self.conn.execute(
             "DELETE FROM state_history
              WHERE since < ?
-               AND since <> (SELECT MAX(since) FROM state_history h
-                             WHERE h.check_id = state_history.check_id)",
+               AND NOT EXISTS (
+                   SELECT 1 FROM (
+                       SELECT check_id, MAX(since) AS newest
+                       FROM state_history GROUP BY check_id
+                   ) latest
+                   WHERE latest.check_id = state_history.check_id
+                     AND latest.newest = state_history.since)",
             duckdb::params![results_before],
         )? as u64;
         let tombstone_days = results_days.max(alerts_days);
         let tombstone_before = now_millis - (tombstone_days as i64) * 86_400_000;
         removed += self.prune_tombstones(tombstone_before)? as u64;
         removed += self.prune_incident_tombstones(tombstone_before)? as u64;
+        // A gap not redetected in an entire alert window is either fixed (a
+        // snapshot restore, an extended catch-up store) or the peer that
+        // reported it is gone; either way it stops being operationally
+        // useful to keep past the horizon everything else here ages out on.
+        removed += self.conn.execute(
+            "DELETE FROM raw_data_gaps WHERE observed_at < ?",
+            duckdb::params![alerts_before],
+        )? as u64;
         self.rebuild_stream_watermarks()?;
         Ok(removed)
     }
@@ -4561,6 +4371,18 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
             self.rebuild_stream_watermarks()?;
         }
         Ok(removed)
+    }
+
+    /// Force DuckDB to apply its WAL to the main file now, rather than
+    /// waiting for its own automatic threshold or a clean shutdown. The
+    /// prune path deliberately does not call this — see the comment on
+    /// `prune` — but a backup is a different situation: it copies the file
+    /// out from under this process on a separate durable medium, and DuckDB
+    /// can only guarantee that copy is openable if the copy captures a state
+    /// the WAL is not needed to reconstruct.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.conn.execute_batch("CHECKPOINT")?;
+        Ok(())
     }
 
     /// How many raw results are stored. Shown before a purge, so the confirm
@@ -5570,18 +5392,32 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
         let alerts = self.stream_digest("alerts")?;
         let incidents = self.stream_digest("incidents")?;
         let incident_tombstones = self.stream_digest("incident_tombstones")?;
-        let config = ConfigKind::ALL
-            .into_iter()
-            .map(|k| self.config_digest_for(k))
-            .collect::<Result<Vec<_>>>()?;
+        let latency_minute_rollups = self.rollup_digest("check_latency_minute_rollups")?;
+        let latency_hour_rollups = self.rollup_digest("check_latency_hour_rollups")?;
+        let config = self.config_digest()?;
         Ok(Digest {
             checks,
             window_start,
             alerts,
             incidents,
             incident_tombstones,
+            latency_minute_rollups,
+            latency_hour_rollups,
             config,
         })
+    }
+
+    /// Every config kind's digest, with no results/alerts/rollup scan riding
+    /// along — what `digest()` computes for its own `config` field, exposed on
+    /// its own for a store that holds only the config plane. The global tier
+    /// (`global::store::GlobalStore`) is the reason this exists: it has no
+    /// results to digest and would otherwise have to call the much more
+    /// expensive `digest()` and throw away everything but this part.
+    pub fn config_digest(&self) -> Result<Vec<ConfigDigest>> {
+        ConfigKind::ALL
+            .into_iter()
+            .map(|k| self.config_digest_for(k))
+            .collect()
     }
 
     /// One kind's contribution to a digest: how many entries it has, and the
@@ -5600,13 +5436,67 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
              )"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(duckdb::params![kind.as_str()], |r| {
-            Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?))
-        })?;
+        let rows = stmt
+            .query_map(duckdb::params![kind.as_str()], |r| {
+                Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<duckdb::Result<Vec<_>>>()?;
+        Ok(Self::digest_from_stamp_rows(kind, rows))
+    }
+
+    /// `region`'s placement-scoped contribution to a Check-kind digest: the
+    /// same shape `config_digest_for` produces for the whole table, but the
+    /// live-row half is restricted to checks `region`'s placement admits (via
+    /// `check_placement_regions`, never a `config` JSON parse). Tombstones
+    /// stay unscoped — an outright delete propagates to every region
+    /// regardless of placement, since nothing here tracks a check's *past*
+    /// placement to scope a tombstone against.
+    ///
+    /// This is what makes Phase 2 reconciliation subset-correct instead of
+    /// amplifying: comparing a *whole-catalogue* check digest against a
+    /// region that legitimately holds only its placed subset would never
+    /// converge, and would re-page the full catalogue every sweep — the
+    /// exact cost this project has already removed twice elsewhere (see
+    /// `STREAM_RESCAN_INTERVAL` and the replicated-dedup high-water mark).
+    /// A region that genuinely holds what its placement calls for produces a
+    /// digest that matches this one, so a converged region costs one HTTP
+    /// digest comparison per sweep and nothing else.
+    pub fn config_digest_for_region(&self, region: &str) -> Result<ConfigDigest> {
+        let sql = "
+            SELECT millis, node FROM (
+                SELECT c.updated_at AS millis, c.updated_by AS node
+                FROM checks c
+                WHERE NOT EXISTS (
+                          SELECT 1 FROM check_placement_regions r WHERE r.check_id = c.id
+                      )
+                   OR EXISTS (
+                          SELECT 1 FROM check_placement_regions r
+                          WHERE r.check_id = c.id AND r.region = ?
+                      )
+                UNION ALL
+                SELECT deleted_at AS millis, node_id AS node
+                FROM config_tombstones WHERE kind = 'check'
+            )";
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt
+            .query_map(duckdb::params![region], |r| {
+                Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<duckdb::Result<Vec<_>>>()?;
+        Ok(Self::digest_from_stamp_rows(ConfigKind::Check, rows))
+    }
+
+    /// Folds `(millis, node)` stamp pairs — a row or tombstone's contribution
+    /// — into the count/max-stamp shape every digest query above produces.
+    /// Shared so the two queries above cannot silently compute "caught up"
+    /// differently from one another.
+    fn digest_from_stamp_rows(
+        kind: ConfigKind,
+        rows: Vec<(Option<i64>, Option<String>)>,
+    ) -> ConfigDigest {
         let mut count = 0i64;
         let mut max_hlc: Option<Hlc> = None;
-        for row in rows {
-            let (millis, node) = row?;
+        for (millis, node) in rows {
             count += 1;
             // NULL here is a row written before stamps existed: the oldest
             // possible HLC, so it never wins a max() against a real one.
@@ -5616,11 +5506,11 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
                 _ => hlc,
             });
         }
-        Ok(ConfigDigest {
+        ConfigDigest {
             kind,
             max_hlc,
             count,
-        })
+        }
     }
 
     /// Paged raw rows for backfill. `(since, since_agent_id)` is exclusive and
@@ -5884,6 +5774,184 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
         )?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+    }
+
+    /// Paged rollup rows for `/internal/backfill/latency-minute` and
+    /// `-hour`, ordered oldest-bucket-first with `check_id` and `agent_id`
+    /// breaking ties — the same composite shape `results_after` uses for raw
+    /// rows, which is what lets one cursored sweep walk the whole table
+    /// instead of one request per divergent check. `table` is the only
+    /// difference between the minute and hour callers.
+    fn rollups_since(
+        &self,
+        table: &str,
+        since_bucket: i64,
+        since_check_id: Option<CheckId>,
+        since_agent_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RollupRow>> {
+        let sql = format!(
+            "SELECT check_id, agent_id, bucket_start, attempts, up, latency_sum,
+                    latency_min, latency_max
+             FROM {table}
+             WHERE bucket_start > ? OR (bucket_start = ? AND (
+                 ? IS NULL OR check_id > ? OR (check_id = ? AND agent_id > ?)
+             ))
+             ORDER BY bucket_start ASC, check_id ASC, agent_id ASC
+             LIMIT ?"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            duckdb::params![
+                since_bucket,
+                since_bucket,
+                since_check_id,
+                since_check_id,
+                since_check_id,
+                since_agent_id,
+                limit as i64
+            ],
+            |row| {
+                Ok(RollupRow {
+                    check_id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    bucket_start: row.get(2)?,
+                    attempts: row.get(3)?,
+                    up: row.get(4)?,
+                    latency_sum: row.get(5)?,
+                    latency_min: row.get(6)?,
+                    latency_max: row.get(7)?,
+                })
+            },
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn minute_rollups_since(
+        &self,
+        since_bucket: i64,
+        since_check_id: Option<CheckId>,
+        since_agent_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RollupRow>> {
+        self.rollups_since(
+            "check_latency_minute_rollups",
+            since_bucket,
+            since_check_id,
+            since_agent_id,
+            limit,
+        )
+    }
+
+    pub fn hour_rollups_since(
+        &self,
+        since_bucket: i64,
+        since_check_id: Option<CheckId>,
+        since_agent_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RollupRow>> {
+        self.rollups_since(
+            "check_latency_hour_rollups",
+            since_bucket,
+            since_check_id,
+            since_agent_id,
+            limit,
+        )
+    }
+
+    /// Merge a backfilled page into rollup `table` via a staging table, the
+    /// same shape `stage_results` uses for raw rows: load once through an
+    /// appender, then let one set-based statement do the merge instead of a
+    /// prepared statement per row.
+    fn apply_rollups(&self, table: &str, rows: &[RollupRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute_batch(&format!(
+            "CREATE TEMP TABLE IF NOT EXISTS ingest_rollup_stage AS
+                 SELECT * FROM {table} WITH NO DATA;
+             DELETE FROM ingest_rollup_stage;"
+        ))?;
+        {
+            let mut appender = self.conn.appender("ingest_rollup_stage")?;
+            for row in rows {
+                appender.append_row(duckdb::params![
+                    row.check_id,
+                    row.agent_id,
+                    row.bucket_start,
+                    row.attempts,
+                    row.up,
+                    row.latency_sum,
+                    row.latency_min,
+                    row.latency_max,
+                ])?;
+            }
+            appender.flush()?;
+        }
+        self.conn.execute_batch(&rollup_merge_from_backfill_sql(
+            table,
+            table,
+            "ingest_rollup_stage",
+        ))?;
+        Ok(())
+    }
+
+    pub fn apply_minute_rollups(&self, rows: &[RollupRow]) -> Result<()> {
+        self.apply_rollups("check_latency_minute_rollups", rows)
+    }
+
+    pub fn apply_hour_rollups(&self, rows: &[RollupRow]) -> Result<()> {
+        self.apply_rollups("check_latency_hour_rollups", rows)
+    }
+
+    // ---- Retention-aware peer recovery (raw-data gaps) ----
+
+    /// Record (or refresh) a standing gap: this node's raw history for
+    /// `check_id` ends at `from_ts`, `peer`'s begins at `to_ts`, and neither
+    /// side holds anything between them. Keyed on `(check_id, peer)` rather
+    /// than appended, because `anti_entropy_sweep` redetects a standing gap on
+    /// every sweep it persists — see the table's own comment in `open`.
+    pub fn record_raw_data_gap(&self, gap: &RawDataGapRow) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO raw_data_gaps (check_id, peer, from_ts, to_ts, observed_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT (check_id, peer) DO UPDATE SET
+                 from_ts = excluded.from_ts,
+                 to_ts = excluded.to_ts,
+                 observed_at = excluded.observed_at",
+            duckdb::params![
+                gap.check_id,
+                gap.peer,
+                gap.from_ts,
+                gap.to_ts,
+                gap.observed_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every standing raw-data gap, newest-observed first, for the admin
+    /// route — an operator asking which checks have holes and over what
+    /// range, not a paged replication cursor. Small and admin-only, so
+    /// returning the whole table and letting the route apply `page::take` is
+    /// simpler than a second cursor scheme for a table this size.
+    pub fn list_raw_data_gaps(&self) -> Result<Vec<RawDataGapRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT check_id, peer, from_ts, to_ts, observed_at
+             FROM raw_data_gaps ORDER BY observed_at DESC, check_id ASC, peer ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RawDataGapRow {
+                check_id: row.get(0)?,
+                peer: row.get(1)?,
+                from_ts: row.get(2)?,
+                to_ts: row.get(3)?,
+                observed_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     // ---- Config replication ----
@@ -6157,8 +6225,17 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
             stamps.tombstoned.remove(&key);
         }
         if e.is_tombstone() {
-            if e.kind != ConfigKind::Check || e.id.parse::<CheckId>().is_ok() {
+            if e.kind != ConfigKind::Check {
                 delete.execute(duckdb::params![e.id])?;
+            } else if let Ok(check_id) = e.id.parse::<CheckId>() {
+                delete.execute(duckdb::params![e.id])?;
+                // Bypasses `delete_check`, which does this too, because a
+                // replicated tombstone applies straight through the prepared
+                // per-kind statement above rather than that helper.
+                self.conn.execute(
+                    "DELETE FROM check_placement_regions WHERE check_id = ?",
+                    duckdb::params![check_id],
+                )?;
             }
             if tombstoned {
                 tombstone_delete.execute(duckdb::params![e.kind.as_str(), e.id])?;
@@ -7079,27 +7156,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_name_migration_uses_identical_deterministic_uuidv7_ids() {
-        let migrate = || -> CheckId {
-            let conn = Connection::open_in_memory().unwrap();
-            conn.execute_batch(
-                "CREATE TABLE checks (name VARCHAR PRIMARY KEY, kind VARCHAR NOT NULL, target VARCHAR NOT NULL);
-                 INSERT INTO checks VALUES ('api', 'http', 'https://api.example');",
-            )
-            .unwrap();
-            migrate_check_identity(&conn).unwrap();
-            conn.query_row("SELECT id FROM checks WHERE name = 'api'", [], |r| r.get(0))
-                .unwrap()
-        };
-        let first = migrate();
-        let second = migrate();
-        assert_eq!(first, second, "separate legacy databases converge by name");
-        assert_eq!(first.get_version_num(), 7);
-        assert_eq!(first.get_variant(), uuid::Variant::RFC4122);
-        assert_ne!(first, deterministic_legacy_check_id("web"));
-    }
-
-    #[test]
     fn notification_queue_identity_migration_preserves_existing_rows() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -7136,127 +7192,6 @@ mod tests {
             format!("oncall:{}:1", cid("api"))
         );
         migrate_notification_queue_identity(&conn).unwrap();
-    }
-
-    #[test]
-    fn canonicalizes_random_legacy_uuid_relationships_and_embedded_ids() {
-        let conn = Connection::open_in_memory().unwrap();
-        let old = CheckId::now_v7();
-        let other = CheckId::now_v7();
-        conn.execute_batch(
-            "CREATE TABLE checks (id UUID PRIMARY KEY, name VARCHAR NOT NULL UNIQUE, config VARCHAR);
-             CREATE TABLE check_results (check_id UUID NOT NULL, agent_id VARCHAR NOT NULL);
-             CREATE TABLE current_state (check_id UUID PRIMARY KEY, status VARCHAR NOT NULL);
-             CREATE TABLE agent_check_state (check_id UUID NOT NULL, agent_id VARCHAR NOT NULL, PRIMARY KEY(check_id, agent_id));
-             CREATE TABLE state_history (check_id UUID NOT NULL, since BIGINT NOT NULL, PRIMARY KEY(check_id, since));
-             CREATE TABLE incidents (id VARCHAR PRIMARY KEY, origin_check UUID);
-             CREATE TABLE incident_checks (incident_id VARCHAR NOT NULL, check_id UUID NOT NULL, PRIMARY KEY(incident_id, check_id));
-             CREATE TABLE notification_queue (notifier VARCHAR NOT NULL, check_id UUID NOT NULL, queued_at BIGINT NOT NULL, PRIMARY KEY(notifier, check_id, queued_at));
-             CREATE TABLE alerts (id VARCHAR PRIMARY KEY, scope VARCHAR NOT NULL, node_id VARCHAR NOT NULL);
-             CREATE TABLE config_tombstones (kind VARCHAR NOT NULL, id VARCHAR NOT NULL, PRIMARY KEY(kind, id));
-             CREATE TABLE settings (key VARCHAR PRIMARY KEY, value VARCHAR NOT NULL);",
-        ).unwrap();
-        let config = serde_json::json!({"id": old.to_string(), "depends_on": [other.to_string()]})
-            .to_string();
-        conn.execute(
-            "INSERT INTO checks VALUES (?, 'api', ?), (?, 'web', NULL)",
-            duckdb::params![old, config, other],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO check_results VALUES (?, 'agent')",
-            duckdb::params![old],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO current_state VALUES (?, 'up')",
-            duckdb::params![old],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO agent_check_state VALUES (?, 'agent')",
-            duckdb::params![old],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO state_history VALUES (?, 1)",
-            duckdb::params![old],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO incidents VALUES ('incident', ?)",
-            duckdb::params![old],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO incident_checks VALUES ('incident', ?)",
-            duckdb::params![old],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO notification_queue VALUES ('notifier', ?, 1)",
-            duckdb::params![old],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO alerts VALUES ('a', 'check', ?)",
-            duckdb::params![old.to_string()],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO config_tombstones VALUES ('check', ?)",
-            duckdb::params![old.to_string()],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO settings VALUES ('maintenance.windows', ?)",
-            duckdb::params![serde_json::json!([{"checks": [old.to_string()]}]).to_string()],
-        )
-        .unwrap();
-        canonicalize_random_legacy_check_ids(&conn).unwrap();
-        let canonical = deterministic_legacy_check_id("api");
-        assert_eq!(
-            conn.query_row("SELECT check_id FROM check_results", [], |r| r
-                .get::<_, CheckId>(0))
-                .unwrap(),
-            canonical
-        );
-        assert_eq!(
-            conn.query_row("SELECT check_id FROM current_state", [], |r| r
-                .get::<_, CheckId>(0))
-                .unwrap(),
-            canonical
-        );
-        for query in [
-            "SELECT check_id FROM agent_check_state",
-            "SELECT check_id FROM state_history",
-            "SELECT origin_check FROM incidents",
-            "SELECT check_id FROM incident_checks",
-            "SELECT check_id FROM notification_queue",
-        ] {
-            assert_eq!(
-                conn.query_row(query, [], |r| r.get::<_, CheckId>(0))
-                    .unwrap(),
-                canonical
-            );
-        }
-        assert_eq!(
-            conn.query_row("SELECT node_id FROM alerts", [], |r| r.get::<_, String>(0))
-                .unwrap(),
-            canonical.to_string()
-        );
-        let config: String = conn
-            .query_row("SELECT config FROM checks WHERE name = 'api'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        let config: serde_json::Value = serde_json::from_str(&config).unwrap();
-        assert_eq!(config["id"], canonical.to_string());
-        assert_eq!(
-            config["depends_on"][0],
-            deterministic_legacy_check_id("web").to_string()
-        );
-        assert!(legacy_id_marker_exists(&conn).unwrap());
     }
 
     #[test]
@@ -8776,6 +8711,138 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    /// Small-scale, always-on regression cover for TODO.md's "restart/recovery
+    /// tests using a persistent production-sized database" — see
+    /// `benchmark_restart_recovery_at_production_scale` below for the scaled
+    /// version this mirrors. Fast enough to run on every `cargo test`, so a
+    /// regression in WAL replay, watermark rebuilds, or the backup/restore
+    /// round trip fails CI rather than waiting for someone to run the
+    /// `#[ignore]`d benchmark by hand.
+    ///
+    /// `std::mem::forget` skips `Connection`'s `Drop` rather than calling it,
+    /// which is the closest thing to an unclean shutdown reachable safely
+    /// from within one test process — an actual killed process is exercised
+    /// manually against the built binary (see SCALING.md's backup section)
+    /// but is not something a unit test can safely automate. It is a real
+    /// difference from a clean `drop`, not a no-op: a clean close lets DuckDB
+    /// release its file lock and finish any pending bookkeeping on the way
+    /// out, and skipping that is exactly what durability across restarts is
+    /// supposed to tolerate.
+    #[test]
+    fn restart_recovers_committed_rows_and_backup_restore_preserves_them() {
+        let path = std::env::temp_dir().join(format!(
+            "warden-restart-recovery-{}.duckdb",
+            uuid::Uuid::now_v7()
+        ));
+        let path_string = path.to_string_lossy().into_owned();
+        let checks = 20u64;
+        let observations_per_check = 500u64;
+
+        {
+            let store = Storage::open(&path_string).unwrap();
+            store
+                .conn
+                .execute_batch(&format!(
+                    "INSERT INTO check_results
+                     SELECT md5('check-' || c::VARCHAR)::UUID, 'agent-a', o * 1000,
+                            'up', 12, 200, NULL, 'zone', 'region', NULL
+                     FROM range({checks}) t(c) CROSS JOIN range({observations_per_check}) u(o);"
+                ))
+                .unwrap();
+            store.rebuild_result_watermarks().unwrap();
+            store.rebuild_latest_check_results().unwrap();
+            store.rebuild_latency_rollups().unwrap();
+            store
+                .update_current_state(cid("check-0"), NodeState::Up, None, 1_000)
+                .unwrap();
+            // No explicit checkpoint and no clean drop: the WAL, not the main
+            // file, is what has to carry every one of these commits forward.
+            std::mem::forget(store);
+        }
+
+        let expected_rows = checks * observations_per_check;
+        let recovery_started = std::time::Instant::now();
+        let restarted = Storage::open(&path_string).unwrap();
+        let recovery_elapsed = recovery_started.elapsed();
+        assert!(
+            recovery_elapsed < std::time::Duration::from_secs(5),
+            "recovery of {expected_rows} rows took {recovery_elapsed:?}, which would be a \
+             regression worth investigating even at this small a scale"
+        );
+        assert_eq!(restarted.count_results().unwrap(), expected_rows);
+        assert_eq!(restarted.list_current_state().unwrap().len(), 1);
+        let watermarks = restarted.digest(0).unwrap();
+        assert_eq!(watermarks.checks.len() as u64, checks);
+        assert_eq!(
+            watermarks
+                .checks
+                .iter()
+                .map(|c| c.count as u64)
+                .sum::<u64>(),
+            expected_rows
+        );
+        let minute_rollups = restarted
+            .rollup_digest("check_latency_minute_rollups")
+            .unwrap();
+        let hour_rollups = restarted
+            .rollup_digest("check_latency_hour_rollups")
+            .unwrap();
+        assert!(minute_rollups.count > 0);
+        assert!(hour_rollups.count > 0);
+
+        let backup_path = std::env::temp_dir().join(format!(
+            "warden-restart-recovery-backup-{}.duckdb",
+            uuid::Uuid::now_v7()
+        ));
+        let restore_path = std::env::temp_dir().join(format!(
+            "warden-restart-recovery-restored-{}.duckdb",
+            uuid::Uuid::now_v7()
+        ));
+        crate::coordinator::backup::create(&path_string, &backup_path).unwrap();
+        let report = crate::coordinator::backup::restore(&backup_path, &restore_path).unwrap();
+        assert!(report.checksum_verified);
+        assert_eq!(report.raw_results, expected_rows);
+        assert_eq!(report.current_states, 1);
+
+        let restored = Storage::open(restore_path.to_str().unwrap()).unwrap();
+        assert_eq!(restored.count_results().unwrap(), expected_rows);
+        let restored_watermarks = restored.digest(0).unwrap();
+        assert_eq!(restored_watermarks.checks.len(), watermarks.checks.len());
+        assert_eq!(
+            restored_watermarks
+                .checks
+                .iter()
+                .map(|c| c.count)
+                .sum::<i64>(),
+            watermarks.checks.iter().map(|c| c.count).sum::<i64>()
+        );
+        assert_eq!(
+            restored
+                .rollup_digest("check_latency_minute_rollups")
+                .unwrap()
+                .count,
+            minute_rollups.count
+        );
+        assert_eq!(
+            restored
+                .rollup_digest("check_latency_hour_rollups")
+                .unwrap()
+                .count,
+            hour_rollups.count
+        );
+
+        drop(restored);
+        let _ = std::fs::remove_file(format!("{path_string}.wal"));
+        std::fs::remove_file(&path).unwrap();
+        for extra in [
+            &backup_path,
+            &restore_path,
+            &std::path::PathBuf::from(format!("{}.manifest.json", backup_path.display())),
+        ] {
+            let _ = std::fs::remove_file(extra);
+        }
+    }
+
     // ---- Clustering: data-plane replication ----
 
     fn check_config(name: &str, target: &str) -> CheckConfig {
@@ -9182,6 +9249,162 @@ mod tests {
         assert!(applied.iter().all(|applied| *applied));
     }
 
+    /// The prune keeps each check's newest span regardless of age, because
+    /// that span is not history — it is what the check reads as right now.
+    #[test]
+    fn state_history_prune_keeps_each_checks_newest_span_however_old() {
+        let s = Storage::open(":memory:").unwrap();
+        let day = 86_400_000i64;
+        let stale = crate::models::new_check_id();
+        let straddling = crate::models::new_check_id();
+        let single = crate::models::new_check_id();
+        // `record_state` only writes a span when the state actually changes,
+        // so these alternate.
+        for (check, since, state) in [
+            (stale, day, NodeState::Up),
+            (stale, 2 * day, NodeState::Down),
+            (stale, 3 * day, NodeState::Up),
+            (straddling, 2 * day, NodeState::Up),
+            (straddling, 9 * day, NodeState::Down),
+            (straddling, 10 * day, NodeState::Up),
+            (single, day, NodeState::Up),
+        ] {
+            s.record_state(check, state, since).unwrap();
+        }
+        // Horizon at day 8: `now` is day 15 with a 7-day result window.
+        s.prune_metadata(7, 90, 15 * day).unwrap();
+
+        let spans = |check| {
+            s.state_spans(check)
+                .unwrap()
+                .into_iter()
+                .map(|span| span.since)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            spans(stale),
+            vec![3 * day],
+            "every span predates the horizon"
+        );
+        assert_eq!(spans(straddling), vec![9 * day, 10 * day]);
+        assert_eq!(spans(single), vec![day]);
+    }
+
+    /// Raw results are the only copy of an observation until a rollup covers
+    /// it. Retention deleting on a clock alone trusts a write it never
+    /// checked, and the window it would lose is indistinguishable afterwards
+    /// from a window in which nothing was measured.
+    #[test]
+    fn retention_will_not_delete_raw_results_no_rollup_covers() {
+        let s = Storage::open(":memory:").unwrap();
+        let minute = MILLIS_PER_MINUTE;
+        let rows: Vec<_> = (1..=5)
+            .map(|i| (result("covered", i * minute, 10), Status::Up))
+            .collect();
+        s.insert_results_dedup(&rows).unwrap();
+        assert_eq!(s.count_results().unwrap(), 5);
+
+        // Simulate the rollup for minute 2 never having been written: a failed
+        // write, or a restore that carried raw rows without their summaries.
+        s.conn
+            .execute(
+                "DELETE FROM check_latency_minute_rollups WHERE bucket_start = ?",
+                duckdb::params![2 * minute],
+            )
+            .unwrap();
+
+        // Asked to drop everything below minute 5, retention stops at the gap.
+        s.prune_results(5 * minute).unwrap();
+        assert_eq!(
+            s.count_results().unwrap(),
+            4,
+            "only the fully summarized minute below the gap may go"
+        );
+
+        // Once the summary exists, the same request completes.
+        s.conn
+            .execute(
+                "INSERT INTO check_latency_minute_rollups
+                 VALUES (?, 'agent', ?, 1, 1, 10, 10, 10)",
+                duckdb::params![cid("covered"), 2 * minute],
+            )
+            .unwrap();
+        s.prune_results(5 * minute).unwrap();
+        assert_eq!(s.count_results().unwrap(), 1, "only minute 5 is retained");
+    }
+
+    /// Manual benchmark for the state-history prune. Run with
+    /// `cargo test benchmark_state_history_prune -- --ignored --nocapture`.
+    /// Reports the shipped anti-join against the correlated form it replaced,
+    /// on the same seeded table, so the rewrite is justified by measurement.
+    #[test]
+    #[ignore = "benchmark"]
+    fn benchmark_state_history_prune() {
+        const CORRELATED: &str = "DELETE FROM state_history
+             WHERE since < ?
+               AND since <> (SELECT MAX(since) FROM state_history h
+                             WHERE h.check_id = state_history.check_id)";
+        const ANTI_JOIN: &str = "DELETE FROM state_history
+             WHERE since < ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM (
+                       SELECT check_id, MAX(since) AS newest
+                       FROM state_history GROUP BY check_id
+                   ) latest
+                   WHERE latest.check_id = state_history.check_id
+                     AND latest.newest = state_history.since)";
+
+        let checks: i64 = std::env::var("WARDEN_BENCH_CHECKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10_000);
+        let spans: i64 = std::env::var("WARDEN_BENCH_SPANS_PER_CHECK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+        let horizon = spans / 2 * 60_000;
+        let seed = |store: &Storage| {
+            store
+                .conn
+                .execute_batch(&format!(
+                    "DELETE FROM state_history;
+                     INSERT INTO state_history
+                     SELECT (uuid_extract_timestamp(uuid())::VARCHAR || c.i::VARCHAR)::VARCHAR,
+                            'up', s.i * 60000
+                     FROM range(0, {checks}) c(i), range(0, {spans}) s(i);"
+                ))
+                .or_else(|_| {
+                    store.conn.execute_batch(&format!(
+                        "DELETE FROM state_history;
+                         INSERT INTO state_history
+                         SELECT ('00000000-0000-7000-8000-' || lpad(c.i::VARCHAR, 12, '0'))::UUID,
+                                'up', s.i * 60000
+                         FROM range(0, {checks}) c(i), range(0, {spans}) s(i);"
+                    ))
+                })
+                .unwrap();
+        };
+
+        let mut report = Vec::new();
+        for (label, sql) in [("anti-join", ANTI_JOIN), ("correlated", CORRELATED)] {
+            let store = Storage::open(":memory:").unwrap();
+            seed(&store);
+            let start = std::time::Instant::now();
+            let removed = store.conn.execute(sql, duckdb::params![horizon]).unwrap();
+            report.push((label, removed, start.elapsed()));
+        }
+        for (label, removed, elapsed) in &report {
+            eprintln!(
+                "{label}: pruned {removed} of {} rows in {elapsed:?}",
+                checks * spans
+            );
+        }
+        assert_eq!(
+            report[0].1, report[1].1,
+            "both forms must remove exactly the same rows"
+        );
+    }
+
     #[test]
     fn config_entry_round_trips_each_kind_through_apply_and_read_back() {
         let s = Storage::open(":memory:").unwrap();
@@ -9350,6 +9573,167 @@ mod tests {
             .config_entries_page(ConfigKind::Setting, Some("delta"), 2)
             .unwrap()
             .is_empty());
+    }
+
+    // ---- Placement-scoped configuration, Phase 2 (SCALING.md) ----
+
+    fn placed_check(name: &str, regions: &[&str]) -> CheckConfig {
+        CheckConfig {
+            placement: crate::placement::Placement {
+                regions: regions.iter().map(|r| r.to_string()).collect(),
+                ..Default::default()
+            },
+            ..check_config(name, "https://example.com")
+        }
+    }
+
+    #[test]
+    fn check_ids_for_region_admits_unplaced_and_named_regions_only() {
+        let s = Storage::open(":memory:").unwrap();
+        let everywhere = placed_check("everywhere", &[]);
+        let us_only = placed_check("us-only", &["us"]);
+        let tw_only = placed_check("tw-only", &["tw"]);
+        for c in [&everywhere, &us_only, &tw_only] {
+            s.upsert_check(c, 1).unwrap();
+        }
+
+        let us_ids = s.check_ids_for_region("us").unwrap();
+        assert_eq!(
+            us_ids,
+            {
+                let mut v = vec![everywhere.id, us_only.id];
+                v.sort();
+                v
+            },
+            "us gets the unscoped check and the one explicitly placed there"
+        );
+
+        let tw_ids = s.check_ids_for_region("tw").unwrap();
+        assert_eq!(
+            tw_ids,
+            {
+                let mut v = vec![everywhere.id, tw_only.id];
+                v.sort();
+                v
+            },
+            "tw must not see the us-only check"
+        );
+    }
+
+    #[test]
+    fn upsert_check_rewrites_the_placement_projection_on_every_edit() {
+        let s = Storage::open(":memory:").unwrap();
+        let mut check = placed_check("moving", &["us"]);
+        s.upsert_check(&check, 1).unwrap();
+        assert_eq!(s.check_ids_for_region("us").unwrap(), vec![check.id]);
+        assert!(s.check_ids_for_region("tw").unwrap().is_empty());
+
+        // Re-placed to tw only: the old row in `check_placement_regions` must
+        // not linger and leave the check reachable from both regions.
+        check.placement.regions = vec!["tw".into()];
+        s.upsert_check(&check, 2).unwrap();
+        assert!(s.check_ids_for_region("us").unwrap().is_empty());
+        assert_eq!(s.check_ids_for_region("tw").unwrap(), vec![check.id]);
+    }
+
+    /// The comparison Phase 2 reconciliation relies on: a region's
+    /// placement-scoped digest must equal the whole-table digest the region
+    /// itself reports once it holds exactly that scoped subset — otherwise
+    /// the two sides could never agree "converged" without paging documents
+    /// to check. Tombstones are deliberately unscoped (a delete reaches
+    /// every region), so they count identically in both digests too.
+    #[test]
+    fn config_digest_for_region_matches_a_region_holding_exactly_its_subset() {
+        let global = Storage::open(":memory:").unwrap();
+        let region = Storage::open(":memory:").unwrap();
+        let us_only = placed_check("us-only", &["us"]);
+        let tw_only = placed_check("tw-only", &["tw"]);
+        global.upsert_check(&us_only, 10).unwrap();
+        global.upsert_check(&tw_only, 20).unwrap();
+        // The region only ever received what its placement admits — the
+        // steady state Phase 2 reconciliation converges every region to.
+        region.upsert_check(&us_only, 10).unwrap();
+
+        let scoped = global.config_digest_for_region("us").unwrap();
+        let whole = region.config_digest_for(ConfigKind::Check).unwrap();
+        assert_eq!(
+            scoped, whole,
+            "a converged region's whole-table digest must equal the global \
+             tier's placement-scoped one, or every sweep would look behind"
+        );
+
+        // A whole-catalogue comparison, the pre-Phase-2 behaviour, would
+        // disagree forever even though the region is fully converged.
+        let unscoped = global.config_digest_for(ConfigKind::Check).unwrap();
+        assert_ne!(
+            unscoped, whole,
+            "the whole catalogue must differ from a converged subset region \
+             — this is exactly the comparison Phase 2 replaces"
+        );
+    }
+
+    #[test]
+    fn config_digest_for_region_counts_tombstones_unscoped() {
+        let s = Storage::open(":memory:").unwrap();
+        let us_only = placed_check("us-only", &["us"]);
+        s.upsert_check(&us_only, 10).unwrap();
+        s.apply_config_entry(&ConfigEntry {
+            kind: ConfigKind::Check,
+            id: crate::models::new_check_id().to_string(),
+            hlc: Hlc::new(20, "global"),
+            document: None,
+        })
+        .unwrap();
+
+        // A region that never held the deleted check, and whose placement
+        // admits nothing else here, still must count the tombstone: deletes
+        // reach every region regardless of placement.
+        let tw_digest = s.config_digest_for_region("tw").unwrap();
+        assert_eq!(tw_digest.count, 1, "the tombstone alone");
+        let us_digest = s.config_digest_for_region("us").unwrap();
+        assert_eq!(us_digest.count, 2, "the placed check plus the tombstone");
+    }
+
+    #[test]
+    fn unplace_and_delete_clear_the_placement_projection() {
+        let s = Storage::open(":memory:").unwrap();
+        let a = placed_check("a", &["us"]);
+        let b = placed_check("b", &["us"]);
+        s.upsert_check(&a, 1).unwrap();
+        s.upsert_check(&b, 1).unwrap();
+        assert_eq!(s.check_ids_for_region("us").unwrap().len(), 2);
+
+        assert!(s.unplace_check_local(a.id).unwrap());
+        assert_eq!(
+            s.check_ids_for_region("us").unwrap(),
+            vec![b.id],
+            "unplace must drop the projection row, or a later differently-\
+             placed check reusing no id could still misreport membership"
+        );
+
+        assert!(s.delete_check(b.id).unwrap());
+        assert!(s.check_ids_for_region("us").unwrap().is_empty());
+    }
+
+    /// A replicated tombstone applies through a different code path
+    /// (`apply_config_entries`'s prepared per-kind statement) than
+    /// `unplace_check_local`/`delete_check`, so it needs its own assertion
+    /// that the projection is still cleaned up rather than left to rot.
+    #[test]
+    fn a_replicated_check_tombstone_clears_the_placement_projection() {
+        let s = Storage::open(":memory:").unwrap();
+        let check = placed_check("doomed", &["us"]);
+        s.upsert_check(&check, 1).unwrap();
+        assert_eq!(s.check_ids_for_region("us").unwrap(), vec![check.id]);
+
+        s.apply_config_entry(&ConfigEntry {
+            kind: ConfigKind::Check,
+            id: check.id.to_string(),
+            hlc: Hlc::new(2, "peer"),
+            document: None,
+        })
+        .unwrap();
+        assert!(s.check_ids_for_region("us").unwrap().is_empty());
     }
 
     #[test]
@@ -10144,6 +10528,12 @@ mod tests {
         let pruned = store.prune((days - 1).max(1), 90, now).unwrap();
         let prune_ms = prune_started.elapsed().as_millis();
         assert!(pruned > 0, "benchmark must exercise raw retention");
+        // Measured before any CHECKPOINT runs, so this answers the actual
+        // question behind TODO's "add checkpoint maintenance if benchmarks
+        // show it is needed": does a delete alone ever shrink the file, or is
+        // an explicit checkpoint the only thing that can?
+        let database_after_prune_no_checkpoint = bytes(&path);
+        let wal_after_prune_no_checkpoint = bytes(&wal_path);
         let checkpoint_started = std::time::Instant::now();
         store.conn.execute_batch("CHECKPOINT").unwrap();
         let checkpoint_ms = checkpoint_started.elapsed().as_millis();
@@ -10153,7 +10543,7 @@ mod tests {
         let history_p95_ms = percentile(&mut history_samples, 95);
         let latency_p95_ms = percentile(&mut latency_samples, 95);
         println!(
-            "checks={check_count} domains={domains} retained_rows={rows} observation_secs={observation_secs} seed_ms={seed_ms} database_before_prune_bytes={database_before_prune} wal_before_prune_bytes={wal_before_prune} backup_bytes={backup_bytes} backup_ms={backup_ms} restore_ms={restore_ms} history_p95_ms={history_p95_ms} latency_p95_ms={latency_p95_ms} pruned_rows={pruned} prune_ms={prune_ms} checkpoint_ms={checkpoint_ms} database_after_prune_bytes={database_after_prune} wal_after_prune_bytes={wal_after_prune}"
+            "checks={check_count} domains={domains} retained_rows={rows} observation_secs={observation_secs} seed_ms={seed_ms} database_before_prune_bytes={database_before_prune} wal_before_prune_bytes={wal_before_prune} backup_bytes={backup_bytes} backup_ms={backup_ms} restore_ms={restore_ms} history_p95_ms={history_p95_ms} latency_p95_ms={latency_p95_ms} pruned_rows={pruned} prune_ms={prune_ms} database_after_prune_no_checkpoint_bytes={database_after_prune_no_checkpoint} wal_after_prune_no_checkpoint_bytes={wal_after_prune_no_checkpoint} checkpoint_ms={checkpoint_ms} database_after_prune_bytes={database_after_prune} wal_after_prune_bytes={wal_after_prune}"
         );
 
         for (name, value) in [
@@ -10177,6 +10567,268 @@ mod tests {
         let _ = std::fs::remove_file(wal_path);
         std::fs::remove_file(backup_path).unwrap();
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// TODO.md: "add explicit checkpoint/file-size maintenance after large
+    /// pruning operations if benchmarks show it is needed." It is not
+    /// needed, and this benchmark is why.
+    ///
+    /// Two things have to both be true for an explicit `CHECKPOINT` after
+    /// `prune_in_slices` to earn its cost: DuckDB has to leave meaningful
+    /// work undone until asked, and doing that work has to shrink the file.
+    /// Neither holds. `wal_autocheckpoint` is pinned high here specifically
+    /// to *stop* DuckDB self-checkpointing mid-prune, so the work an explicit
+    /// call would do is visible in isolation rather than already applied —
+    /// with the pragma left at its default, a prune this size crosses
+    /// DuckDB's own threshold before `prune_results` even returns, and a
+    /// caller-issued CHECKPOINT afterward finds nothing left to flush. Run
+    /// with `WARDEN_BENCH_CHECKS`/`WARDEN_BENCH_DAYS`/
+    /// `WARDEN_BENCH_OBSERVATION_SECS` for other scales; the numbers recorded
+    /// in TODO.md/SCALING.md are the defaults below.
+    #[test]
+    #[ignore = "capacity baseline; configure WARDEN_BENCH_* for the intended scale"]
+    fn benchmark_checkpoint_after_prune() {
+        fn env_u64(name: &str, default: u64) -> u64 {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        }
+        fn bytes(path: &std::path::Path) -> u64 {
+            std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+        }
+
+        let check_count = env_u64("WARDEN_BENCH_CHECKS", 1_000);
+        let days = env_u64("WARDEN_BENCH_DAYS", 30);
+        let observation_secs = env_u64("WARDEN_BENCH_OBSERVATION_SECS", 30);
+        let observations_per_check = days * 86_400 / observation_secs;
+        let step_ms = observation_secs as i64 * 1_000;
+        let path = std::env::temp_dir().join(format!(
+            "warden-checkpoint-bench-{}-{}.duckdb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let wal_path = std::path::PathBuf::from(format!("{}.wal", path.display()));
+        let store = Storage::open(path.to_str().unwrap()).unwrap();
+
+        store
+            .conn
+            .execute_batch(&format!(
+                "INSERT INTO check_results
+                 SELECT md5('check-' || check_number::VARCHAR)::UUID,
+                        'agent-' || (check_number % 3)::VARCHAR,
+                        observation_number * {step_ms},
+                        'up', 15, 200, NULL, 'zone', 'region', NULL
+                 FROM range({check_count}) checks(check_number)
+                 CROSS JOIN range({observations_per_check}) observations(observation_number);"
+            ))
+            .unwrap();
+        store.rebuild_result_watermarks().unwrap();
+        store.rebuild_latest_check_results().unwrap();
+        // Real ingest maintains rollups incrementally with every write; this
+        // bulk seed does not, so backfill once here rather than have
+        // `prune_results` hold the horizon back for a gap that only exists
+        // because of how the benchmark seeds data.
+        store.rebuild_latency_rollups().unwrap();
+        store.conn.execute_batch("CHECKPOINT").unwrap();
+        let seeded_bytes = bytes(&path);
+
+        // Hold DuckDB's own automatic checkpoint off so the prune's WAL
+        // growth and an explicit CHECKPOINT's cost are each visible on their
+        // own, instead of the two being indistinguishable the way they are
+        // with the default threshold (see the doc comment above).
+        store
+            .conn
+            .execute_batch("PRAGMA wal_autocheckpoint='1TB';")
+            .unwrap();
+
+        let cutoff = step_ms * (observations_per_check as i64 / 30);
+        let prune_started = std::time::Instant::now();
+        let removed = store.prune_results(cutoff).unwrap();
+        let prune_ms = prune_started.elapsed().as_millis();
+        assert!(removed > 0, "benchmark must exercise raw retention");
+        let database_after_prune_bytes = bytes(&path);
+        let wal_after_prune_bytes = bytes(&wal_path);
+
+        let checkpoint_started = std::time::Instant::now();
+        store.conn.execute_batch("CHECKPOINT").unwrap();
+        let checkpoint_ms = checkpoint_started.elapsed().as_millis();
+        let database_after_checkpoint_bytes = bytes(&path);
+
+        // A second CHECKPOINT with nothing pending: if the file were ever
+        // going to shrink from reclaiming the deleted rows' space, one of
+        // these two calls would have done it.
+        let second_checkpoint_started = std::time::Instant::now();
+        store.conn.execute_batch("CHECKPOINT").unwrap();
+        let second_checkpoint_ms = second_checkpoint_started.elapsed().as_millis();
+        let database_after_second_checkpoint_bytes = bytes(&path);
+
+        println!(
+            "checks={check_count} days={days} observation_secs={observation_secs} removed_rows={removed} seeded_bytes={seeded_bytes} prune_ms={prune_ms} database_after_prune_bytes={database_after_prune_bytes} wal_after_prune_bytes={wal_after_prune_bytes} checkpoint_ms={checkpoint_ms} database_after_checkpoint_bytes={database_after_checkpoint_bytes} second_checkpoint_ms={second_checkpoint_ms} database_after_second_checkpoint_bytes={database_after_second_checkpoint_bytes}"
+        );
+
+        // The file must never shrink by itself, or this benchmark's own
+        // premise — that CHECKPOINT does not reclaim space — is wrong and
+        // needs to be re-examined before touching the prune path.
+        assert!(
+            database_after_checkpoint_bytes >= database_after_prune_bytes,
+            "a checkpoint should never shrink the file if this decision is right"
+        );
+        assert_eq!(
+            database_after_second_checkpoint_bytes, database_after_checkpoint_bytes,
+            "a checkpoint with nothing pending must be a byte-for-byte no-op"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(&wal_path);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// TODO.md: "add restart/recovery tests using a persistent
+    /// production-sized database." Production-scale sibling of
+    /// `restart_recovers_committed_rows_and_backup_restore_preserves_them`
+    /// above; that test is the fast, always-on regression cover for the same
+    /// three invariants — (a) recovery duration, (b) no data loss of
+    /// committed rows, (c) a backup/restore round trip preserving row
+    /// counts, watermarks, and rollups — at a scale CI cannot afford to run
+    /// on every commit. Configure `WARDEN_BENCH_CHECKS`/`WARDEN_BENCH_DAYS`/
+    /// `WARDEN_BENCH_OBSERVATION_SECS` for the intended scale; see that test's
+    /// doc comment for what "closed uncleanly" does and does not simulate
+    /// here.
+    #[test]
+    #[ignore = "capacity baseline; configure WARDEN_BENCH_* for the intended scale"]
+    fn benchmark_restart_recovery_at_production_scale() {
+        fn env_u64(name: &str, default: u64) -> u64 {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        }
+        fn env_u128(name: &str) -> Option<u128> {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+        }
+
+        let check_count = env_u64("WARDEN_BENCH_CHECKS", 1_000);
+        let days = env_u64("WARDEN_BENCH_DAYS", 30);
+        let observation_secs = env_u64("WARDEN_BENCH_OBSERVATION_SECS", 30);
+        let observations_per_check = days * 86_400 / observation_secs;
+        let step_ms = observation_secs as i64 * 1_000;
+        let expected_rows = check_count * observations_per_check;
+        let path = std::env::temp_dir().join(format!(
+            "warden-restart-bench-{}-{}.duckdb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path_string = path.to_string_lossy().into_owned();
+
+        {
+            let store = Storage::open(&path_string).unwrap();
+            store
+                .conn
+                .execute_batch(&format!(
+                    "INSERT INTO check_results
+                     SELECT md5('check-' || check_number::VARCHAR)::UUID,
+                            'agent-' || (check_number % 3)::VARCHAR,
+                            observation_number * {step_ms},
+                            'up', 15, 200, NULL, 'zone', 'region', NULL
+                     FROM range({check_count}) checks(check_number)
+                     CROSS JOIN range({observations_per_check}) observations(observation_number);"
+                ))
+                .unwrap();
+            store.rebuild_result_watermarks().unwrap();
+            store.rebuild_latest_check_results().unwrap();
+            store.rebuild_latency_rollups().unwrap();
+            // No checkpoint, no clean drop: every one of these rows has to be
+            // recovered from the WAL, the way a killed process would leave it.
+            std::mem::forget(store);
+        }
+
+        let recovery_started = std::time::Instant::now();
+        let store = Storage::open(&path_string).unwrap();
+        let recovery_ms = recovery_started.elapsed().as_millis();
+        let recovered_rows = store.count_results().unwrap();
+        assert_eq!(
+            recovered_rows, expected_rows,
+            "committed rows must not be lost across an unclean close"
+        );
+        let watermarks = store.digest(0).unwrap();
+        let minute_rollups = store.rollup_digest("check_latency_minute_rollups").unwrap();
+        let hour_rollups = store.rollup_digest("check_latency_hour_rollups").unwrap();
+
+        let backup_path = path.with_extension("backup.duckdb");
+        let restore_path = path.with_extension("restore.duckdb");
+        let backup_started = std::time::Instant::now();
+        crate::coordinator::backup::create(&path_string, &backup_path).unwrap();
+        let backup_ms = backup_started.elapsed().as_millis();
+        let restore_started = std::time::Instant::now();
+        let report = crate::coordinator::backup::restore(&backup_path, &restore_path).unwrap();
+        let restore_ms = restore_started.elapsed().as_millis();
+        assert!(report.checksum_verified);
+        assert_eq!(report.raw_results, expected_rows);
+
+        let restored = Storage::open(restore_path.to_str().unwrap()).unwrap();
+        assert_eq!(restored.count_results().unwrap(), expected_rows);
+        let restored_watermarks = restored.digest(0).unwrap();
+        assert_eq!(restored_watermarks.checks.len(), watermarks.checks.len());
+        assert_eq!(
+            restored_watermarks
+                .checks
+                .iter()
+                .map(|c| c.count)
+                .sum::<i64>(),
+            watermarks.checks.iter().map(|c| c.count).sum::<i64>(),
+            "backup/restore must preserve replication watermarks exactly"
+        );
+        assert_eq!(
+            restored
+                .rollup_digest("check_latency_minute_rollups")
+                .unwrap()
+                .count,
+            minute_rollups.count,
+            "backup/restore must preserve minute rollups exactly"
+        );
+        assert_eq!(
+            restored
+                .rollup_digest("check_latency_hour_rollups")
+                .unwrap()
+                .count,
+            hour_rollups.count,
+            "backup/restore must preserve hour rollups exactly"
+        );
+
+        println!(
+            "checks={check_count} days={days} observation_secs={observation_secs} rows={expected_rows} recovery_ms={recovery_ms} backup_ms={backup_ms} restore_ms={restore_ms} minute_rollups={} hour_rollups={}",
+            minute_rollups.count, hour_rollups.count
+        );
+        for (name, value) in [
+            ("WARDEN_BENCH_MAX_RECOVERY_MS", recovery_ms),
+            ("WARDEN_BENCH_MAX_BACKUP_MS", backup_ms),
+            ("WARDEN_BENCH_MAX_RESTORE_MS", restore_ms),
+        ] {
+            if let Some(limit) = env_u128(name) {
+                assert!(value <= limit, "{name}: measured {value}, limit {limit}");
+            }
+        }
+
+        drop(store);
+        drop(restored);
+        let _ = std::fs::remove_file(format!("{path_string}.wal"));
+        let _ = std::fs::remove_file(&path);
+        for extra in [
+            &backup_path,
+            &restore_path,
+            &std::path::PathBuf::from(format!("{}.manifest.json", backup_path.display())),
+        ] {
+            let _ = std::fs::remove_file(extra);
+        }
     }
 
     #[test]
@@ -10750,12 +11402,15 @@ mod migration_tests {
         let path_str = path.to_str().unwrap().to_string();
         let _ = std::fs::remove_file(&path);
 
-        // The `checks` table exactly as the previous release wrote it.
+        // The `checks` table exactly as the previous release wrote it — already
+        // UUID-keyed, since a database predating native check identity is out
+        // of scope (see `SCALING.md`'s "Pre-1.0 database policy").
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(
                 "CREATE TABLE checks (
-                    name        VARCHAR PRIMARY KEY,
+                    id          UUID PRIMARY KEY,
+                    name        VARCHAR NOT NULL UNIQUE,
                     kind        VARCHAR NOT NULL,
                     target      VARCHAR NOT NULL,
                     interval_secs BIGINT NOT NULL,
@@ -10766,9 +11421,12 @@ mod migration_tests {
                     expect_status INTEGER,
                     expect_body_contains VARCHAR,
                     updated_at  BIGINT  NOT NULL
-                );
-                INSERT INTO checks VALUES
-                    ('legacy', 'http', 'https://legacy.test', 30, 10, 'Old', true, true, 200, NULL, 0);",
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO checks VALUES (?, 'legacy', 'http', 'https://legacy.test', 30, 10, 'Old', true, true, 200, NULL, 0)",
+                duckdb::params![cid("legacy")],
             )
             .unwrap();
         }
@@ -10881,14 +11539,18 @@ mod migration_tests {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(
                 "CREATE TABLE agent_check_state (
-                    check_id VARCHAR NOT NULL,
+                    check_id UUID NOT NULL,
                     agent_id VARCHAR NOT NULL,
                     status VARCHAR NOT NULL,
                     consecutive_failures INTEGER NOT NULL DEFAULT 0,
                     last_check BIGINT NOT NULL,
                     PRIMARY KEY (check_id, agent_id)
-                );
-                INSERT INTO agent_check_state VALUES ('svc', 'agent-a', 'up', 1, 1_000);",
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_check_state VALUES (?, 'agent-a', 'up', 1, 1_000)",
+                duckdb::params![cid("svc")],
             )
             .unwrap();
         }
@@ -11154,5 +11816,616 @@ mod migration_tests {
             for_a.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
             vec!["b-2000", "a-1000"]
         );
+    }
+}
+
+#[cfg(test)]
+mod rollup_replication_tests {
+    use super::tests::cid;
+    use super::*;
+
+    fn row(
+        check_id: &str,
+        agent_id: &str,
+        bucket_start: i64,
+        attempts: i64,
+        up: i64,
+        latency_sum: i64,
+    ) -> RollupRow {
+        RollupRow {
+            check_id: cid(check_id),
+            agent_id: agent_id.into(),
+            bucket_start,
+            attempts,
+            up,
+            latency_sum,
+            latency_min: Some(10),
+            latency_max: Some(10),
+        }
+    }
+
+    /// The scenario item A's merge is built for: a page of rollup rows this
+    /// node never derived from its own raw observations, applied for the
+    /// first time.
+    #[test]
+    fn a_backfilled_rollup_page_is_applied_on_first_receipt() {
+        let s = Storage::open(":memory:").unwrap();
+        let page = vec![row("a", "agent-1", 60_000, 5, 4, 40)];
+
+        s.apply_minute_rollups(&page).unwrap();
+
+        let stored = s.minute_rollups_since(i64::MIN, None, None, 10).unwrap();
+        assert_eq!(stored, page);
+    }
+
+    /// The hardest requirement on the backfill merge: a retried or replayed
+    /// page must land exactly once. `rollup_merge_from_backfill_sql` uses
+    /// `GREATEST` rather than addition precisely so this holds.
+    #[test]
+    fn applying_the_same_backfilled_rollup_page_twice_does_not_double_count() {
+        let s = Storage::open(":memory:").unwrap();
+        let page = vec![row("a", "agent-1", 60_000, 3, 2, 20)];
+
+        s.apply_minute_rollups(&page).unwrap();
+        s.apply_minute_rollups(&page).unwrap();
+
+        let stored = s.minute_rollups_since(i64::MIN, None, None, 10).unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "a replay must merge into the same row, not add another"
+        );
+        assert_eq!(
+            stored[0].attempts, 3,
+            "a replayed page must not inflate attempts"
+        );
+        assert_eq!(stored[0].up, 2);
+        assert_eq!(stored[0].latency_sum, 20);
+
+        // The digest's checksum is maintained by the same statement batch and
+        // must be exactly as replay-safe as the row it summarizes.
+        let digest = s.digest(0).unwrap().latency_minute_rollups;
+        assert_eq!(digest.count, 1);
+        assert_eq!(
+            digest.attempts_sum, 3,
+            "the digest checksum must not double-count a replay either"
+        );
+        assert_eq!(digest.up_sum, 2);
+        assert_eq!(digest.latency_sum_sum, 20);
+    }
+
+    /// A backfilled total only ever grows what is already held — it never
+    /// erases local progress a peer has not caught up to yet.
+    #[test]
+    fn a_backfilled_rollup_never_shrinks_a_larger_local_total() {
+        let s = Storage::open(":memory:").unwrap();
+        s.apply_minute_rollups(&[row("a", "agent-1", 60_000, 10, 8, 80)])
+            .unwrap();
+        // A peer's page for the same bucket, smaller in every field — as if
+        // it were still mid-catch-up itself.
+        s.apply_minute_rollups(&[row("a", "agent-1", 60_000, 4, 4, 40)])
+            .unwrap();
+
+        let stored = s.minute_rollups_since(i64::MIN, None, None, 10).unwrap();
+        assert_eq!(stored[0].attempts, 10);
+        assert_eq!(stored[0].up, 8);
+        assert_eq!(stored[0].latency_sum, 80);
+    }
+
+    /// `StreamDigest`'s shape (max position plus a count) would call these two
+    /// replicas converged: same bucket count, same newest bucket. Only the
+    /// counter totals `RollupDigest` adds tell them apart.
+    #[test]
+    fn rollup_digest_reflects_counter_totals_not_just_count_and_max() {
+        let behind = Storage::open(":memory:").unwrap();
+        let ahead = Storage::open(":memory:").unwrap();
+        behind
+            .apply_minute_rollups(&[row("a", "agent-1", 60_000, 3, 1, 10)])
+            .unwrap();
+        ahead
+            .apply_minute_rollups(&[row("a", "agent-1", 60_000, 5, 5, 50)])
+            .unwrap();
+
+        let behind_digest = behind.digest(0).unwrap().latency_minute_rollups;
+        let ahead_digest = ahead.digest(0).unwrap().latency_minute_rollups;
+        assert_eq!(behind_digest.count, ahead_digest.count);
+        assert_eq!(
+            behind_digest.max_bucket_start,
+            ahead_digest.max_bucket_start
+        );
+        assert_ne!(
+            behind_digest.attempts_sum, ahead_digest.attempts_sum,
+            "count and max agree, but the counters do not, and the digest must show it"
+        );
+    }
+
+    /// Item B: a detected gap is durable metadata, not an in-memory signal —
+    /// it must be there for an operator to read after any restart, not only
+    /// until the next one.
+    #[test]
+    fn a_raw_data_gap_survives_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "warden-raw-data-gap-{}.duckdb",
+            uuid::Uuid::now_v7()
+        ));
+        let path = path.to_string_lossy().into_owned();
+        let gap = RawDataGapRow {
+            check_id: cid("a"),
+            peer: "http://peer".into(),
+            from_ts: 1_000,
+            to_ts: 5_000,
+            observed_at: 9_000,
+        };
+        {
+            let s = Storage::open(&path).unwrap();
+            s.record_raw_data_gap(&gap).unwrap();
+        }
+
+        let reopened = Storage::open(&path).unwrap();
+        assert_eq!(reopened.list_raw_data_gaps().unwrap(), vec![gap.clone()]);
+
+        // The same standing gap, redetected on a later sweep with a fresher
+        // `observed_at`, must refresh the one row rather than accumulate a
+        // second one keyed the same way.
+        let refreshed = RawDataGapRow {
+            observed_at: 9_500,
+            ..gap
+        };
+        reopened.record_raw_data_gap(&refreshed).unwrap();
+        assert_eq!(
+            reopened.list_raw_data_gaps().unwrap(),
+            vec![refreshed],
+            "redetecting a standing gap must update it in place"
+        );
+    }
+
+    /// TODO.md: "evaluate an index or storage strategy for
+    /// `check_results(check_id, ts_millis)`." This is the measurement that
+    /// answers it, not an assumption either way.
+    ///
+    /// `check_results` has no index today beyond DuckDB's automatic per-row-group
+    /// zone maps: `ts_millis` is monotonically appended, so a time-bounded scan
+    /// already skips most row groups for free, but `check_id` has no locality —
+    /// every ingest batch interleaves every check — so a single-check read has
+    /// to evaluate `check_id = ?` against every row in whatever `ts_millis`
+    /// window survives pruning. An ART index on `(check_id, ts_millis)` is the
+    /// textbook fix for exactly that access pattern (`Storage::history`,
+    /// `Storage::latency_series`'s per-check filter). The question is whether it
+    /// is worth what DuckDB's own docs warn it costs: every insert into an
+    /// indexed table pays ART maintenance, and an index the buffer manager
+    /// cannot evict grows the resident memory floor for as long as any part of
+    /// it has been touched.
+    ///
+    /// Seeds the same representative shape as
+    /// `benchmark_representative_storage_capacity_baseline` twice — once with
+    /// the candidate index created before any data lands (the worst case: every
+    /// row ever written pays the maintenance cost, matching what putting it in
+    /// `Storage::open`'s DDL would mean), once without — and reports the read
+    /// and write sides side by side. Run with `WARDEN_BENCH_CHECKS`/
+    /// `WARDEN_BENCH_DAYS`/`WARDEN_BENCH_OBSERVATION_SECS`/
+    /// `WARDEN_BENCH_INGEST_ROUNDS` for other scales; the numbers recorded in
+    /// SCALING.md are the defaults below.
+    #[test]
+    #[ignore = "index tradeoff benchmark; configure WARDEN_BENCH_* for the intended scale"]
+    fn benchmark_check_results_check_id_ts_index_tradeoff() {
+        fn env_u64(name: &str, default: u64) -> u64 {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        }
+        fn percentile(samples: &mut [std::time::Duration], percentile: usize) -> u128 {
+            samples.sort_unstable();
+            samples[(samples.len() * percentile / 100).min(samples.len() - 1)].as_millis()
+        }
+        fn bytes(path: &std::path::Path) -> u64 {
+            std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+        }
+
+        let check_count = env_u64("WARDEN_BENCH_CHECKS", 1_000);
+        let days = env_u64("WARDEN_BENCH_DAYS", 7);
+        let observation_secs = env_u64("WARDEN_BENCH_OBSERVATION_SECS", 30);
+        let ingest_rounds = env_u64("WARDEN_BENCH_INGEST_ROUNDS", 20);
+        let observations_per_check = days * 86_400 / observation_secs;
+        let rows = check_count * observations_per_check;
+        let step_ms = observation_secs as i64 * 1_000;
+        let now = days as i64 * 86_400_000;
+
+        struct Report {
+            label: &'static str,
+            seed_ms: u128,
+            database_bytes: u64,
+            reopen_ms: u128,
+            history_p50_ms: u128,
+            history_p95_ms: u128,
+            latency_p50_ms: u128,
+            latency_p95_ms: u128,
+            ingest_rows_per_sec: f64,
+        }
+        let mut reports = Vec::new();
+
+        for (label, with_index) in [("no_index", false), ("with_index", true)] {
+            let path = std::env::temp_dir().join(format!(
+                "warden-check-results-index-bench-{label}-{}-{}.duckdb",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let wal_path = std::path::PathBuf::from(format!("{}.wal", path.display()));
+            let path_string = path.to_string_lossy().into_owned();
+            let store = Storage::open(&path_string).unwrap();
+            if with_index {
+                // Created immediately after the table, before any row lands —
+                // the same position a DDL-resident index would occupy in
+                // `Storage::open`, so seeding below pays maintenance on every
+                // row rather than a one-time bulk-build at the end.
+                store
+                    .conn
+                    .execute_batch(
+                        "CREATE INDEX bench_check_results_check_ts
+                         ON check_results (check_id, ts_millis)",
+                    )
+                    .unwrap();
+            }
+
+            let seed_started = std::time::Instant::now();
+            store
+                .conn
+                .execute_batch(&format!(
+                    "INSERT INTO check_results
+                     SELECT md5('check-' || check_number::VARCHAR)::UUID,
+                            'agent-' || (check_number % 3)::VARCHAR,
+                            observation_number * {step_ms},
+                            CASE WHEN (observation_number + check_number * 17) % 97 = 0
+                                 THEN 'down' ELSE 'up' END,
+                            15 + ((observation_number * 37 + check_number * 13) % 2_000),
+                            CASE WHEN (observation_number + check_number * 17) % 97 = 0
+                                 THEN 503 ELSE 200 END,
+                            NULL, NULL, 'zone', 'region'
+                     FROM range({check_count}) checks(check_number)
+                     CROSS JOIN range({observations_per_check}) observations(observation_number);"
+                ))
+                .unwrap();
+            store.rebuild_result_watermarks().unwrap();
+            store.rebuild_latest_check_results().unwrap();
+            // This bulk seed bypasses ordinary ingest, so latency rollups are
+            // backfilled here for the same reason `benchmark_checkpoint_after_prune`
+            // does it: leaving them empty would make the reopen below trigger
+            // `Storage::open`'s one-time rollup backfill instead of measuring
+            // an ordinary restart.
+            store.rebuild_latency_rollups().unwrap();
+            store.conn.execute_batch("CHECKPOINT").unwrap();
+            let seed_ms = seed_started.elapsed().as_millis();
+            assert_eq!(store.count_results().unwrap(), rows);
+            let database_bytes = bytes(&path);
+            drop(store);
+
+            // Reopen: what an index the docs call lazily-deserialized should
+            // cost at startup is "nothing more than the base table load" — this
+            // is the number that confirms or refutes that for the bundled
+            // DuckDB build rather than trusting the docs unverified.
+            let reopen_started = std::time::Instant::now();
+            let store = Storage::open(&path_string).unwrap();
+            let reopen_ms = reopen_started.elapsed().as_millis();
+
+            let check_ids: Vec<CheckId> = {
+                let mut stmt = store
+                    .conn
+                    .prepare("SELECT DISTINCT check_id FROM check_results")
+                    .unwrap();
+                stmt.query_map([], |r| r.get::<_, CheckId>(0))
+                    .unwrap()
+                    .collect::<std::result::Result<_, _>>()
+                    .unwrap()
+            };
+            assert_eq!(check_ids.len() as u64, check_count);
+            let hot_check_id = check_ids[0];
+
+            let mut history_samples = Vec::new();
+            let mut latency_samples = Vec::new();
+            for _ in 0..20 {
+                let started = std::time::Instant::now();
+                let history = store
+                    .history(hot_check_id, 100, Some(0), Some(now), None)
+                    .unwrap();
+                history_samples.push(started.elapsed());
+                assert_eq!(history.len(), 100);
+                let started = std::time::Instant::now();
+                let series = store.latency_series(hot_check_id, 0, now, 120).unwrap();
+                latency_samples.push(started.elapsed());
+                assert!(series.overall.attempts > 0);
+            }
+
+            // Sustained ingest landing on top of the seeded backlog: the shape
+            // that shows an index's steady-state per-row write cost, as
+            // opposed to seed_ms above which mixes that cost with the one-time
+            // bulk build. Every batch reuses the same check ids the backlog
+            // already holds millions of rows for, so this is an insert into an
+            // ART node that is already large, not an empty one.
+            let ingest_started = std::time::Instant::now();
+            for round in 0..ingest_rounds {
+                let ts = now + (round as i64 + 1) * step_ms;
+                let batch: Vec<(CheckResult, Status)> = check_ids
+                    .iter()
+                    .map(|&check_id| {
+                        (
+                            CheckResult {
+                                zone: "zone".into(),
+                                region: "region".into(),
+                                body: None,
+                                headers: None,
+                                check_id,
+                                agent_id: "agent-0".into(),
+                                kind: CheckKind::Http,
+                                timestamp: chrono::DateTime::from_timestamp_millis(ts).unwrap(),
+                                latency_ms: 20,
+                                status_code: Some(200),
+                                body_matched: None,
+                                error: None,
+                                failure: None,
+                                metric: None,
+                                metrics: None,
+                            },
+                            Status::Up,
+                        )
+                    })
+                    .collect();
+                store.persist_ingest(&batch, &[], &[]).unwrap();
+            }
+            let ingest_elapsed = ingest_started.elapsed();
+            let ingest_rows_per_sec =
+                (check_count * ingest_rounds) as f64 / ingest_elapsed.as_secs_f64();
+
+            reports.push(Report {
+                label,
+                seed_ms,
+                database_bytes,
+                reopen_ms,
+                history_p50_ms: percentile(&mut history_samples, 50),
+                history_p95_ms: percentile(&mut history_samples, 95),
+                latency_p50_ms: percentile(&mut latency_samples, 50),
+                latency_p95_ms: percentile(&mut latency_samples, 95),
+                ingest_rows_per_sec,
+            });
+
+            drop(store);
+            let _ = std::fs::remove_file(wal_path);
+            let _ = std::fs::remove_file(path);
+        }
+
+        eprintln!(
+            "checks={check_count} days={days} observation_secs={observation_secs} \
+             retained_rows={rows} ingest_rounds={ingest_rounds}"
+        );
+        for r in &reports {
+            eprintln!(
+                "{label}: seed_ms={seed_ms} database_bytes={database_bytes} reopen_ms={reopen_ms} \
+                 history_p50_ms={history_p50_ms} history_p95_ms={history_p95_ms} \
+                 latency_p50_ms={latency_p50_ms} latency_p95_ms={latency_p95_ms} \
+                 ingest_rows_per_sec={ingest_rows_per_sec:.0}",
+                label = r.label,
+                seed_ms = r.seed_ms,
+                database_bytes = r.database_bytes,
+                reopen_ms = r.reopen_ms,
+                history_p50_ms = r.history_p50_ms,
+                history_p95_ms = r.history_p95_ms,
+                latency_p50_ms = r.latency_p50_ms,
+                latency_p95_ms = r.latency_p95_ms,
+                ingest_rows_per_sec = r.ingest_rows_per_sec,
+            );
+        }
+    }
+
+    /// TODO.md: "evaluate indexes for alert, incident, and state-history lookup
+    /// patterns." State-history is not benchmarked here: every lookup this
+    /// codebase makes against it (`record_state`, `state_spans`, the prune
+    /// anti-join) leads with `check_id`, which is already the first column of
+    /// its declared `PRIMARY KEY (check_id, since)` — DuckDB builds an ART for
+    /// every PRIMARY KEY automatically, so that table already has the index
+    /// this TODO item would otherwise add. `list_status` and `uptime_strips`
+    /// scan the whole table unfiltered by check_id (they want every check at
+    /// once), which a `check_id`-leading index cannot help regardless.
+    ///
+    /// What is unindexed is the *reverse* lookups: `alerts` is scanned by
+    /// `ts_millis` (`recent_alerts`, `alerts_since`, the retention delete) with
+    /// only an `id` primary key, and `incident_checks` is scanned by
+    /// `check_id` (`open_incident_for`, `incidents_for_check`) with only a
+    /// `(incident_id, check_id)` primary key that does not lead with the
+    /// column being filtered on. Both tables are bounded by `alerts_days`
+    /// retention rather than by raw observation volume, so they stay orders of
+    /// magnitude smaller than `check_results` — seeded here at a deliberately
+    /// pessimistic upper bound: every check flapping roughly daily for the
+    /// full 90-day default retention.
+    #[test]
+    #[ignore = "index tradeoff benchmark; configure WARDEN_BENCH_* for the intended scale"]
+    fn benchmark_alert_incident_lookup_index_tradeoff() {
+        fn env_u64(name: &str, default: u64) -> u64 {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        }
+        fn percentile(samples: &mut [std::time::Duration], percentile: usize) -> u128 {
+            samples.sort_unstable();
+            samples[(samples.len() * percentile / 100).min(samples.len() - 1)].as_millis()
+        }
+        fn bytes(path: &std::path::Path) -> u64 {
+            std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+        }
+
+        let alert_count = env_u64("WARDEN_BENCH_ALERTS", 900_000);
+        let incident_count = env_u64("WARDEN_BENCH_INCIDENTS", 45_000);
+        let check_pool = env_u64("WARDEN_BENCH_CHECK_POOL", 10_000);
+        let write_rounds = env_u64("WARDEN_BENCH_ALERT_WRITE_ROUNDS", 2_000);
+
+        struct Report {
+            label: &'static str,
+            seed_ms: u128,
+            database_bytes: u64,
+            reopen_ms: u128,
+            recent_alerts_p95_ms: u128,
+            alerts_since_p95_ms: u128,
+            open_incident_for_p95_ms: u128,
+            incidents_for_check_p95_ms: u128,
+            insert_alert_rows_per_sec: f64,
+        }
+        let mut reports = Vec::new();
+
+        for (label, with_index) in [("no_index", false), ("with_index", true)] {
+            let path = std::env::temp_dir().join(format!(
+                "warden-alert-incident-index-bench-{label}-{}-{}.duckdb",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let wal_path = std::path::PathBuf::from(format!("{}.wal", path.display()));
+            let path_string = path.to_string_lossy().into_owned();
+            let store = Storage::open(&path_string).unwrap();
+            if with_index {
+                store
+                    .conn
+                    .execute_batch(
+                        "CREATE INDEX bench_alerts_ts ON alerts (ts_millis);
+                         CREATE INDEX bench_incident_checks_check ON incident_checks (check_id)",
+                    )
+                    .unwrap();
+            }
+
+            let seed_started = std::time::Instant::now();
+            store
+                .conn
+                .execute_batch(&format!(
+                    "INSERT INTO incidents
+                         (id, title, state, started_at, resolved_at, global, origin_check,
+                          version_millis, version_node)
+                     SELECT 'incident-' || i::VARCHAR, 'Down',
+                            CASE WHEN i % 20 = 0 THEN 'detected' ELSE 'resolved' END,
+                            i * 60_000,
+                            CASE WHEN i % 20 = 0 THEN NULL ELSE i * 60_000 + 30_000 END,
+                            FALSE,
+                            md5('check-' || (i % {check_pool})::VARCHAR)::UUID,
+                            i * 60_000, 'bench-node'
+                     FROM range({incident_count}) t(i);
+                     INSERT INTO incident_checks (incident_id, check_id, source)
+                     SELECT 'incident-' || i::VARCHAR,
+                            md5('check-' || (i % {check_pool})::VARCHAR)::UUID, 'origin'
+                     FROM range({incident_count}) t(i);
+                     INSERT INTO alerts
+                         (id, scope, node_id, previous_state, current_state, ts_millis, incident_id)
+                     SELECT 'alert-' || i::VARCHAR, 'check',
+                            md5('check-' || (i % {check_pool})::VARCHAR)::VARCHAR,
+                            'up', CASE WHEN i % 2 = 0 THEN 'down' ELSE 'up' END, i * 1_000,
+                            'incident-' || (i % {incident_count})::VARCHAR
+                     FROM range({alert_count}) t(i);"
+                ))
+                .unwrap();
+            store.conn.execute_batch("CHECKPOINT").unwrap();
+            let seed_ms = seed_started.elapsed().as_millis();
+            let database_bytes = bytes(&path);
+            drop(store);
+
+            let reopen_started = std::time::Instant::now();
+            let store = Storage::open(&path_string).unwrap();
+            let reopen_ms = reopen_started.elapsed().as_millis();
+
+            let hot_check_id: CheckId = store
+                .conn
+                .query_row(
+                    "SELECT check_id FROM incident_checks
+                     GROUP BY check_id ORDER BY COUNT(*) DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+
+            let mut recent_alerts_samples = Vec::new();
+            let mut alerts_since_samples = Vec::new();
+            let mut open_incident_for_samples = Vec::new();
+            let mut incidents_for_check_samples = Vec::new();
+            for _ in 0..20 {
+                let started = std::time::Instant::now();
+                let recent = store.recent_alerts(50).unwrap();
+                recent_alerts_samples.push(started.elapsed());
+                assert_eq!(recent.len(), 50);
+
+                let started = std::time::Instant::now();
+                let since = store
+                    .alerts_since(alert_count as i64 * 1_000 / 2, "", 50)
+                    .unwrap();
+                alerts_since_samples.push(started.elapsed());
+                assert_eq!(since.len(), 50);
+
+                let started = std::time::Instant::now();
+                store.open_incident_for(hot_check_id).unwrap();
+                open_incident_for_samples.push(started.elapsed());
+
+                let started = std::time::Instant::now();
+                let incidents = store.incidents_for_check(hot_check_id, 50).unwrap();
+                incidents_for_check_samples.push(started.elapsed());
+                assert!(!incidents.is_empty());
+            }
+
+            // Alerts are inserted one confirmed transition at a time, never in
+            // bulk, so the write-cost question here is per-row `INSERT` cost
+            // against an already-large table, not a bulk-load rate.
+            let write_started = std::time::Instant::now();
+            for i in 0..write_rounds {
+                store
+                    .insert_alert(
+                        AlertScope::Check,
+                        &format!("write-check-{i}"),
+                        Some(NodeState::Up),
+                        NodeState::Down,
+                        alert_count as i64 * 1_000 + i as i64,
+                        None,
+                    )
+                    .unwrap();
+            }
+            let write_elapsed = write_started.elapsed();
+            let insert_alert_rows_per_sec = write_rounds as f64 / write_elapsed.as_secs_f64();
+
+            reports.push(Report {
+                label,
+                seed_ms,
+                database_bytes,
+                reopen_ms,
+                recent_alerts_p95_ms: percentile(&mut recent_alerts_samples, 95),
+                alerts_since_p95_ms: percentile(&mut alerts_since_samples, 95),
+                open_incident_for_p95_ms: percentile(&mut open_incident_for_samples, 95),
+                incidents_for_check_p95_ms: percentile(&mut incidents_for_check_samples, 95),
+                insert_alert_rows_per_sec,
+            });
+
+            drop(store);
+            let _ = std::fs::remove_file(wal_path);
+            let _ = std::fs::remove_file(path);
+        }
+
+        eprintln!(
+            "alerts={alert_count} incidents={incident_count} check_pool={check_pool} \
+             write_rounds={write_rounds}"
+        );
+        for r in &reports {
+            eprintln!(
+                "{label}: seed_ms={seed_ms} database_bytes={database_bytes} reopen_ms={reopen_ms} \
+                 recent_alerts_p95_ms={recent_alerts_p95_ms} alerts_since_p95_ms={alerts_since_p95_ms} \
+                 open_incident_for_p95_ms={open_incident_for_p95_ms} \
+                 incidents_for_check_p95_ms={incidents_for_check_p95_ms} \
+                 insert_alert_rows_per_sec={insert_alert_rows_per_sec:.0}",
+                label = r.label,
+                seed_ms = r.seed_ms,
+                database_bytes = r.database_bytes,
+                reopen_ms = r.reopen_ms,
+                recent_alerts_p95_ms = r.recent_alerts_p95_ms,
+                alerts_since_p95_ms = r.alerts_since_p95_ms,
+                open_incident_for_p95_ms = r.open_incident_for_p95_ms,
+                incidents_for_check_p95_ms = r.incidents_for_check_p95_ms,
+                insert_alert_rows_per_sec = r.insert_alert_rows_per_sec,
+            );
+        }
     }
 }

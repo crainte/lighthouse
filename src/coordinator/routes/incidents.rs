@@ -122,13 +122,6 @@ struct IncidentsResponse {
     incidents: Vec<IncidentDto>,
 }
 
-/// Largest incident page accepted by public list routes.
-const MAX_INCIDENT_PAGE_SIZE: usize = 1_000;
-
-fn bounded_incident_page_size(requested: Option<usize>, default: usize) -> usize {
-    requested.unwrap_or(default).min(MAX_INCIDENT_PAGE_SIZE)
-}
-
 /// Query for the incidents endpoints. `status` mirrors the incident's
 /// lifecycle, not a check's UP/DOWN/UNKNOWN: `?status=open` lists only current
 /// outages, which is any state other than resolved.
@@ -219,7 +212,7 @@ pub(in crate::coordinator) async fn incidents_handler(
     State(coord): State<Coordinator>,
     Query(q): Query<IncidentQuery>,
 ) -> Response {
-    let limit = bounded_incident_page_size(q.limit, 50);
+    let limit = crate::page::bounded(q.limit, 50);
     let open_only = incident_open_filter(q.status.as_deref());
     let now = chrono::Utc::now().timestamp_millis();
     match coord
@@ -597,7 +590,7 @@ pub(in crate::coordinator) async fn check_incidents_handler(
     Path(id): Path<crate::models::CheckId>,
     Query(q): Query<IncidentQuery>,
 ) -> Response {
-    let limit = bounded_incident_page_size(q.limit, 20);
+    let limit = crate::page::bounded(q.limit, 20);
     let now = chrono::Utc::now().timestamp_millis();
     match coord
         .db(move |storage| {
@@ -614,20 +607,5 @@ pub(in crate::coordinator) async fn check_incidents_handler(
     {
         Ok(incidents) => Json(IncidentsResponse { incidents }).into_response(),
         Err(e) => internal_error(e),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn incident_page_size_uses_defaults_and_caps_requested_values() {
-        assert_eq!(bounded_incident_page_size(None, 50), 50);
-        assert_eq!(bounded_incident_page_size(Some(20), 50), 20);
-        assert_eq!(
-            bounded_incident_page_size(Some(MAX_INCIDENT_PAGE_SIZE + 1), 50),
-            MAX_INCIDENT_PAGE_SIZE
-        );
     }
 }

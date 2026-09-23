@@ -162,6 +162,16 @@ pub struct CoordinatorConfig {
     /// request headers, which untrusted clients can forge.
     #[serde(default)]
     pub secure_cookies: bool,
+    /// Reverse proxies (or load balancers) allowed to supply `X-Forwarded-For`,
+    /// as bare IPs or CIDR blocks (`"10.0.0.0/8"`).
+    ///
+    /// Empty is the default and the safe one: login rate limiting keys on the
+    /// raw peer address exactly as it always has, and a header a client set
+    /// itself is never consulted. Populating this list is what lets a
+    /// deployment behind a reverse proxy rate-limit per real client instead
+    /// of per shared proxy bucket — see `crate::security::client_ip`.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
     /// How long result, alert and incident history is kept. A nightly prune
     /// deletes rows older than this; raising the values keeps more history.
     #[serde(default)]
@@ -302,6 +312,13 @@ pub struct GlobalConfig {
     /// served over TLS or behind a trusted TLS-terminating proxy.
     #[serde(default)]
     pub secure_cookies: bool,
+    /// Reverse proxies allowed to supply `X-Forwarded-For` for this node's
+    /// own login rate limiting. See `coordinator.trusted_proxies`; the same
+    /// contract, kept as a second field because it names a different
+    /// deployment's proxies rather than sharing this project's only other
+    /// notion of trust.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
     /// Secret regional coordinators must present to push state. Required in
     /// `global` mode: an unauthenticated push endpoint would let anyone rewrite
     /// what the global dashboard shows. Falls back to `WARDEN_GLOBAL_TOKEN`.
@@ -330,6 +347,43 @@ pub struct GlobalConfig {
     /// regions unreachable.
     #[serde(default, alias = "region")]
     pub regions: Vec<GlobalRegion>,
+    /// Where the global tier's own catalogue lives (SCALING.md "Placement-scoped
+    /// configuration", Phase 1). Unlike a coordinator this holds no results or
+    /// rollups — `Storage::open` still creates those tables because it is the
+    /// same schema, but nothing ever writes a row into them from here; only
+    /// `checks` and `sections` (see `global::store`) are ever touched.
+    #[serde(default = "default_db_path")]
+    pub db_path: String,
+    /// Other global nodes to *contact first*, as base URLs. Same contract as
+    /// `coordinator.peers`: a seed list, not the membership, and peers
+    /// authenticate with `peer_token`. Empty means a standalone global node,
+    /// which is a complete Phase 1 deployment on its own — Phase 4 is running
+    /// three of them with this set.
+    #[serde(default)]
+    pub peers: Vec<String>,
+    /// Shared secret global nodes present to each other on `/internal/*`.
+    /// Unset means clustering is refused, exactly like `coordinator.peer_token`.
+    #[serde(default)]
+    pub peer_token: Option<String>,
+    /// Stable identity of this global node within its own cluster. Unset means
+    /// one is generated on first boot and persisted in `settings`, so a restart
+    /// rejoins as itself. Also breaks HLC ties for the catalogue's clock.
+    #[serde(default)]
+    pub node_id: Option<String>,
+    /// How peers reach *this* node, as a base URL. Required when `peers` is
+    /// non-empty, for the same reason as a coordinator's.
+    #[serde(default)]
+    pub advertise_url: Option<String>,
+    /// How often this node pings every known global peer.
+    #[serde(default = "default_gossip_interval_secs")]
+    pub gossip_interval_secs: u64,
+    /// Silence after which a peer becomes `suspect`, then `dead`.
+    #[serde(default = "default_peer_timeout_secs")]
+    pub peer_timeout_secs: u64,
+    /// How often this node reconciles its catalogue with a peer global node by
+    /// digest, and with every region it knows of.
+    #[serde(default = "default_anti_entropy_secs")]
+    pub anti_entropy_secs: u64,
 }
 
 /// One `[[global.region]]` block: a region name and the coordinator endpoints
@@ -349,10 +403,19 @@ impl Default for GlobalConfig {
             listen: default_global_listen(),
             admin_password: None,
             secure_cookies: false,
+            trusted_proxies: Vec::new(),
             token: None,
             region_staleness_secs: default_region_staleness_secs(),
             notifiers: Vec::new(),
             regions: Vec::new(),
+            db_path: default_db_path(),
+            peers: Vec::new(),
+            peer_token: None,
+            node_id: None,
+            advertise_url: None,
+            gossip_interval_secs: default_gossip_interval_secs(),
+            peer_timeout_secs: default_peer_timeout_secs(),
+            anti_entropy_secs: default_anti_entropy_secs(),
         }
     }
 }
@@ -374,7 +437,36 @@ impl GlobalConfig {
             .filter(|s| !s.is_empty())
     }
 
-    /// Refuse to start a global node that would accept anonymous pushes.
+    /// Secret global peers present to each other on `/internal/*`. Same
+    /// environment fallback name as a coordinator's: a process is always
+    /// exactly one of the two, so the two never collide.
+    pub fn resolved_peer_token(&self) -> Option<String> {
+        self.peer_token
+            .clone()
+            .or_else(|| std::env::var("WARDEN_PEER_TOKEN").ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn resolved_advertise_url(&self) -> Option<String> {
+        self.advertise_url
+            .clone()
+            .or_else(|| std::env::var("WARDEN_ADVERTISE_URL").ok())
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn resolved_node_id(&self) -> Option<String> {
+        self.node_id
+            .clone()
+            .or_else(|| std::env::var("WARDEN_NODE_ID").ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Refuse to start a global node that would accept anonymous pushes, or a
+    /// half-configured global-to-global cluster — same reasoning as
+    /// `CoordinatorConfig::validate_cluster`.
     pub fn validate(&self) -> Result<()> {
         if self.resolved_token().is_none() {
             anyhow::bail!(
@@ -382,6 +474,25 @@ impl GlobalConfig {
                  WARDEN_GLOBAL_TOKEN) to the same value the regional \
                  coordinators present in [coordinator.global] token."
             );
+        }
+        crate::security::TrustedProxies::parse(&self.trusted_proxies)
+            .map_err(|e| anyhow::anyhow!("global.trusted_proxies: {e}"))?;
+        if !self.peers.is_empty() {
+            if self.resolved_peer_token().is_none() {
+                anyhow::bail!(
+                    "global.peers is set but peer_token is not: peers would refuse \
+                     every message. Set peer_token (or WARDEN_PEER_TOKEN) to the \
+                     same value on every global node."
+                );
+            }
+            if self.resolved_advertise_url().is_none() {
+                anyhow::bail!(
+                    "global.peers is set but advertise_url is not: peers would have \
+                     no address to reach this node on. Set advertise_url (or \
+                     WARDEN_ADVERTISE_URL) to this node's base URL, e.g. \
+                     http://global-a:8080"
+                );
+            }
         }
         Ok(())
     }
@@ -1401,6 +1512,62 @@ impl CheckConfig {
         ))
     }
 
+    /// Parse an admin-submitted document. The wire type is `CheckConfig`
+    /// itself — a parallel DTO duplicated twenty-odd fields and two
+    /// conversions for no gain, and a field added to one and forgotten in the
+    /// other is exactly the drift that would silently drop a setting on save.
+    ///
+    /// Shared by the coordinator's own admin API (`routes::checks`) and the
+    /// global tier's (`global::store`): both accept the same JSON shape from
+    /// the same admin console, so both parse it the same way. It carries the
+    /// target, so the result must only ever be produced behind authentication.
+    pub fn from_submitted(body: serde_json::Value, new_default: bool) -> Result<Self, String> {
+        let has_failure_threshold = body.get("failures_before_down").is_some();
+        let mut check: CheckConfig = serde_json::from_value(body).map_err(|e| e.to_string())?;
+        if new_default && !has_failure_threshold {
+            check.failures_before_down = NEW_CHECK_FAILURES_BEFORE_DOWN;
+        }
+        Ok(check)
+    }
+
+    /// Trim the strings a form submits and drop the blanks, so an untouched
+    /// field means "unset" rather than a group literally named "". Shared for
+    /// the same reason `from_submitted` is.
+    pub fn normalised(mut self) -> Self {
+        let blank_to_none = |s: Option<String>| s.filter(|v: &String| !v.trim().is_empty());
+        self.name = self.name.trim().to_string();
+        self.target = self.target.trim().to_string();
+        self.cron = self.cron.trim().to_string();
+        self.group = blank_to_none(self.group);
+        self.eval = blank_to_none(self.eval);
+        self.description = blank_to_none(self.description);
+        self.image = blank_to_none(self.image);
+        self.tag = blank_to_none(self.tag);
+        self.expect.body_contains = blank_to_none(self.expect.body_contains);
+        self.dns.nameserver = blank_to_none(self.dns.nameserver);
+        self.hosts = self
+            .hosts
+            .into_iter()
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty())
+            .collect();
+        self.agents = self
+            .agents
+            .into_iter()
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .collect();
+        self.dns.expected = self
+            .dns
+            .expected
+            .into_iter()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .collect();
+        self.headers.retain(|h| !h.name.trim().is_empty());
+        self
+    }
+
     /// Reject a check that could not work, before it reaches storage. The admin
     /// UI can submit anything, so the rules live with the type rather than in
     /// one handler.
@@ -1682,6 +1849,7 @@ impl Default for CoordinatorConfig {
             notifiers: Vec::new(),
             admin_password: None,
             secure_cookies: false,
+            trusted_proxies: Vec::new(),
             retention: RetentionConfig::default(),
             peers: Vec::new(),
             peer_token: None,

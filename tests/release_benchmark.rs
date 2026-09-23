@@ -420,8 +420,11 @@ async fn release_benchmark_three_peers_one_region_global_live_agents_and_retenti
             listen: "127.0.0.1:0".into(),
             token: Some(global_token.clone()),
             regions: Vec::new(),
+            db_path: ":memory:".into(),
             ..Default::default()
         })
+        .await
+        .unwrap()
         .router(),
     )
     .await;

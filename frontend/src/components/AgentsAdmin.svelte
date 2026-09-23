@@ -18,10 +18,15 @@
   const LARGE_FLEET = 100;
 
   let agents = $state<Agent[]>([]);
+  // The arrays are a server-capped sample; the totals are the real finding.
+  // A region that loses its agents orphans every check it holds, and naming
+  // all of them would make this banner cost what the status page costs.
   let orphaned = $state<string[]>([]);
+  let orphanedTotal = $state(0);
   // Separate from `orphaned` because the remedy is different: those agents are
   // not missing, they are too old to run the kind they were given.
   let unrunnable = $state<string[]>([]);
+  let unrunnableTotal = $state(0);
   // `orphaned`/`unrunnable` are check names, not ids — the editor route needs
   // the id, so this resolves one from the other for the orphan links below.
   let idByName = $state<Map<string, string>>(new Map());
@@ -332,7 +337,9 @@
       const [r, checks] = await Promise.all([fetchAgents(), fetchAdminChecks()]);
       agents = r.agents;
       orphaned = r.checks_with_no_live_agent;
+      orphanedTotal = r.checks_with_no_live_agent_total;
       unrunnable = r.checks_no_agent_can_run;
+      unrunnableTotal = r.checks_no_agent_can_run_total;
       idByName = new Map(checks.map((c) => [c.name, c.id]));
     } catch (e) {
       loadError = fail(e);
@@ -395,11 +402,11 @@
     </div>
   </div>
 
-  {#if orphaned.length > 0}
+  {#if orphanedTotal > 0}
     <div class="admin-panel orphans">
       <div class="orphan-title">
-        {orphaned.length}
-        {orphaned.length === 1 ? 'check has' : 'checks have'} no live agent
+        {orphanedTotal}
+        {orphanedTotal === 1 ? 'check has' : 'checks have'} no live agent
       </div>
       <p class="orphan-note">
         Enabled and configured, but every agent each one names has gone silent. Nothing is probing
@@ -412,14 +419,20 @@
           <button class="orphan-link" onclick={() => onopen(idByName.get(n) ?? n)}>{n}</button>
         {/each}
       </div>
+      {#if orphanedTotal > orphaned.length}
+        <p class="orphan-note">
+          Showing {orphaned.length} of {orphanedTotal}. A list this long is a fleet problem, not a
+          check problem — find the agents that stopped reporting.
+        </p>
+      {/if}
     </div>
   {/if}
 
-  {#if unrunnable.length > 0}
+  {#if unrunnableTotal > 0}
     <div class="admin-panel orphans">
       <div class="orphan-title">
-        {unrunnable.length}
-        {unrunnable.length === 1 ? 'check needs' : 'checks need'} a newer agent
+        {unrunnableTotal}
+        {unrunnableTotal === 1 ? 'check needs' : 'checks need'} a newer agent
       </div>
       <p class="orphan-note">
         Every agent eligible for these is reporting normally but has said it cannot probe that check
@@ -432,6 +445,11 @@
           <button class="orphan-link" onclick={() => onopen(idByName.get(n) ?? n)}>{n}</button>
         {/each}
       </div>
+      {#if unrunnableTotal > unrunnable.length}
+        <p class="orphan-note">
+          Showing {unrunnable.length} of {unrunnableTotal}.
+        </p>
+      {/if}
     </div>
   {/if}
 

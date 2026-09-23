@@ -4,11 +4,11 @@
 //! **A check definition is authoritative as a JSON document, not a set of
 //! columns.** `write_config` persists the whole `CheckConfig` and stamps it
 //! for replication in one step, so there is no partial-field update to get
-//! half-applied on this node or half-propagated to a peer. That is also why
-//! `normalise` — trimming form input and dropping blanks — lives next to the
-//! handlers that accept an edit rather than in `storage` or in `CheckConfig`
-//! itself: it is about what makes a submitted document fit to save, the same
-//! job `validate` does immediately after.
+//! half-applied on this node or half-propagated to a peer. Parsing a
+//! submission and trimming it — `CheckConfig::from_submitted` and
+//! `normalised` — live on `CheckConfig` itself rather than here, because the
+//! global tier's own admin API (`global::store`) accepts the exact same JSON
+//! shape from the exact same console and must parse it identically.
 //!
 //! **Identity is the path id, never the body.** `update_check_handler` always
 //! overwrites `body.id` with the path parameter, so a client cannot move an
@@ -32,7 +32,7 @@ use super::super::{
 use super::session::{bearer, require_admin};
 use crate::config::CheckConfig;
 use crate::models::{CheckId, CheckResult};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -40,8 +40,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::info;
 
-/// Trim the strings a form submits and drop the blanks, so an untouched field
-/// means "unset" rather than a group literally named "" or an agent id of "".
+/// Whether the caller authenticated with a cross-node secret rather than an
+/// admin session — the global tier relaying a write it already decided, or
+/// another coordinator in this region.
 fn is_peer_request(coord: &Coordinator, headers: &HeaderMap) -> bool {
     use subtle::ConstantTimeEq;
     let Some(got) = bearer(headers) else {
@@ -68,59 +69,38 @@ fn parse_check_id(id: &str) -> Result<CheckId, Box<Response>> {
         .map_err(|_| Box::new(error_response(StatusCode::NOT_FOUND, "no such check")))
 }
 
-fn normalise(mut c: CheckConfig) -> CheckConfig {
-    let blank_to_none = |s: Option<String>| s.filter(|v: &String| !v.trim().is_empty());
-    c.name = c.name.trim().to_string();
-    c.target = c.target.trim().to_string();
-    c.cron = c.cron.trim().to_string();
-    c.group = blank_to_none(c.group);
-    c.eval = blank_to_none(c.eval);
-    c.description = blank_to_none(c.description);
-    c.image = blank_to_none(c.image);
-    c.tag = blank_to_none(c.tag);
-    c.expect.body_contains = blank_to_none(c.expect.body_contains);
-    c.dns.nameserver = blank_to_none(c.dns.nameserver);
-    c.hosts = c
-        .hosts
-        .into_iter()
-        .map(|h| h.trim().to_string())
-        .filter(|h| !h.is_empty())
-        .collect();
-    c.agents = c
-        .agents
-        .into_iter()
-        .map(|a| a.trim().to_string())
-        .filter(|a| !a.is_empty())
-        .collect();
-    c.dns.expected = c
-        .dns
-        .expected
-        .into_iter()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .collect();
-    c.headers.retain(|h| !h.name.trim().is_empty());
-    c
-}
-
-/// The admin wire type is `CheckConfig` itself. A parallel DTO duplicated
-/// twenty-odd fields and two conversions for no gain — and a field added to one
-/// and forgotten in the other is exactly the drift that would silently drop a
-/// setting on save.
-///
-/// It carries the target, so it must only ever be produced behind authentication.
-fn submitted_check(body: Value, new_default: bool) -> Result<CheckConfig, String> {
-    let has_failure_threshold = body.get("failures_before_down").is_some();
-    let mut check: CheckConfig = serde_json::from_value(body).map_err(|e| e.to_string())?;
-    if new_default && !has_failure_threshold {
-        check.failures_before_down = crate::config::NEW_CHECK_FAILURES_BEFORE_DOWN;
-    }
-    Ok(check)
-}
-
 #[derive(Serialize)]
 struct AdminChecksResponse {
     checks: Vec<CheckConfig>,
+    /// Checks in the catalogue, not in this page. The console's dependency
+    /// pickers and section editors want the whole list, so they page until
+    /// `has_more` is false rather than being handed all of it at once.
+    total: usize,
+    has_more: bool,
+}
+
+impl AdminChecksResponse {
+    /// The whole catalogue, for the write paths that answer with the list they
+    /// just rewrote. These are bounded by what an operator can edit in one
+    /// request, not by how many checks exist.
+    fn whole(checks: Vec<CheckConfig>) -> Self {
+        Self {
+            total: checks.len(),
+            has_more: false,
+            checks,
+        }
+    }
+}
+
+/// Paging for the admin catalogue. The default is the shared ceiling rather
+/// than a screenful: this list is a lookup table for half the console, and a
+/// small default would turn every consumer into a paging loop for the sake of
+/// deployments that have no pages. The ceiling is the point — one request must
+/// not be able to ask the single database worker for ten thousand documents.
+#[derive(Deserialize)]
+pub(in crate::coordinator) struct AdminChecksQuery {
+    page: Option<usize>,
+    limit: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -131,12 +111,25 @@ pub(in crate::coordinator) struct CheckResponse {
 pub(in crate::coordinator) async fn list_checks_handler(
     State(coord): State<Coordinator>,
     headers: HeaderMap,
+    Query(q): Query<AdminChecksQuery>,
 ) -> Response {
     if let Some(denied) = require_admin(&coord, &headers) {
         return denied;
     }
+    let (page, limit) = (
+        q.page.unwrap_or(0),
+        crate::page::bounded(q.limit, crate::page::MAX_PAGE_SIZE),
+    );
     match coord.db(|storage| storage.list_checks()).await {
-        Ok(checks) => Json(AdminChecksResponse { checks }).into_response(),
+        Ok(mut checks) => {
+            let (total, has_more) = crate::page::take(&mut checks, page, limit);
+            Json(AdminChecksResponse {
+                checks,
+                total,
+                has_more,
+            })
+            .into_response()
+        }
         Err(e) => internal_error(e),
     }
 }
@@ -150,8 +143,8 @@ pub(in crate::coordinator) async fn create_check_handler(
         return denied;
     }
     let trusted_global = is_peer_request(&coord, &headers);
-    let mut check = match submitted_check(body, !trusted_global) {
-        Ok(check) => normalise(check),
+    let mut check = match CheckConfig::from_submitted(body, !trusted_global) {
+        Ok(check) => check.normalised(),
         Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
     };
     // Browser callers never choose identity. The global coordinator uses the
@@ -197,8 +190,8 @@ pub(in crate::coordinator) async fn update_check_handler(
         Ok(id) => id,
         Err(denied) => return *denied,
     };
-    let mut check = match submitted_check(body, false) {
-        Ok(check) => normalise(check),
+    let mut check = match CheckConfig::from_submitted(body, false) {
+        Ok(check) => check.normalised(),
         Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
     };
     // The id is the identity, never the body's. A client cannot move an edit
@@ -388,7 +381,7 @@ pub(in crate::coordinator) async fn reorder_checks_handler(
                 .await;
         }
     }
-    Json(AdminChecksResponse { checks }).into_response()
+    Json(AdminChecksResponse::whole(checks)).into_response()
 }
 
 /// Record a heartbeat ping. The immutable UUID keeps this URL stable when the

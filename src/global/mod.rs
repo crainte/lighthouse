@@ -8,8 +8,13 @@
 //! node today; the push/cache split is shaped so global-to-global replication
 //! can be added later without changing the wire format (see [`wire`]).
 
+mod admin;
 pub mod alert;
 pub mod cache;
+pub mod cluster;
+pub mod incidents;
+pub mod reconcile;
+pub mod store;
 pub mod wire;
 
 use crate::config::GlobalConfig;
@@ -19,7 +24,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{any, get, post, put};
 use axum::{body::Bytes, Json, Router};
 use cache::GlobalCache;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
@@ -58,18 +63,47 @@ struct Inner {
     auth: crate::auth::Auth,
     /// Secret regional coordinators present on `/internal/global/*`. Also the
     /// credential the global node presents *back* to a region as a `Bearer` to
-    /// relay admin operations an operator drives from the global dashboard.
+    /// relay admin operations an operator drives from the global dashboard,
+    /// and as the push destination for the durable catalogue in `store`.
     token: Option<String>,
     secure_cookies: bool,
+    /// Reverse proxies trusted to supply `X-Forwarded-For` for login rate
+    /// limiting, parsed by `GlobalConfig::validate`. `new` is not fallible,
+    /// so a config that bypassed `validate` (only possible from a direct,
+    /// non-`main` construction, e.g. a test) falls back to trusting nothing.
+    trusted_proxies: crate::security::TrustedProxies,
     /// Client for proxying drill-down reads and admin writes to regions.
     client: reqwest::Client,
     /// Fan-out for dashboard WebSocket clients. A `state_change` is published
     /// here whenever an incoming push moves a check's cross-region rollup.
     events: broadcast::Sender<GlobalWsEvent>,
+    /// The durable catalogue (SCALING.md "Placement-scoped configuration",
+    /// Phase 1). Authoritative for checks and sections; everything else the
+    /// global dashboard edits still goes straight to regions the way it
+    /// always has. See `store`'s module doc.
+    store: store::GlobalStore,
+    /// Membership and config anti-entropy against other global nodes
+    /// (Phase 4). `None` when `global.peers` is not configured — a single
+    /// global node is a complete deployment on its own.
+    cluster: Option<Arc<crate::coordinator::cluster::Cluster>>,
+    /// Secret other global nodes present on `/internal/*`. Kept alongside
+    /// `cluster` rather than read out of it: a coordinator's own
+    /// `require_peer` gates the same way, against its own copy rather than
+    /// reaching into `Cluster`, which has no public accessor for it.
+    peer_token: Option<String>,
+    /// How often `spawn_background`'s heartbeat loop pings every global peer.
+    gossip_interval_secs: u64,
+    /// How often `spawn_background`'s anti-entropy loop reconciles the
+    /// catalogue with a peer global node and with every known region.
+    anti_entropy_secs: u64,
 }
 
 impl GlobalNode {
-    pub fn new(cfg: &GlobalConfig) -> Self {
+    /// Opens the durable catalogue and, when `global.peers` is configured,
+    /// this node's own cluster membership — the two things a global node
+    /// needs that a cache-only one did not. Everything else is unchanged
+    /// from before Phase 1.
+    pub async fn new(cfg: &GlobalConfig) -> anyhow::Result<Self> {
         let cache = GlobalCache::new(cfg.region_staleness_secs, &cfg.regions);
         // Signing key from the shared push token when present, so a restart
         // does not invalidate every admin session — the same trick the
@@ -83,18 +117,54 @@ impl GlobalNode {
         if !auth.admin_enabled() {
             warn!("no admin password set (WARDEN_ADMIN_PASSWORD); the admin UI is disabled");
         }
+        let store = store::GlobalStore::open(cfg.db_path.clone(), cfg.resolved_node_id()).await?;
+        let node_id = store.node_id().to_string();
+        let cluster = match (cfg.resolved_peer_token(), cfg.resolved_advertise_url()) {
+            (Some(token), Some(url)) => {
+                let now = chrono::Utc::now().timestamp_millis();
+                let c = crate::coordinator::cluster::Cluster::new(
+                    node_id,
+                    url,
+                    now,
+                    cfg.peers.clone(),
+                    Some(token),
+                    cfg.peer_timeout_secs,
+                );
+                Some(Arc::new(c))
+            }
+            _ => None,
+        };
+        let peer_token = cfg.resolved_peer_token();
         let (events, _) = broadcast::channel(256);
-        Self {
+        Ok(Self {
             inner: Arc::new(Inner {
                 cache,
                 alerter: GlobalAlerter::new(cfg.notifiers.clone()),
                 auth,
                 token: cfg.resolved_token(),
                 secure_cookies: cfg.secure_cookies,
+                trusted_proxies: crate::security::TrustedProxies::parse(&cfg.trusted_proxies)
+                    .unwrap_or_default(),
                 client: reqwest::Client::new(),
                 events,
+                store,
+                cluster,
+                peer_token,
+                gossip_interval_secs: cfg.gossip_interval_secs,
+                anti_entropy_secs: cfg.anti_entropy_secs,
             }),
-        }
+        })
+    }
+
+    /// Starts the background loops a running global node needs beyond
+    /// serving requests: membership heartbeat and config anti-entropy against
+    /// peer global nodes (a no-op without `global.peers`), and catalogue
+    /// reconciliation against every known region. Mirrors
+    /// `Coordinator::spawn_cluster`; kept separate from `new` for the same
+    /// reason — a test that only wants a router has no use for timers.
+    pub fn spawn_background(&self) {
+        cluster::spawn(self);
+        reconcile::spawn_region_reconciler(self.clone());
     }
 
     pub fn router(self) -> Router {
@@ -111,6 +181,32 @@ impl GlobalNode {
             // first region's agents. Explicit route so it never falls through to
             // that relay.
             .route("/api/v1/agents", get(agents_handler))
+            // The catalogue this node holds authoritatively (Phase 1): checks
+            // and sections. Explicit routes so they never fall through to the
+            // regional relay below.
+            .route(
+                "/api/v1/admin/checks",
+                get(admin::list_checks_handler).post(admin::create_check_handler),
+            )
+            .route(
+                "/api/v1/admin/checks/order",
+                put(admin::reorder_checks_handler),
+            )
+            .route(
+                "/api/v1/admin/checks/:id",
+                put(admin::update_check_handler).delete(admin::delete_check_handler),
+            )
+            .route(
+                "/api/v1/admin/sections",
+                get(admin::list_sections_handler)
+                    .post(admin::create_section_handler)
+                    .put(admin::reorder_sections_handler),
+            )
+            .route(
+                "/api/v1/admin/sections/:name",
+                put(admin::rename_section_handler).delete(admin::delete_section_handler),
+            )
+            .route("/api/v1/sections", get(admin::public_sections_handler))
             // Auth: same contract as the coordinator so the SPA's login flow
             // works unchanged. `session` also carries a `mode` marker.
             .route(
@@ -128,12 +224,24 @@ impl GlobalNode {
                 "/internal/global/state",
                 post(push_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
             )
+            // Global-to-global config plane (Phase 4): the same shape a
+            // coordinator's own `/internal/config`/`/internal/digest` are,
+            // peer-gated by `global.peer_token` rather than a region's.
+            .route(
+                "/internal/config",
+                post(cluster::config_handler)
+                    .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
+                    .get(cluster::config_entries_handler),
+            )
+            .route("/internal/digest", get(cluster::digest_handler))
+            .route("/internal/cluster/ping", post(cluster::ping_handler))
             // Everything else under /api/v1 that a coordinator answers is
             // relayed to regions: drill-down reads (history, uptime,
-            // sparklines) to the owning region, and admin operations
-            // (add/edit/delete checks, notifiers, sections, incidents…) fanned
-            // out to every region so the fleet stays uniform. `any` so writes,
-            // not just GETs, reach the relay.
+            // sparklines) to the owning region, and admin operations this
+            // node is not authoritative for (notifiers, credentials, rollup
+            // policies, incidents, maintenance…) fanned out to every region so
+            // the fleet stays uniform. `any` so writes, not just GETs, reach
+            // the relay.
             .fallback(any(relay_handler))
             .layer(DefaultBodyLimit::max(1024 * 1024))
             .layer(axum::middleware::from_fn(crate::security::security_headers))
@@ -288,7 +396,7 @@ struct FleetRowDto {
 async fn status_handler(State(node): State<GlobalNode>, uri: Uri) -> Response {
     let now = chrono::Utc::now().timestamp_millis();
     let page = query_usize(uri.query(), "page").unwrap_or(0);
-    let limit = query_usize(uri.query(), "limit").unwrap_or(100).min(1_000);
+    let limit = crate::page::bounded(query_usize(uri.query(), "limit"), 100);
     let section = query_value(uri.query(), "section");
     let mut checks = node
         .inner
@@ -667,10 +775,12 @@ struct SessionResponse {
 async fn login_handler(
     State(node): State<GlobalNode>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Response {
     let now = chrono::Utc::now().timestamp_millis();
-    match node.inner.auth.login(&body.password, peer.ip(), now) {
+    let client_ip = crate::security::client_ip(peer.ip(), &headers, &node.inner.trusted_proxies);
+    match node.inner.auth.login(&body.password, client_ip, now) {
         Ok(token) => {
             let secure = if node.inner.secure_cookies {
                 "; Secure"
@@ -759,8 +869,10 @@ fn require_admin(node: &GlobalNode, headers: &HeaderMap) -> Option<Response> {
 
 // ---- Region relay: drill-down reads, admin reads, admin write fan-out ------
 
-/// Everything under `/api/v1` the global node does not serve from its own cache
-/// is relayed to regional coordinators. Three shapes:
+/// Everything under `/api/v1` the global node does not serve from its own
+/// cache or its own catalogue (`global::admin` — checks and sections,
+/// intercepted by explicit routes before this fallback is ever reached) is
+/// relayed to regional coordinators. Three shapes:
 ///
 /// * **Public reads** (`GET`, no `/admin/`) — a drill-down: route to the region
 ///   that owns the named check, take the first answer.
@@ -768,10 +880,13 @@ fn require_admin(node: &GlobalNode, headers: &HeaderMap) -> Option<Response> {
 ///   the operator's global session is translated into the shared trust token so
 ///   the region authorizes it. De-duplication of list results is left to the
 ///   region: they run identical config, so any one region's list is the fleet's.
-/// * **Admin writes** (`POST`/`PUT`/`PATCH`/`DELETE`) — fanned out to *every*
-///   region so a check added or edited here exists uniformly across the fleet.
+/// * **Admin writes** (`POST`/`PUT`/`PATCH`/`DELETE`) not covered by
+///   `global::admin` — notifiers, credentials, rollup policies, maintenance,
+///   incidents — are fanned out to *every* region so the fleet stays uniform.
 ///   The operator sees the first region's response; a failure on any region is
-///   surfaced so a partial fan-out is never silently reported as success.
+///   surfaced so a partial fan-out is never silently reported as success. This
+///   is the pre-Phase-1 mechanism, unreconciled if a region misses it; see
+///   `fan_out_write`'s doc for why the catalogue no longer uses it.
 ///
 /// Non-API paths serve the embedded SPA.
 async fn relay_handler(
@@ -1073,10 +1188,38 @@ async fn relay_merge(
             if matches!(uri.path(), "/api/v1/uptime" | "/api/v1/latency-points") {
                 filter_chart_page(node, uri, &mut response.0);
             }
+            if uri.path().ends_with("/incidents") {
+                attach_incident_groups(node, &mut response.0);
+            }
             response.into_response()
         }
         Err(message) => error_response(StatusCode::BAD_GATEWAY, &message),
     }
+}
+
+/// Add a `"groups"` array alongside the merged `"incidents"` list: the same
+/// per-region rows, folded by same-check overlapping windows and attributed
+/// to a cross-region upstream where one applies. Presentation only — the
+/// flat `"incidents"` array this reads is left exactly as `merge_responses`
+/// built it, so a caller keyed to individual incident ids (the admin editor,
+/// `IncidentEditor`) is unaffected. See `incidents::group_and_attribute` for
+/// the rules.
+fn attach_incident_groups(node: &GlobalNode, response: &mut serde_json::Value) {
+    let Some(items) = response.get("incidents").and_then(|v| v.as_array()) else {
+        return;
+    };
+    let raw: Vec<incidents::RawIncident> = items
+        .iter()
+        .filter_map(incidents::RawIncident::from_json)
+        .collect();
+    if raw.is_empty() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let depends_on = node.inner.cache.depends_on_map(now);
+    let groups = incidents::group_and_attribute(&raw, &depends_on, now);
+    response["groups"] =
+        serde_json::to_value(groups).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
 }
 
 /// Remove status-page selectors before fanning a batched chart request out.
@@ -1106,7 +1249,7 @@ fn chart_relay_path(uri: &Uri) -> String {
 /// Keep chart entries to precisely the ids rendered by the global status page.
 fn filter_chart_page(node: &GlobalNode, uri: &Uri, response: &mut serde_json::Value) {
     let page = query_usize(uri.query(), "page").unwrap_or(0);
-    let limit = query_usize(uri.query(), "limit").unwrap_or(100).min(1_000);
+    let limit = crate::page::bounded(query_usize(uri.query(), "limit"), 100);
     let section = query_value(uri.query(), "section");
     let mut checks = node
         .inner
@@ -1596,11 +1739,23 @@ async fn relay_single(
     )
 }
 
-/// Fan an admin write out to one live coordinator in every region. Regions run
-/// identical config, so the write must land everywhere or the fleet diverges.
-/// The first region's response is returned to the operator; if any region
-/// errors (transport or a non-2xx), that failure is surfaced instead so a
-/// partial apply is never reported as success.
+/// Fan an admin write out to one live coordinator in every region, for
+/// everything the global tier is *not* authoritative for (`global::admin`
+/// intercepts checks and sections before this is ever reached — see its
+/// module doc). Regions run identical config, so the write must land
+/// everywhere or the fleet diverges. The first region's response is returned
+/// to the operator; if any region errors (transport or a non-2xx), that
+/// failure is surfaced instead so a partial apply is never reported as
+/// success.
+///
+/// This is the old, all-or-nothing mechanism SCALING.md's "Placement-scoped
+/// configuration" describes the gap in: a region that is merely stale drops
+/// out of `region_endpoints` and misses the write silently, and nothing
+/// reconciles it afterwards. Phase 1 closes that gap for the catalogue by
+/// routing it through `store::GlobalStore` and `reconcile` instead; widening
+/// the fix to notifiers, credentials, rollup policies, maintenance and
+/// incidents is Phase 2/3 work (see `store`'s module doc for why each of
+/// those is not simply added to the authoritative list today).
 async fn fan_out_write(
     node: &GlobalNode,
     method: &Method,
@@ -1612,14 +1767,6 @@ async fn fan_out_write(
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or_else(|| uri.path());
-    // Public global creation is a single logical operation. Mint the UUIDv7
-    // here, before sending the document to any region, so every replica stores
-    // the same immutable identity rather than each regional handler minting one.
-    let minted_body = match mint_global_check_id(method, uri.path(), body) {
-        Ok(body) => body,
-        Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
-    };
-    let body = &minted_body;
     let regions = node.inner.cache.region_endpoints(now);
     if regions.is_empty() {
         return error_response(
@@ -1660,26 +1807,6 @@ async fn fan_out_write(
 /// that is already missing the target has the state the operator asked for.
 /// Treating that as failure would make a single drifted region wedge every
 /// delete, which is exactly the drift fan-out exists to heal.
-/// Replace any client-supplied ID for a global check creation with one UUIDv7.
-/// Other writes pass through untouched.
-fn mint_global_check_id(method: &Method, path: &str, body: &Bytes) -> Result<Bytes, String> {
-    if method != Method::POST || !matches!(path, "/api/v1/admin/checks" | "/api/v1/checks") {
-        return Ok(body.clone());
-    }
-    let mut value: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|_| "check creation body must be valid JSON".to_string())?;
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| "check creation body must be a JSON object".to_string())?;
-    object.insert(
-        "id".to_string(),
-        serde_json::Value::String(crate::models::new_check_id().to_string()),
-    );
-    serde_json::to_vec(&value)
-        .map(Bytes::from)
-        .map_err(|e| format!("could not encode check creation: {e}"))
-}
-
 async fn apply_to_region(
     node: &GlobalNode,
     method: &Method,
@@ -2038,5 +2165,648 @@ mod tests {
         rewrite_incident_value("us", &mut incident);
         assert_eq!(incident["id"], "us:i1");
         assert_eq!(incident["updates"][0]["id"], "us:u1");
+    }
+
+    // ---- Placement-scoped configuration, Phase 1 & 4 (SCALING.md) ----
+
+    use crate::config::{CoordinatorConfig, GlobalPushConfig, GlobalRegion};
+    use crate::coordinator::Coordinator;
+
+    async fn serve_router(router: Router) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        addr
+    }
+
+    fn admin_cookie(node: &GlobalNode, password: &str) -> String {
+        let token = node
+            .inner
+            .auth
+            .login(
+                password,
+                "127.0.0.1".parse().unwrap(),
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .unwrap();
+        format!("{}={}", crate::auth::GLOBAL_SESSION_COOKIE, token)
+    }
+
+    /// Phase 1's central claim: a catalogue write commits to the global store
+    /// as one local operation, so it is unaffected by a region being down —
+    /// no 502, no partial fan-out — and the down region converges on its own
+    /// once it is reachable again, with no repeat of the write from the
+    /// operator.
+    #[tokio::test]
+    async fn admin_write_survives_an_unreachable_region_and_converges_once_it_returns() {
+        let global_token = "global-token";
+        let admin_password = "secret";
+        let coord = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            region: "us".into(),
+            global: Some(GlobalPushConfig {
+                url: "http://ignored.invalid".into(),
+                token: Some(global_token.into()),
+                token_env: None,
+                push_secs: 3600,
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let coord_addr = serve_router(coord.clone().router()).await;
+
+        let node = GlobalNode::new(&GlobalConfig {
+            token: Some(global_token.into()),
+            admin_password: Some(admin_password.into()),
+            db_path: ":memory:".into(),
+            regions: vec![GlobalRegion {
+                name: "us".into(),
+                // Port 1 is a reserved, never-listening port: an admin write
+                // must not depend on this ever answering.
+                endpoints: vec!["http://127.0.0.1:1".into()],
+            }],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let cookie = admin_cookie(&node, admin_password);
+        let global_addr = serve_router(node.clone().router()).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("http://{global_addr}/api/v1/admin/checks"))
+            .header(reqwest::header::COOKIE, &cookie)
+            .json(&serde_json::json!({"name": "web", "type": "http", "target": "https://example.com"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the write itself must not fail"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let check_name = body["check"]["name"].as_str().unwrap().to_string();
+        assert_eq!(check_name, "web");
+
+        // The catalogue is authoritative on the global store regardless of
+        // whether any region ever answers.
+        let (checks, total, _) = node.inner.store.list_checks(0, 10).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(checks[0].name, "web");
+
+        // The region has not seen it yet — its only endpoint never answers.
+        assert!(coord.list_checks_for_test().await.is_empty());
+
+        // The region "returns": it pushes a fresh state summary naming its
+        // real, reachable address, exactly as `Coordinator::spawn_global_push`
+        // would on its own timer.
+        let push = wire::RegionStatePush {
+            region: "us".into(),
+            origin: "coordinator-us".into(),
+            advertise_url: Some(format!("http://{coord_addr}")),
+            pushed_at: chrono::Utc::now().timestamp_millis(),
+            region_health: crate::models::NodeState::Up,
+            agents_healthy: 1,
+            agents_total: 1,
+            checks: Vec::new(),
+        };
+        client
+            .post(format!("http://{global_addr}/internal/global/state"))
+            .bearer_auth(global_token)
+            .json(&push)
+            .send()
+            .await
+            .unwrap();
+
+        // Drive one reconciliation pass directly rather than waiting on
+        // `reconcile::RECONCILE_INTERVAL`.
+        let now = chrono::Utc::now().timestamp_millis();
+        for (region, endpoints) in node.inner.cache.region_endpoints(now) {
+            reconcile::reconcile_region(&node, &region, &endpoints).await;
+        }
+
+        let checks = coord.list_checks_for_test().await;
+        assert_eq!(
+            checks.len(),
+            1,
+            "the region converges without a repeated write"
+        );
+        assert_eq!(checks[0].name, "web");
+    }
+
+    /// Phase 4: two global nodes reconcile the catalogue between themselves —
+    /// a write applied only to one converges onto the other through the same
+    /// digest-and-backfill anti-entropy a coordinator's peers already use.
+    #[tokio::test]
+    async fn two_global_nodes_converge_through_anti_entropy() {
+        let global_token = "global-token";
+        let peer_token = "global-peer-token";
+
+        let node_a = GlobalNode::new(&GlobalConfig {
+            token: Some(global_token.into()),
+            db_path: ":memory:".into(),
+            node_id: Some("global-a".into()),
+            peer_token: Some(peer_token.into()),
+            advertise_url: Some("http://global-a.invalid".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let addr_a = serve_router(node_a.clone().router()).await;
+
+        // A write that only ever reaches node A — node B never hears it any
+        // other way in this test, standing in for "B was down when A wrote".
+        node_a
+            .inner
+            .store
+            .create_check(
+                serde_json::json!({"name": "web", "type": "http", "target": "https://example.com"}),
+            )
+            .await
+            .ok()
+            .unwrap();
+
+        let node_b = GlobalNode::new(&GlobalConfig {
+            token: Some(global_token.into()),
+            db_path: ":memory:".into(),
+            node_id: Some("global-b".into()),
+            peer_token: Some(peer_token.into()),
+            advertise_url: Some("http://global-b.invalid".into()),
+            peers: vec![format!("http://{addr_a}")],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        assert!(node_b
+            .inner
+            .store
+            .list_checks(0, 10)
+            .await
+            .unwrap()
+            .0
+            .is_empty());
+
+        cluster::reconcile_with_peer(&node_b, &format!("http://{addr_a}")).await;
+
+        let (checks, total, _) = node_b.inner.store.list_checks(0, 10).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(checks[0].name, "web");
+    }
+
+    /// Phase 1: the catalogue is durable, not merely cached — a restart with
+    /// the same `db_path` reopens the same checks rather than starting empty.
+    #[tokio::test]
+    async fn global_node_restart_preserves_the_catalogue() {
+        let dir = std::env::temp_dir().join(format!(
+            "warden-global-restart-test-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("global.duckdb").to_string_lossy().to_string();
+        let cfg = GlobalConfig {
+            token: Some("global-token".into()),
+            db_path: db_path.clone(),
+            ..Default::default()
+        };
+
+        let node = GlobalNode::new(&cfg).await.unwrap();
+        node.inner
+            .store
+            .create_check(
+                serde_json::json!({"name": "web", "type": "http", "target": "https://example.com"}),
+            )
+            .await
+            .ok()
+            .unwrap();
+        drop(node);
+
+        let reopened = GlobalNode::new(&cfg).await.unwrap();
+        let (checks, total, _) = reopened.inner.store.list_checks(0, 10).await.unwrap();
+        assert_eq!(total, 1, "the catalogue survives a restart");
+        assert_eq!(checks[0].name, "web");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The data plane stays regional: a coordinator keeps serving status with
+    /// no global node reachable at all — not merely tolerant of a slow one,
+    /// but functionally independent of it. `spawn_global_push` is started to
+    /// show its failure against an address nothing listens on costs nothing
+    /// beyond a logged warning.
+    #[tokio::test]
+    async fn regions_keep_serving_status_with_the_global_tier_entirely_down() {
+        let coord = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            region: "us".into(),
+            global: Some(GlobalPushConfig {
+                url: "http://127.0.0.1:1".into(),
+                token: Some("global-token".into()),
+                token_env: None,
+                push_secs: 1,
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        coord.spawn_global_push();
+        coord
+            .create_check_for_test(crate::config::CheckConfig {
+                name: "web".into(),
+                kind: crate::models::CheckKind::Http,
+                target: "https://example.com".into(),
+                ..Default::default()
+            })
+            .await;
+        let coord_addr = serve_router(coord.router()).await;
+
+        let resp = reqwest::get(format!("http://{coord_addr}/api/v1/status"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["checks"][0]["name"], "web");
+    }
+
+    // ---- Placement-scoped configuration, Phase 2 & 3 (SCALING.md) ----
+
+    /// SCALING.md's concrete disclosure case: `unifi`/`upstream`, placed to
+    /// `["us"]` only, still had their full definitions — one with a push
+    /// credential in its target — sitting in `coordinator-tw`'s database.
+    /// This is the test that Phase 2 reconciliation actually closes that
+    /// gap: a check whose placement admits only `us` must never reach
+    /// `tw`'s store at all.
+    #[tokio::test]
+    async fn a_check_placed_to_one_region_never_reaches_another() {
+        let global_token = "global-token";
+        let admin_password = "secret";
+        let us = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            region: "us".into(),
+            global: Some(GlobalPushConfig {
+                url: "http://ignored.invalid".into(),
+                token: Some(global_token.into()),
+                token_env: None,
+                push_secs: 3600,
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let us_addr = serve_router(us.clone().router()).await;
+
+        let tw = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            region: "tw".into(),
+            global: Some(GlobalPushConfig {
+                url: "http://ignored.invalid".into(),
+                token: Some(global_token.into()),
+                token_env: None,
+                push_secs: 3600,
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let tw_addr = serve_router(tw.clone().router()).await;
+
+        let node = GlobalNode::new(&GlobalConfig {
+            token: Some(global_token.into()),
+            admin_password: Some(admin_password.into()),
+            db_path: ":memory:".into(),
+            regions: vec![
+                GlobalRegion {
+                    name: "us".into(),
+                    endpoints: vec![format!("http://{us_addr}")],
+                },
+                GlobalRegion {
+                    name: "tw".into(),
+                    endpoints: vec![format!("http://{tw_addr}")],
+                },
+            ],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let cookie = admin_cookie(&node, admin_password);
+        let global_addr = serve_router(node.clone().router()).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("http://{global_addr}/api/v1/admin/checks"))
+            .header(reqwest::header::COOKIE, &cookie)
+            .json(&serde_json::json!({
+                "name": "unifi",
+                "type": "http",
+                // A referenced secret, per Phase 0 ("Secrets are referenced,
+                // not carried") — a literal credential in a query value is
+                // rejected outright, which is a separate control from this
+                // test's placement-scoping claim.
+                "target": "https://192.168.1.1/push?token=${PUSH_TOKEN}",
+                "placement": {"regions": ["us"]},
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Drive reconciliation for both regions directly rather than waiting
+        // on `push_now`'s spawned task or `RECONCILE_INTERVAL`.
+        let now = chrono::Utc::now().timestamp_millis();
+        for (region, endpoints) in node.inner.cache.region_endpoints(now) {
+            reconcile::reconcile_region(&node, &region, &endpoints).await;
+        }
+
+        let us_checks = us.list_checks_for_test().await;
+        assert_eq!(us_checks.len(), 1, "the placed region receives it");
+        assert_eq!(us_checks[0].name, "unifi");
+
+        let tw_checks = tw.list_checks_for_test().await;
+        assert!(
+            tw_checks.is_empty(),
+            "a region never placed must never hold the definition, secret included: {tw_checks:?}"
+        );
+    }
+
+    /// Narrowing a check's placement away from a region must unplace it
+    /// there — never delete it, which would write a `config_tombstone` that
+    /// replicates and deletes the check in the region still probing it
+    /// (SCALING.md "Unplace is disable-shaped, not delete-shaped"). Checked
+    /// directly against the region's own digest: a tombstone would leave
+    /// `config_digest`'s Check-kind count at 1 (the tombstone row), not 0.
+    #[tokio::test]
+    async fn unplace_writes_no_tombstone_and_the_holding_region_keeps_the_check() {
+        let global_token = "global-token";
+        let us = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            region: "us".into(),
+            global: Some(GlobalPushConfig {
+                url: "http://ignored.invalid".into(),
+                token: Some(global_token.into()),
+                token_env: None,
+                push_secs: 3600,
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let us_addr = serve_router(us.clone().router()).await;
+
+        let tw = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            region: "tw".into(),
+            global: Some(GlobalPushConfig {
+                url: "http://ignored.invalid".into(),
+                token: Some(global_token.into()),
+                token_env: None,
+                push_secs: 3600,
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let tw_addr = serve_router(tw.clone().router()).await;
+
+        let node = GlobalNode::new(&GlobalConfig {
+            token: Some(global_token.into()),
+            db_path: ":memory:".into(),
+            regions: vec![
+                GlobalRegion {
+                    name: "us".into(),
+                    endpoints: vec![format!("http://{us_addr}")],
+                },
+                GlobalRegion {
+                    name: "tw".into(),
+                    endpoints: vec![format!("http://{tw_addr}")],
+                },
+            ],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        // No placement named: every region admits it, so both get it.
+        let (_, entry) = node
+            .inner
+            .store
+            .create_check(serde_json::json!({
+                "name": "dns", "type": "http", "target": "https://example.com",
+            }))
+            .await
+            .ok()
+            .unwrap();
+        let check_id: crate::models::CheckId = entry.id.parse().unwrap();
+
+        let now = chrono::Utc::now().timestamp_millis();
+        for (region, endpoints) in node.inner.cache.region_endpoints(now) {
+            reconcile::reconcile_region(&node, &region, &endpoints).await;
+        }
+        assert_eq!(us.list_checks_for_test().await.len(), 1, "us receives it");
+        assert_eq!(
+            tw.list_checks_for_test().await.len(),
+            1,
+            "tw receives it too"
+        );
+
+        // Narrow placement to `us` only.
+        node.inner
+            .store
+            .update_check(
+                check_id,
+                serde_json::json!({
+                    "name": "dns", "type": "http", "target": "https://example.com",
+                    "placement": {"regions": ["us"]},
+                }),
+            )
+            .await
+            .ok()
+            .unwrap();
+        for (region, endpoints) in node.inner.cache.region_endpoints(now) {
+            reconcile::reconcile_region(&node, &region, &endpoints).await;
+        }
+
+        assert_eq!(
+            us.list_checks_for_test().await.len(),
+            1,
+            "the still-placed region keeps it"
+        );
+        assert!(
+            tw.list_checks_for_test().await.is_empty(),
+            "tw's placement no longer admits it"
+        );
+
+        let tw_digest = tw.config_digest_for_test().await;
+        let check_digest = tw_digest
+            .iter()
+            .find(|d| d.kind == crate::coordinator::storage::ConfigKind::Check)
+            .unwrap();
+        assert_eq!(
+            check_digest.count, 0,
+            "unplace must leave no tombstone behind — a tombstone here would \
+             replicate and delete the check in us too"
+        );
+    }
+
+    /// Once a region has converged, a further sweep must cost exactly one
+    /// digest comparison — no full-table push, no id-set diff, no unplace
+    /// call. A placement-scoped digest that still amplified would defeat the
+    /// whole point of Phase 2, the same way a whole-catalogue digest against
+    /// a subset region already did before this change.
+    #[tokio::test]
+    async fn converged_region_costs_no_further_paging_once_reconciled() {
+        async fn log_requests(
+            axum::extract::State(log): axum::extract::State<RequestLog>,
+            req: axum::extract::Request,
+            next: axum::middleware::Next,
+        ) -> Response {
+            log.lock()
+                .unwrap()
+                .push((req.method().to_string(), req.uri().path().to_string()));
+            next.run(req).await
+        }
+        type RequestLog = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+        let global_token = "global-token";
+        let coord = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            region: "us".into(),
+            global: Some(GlobalPushConfig {
+                url: "http://ignored.invalid".into(),
+                token: Some(global_token.into()),
+                token_env: None,
+                push_secs: 3600,
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let log: RequestLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = coord
+            .clone()
+            .router()
+            .layer(axum::middleware::from_fn_with_state(
+                log.clone(),
+                log_requests,
+            ));
+        let coord_addr = serve_router(router).await;
+
+        let node = GlobalNode::new(&GlobalConfig {
+            token: Some(global_token.into()),
+            db_path: ":memory:".into(),
+            regions: vec![GlobalRegion {
+                name: "us".into(),
+                endpoints: vec![format!("http://{coord_addr}")],
+            }],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        node.inner
+            .store
+            .create_check(serde_json::json!({
+                "name": "web", "type": "http", "target": "https://example.com",
+            }))
+            .await
+            .ok()
+            .unwrap();
+
+        let now = chrono::Utc::now().timestamp_millis();
+        for (region, endpoints) in node.inner.cache.region_endpoints(now) {
+            reconcile::reconcile_region(&node, &region, &endpoints).await;
+        }
+        assert_eq!(
+            coord.list_checks_for_test().await.len(),
+            1,
+            "first sweep converges the region"
+        );
+
+        log.lock().unwrap().clear();
+        for (region, endpoints) in node.inner.cache.region_endpoints(now) {
+            reconcile::reconcile_region(&node, &region, &endpoints).await;
+        }
+        let seen = log.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![(
+                "GET".to_string(),
+                "/internal/global/config-digest".to_string()
+            )],
+            "a converged region must cost exactly one digest read per sweep, not a full page"
+        );
+    }
+
+    /// The data plane's independence claim, specifically for a check that
+    /// arrived *through* placement-scoped reconciliation rather than a
+    /// direct write: once placed, a region that never hears from global
+    /// again keeps probing and serving status for it. Nothing regional ever
+    /// unplaces a check on its own — that verb is only ever driven by an
+    /// incoming call from the global tier — so losing contact with global
+    /// must read as "no further instructions", never as "unplace
+    /// everything".
+    #[tokio::test]
+    async fn a_region_cut_off_from_global_keeps_what_it_was_placed() {
+        let global_token = "global-token";
+        let coord = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            region: "us".into(),
+            global: Some(GlobalPushConfig {
+                url: "http://127.0.0.1:1".into(),
+                token: Some(global_token.into()),
+                token_env: None,
+                push_secs: 3600,
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let coord_addr = serve_router(coord.clone().router()).await;
+
+        let node = GlobalNode::new(&GlobalConfig {
+            token: Some(global_token.into()),
+            db_path: ":memory:".into(),
+            regions: vec![GlobalRegion {
+                name: "us".into(),
+                endpoints: vec![format!("http://{coord_addr}")],
+            }],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        node.inner
+            .store
+            .create_check(serde_json::json!({
+                "name": "web", "type": "http", "target": "https://example.com",
+            }))
+            .await
+            .ok()
+            .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        for (region, endpoints) in node.inner.cache.region_endpoints(now) {
+            reconcile::reconcile_region(&node, &region, &endpoints).await;
+        }
+        assert_eq!(
+            coord.list_checks_for_test().await.len(),
+            1,
+            "reconciliation placed it"
+        );
+
+        // The global node vanishes entirely; no further sweep ever reaches
+        // this region again.
+        drop(node);
+
+        let resp = reqwest::get(format!("http://{coord_addr}/api/v1/status"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["checks"][0]["name"], "web");
+        assert_eq!(
+            coord.list_checks_for_test().await.len(),
+            1,
+            "still placed with no global reachable at all"
+        );
     }
 }

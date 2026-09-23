@@ -15,6 +15,7 @@
     Check,
     Alert,
     Incident,
+    IncidentGroup,
     FleetRow,
     MaintenanceNotice,
     UptimeResponse,
@@ -229,6 +230,11 @@
   // retains full history for incident management.
   let publicIncidents = $state<Incident[]>([]);
   let adminIncidents = $state<Incident[]>([]);
+  // Only a global node's merge sets `groups` on the response; a regional
+  // coordinator's answer never does, so these stay empty there and the two
+  // list components fall back to their un-grouped rendering unchanged.
+  let publicIncidentGroups = $state<IncidentGroup[]>([]);
+  let adminIncidentGroups = $state<IncidentGroup[]>([]);
   // Fleet liveness as the coordinator chose to publish it: regions, or pinned
   // agents. Deliberately not `/api/v1/agents` — that needs a session, and this
   // page is anonymous, so fetching it here failed the whole load with a 401.
@@ -550,6 +556,8 @@
         alerts = a.alerts;
         publicIncidents = publicInc.incidents;
         adminIncidents = adminInc.incidents;
+        publicIncidentGroups = publicInc.groups ?? [];
+        adminIncidentGroups = adminInc.groups ?? [];
         fleet = s.agents;
         maintenance = s.maintenance;
       } catch {
@@ -592,6 +600,8 @@
       alerts = a.alerts;
       publicIncidents = publicInc.incidents;
       adminIncidents = adminInc.incidents;
+      publicIncidentGroups = publicInc.groups ?? [];
+      adminIncidentGroups = adminInc.groups ?? [];
       fleet = s.agents;
       maintenance = s.maintenance;
       sectionRollups = s.sections;
@@ -609,7 +619,10 @@
     const fetched = await fetchIncidents(50, since);
     // A slower response for a previously selected range must not overwrite the
     // list for the range now visible on screen.
-    if (days === window) publicIncidents = fetched.incidents;
+    if (days === window) {
+      publicIncidents = fetched.incidents;
+      publicIncidentGroups = fetched.groups ?? [];
+    }
   }
 
   function setDays(next: number) {
@@ -737,6 +750,8 @@
       alerts = a.alerts;
       publicIncidents = publicInc.incidents;
       adminIncidents = adminInc.incidents;
+      publicIncidentGroups = publicInc.groups ?? [];
+      adminIncidentGroups = adminInc.groups ?? [];
       fleet = s.agents;
       maintenance = s.maintenance;
       sections = sec;
@@ -974,6 +989,7 @@
             {/if}
             <IncidentsList
               incidents={adminIncidents}
+              groups={adminIncidentGroups}
               {checks}
               onEdit={(i) => openIncidentEditor(i.id)}
               onAck={acknowledge}
@@ -1171,7 +1187,12 @@
 
     <section class="section">
       <h2 class="section-title">Past Incidents</h2>
-       <PastIncidents incidents={publicIncidents} {checks} onOpen={openIncident} />
+       <PastIncidents
+         incidents={publicIncidents}
+         groups={publicIncidentGroups}
+         {checks}
+         onOpen={openIncident}
+       />
     </section>
   {/if}
 </div>

@@ -72,19 +72,6 @@ pub(in crate::coordinator) struct ReorderRequest {
     order: Vec<String>,
 }
 
-/// Section names appear as headings and are matched against `checks.group_name`,
-/// so an empty or absurd one is rejected at the boundary.
-fn valid_section_name(name: &str) -> Result<String, String> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err("section name is required".into());
-    }
-    if trimmed.chars().count() > 60 {
-        return Err("section name must be 60 characters or fewer".into());
-    }
-    Ok(trimmed.to_string())
-}
-
 async fn sections_response(coord: &Coordinator) -> Response {
     match coord.db(|storage| storage.list_sections()).await {
         Ok(sections) => Json(SectionsResponse {
@@ -121,7 +108,7 @@ pub(in crate::coordinator) async fn create_section_handler(
     if let Some(denied) = require_admin(&coord, &headers) {
         return denied;
     }
-    let name = match valid_section_name(&body.name) {
+    let name = match storage::Section::valid_name(&body.name) {
         Ok(n) => n,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
     };
@@ -164,7 +151,7 @@ pub(in crate::coordinator) async fn rename_section_handler(
     if let Some(denied) = require_admin(&coord, &headers) {
         return denied;
     }
-    let name = match valid_section_name(&body.name) {
+    let name = match storage::Section::valid_name(&body.name) {
         Ok(n) => n,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
     };

@@ -1,27 +1,44 @@
-# Stage B / Phase 6 demo: two regions behind one global coordinator.
+# Stage B / Phase 6 demo: two regions behind a three-node global tier.
 #
 #   region   UI / coordinator   agents                zone           port
 #   us       coordinator-us-a   agent-us-1, agent-us-2 us-west-1a    :9001
 #            coordinator-us-b                                        :9002
-#            coordinator-us-c   agent-us-3            us-east-1a     :9003
-#   tw       coordinator-tw     agent-tw             tw-north-1a    :9004
-#   (global) global             — aggregates us + tw —              :9005
+#            coordinator-us-c   agent-us-3             us-east-1a     :9003
+#   tw       coordinator-tw     agent-tw               tw-north-1a    :9004
+#   (global) global-a           — aggregates us + tw —                :9005
+#            global-b                                                :9006
+#            global-c                                                :9007
 #
-# The us region is a 3-node cluster (seed chain a -> b -> c -> a); tw is a
-# single coordinator. Both regions push their state summary to `global`, which
-# holds no raw data: it caches the summaries, serves an aggregated dashboard on
-# :9005, and proxies drill-down reads back to the owning region.
+# The us region is a 3-node coordinator cluster (seed chain a -> b -> c -> a);
+# tw is a single coordinator. The global tier is likewise three nodes
+# (SCALING.md "Placement-scoped configuration", Phase 4), seeded a -> b -> c
+# -> a the same way. Regions push their state summary to global-a only in
+# this fixture — see `global::reconcile`'s module doc: that push is ephemeral
+# per-region *data*, not the catalogue, and only the receiving node's cache
+# holds it. What all three global nodes agree on is the *catalogue* (checks
+# and sections), which global-a distributes to every region
+# (`global::store`/`global::reconcile`) and replicates to global-b and
+# global-c over their own peer cluster (`global::cluster`) — durably, in
+# `/data/warden.duckdb` on each, so any one of the three can restart, or the
+# operator's browser can point at any one of the three, without losing or
+# disagreeing about the catalogue. A production deployment would put a load
+# balancer in front of all three and every region's `[coordinator.global]`
+# behind it; this fixture dials each region straight at global-a to keep the
+# compose file's environment small, which is enough to demonstrate the
+# catalogue converging across the three without one.
 #
 # Required env (no committed defaults):
-#   WARDEN_PEER_TOKEN        shared by the us cluster
-#   WARDEN_GLOBAL_TOKEN      shared by every coordinator and the global node
+#   WARDEN_PEER_TOKEN        shared by the us coordinator cluster
+#   WARDEN_GLOBAL_TOKEN      shared by every coordinator and every global node
+#   WARDEN_GLOBAL_PEER_TOKEN shared by the three global nodes' own cluster
 #   WARDEN_AGENT_TOKEN_W     the two us-west agents
 #   WARDEN_AGENT_TOKEN_E     the one us-east agent
 #   WARDEN_AGENT_TOKEN_TW    the tw agent
 #   WARDEN_ADMIN_PASSWORD    optional; the admin UI is read-only without it
 #
 # Preview: open http://localhost:9005 for the global dashboard once the stack
-# is up (cold start ~55s). The regional dashboards remain on :9001-:9004.
+# is up (cold start ~55s); :9006 and :9007 serve the same catalogue. The
+# regional dashboards remain on :9001-:9004.
 
 name: warden-global
 
@@ -39,6 +56,28 @@ x-coordinator: &coordinator
     WARDEN_AGENT_TOKEN_W: ${WARDEN_AGENT_TOKEN_W:?WARDEN_AGENT_TOKEN_W is required}
     WARDEN_AGENT_TOKEN_E: ${WARDEN_AGENT_TOKEN_E:?WARDEN_AGENT_TOKEN_E is required}
     WARDEN_AGENT_TOKEN_TW: ${WARDEN_AGENT_TOKEN_TW:?WARDEN_AGENT_TOKEN_TW is required}
+  restart: unless-stopped
+  networks:
+    - warden
+
+x-global: &global
+  build:
+    context: .
+    args:
+      GIT_SHA: ${GIT_SHA:-}
+  image: warden:latest
+  command: ["global"]
+  environment:
+    WARDEN_ADMIN_PASSWORD: ${WARDEN_ADMIN_PASSWORD:-}
+    WARDEN_GLOBAL_TOKEN: ${WARDEN_GLOBAL_TOKEN:?WARDEN_GLOBAL_TOKEN is required}
+    # This global node's own cluster secret (Phase 4) — distinct from the
+    # cross-region trust token above, which regions present. Named
+    # WARDEN_PEER_TOKEN inside the container because `GlobalConfig` resolves
+    # its peer token from that variable, the same one a coordinator's own
+    # cluster uses; the compose-level name is kept separate
+    # (WARDEN_GLOBAL_PEER_TOKEN) so the two secrets are never accidentally
+    # set to the same value.
+    WARDEN_PEER_TOKEN: ${WARDEN_GLOBAL_PEER_TOKEN:?WARDEN_GLOBAL_PEER_TOKEN is required}
   restart: unless-stopped
   networks:
     - warden
@@ -99,25 +138,37 @@ services:
     volumes:
       - coordinator-tw-data:/data
 
-  # ---- Global coordinator ----
-  global:
-    build:
-      context: .
-      args:
-        GIT_SHA: ${GIT_SHA:-}
-    image: warden:latest
-    command: ["global"]
+  # ---- Global tier: 3-node cluster (Phase 4), each with its own durable
+  #      catalogue (Phase 1). ----
+  global-a:
+    <<: *global
     ports:
       - "${WARDEN_PORT_GLOBAL:-9005}:8080"
-    environment:
-      WARDEN_ADMIN_PASSWORD: ${WARDEN_ADMIN_PASSWORD:-}
-      WARDEN_GLOBAL_TOKEN: ${WARDEN_GLOBAL_TOKEN:?WARDEN_GLOBAL_TOKEN is required}
     configs:
-      - source: global-toml
+      - source: global-a-toml
         target: /data/warden.toml
-    restart: unless-stopped
-    networks:
-      - warden
+    volumes:
+      - global-a-data:/data
+
+  global-b:
+    <<: *global
+    ports:
+      - "${WARDEN_PORT_GLOBAL_B:-9006}:8080"
+    configs:
+      - source: global-b-toml
+        target: /data/warden.toml
+    volumes:
+      - global-b-data:/data
+
+  global-c:
+    <<: *global
+    ports:
+      - "${WARDEN_PORT_GLOBAL_C:-9007}:8080"
+    configs:
+      - source: global-c-toml
+        target: /data/warden.toml
+    volumes:
+      - global-c-data:/data
 
   # ---- US agents ----
   agent-us-1:
@@ -172,7 +223,7 @@ configs:
       anti_entropy_secs = 60
 
       [coordinator.global]
-      url = "http://global:8080"
+      url = "http://global-a:8080"
       token_env = "WARDEN_GLOBAL_TOKEN"
       push_secs = 5
 
@@ -203,7 +254,7 @@ configs:
       anti_entropy_secs = 60
 
       [coordinator.global]
-      url = "http://global:8080"
+      url = "http://global-a:8080"
       token_env = "WARDEN_GLOBAL_TOKEN"
       push_secs = 5
 
@@ -231,7 +282,7 @@ configs:
       anti_entropy_secs = 60
 
       [coordinator.global]
-      url = "http://global:8080"
+      url = "http://global-a:8080"
       token_env = "WARDEN_GLOBAL_TOKEN"
       push_secs = 5
 
@@ -258,7 +309,7 @@ configs:
       min_incident_secs = 60
 
       [coordinator.global]
-      url = "http://global:8080"
+      url = "http://global-a:8080"
       token_env = "WARDEN_GLOBAL_TOKEN"
       push_secs = 5
 
@@ -270,14 +321,76 @@ configs:
       # Checks are created through the Admin UI or API and persisted in the
       # database; none are seeded from this file.
 
-  # ---- Global node: caches both regions, seeded with their endpoints so
-  #      drill-down proxying works before the first push and after a restart. ----
-  global-toml:
+  # ---- Global tier: 3 nodes, seeded a -> b -> c -> a like the us
+  #      coordinators. Each holds the whole catalogue durably and reconciles
+  #      it with the other two (Phase 4) and with every region (Phase 1); none
+  #      of the three holds raw results. Only global-a is listed in every
+  #      region's [coordinator.global] in this fixture — see the file header. ----
+  global-a-toml:
     content: |
       [global]
       listen = "0.0.0.0:8080"
+      db_path = "/data/warden.duckdb"
       token_env = "WARDEN_GLOBAL_TOKEN"
       region_staleness_secs = 20
+      node_id = "global-a"
+      advertise_url = "http://global-a:8080"
+      peers = ["http://global-b:8080"]
+      gossip_interval_secs = 5
+      peer_timeout_secs = 15
+      anti_entropy_secs = 30
+
+      [[global.region]]
+      name = "us"
+      endpoints = [
+        "http://coordinator-us-a:8080",
+        "http://coordinator-us-b:8080",
+        "http://coordinator-us-c:8080",
+      ]
+
+      [[global.region]]
+      name = "tw"
+      endpoints = ["http://coordinator-tw:8080"]
+
+  global-b-toml:
+    content: |
+      [global]
+      listen = "0.0.0.0:8080"
+      db_path = "/data/warden.duckdb"
+      token_env = "WARDEN_GLOBAL_TOKEN"
+      region_staleness_secs = 20
+      node_id = "global-b"
+      advertise_url = "http://global-b:8080"
+      peers = ["http://global-c:8080"]
+      gossip_interval_secs = 5
+      peer_timeout_secs = 15
+      anti_entropy_secs = 30
+
+      [[global.region]]
+      name = "us"
+      endpoints = [
+        "http://coordinator-us-a:8080",
+        "http://coordinator-us-b:8080",
+        "http://coordinator-us-c:8080",
+      ]
+
+      [[global.region]]
+      name = "tw"
+      endpoints = ["http://coordinator-tw:8080"]
+
+  global-c-toml:
+    content: |
+      [global]
+      listen = "0.0.0.0:8080"
+      db_path = "/data/warden.duckdb"
+      token_env = "WARDEN_GLOBAL_TOKEN"
+      region_staleness_secs = 20
+      node_id = "global-c"
+      advertise_url = "http://global-c:8080"
+      peers = ["http://global-a:8080"]
+      gossip_interval_secs = 5
+      peer_timeout_secs = 15
+      anti_entropy_secs = 30
 
       [[global.region]]
       name = "us"
@@ -326,6 +439,9 @@ volumes:
   coordinator-us-b-data:
   coordinator-us-c-data:
   coordinator-tw-data:
+  global-a-data:
+  global-b-data:
+  global-c-data:
 
 networks:
   warden:
