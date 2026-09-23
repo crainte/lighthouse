@@ -994,7 +994,14 @@ per_zone: draft.placement.count ?? 1,
         {#if kind === 'http'}
           <label class="field wide">
             <span class="field-label">Target URL</span>
-            <input class="mono" bind:value={draft.target} placeholder="https://example.com/health?token=${API_TOKEN}" />
+            <!-- The placeholder is an expression, not a literal attribute: Svelte reads
+                 `{NAME}` in attribute text as an interpolation, so writing the credential
+                 reference inline made the editor crash on an undefined variable. -->
+            <input
+              class="mono"
+              bind:value={draft.target}
+              placeholder={'https://example.com/health?token=${API_TOKEN}'}
+            />
             <span class="field-note">Use ${'{NAME}'} for credentials; it resolves only in the probing region.</span>
           </label>
 

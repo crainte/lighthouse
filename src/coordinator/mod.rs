@@ -1393,10 +1393,28 @@ impl Coordinator {
             return;
         };
         let coord = self.clone();
-        let client = reqwest::Client::new();
+        // A global node that accepts the connection and never answers — or one
+        // whose address resolves somewhere that silently drops packets, which
+        // is what a half-created container looks like — would otherwise hold
+        // this loop on its first iteration forever. Nothing would notice: the
+        // region stops appearing on the global dashboard and logs nothing at
+        // all, which reads exactly like "no region has pushed yet". Bound the
+        // attempt to under the push interval so a dark global costs one
+        // warning per tick and recovers on its own when it returns.
+        let attempt_timeout = std::time::Duration::from_secs(push_secs).mul_f32(0.8);
+        let client = match reqwest::Client::builder().timeout(attempt_timeout).build() {
+            Ok(client) => client,
+            Err(error) => {
+                warn!(%error, "global push: failed to build HTTP client");
+                return;
+            }
+        };
         let endpoint = format!("{}/internal/global/state", url.trim_end_matches('/'));
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(push_secs));
+            // A slow push must delay the next tick, not queue a burst of
+            // catch-up pushes carrying the same snapshot.
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
                 let push = coord.build_state_push().await;
@@ -3284,7 +3302,21 @@ impl Coordinator {
         let Some(peer) = peer else {
             return;
         };
-        let client = reqwest::Client::new();
+        // Bounded for the same reason the repair budget is bounded: a peer
+        // that accepts the connection and never answers must cost this sweep a
+        // request, not the sweep itself. An unbounded client here stops
+        // anti-entropy permanently and silently, since the periodic task owns
+        // exactly one sweep at a time.
+        let client = match reqwest::Client::builder()
+            .timeout(ANTI_ENTROPY_REQUEST_TIMEOUT)
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(%error, "anti-entropy: failed to build HTTP client");
+                return;
+            }
+        };
         let Some(their) = self.fetch_digest(&client, &peer).await else {
             return;
         };
@@ -4544,6 +4576,12 @@ const ANTI_ENTROPY_PAGES_PER_SWEEP: usize = 4;
 /// happening; doing it every sweep is what turns a stream that cannot converge
 /// into a permanent replay of the peer's whole history.
 const STREAM_RESCAN_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// Budget for one anti-entropy request. Generous next to the control plane's
+/// five seconds because a backfill page is applied inside one transaction on
+/// the receiver, behind its single database worker — but finite, because the
+/// sweep is a single periodic task and a peer that never answers would
+/// otherwise end anti-entropy for the life of the process.
+const ANTI_ENTROPY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How often the retry job looks for due notifications. Also the finest
 /// backoff granularity there is, which is why the first retry waits exactly

@@ -374,7 +374,12 @@ Follow-ups implemented in P1:
 
 ## Existing product issues
 
-- [ ] Convert global coordinator credentials to per-region credentials used to attach regional coordinators to the global coordinator.
+- [ ] Convert global coordinator credentials to per-region credentials used to attach regional
+      coordinators to the global coordinator. Today a region is static `[[global.region]]` config
+      on the global node and a shared token; it cannot check in. The target is the agent model:
+      a region holds a registration key and attaches itself to whichever global node exists,
+      so regions are discovered rather than declared. Phase 1's durable global store is the
+      prerequisite that now exists — a registering region has somewhere authoritative to land.
 - [ ] Add a supported way to decommission a cluster member.
   - [ ] Remove it from persistent membership and configured seeds on every node; stop retries and replication to it.
   - [ ] Define and test how removal propagates without stale gossip or a returning node resurrecting membership.

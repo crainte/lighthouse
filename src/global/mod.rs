@@ -145,7 +145,15 @@ impl GlobalNode {
                 secure_cookies: cfg.secure_cookies,
                 trusted_proxies: crate::security::TrustedProxies::parse(&cfg.trusted_proxies)
                     .unwrap_or_default(),
-                client: reqwest::Client::new(),
+                // Bounded: this client drives the periodic region
+                // reconciler as well as dashboard relays. A region that
+                // accepts the connection and never answers would otherwise
+                // hold the reconcile loop forever, and the only symptom
+                // would be regions quietly ceasing to converge.
+                client: reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()
+                    .unwrap_or_default(),
                 events,
                 store,
                 cluster,
@@ -2397,6 +2405,56 @@ mod tests {
     /// but functionally independent of it. `spawn_global_push` is started to
     /// show its failure against an address nothing listens on costs nothing
     /// beyond a logged warning.
+    /// A refused connection fails fast; a blackholed one does not. A global
+    /// node that accepts the socket and never answers — a half-created
+    /// container, a dropped route — used to hold the push loop on its first
+    /// iteration for the life of the process, with no warning and no retry.
+    /// The region simply stopped appearing on the global dashboard, which is
+    /// indistinguishable from a region that has not pushed yet. This is the
+    /// failure mode this project treats as the dangerous one, so the push
+    /// must be bounded and must keep ticking.
+    #[tokio::test]
+    async fn a_global_node_that_never_answers_does_not_wedge_the_push_loop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+                // Hold the socket open and never answer.
+                held.push(socket);
+            }
+        });
+
+        let coord = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            region: "us".into(),
+            global: Some(GlobalPushConfig {
+                url: format!("http://{addr}"),
+                token: Some("global-token".into()),
+                token_env: None,
+                push_secs: 1,
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        coord.spawn_global_push();
+
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        let tries = accepted.load(Ordering::Relaxed);
+        assert!(
+            tries >= 2,
+            "a silent global must cost one bounded attempt per tick, not one forever: {tries}"
+        );
+    }
+
     #[tokio::test]
     async fn regions_keep_serving_status_with_the_global_tier_entirely_down() {
         let coord = Coordinator::new(&CoordinatorConfig {

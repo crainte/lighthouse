@@ -1124,7 +1124,7 @@
             check={c}
             uptime={uptime[c.check_id]}
             sparkline={sparkline[c.check_id] ?? null}
-            incident={openIncidentForCheck(incidents, c.check_id)}
+            incident={openIncidentForCheck(publicIncidents, c.check_id)}
             onselect={openDetail}
             onbarclick={(id, b) => (dayModal = { checkId: id, bucket: b })}
           />
