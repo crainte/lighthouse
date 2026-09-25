@@ -10,12 +10,12 @@
 //!
 //! Split across sibling modules by concern: [`routes`] builds the router and
 //! serves the handlers answered from local cache/state; [`relay`] proxies
-//! everything else to regional coordinators; [`merge`] folds the resulting
-//! per-region answers into one; [`assets`] serves the embedded SPA.
+//! everything else to regional coordinators, and serves the embedded SPA
+//! (`crate::http::serve_asset`) for anything else; [`merge`] folds the
+//! resulting per-region answers into one.
 
 mod admin;
 pub mod alert;
-mod assets;
 pub mod cache;
 pub mod cluster;
 pub mod incidents;

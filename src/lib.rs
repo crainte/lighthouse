@@ -5,6 +5,7 @@ pub mod configplane;
 pub mod coordinator;
 pub mod credential;
 pub mod global;
+pub mod http;
 pub mod maintenance;
 pub mod models;
 pub mod notify;

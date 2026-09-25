@@ -1,6 +1,5 @@
 //! Proxying (relaying) requests to regional coordinators.
 
-use super::assets::static_asset;
 use super::merge::{attach_incident_groups, chart_relay_path, filter_chart_page, merge_responses};
 use super::routes::{error_response, is_admin};
 use super::GlobalNode;
@@ -42,7 +41,7 @@ pub(super) async fn relay_handler(
 ) -> Response {
     let path = uri.path().trim_start_matches('/');
     if !path.starts_with("api/") {
-        return static_asset(&uri);
+        return crate::http::serve_asset(&uri);
     }
     let now = chrono::Utc::now().timestamp_millis();
     let is_admin_path = path.starts_with("api/v1/admin/");

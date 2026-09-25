@@ -2,9 +2,9 @@ use super::*;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, StatusCode, Uri};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
-use axum::{Json, Router};
+use axum::Router;
 use fleet::{fleet_rows, FleetMemberDto, FleetRowDto};
 use routes::agents::{
     agent_checks_handler, agents_handler, ingest_handler, list_agent_credentials_handler,
@@ -132,68 +132,20 @@ async fn handle_ws(mut socket: WebSocket, coord: Coordinator) {
     }
 }
 
-pub(in crate::coordinator) fn internal_error(e: anyhow::Error) -> Response {
-    tracing::error!(error = %e, "request failed");
-    (
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        "internal error",
-    )
-        .into_response()
-}
-
 // ---- Embedded dashboard (built Svelte SPA under frontend/dist) ----
-
-#[derive(rust_embed::RustEmbed)]
-#[folder = "frontend/dist"]
-struct Assets;
 
 /// Serve the embedded SPA. Unknown non-API paths fall back to index.html so
 /// client-side routing works. Unmatched /api paths return 404 (not the SPA).
 async fn static_handler(uri: Uri) -> Response {
-    let path = uri.path().trim_start_matches('/');
-
-    if path.starts_with("api/") {
+    if uri.path().trim_start_matches('/').starts_with("api/") {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
-
-    let lookup = if path.is_empty() { "index.html" } else { path };
-    if let Some(content) = Assets::get(lookup) {
-        let mime = mime_guess::from_path(lookup).first_or_octet_stream();
-        return ([(header::CONTENT_TYPE, mime.as_ref())], content.data).into_response();
-    }
-
-    // SPA fallback / unbuilt-frontend placeholder.
-    match Assets::get("index.html") {
-        Some(content) => Html(content.data).into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            "dashboard not built — run `bun run build` in frontend/",
-        )
-            .into_response(),
-    }
+    crate::http::serve_asset(&uri)
 }
 
 // ---- Auth and the check editor ----
 
-#[derive(Serialize)]
-struct ErrorResponse {
-    error: String,
-}
-
-pub(in crate::coordinator) fn error_response(code: StatusCode, message: &str) -> Response {
-    (
-        code,
-        Json(ErrorResponse {
-            error: message.to_string(),
-        }),
-    )
-        .into_response()
-}
-
-#[derive(Serialize)]
-pub(in crate::coordinator) struct DeletedResponse {
-    pub(in crate::coordinator) deleted: String,
-}
+pub(in crate::coordinator) use crate::http::{error_response, internal_error, DeletedResponse};
 
 impl Coordinator {
     pub fn router(self) -> Router {

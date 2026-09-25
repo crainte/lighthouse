@@ -733,17 +733,4 @@ pub(crate) fn require_admin(node: &GlobalNode, headers: &HeaderMap) -> Option<Re
         .then(|| error_response(StatusCode::UNAUTHORIZED, "authentication required"))
 }
 
-#[derive(Serialize)]
-struct ErrorResponse {
-    error: String,
-}
-
-pub(crate) fn error_response(code: StatusCode, message: &str) -> Response {
-    (
-        code,
-        Json(ErrorResponse {
-            error: message.to_string(),
-        }),
-    )
-        .into_response()
-}
+pub(crate) use crate::http::error_response;
