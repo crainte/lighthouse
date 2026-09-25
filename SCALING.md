@@ -348,6 +348,23 @@ re-accumulates history from the retention window forward. That is cheap and
 correct precisely because the project has no released state to preserve yet;
 once it does, this policy is the thing that will need to change.
 
+`Storage::open` enforces this rather than leaving it as an operational
+convention: it applies its DDL to an in-memory reference connection and
+diffs `information_schema.columns` against the database being opened. A
+missing table or column fails with `bail!`, naming the table and column and
+pointing back at this section, instead of crash-looping on an `ALTER TABLE`
+DuckDB rejects or silently reading a row that never got the column. Extra
+columns — a rollback onto a database a newer binary already touched — are
+tolerated.
+
+Rebuild procedure for a node that fails to open on a real deployment: stop
+the node, move its database file aside (e.g. `/data/warden.duckdb` to
+`/data/warden.duckdb.bak`), and restart it. It re-replicates current
+configuration from its peers and re-accumulates history from the retention
+window forward; global-tier config re-replicates the same way regional
+peers do. Do not delete the moved-aside file until the rebuilt node has
+caught up.
+
 ## UUIDv7 implementation plan
 
 The identity migration must remain coherent across all components. Partial conversion would create checks whose configuration, results, incidents, or global summaries cannot be joined.
