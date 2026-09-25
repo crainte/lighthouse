@@ -1,0 +1,61 @@
+import { request } from "./client";
+
+/** Gossip failure-detector state for one coordinator, as another node currently
+ *  believes it — the same shape for `self` and for every peer, so the panel
+ *  needs no special case to show where it is standing. */
+export type ClusterState = "alive" | "suspect" | "dead";
+export type ClusterMode = "coordinator" | "global";
+export type ClusterLinkOutcome = "connected" | "failed";
+
+export interface ClusterLink {
+  source: string;
+  target: string;
+  source_generation: number;
+  observed_at: number;
+  outcome: ClusterLinkOutcome;
+}
+
+export function buildIdentity(build: string): string {
+  const match = /^(.*) \((.*), built .*\)$/.exec(build);
+  return match ? `${match[1]} (${match[2]})` : build;
+}
+
+export interface ClusterMember {
+  node_id: string;
+  url: string;
+  /** Bumped on every restart, so a stale message from a previous life of this
+   *  node loses to a fresher one carrying the same node_id. */
+  generation: number;
+  /** Epoch millis, as the responding node's own clock saw it — pair with
+   *  `ClusterResponse.now`, not the browser's clock, to read it as an age. */
+  last_seen: number;
+  state: ClusterState;
+  /** What that node reported it is running. Absent for a peer on a build that
+   *  predates reporting one, or for an entry restored from disk that no ping
+   *  has refreshed yet — builds are deliberately not persisted, since a stored
+   *  one describes a process that may since have been replaced. */
+  build?: string | null;
+  /** The peer wire protocol that node speaks. Absent from a peer predating the
+   *  field. Nothing is gated on it; a mismatch is a diagnosis, not a refusal. */
+  protocol?: number | null;
+}
+
+/** A standalone coordinator answers with `members: []` rather than failing the
+ *  call, so the panel can tell "no cluster configured" from "cluster fetch
+ *  failed" without a second endpoint. */
+export interface ClusterResponse {
+  self: ClusterMember;
+  members: ClusterMember[];
+  /** Epoch millis on the responding node. */
+  now: number;
+  mode?: ClusterMode;
+  links?: ClusterLink[];
+  link_stale_after_ms?: number;
+}
+
+/** Lives outside `/admin/*`: cluster membership is coordinator state, not
+ *  status-page configuration, but it carries the same session and 401s the
+ *  same way. */
+export function fetchCluster(): Promise<ClusterResponse> {
+  return request<ClusterResponse>("/api/v1/cluster");
+}
