@@ -282,95 +282,104 @@ Follow-ups implemented in P1:
 
 ### Split oversized backend modules
 
-- [ ] Split `src/coordinator/storage.rs` into focused modules.
-  - [ ] `storage/schema.rs`
-  - [ ] `storage/results.rs`
-  - [ ] `storage/checks.rs`
-  - [ ] `storage/incidents.rs`
-  - [ ] `storage/alerts.rs`
-  - [ ] `storage/config_replication.rs`
-  - [ ] `storage/fleet.rs`
-  - [ ] Move tests to their corresponding domains.
-- [ ] Split `src/coordinator/mod.rs` into focused modules.
-  - [ ] `coordinator/ingest.rs`
-  - [ ] `coordinator/replication.rs`
-  - [ ] `coordinator/dispatch.rs`
-  - [ ] `coordinator/rollup_tree.rs`
-  - [ ] `coordinator/router.rs`
-- [ ] Split `src/global/mod.rs` into routes, relay, merge, and asset-serving modules.
-- [ ] Split `src/config.rs` by runtime role if configuration continues to grow.
-- [ ] Split `src/agent.rs` into protocol-specific probe modules.
-- [ ] Extract shared coordinator/global HTTP utilities.
-  - [ ] Share error response types and helpers.
-  - [ ] Share static embedded-asset serving.
-  - [ ] Reconcile duplicated fleet/member DTOs where their semantics match.
-- [ ] Replace repeated route-level `require_admin` boilerplate with an Axum request-parts extractor.
+- [x] Split `src/coordinator/storage.rs` into focused modules.
+  - [x] `storage/schema.rs`
+  - [x] `storage/results.rs`
+  - [x] `storage/checks.rs`
+  - [x] `storage/incidents.rs`
+  - [x] `storage/alerts.rs`
+  - [x] `storage/config_replication.rs`
+  - [x] `storage/fleet.rs`
+  - [x] Move tests to their corresponding domains.
+- [x] Split `src/coordinator/mod.rs` into focused modules.
+  - [x] `coordinator/ingest.rs`
+  - [x] `coordinator/replication.rs`
+  - [x] `coordinator/dispatch.rs`
+  - [x] `coordinator/rollup_tree.rs`
+  - [x] `coordinator/router.rs`
+- [x] Split `src/global/mod.rs` into routes, relay, merge, and asset-serving modules.
+- [x] Split `src/config.rs` by runtime role if configuration continues to grow.
+  Evaluated, not split: most of it is the shared `CheckConfig` wire format used by every role, and the role structs embed each other.
+- [x] Split `src/agent.rs` into protocol-specific probe modules.
+- [x] Extract shared coordinator/global HTTP utilities.
+  - [x] Share error response types and helpers.
+  - [x] Share static embedded-asset serving.
+  - [x] Reconcile duplicated fleet/member DTOs where their semantics match.
+    `SectionDto` merged into `storage::Section`. The fleet DTOs stay separate: the coordinator's version carries merge-ordered enums that the global tier does not need.
+- [x] Replace repeated route-level `require_admin` boilerplate with an Axum request-parts extractor.
 
 ### Split oversized frontend modules
 
-- [ ] Split `CheckEditor.svelte` into an orchestrator and focused subcomponents.
-  - [ ] HTTP fields
-  - [ ] TCP fields
-  - [ ] DNS fields
-  - [ ] ICMP/ping fields
-  - [ ] SSL fields
-  - [ ] Heartbeat fields
-  - [ ] OpenMetrics fields
-  - [ ] Headers editor
-  - [ ] Placement editor
-  - [ ] Rollup-policy editor
-  - [ ] Dependency editor
-  - [ ] Evaluation tester
-- [ ] Split `AgentsAdmin.svelte` into focused panels/components.
-- [ ] Extract routing, session, and WebSocket/resync orchestration from `App.svelte`.
-- [ ] Split `frontend/src/lib/admin.ts` into per-domain API/type modules.
-- [ ] Review `RegionTreeAdmin.svelte`, `DayDetailModal.svelte`, `SectionsAdmin.svelte`, and `CheckDetail.svelte` for natural component boundaries.
+- [x] Split `CheckEditor.svelte` into an orchestrator and focused subcomponents.
+  - [x] HTTP fields
+  - [x] TCP fields
+  - [x] DNS fields
+  - [x] ICMP/ping fields
+  - [x] SSL fields
+  - [x] Heartbeat fields
+  - [x] OpenMetrics fields
+  - [x] Headers editor
+  - [x] Placement editor
+  - [x] Rollup-policy editor
+  - [x] Dependency editor
+  - [x] Evaluation tester
+- [x] Split `AgentsAdmin.svelte` into focused panels/components.
+- [x] Extract routing, session, and WebSocket/resync orchestration from `App.svelte`.
+- [x] Split `frontend/src/lib/admin.ts` into per-domain API/type modules.
+- [x] Review `RegionTreeAdmin.svelte`, `DayDetailModal.svelte`, `SectionsAdmin.svelte`, and `CheckDetail.svelte` for natural component boundaries.
+  SectionsAdmin was split, and the probe-grid logic shared by CheckDetail and DayDetailModal now lives in `lib/probeGrid.ts`. The rest are single cohesive views.
 
 ### Dead and compatibility code
 
-- [ ] Remove or use the currently unused `sortChecks` helper and its supporting types/tests.
-- [ ] Remove the stale `#[allow(dead_code)]` from `CheckMeta::degraded_is_downtime` if it remains used.
-- [ ] Decide and document the pre-1.0 database compatibility policy.
-  - [ ] If existing pre-UUID databases must be supported, move the UUID migration subsystem into a dedicated migration module and retain upgrade tests.
-  - [ ] If they do not need support, delete the legacy migration subsystem and document the required one-time rebuild procedure.
-  - [ ] Avoid mixing implicit `ALTER TABLE` migrations with undocumented drop/rebuild expectations.
-- [ ] Review comments and design documentation for outdated anti-entropy guarantees.
-- [ ] Split large integration test files by feature area, especially `tests/admin_api.rs`.
+- [x] Remove or use the currently unused `sortChecks` helper and its supporting types/tests.
+- [x] Remove the stale `#[allow(dead_code)]` from `CheckMeta::degraded_is_downtime` if it remains used.
+- [x] Decide and document the pre-1.0 database compatibility policy.
+  - [x] ~~If existing pre-UUID databases must be supported, …~~ Not supported.
+  - [x] If they do not need support, delete the legacy migration subsystem and document the required one-time rebuild procedure.
+  - [x] Avoid mixing implicit `ALTER TABLE` migrations with undocumented drop/rebuild expectations.
+- [x] Review comments and design documentation for outdated anti-entropy guarantees.
+- [x] Split large integration test files by feature area, especially `tests/admin_api.rs`.
 
 ## P2 — Production operations and validation
 
-- [ ] Add production-scale benchmarks and regression thresholds.
-  - [ ] Sustained result ingest
-  - [ ] Public status latency
-  - [ ] 24-hour uptime calculation
-  - [ ] History and latency queries
-  - [ ] Anti-entropy reconciliation
-  - [ ] Retention cleanup
-  - [ ] Startup and recovery with a large persistent database
-- [ ] Add chaos and recovery tests.
-  - [ ] Peer unavailable during DOWN transition
-  - [ ] Peer unavailable through DOWN and recovery
-  - [ ] Duplicate/reordered replication delivery
-  - [ ] Coordinator restart during ingest
-  - [ ] Two-node partition healing
-  - [ ] Full cluster bisection healing
-  - [ ] Agent failover between coordinators
-- [ ] Add production observability.
-  - [ ] Database operation latency and lock wait time
-  - [ ] Ingest queue/backpressure
-  - [ ] Replication failures and reconciliation lag
-  - [ ] Notification retry/give-up counts
-  - [ ] Cluster membership transitions
-  - [ ] Retention duration and rows removed
-- [ ] Establish release gates.
-  - [ ] Clean `cargo check --all-targets`.
-  - [ ] Clean `cargo clippy --all-targets -- -D warnings`.
-  - [ ] Passing Rust and frontend tests.
-  - [ ] Passing frontend and Rust dependency audits.
-  - [ ] Successful production frontend and container builds.
-  - [ ] Backup/restore smoke test.
-  - [ ] Clean or intentionally documented working tree.
-- [ ] Break the current large working-tree change set into reviewable commits before release.
+- [x] Add production-scale benchmarks and regression thresholds (`tests/release_benchmark.rs`, thresholds in SCALING.md).
+  - [x] Sustained result ingest
+  - [x] Public status latency
+  - [x] 24-hour uptime calculation
+  - [x] History and latency queries
+  - [x] Anti-entropy reconciliation
+  - [x] Retention cleanup
+  - [x] Startup and recovery with a large persistent database
+- [x] Add chaos and recovery tests (`tests/chaos.rs`; scenarios already covered elsewhere are referenced there, not duplicated).
+  - [x] Peer unavailable during DOWN transition
+  - [x] Peer unavailable through DOWN and recovery
+  - [x] Duplicate/reordered replication delivery
+  - [x] Coordinator restart during ingest
+  - [x] Two-node partition healing
+  - [x] Full cluster bisection healing
+  - [x] Agent failover between coordinators
+- [x] Add production observability.
+  - [x] Database operation latency and lock wait time
+  - [x] Ingest queue/backpressure
+  - [x] Replication failures and reconciliation lag
+  - [x] Notification retry/give-up counts
+  - [x] Cluster membership transitions
+  - [x] Retention duration and rows removed
+- [x] Establish release gates: `scripts/release-gate.sh` (CI: `.github/workflows/release-gate.yml`, fast subset in `hk.pkl`).
+  - [x] Clean `cargo check --all-targets`.
+  - [x] Clean `cargo clippy --all-targets -- -D warnings`.
+  - [x] Passing Rust and frontend tests.
+  - [x] Passing frontend and Rust dependency audits.
+  - [x] Successful production frontend and container builds.
+  - [x] Backup/restore smoke test.
+  - [x] Clean or intentionally documented working tree.
+- [x] Break the current large working-tree change set into reviewable commits before release.
+
+### P2 follow-ups
+
+- [ ] The config digest still full-scans the config tables on every sweep; back it with watermarks like the results/stream digests.
+- [ ] Instrument global-tier reconciliation and region-push staleness (the coordinator-side metrics exist; the global tier exposes only DB and membership metrics).
+- [ ] `release_benchmark_three_peers_one_region_global_live_agents_and_retention` times out waiting for public check status on this machine; it predates P2.
 
 ## Existing product issues
 
