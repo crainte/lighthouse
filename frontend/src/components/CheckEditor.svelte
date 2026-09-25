@@ -1,17 +1,8 @@
 <script lang="ts">
-  import type { Agent, CheckKind, HistoryPoint } from '../lib/api';
-  import { UNKNOWN_LOCATION, fetchAgents, fetchHistory } from '../lib/api';
+  import type { Agent, HistoryPoint } from '../lib/api';
+  import { fetchAgents, fetchHistory } from '../lib/api';
   import { failureReason, formatLatency, formatRelativeTime, statusColor } from '../lib/format';
-  import type {
-    AdminCheck,
-    CheckPayload,
-    DefaultStatus,
-    EvalResult,
-    MatchMode,
-    RollupPolicy,
-    Section,
-    Threshold,
-  } from '../lib/admin';
+  import type { CheckPayload, Section } from '../lib/admin';
   import {
     AdminError,
     createCheck,
@@ -21,10 +12,30 @@
     fetchSections,
     purgeCheckData,
     purgeCheckEverything,
-    testEval,
     updateCheck,
   } from '../lib/admin';
   import NumberField from './NumberField.svelte';
+  import type { Draft } from './check-editor/draft';
+  import {
+    KINDS,
+    DEFAULT_STATUSES,
+    blank,
+    fromCheck,
+    whole,
+    validPolicy,
+    policyValue,
+  } from './check-editor/draft';
+  import HttpFields from './check-editor/HttpFields.svelte';
+  import TcpFields from './check-editor/TcpFields.svelte';
+  import IcmpFields from './check-editor/IcmpFields.svelte';
+  import DnsFields from './check-editor/DnsFields.svelte';
+  import SslFields from './check-editor/SslFields.svelte';
+  import OpenMetricsFields from './check-editor/OpenMetricsFields.svelte';
+  import HeartbeatFields from './check-editor/HeartbeatFields.svelte';
+  import PlacementEditor from './check-editor/PlacementEditor.svelte';
+  import RollupPolicyEditor from './check-editor/RollupPolicyEditor.svelte';
+  import DependencyEditor from './check-editor/DependencyEditor.svelte';
+  import EvaluationTester from './check-editor/EvaluationTester.svelte';
 
   let {
     id,
@@ -32,215 +43,7 @@
     onclose,
   }: { id: string | null; onsaved: () => void; onclose: () => void } = $props();
 
-  // Number inputs go empty rather than to zero when cleared, so the draft holds
-  // nulls and the guards below refuse them; AdminCheck itself stays honest.
-  // `group` and the optional strings are non-optional here because `bind:value`
-  // needs a string, and `position` is absent because the server owns ordering.
-  type ThresholdKind = 'any' | 'majority' | 'all' | 'quorum';
-  type ThresholdDraft = { kind: ThresholdKind; quorum: number | null };
-  type PolicyDraft = { degraded_when: ThresholdDraft; down_when: ThresholdDraft };
-  type OptionalBoolean = '' | 'true' | 'false';
-
-  type Draft = Omit<
-    AdminCheck,
-    | 'id'
-    | 'timeout_secs'
-    | 'expect'
-    | 'group'
-    | 'eval'
-    | 'description'
-    | 'image'
-    | 'tag'
-    | 'position'
-    | 'dns'
-    | 'ping'
-    | 'cert_warning_days'
-    | 'grace_secs'
-    | 'retry_interval_secs'
-    | 'down_interval_secs'
-    | 'placement'
-    | 'rollup'
-    | 'min_incident_secs'
-    | 'min_recovery_secs'
-    | 'notify_degraded'
-    | 'degraded_is_downtime'
-  > & {
-    timeout_secs: number | null;
-    expect_status: number | null;
-    expect_body: string;
-    group: string;
-    eval: string;
-    description: string;
-    image: string;
-    tag: string;
-    dns: { nameserver: string; record: string; match_type: MatchMode; expected: string[] };
-    ping: { ip_type: string; count: number | null };
-    cert_warning_days: number | null;
-    grace_secs: number | null;
-    failures_before_down: number | null;
-    // Blank means omitted — the server derives a value from the schedule and
-    // timeout — while heartbeat checks never read either, since nothing is
-    // retried between pings.
-    retry_interval_secs: number | null;
-    down_interval_secs: number | null;
-    rollup: { zone: PolicyDraft | null; region: PolicyDraft | null; global: PolicyDraft | null };
-    min_incident_secs: number | null;
-    min_recovery_secs: number | null;
-    notify_degraded: OptionalBoolean;
-    degraded_is_downtime: OptionalBoolean;
-    /** Upstream checks. A DOWN here joins the upstream's open incident rather
-     *  than opening a second one for the same root cause. */
-    depends_on: string[];
-    // Same reason as every other number here: cleared reads as empty, not zero.
-    placement: { mode: 'zone' | 'region'; zones: string[]; regions: string[]; count: number | null };
-  };
-
-  const KINDS: CheckKind[] = ['http', 'tcp', 'dns', 'icmp', 'ssl', 'heartbeat', 'openmetrics'];
-  const MATCH_MODES: MatchMode[] = ['any', 'all'];
-  const DEFAULT_STATUSES: DefaultStatus[] = ['up', 'down', 'unknown'];
-  const DNS_RECORDS = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS'];
-  const IP_TYPES = ['any', 'ipv4', 'ipv6'];
-  const THRESHOLD_KINDS: ThresholdKind[] = ['any', 'majority', 'all', 'quorum'];
-  const POLICY_EDGES: { key: keyof PolicyDraft; label: string }[] = [
-    { key: 'degraded_when', label: 'Degraded' },
-    { key: 'down_when', label: 'DOWN' },
-  ];
   const LOG_LIMIT = 50;
-
-  function thresholdDraft(value: Threshold): ThresholdDraft {
-    return typeof value === 'string'
-      ? { kind: value, quorum: 1 }
-      : { kind: 'quorum', quorum: value.quorum };
-  }
-
-  function policyDraft(value: RollupPolicy): PolicyDraft {
-    return {
-      degraded_when: thresholdDraft(value.degraded_when),
-      down_when: thresholdDraft(value.down_when),
-    };
-  }
-
-  function thresholdValue(value: ThresholdDraft): Threshold {
-    return value.kind === 'quorum' ? { quorum: value.quorum ?? 1 } : value.kind;
-  }
-
-  function policyValue(value: PolicyDraft): RollupPolicy {
-    return {
-      degraded_when: thresholdValue(value.degraded_when),
-      down_when: thresholdValue(value.down_when),
-    };
-  }
-
-  function optionalBoolean(value: boolean | undefined): OptionalBoolean {
-    return value === undefined ? '' : String(value) as OptionalBoolean;
-  }
-
-  function blank(): Draft {
-    return {
-      name: '',
-      type: 'http',
-      target: '',
-      hosts: [],
-      host_match: 'all',
-      cron: '*/30 * * * * *',
-      timeout_secs: 10,
-      group: '',
-      latency_graph: false,
-      expect_status: null,
-      expect_body: '',
-      enabled: true,
-      visible: true,
-      notify: true,
-      notifiers: [],
-      depends_on: [],
-      eval: '',
-      agents: [],
-      description: '',
-      image: '',
-      tag: '',
-      default_status: 'unknown',
-      headers: [],
-      allow_self_signed: false,
-      dns: { nameserver: '', record: 'A', match_type: 'all', expected: [] },
-      ping: { ip_type: 'any', count: 1 },
-      metric: { name: '', labels: [] },
-      cert_warning_days: 14,
-      grace_secs: 300,
-      failures_before_down: 1,
-      retry_interval_secs: null,
-      down_interval_secs: null,
-      rollup: { zone: null, region: null, global: null },
-      min_incident_secs: null,
-      min_recovery_secs: null,
-      notify_degraded: '',
-      degraded_is_downtime: '',
-      placement: { mode: 'zone', zones: [], regions: [], count: 1 },
-    };
-  }
-
-  // Deep-copied field by field rather than spread: the draft must not alias the
-  // arrays inside the loaded check, or "cancel" would still have mutated them.
-  function fromCheck(c: AdminCheck): Draft {
-    const d = blank();
-    return {
-      ...d,
-      name: c.name,
-      type: c.type,
-      target: c.target ?? '',
-      hosts: [...(c.hosts ?? [])],
-      host_match: c.host_match ?? d.host_match,
-      cron: c.cron ?? d.cron,
-      timeout_secs: c.timeout_secs ?? d.timeout_secs,
-      group: c.group ?? '',
-      latency_graph: c.latency_graph ?? false,
-      expect_status: c.expect?.status ?? null,
-      expect_body: c.expect?.body_contains ?? '',
-      enabled: c.enabled ?? true,
-      visible: c.visible ?? true,
-      notify: c.notify ?? true,
-      notifiers: [...(c.notifiers ?? [])],
-      depends_on: [...(c.depends_on ?? [])],
-      eval: c.eval ?? '',
-      agents: [...(c.agents ?? [])],
-      description: c.description ?? '',
-      image: c.image ?? '',
-      tag: c.tag ?? '',
-      default_status: c.default_status ?? d.default_status,
-      headers: (c.headers ?? []).map((h) => ({ name: h.name, value: h.value })),
-      allow_self_signed: c.allow_self_signed ?? false,
-      dns: {
-        nameserver: c.dns?.nameserver ?? '',
-        record: c.dns?.record ?? d.dns.record,
-        match_type: c.dns?.match_type ?? d.dns.match_type,
-        expected: [...(c.dns?.expected ?? [])],
-      },
-      ping: { ip_type: c.ping?.ip_type ?? d.ping.ip_type, count: c.ping?.count ?? d.ping.count },
-      metric: {
-        name: c.metric?.name ?? '',
-        labels: (c.metric?.labels ?? []).map((l) => ({ name: l.name, value: l.value })),
-      },
-      cert_warning_days: c.cert_warning_days ?? d.cert_warning_days,
-      grace_secs: c.grace_secs ?? d.grace_secs,
-      failures_before_down: c.failures_before_down ?? d.failures_before_down,
-      retry_interval_secs: c.retry_interval_secs ?? null,
-      down_interval_secs: c.down_interval_secs ?? null,
-      rollup: {
-        zone: c.rollup?.zone ? policyDraft(c.rollup.zone) : null,
-        region: c.rollup?.region ? policyDraft(c.rollup.region) : null,
-        global: c.rollup?.global ? policyDraft(c.rollup.global) : null,
-      },
-      min_incident_secs: c.min_incident_secs ?? null,
-      min_recovery_secs: c.min_recovery_secs ?? null,
-      notify_degraded: optionalBoolean(c.notify_degraded),
-      degraded_is_downtime: optionalBoolean(c.degraded_is_downtime),
-placement: {
-mode: c.placement?.mode ?? 'zone',
-zones: [...(c.placement?.zones ?? [])],
-regions: [...(c.placement?.regions ?? [])],
-count: c.placement?.count ?? c.placement?.per_zone ?? 1,
-},
-    };
-  }
 
   let draft = $state<Draft>(blank());
   /** Server-owned ordering, round-tripped untouched. Absent on create. */
@@ -267,21 +70,6 @@ count: c.placement?.count ?? c.placement?.per_zone ?? 1,
   let logsError = $state<string | null>(null);
   let logsLoading = $state(false);
 
-  let evalResult = $state<EvalResult | null>(null);
-  let evalError = $state<string | null>(null);
-  let testing = $state(false);
-  let sample = $state<{
-    status: number | null;
-    latency: number | null;
-    body: string;
-    metric: number | null;
-  }>({
-    status: 200,
-    latency: 42,
-    body: 'ok',
-    metric: 1,
-  });
-
   // Each destructive action confirms on its own, so arming one never arms the
   // other — they destroy very different things.
   let pending = $state<'purge' | 'delete' | 'erase' | null>(null);
@@ -289,8 +77,6 @@ count: c.placement?.count ?? c.placement?.per_zone ?? 1,
   let dangerError = $state<string | null>(null);
   let dangerNote = $state<string | null>(null);
 
-  let copied = $state(false);
-  let copyError = $state<string | null>(null);
   // This is deliberately initialized, rather than derived: after a new check
   // is saved, closing Probe remains the editor's own persistent choice.
   // svelte-ignore state_referenced_locally
@@ -380,11 +166,6 @@ count: c.placement?.count ?? c.placement?.per_zone ?? 1,
     return { domains, total: domains.reduce((n, d) => n + d.probes, 0), count };
   });
 
-  /** Free-text buffer per axis, so a zone can be named before any agent in it
-   *  has ever reported. Keyed by axis because the picker below is one snippet
-   *  rendered twice. */
-  let adding = $state<{ zones: string; regions: string }>({ zones: '', regions: '' });
-
   const cronHint = $derived(describeCron(draft.cron));
   const retryIntervalHint = $derived(describeInterval(draft.retry_interval_secs));
   const downIntervalHint = $derived(describeInterval(draft.down_interval_secs));
@@ -471,10 +252,9 @@ count: c.placement?.count ?? c.placement?.per_zone ?? 1,
       .join(' · '),
   );
 
-  /* Advanced disclosures. Set from the loaded check in load(), then owned by
+  /* Advanced disclosure. Set from the loaded check in load(), then owned by
      whoever is typing. */
   let verdictAdvanced = $state(false);
-  let probeAdvanced = $state(false);
 
   /** Plain-language gloss for the shapes people actually type. Anything else
    *  says it cannot read the expression rather than guessing — a wrong reading
@@ -563,7 +343,6 @@ count: c.placement?.count ?? c.placement?.per_zone ?? 1,
         // carries overrides must arrive with them on screen, but clearing the
         // last one must not then slam the panel shut under the cursor.
         verdictAdvanced = verdictOverrides > 0;
-        probeAdvanced = draft.eval.trim().length > 0;
       }
     } catch (e) {
       loadError =
@@ -591,57 +370,6 @@ count: c.placement?.count ?? c.placement?.per_zone ?? 1,
 
   load();
   loadLogs();
-
-  /** These map to unsigned integers server-side. A negative or fractional value
-   *  can be typed past the `min` attribute and would fail JSON deserialization,
-   *  surfacing a framework message instead of Warden's own. */
-  function whole(v: number | null, min: number): boolean {
-    return v !== null && Number.isInteger(v) && v >= min;
-  }
-
-  function addHost() {
-    draft.hosts.push('');
-  }
-  function addHeader() {
-    draft.headers.push({ name: '', value: '' });
-  }
-  function addExpected() {
-    draft.dns.expected.push('');
-  }
-  function addMetricLabel() {
-    draft.metric.labels.push({ name: '', value: '' });
-  }
-
-  /** Adding a location the fleet has never reported is deliberate: a zone is
-   *  usually configured before the agent that will live in it boots. */
-  function addLocation(axis: 'zones' | 'regions', value: string) {
-    const v = value.trim();
-    if (v && !draft.placement[axis].includes(v)) draft.placement[axis].push(v);
-  }
-
-  function toggleLocation(axis: 'zones' | 'regions', value: string, on: boolean) {
-    const list = draft.placement[axis];
-    const at = list.indexOf(value);
-    if (on && at === -1) list.push(value);
-    if (!on && at !== -1) list.splice(at, 1);
-  }
-
-  function defaultPolicy(level: 'zone' | 'region' | 'global'): PolicyDraft {
-    if (level === 'zone') return policyDraft({ degraded_when: 'all', down_when: 'all' });
-    if (level === 'region') return policyDraft({ degraded_when: 'any', down_when: 'all' });
-    return policyDraft({ degraded_when: 'any', down_when: 'majority' });
-  }
-
-  function togglePolicy(level: 'zone' | 'region' | 'global', enabled: boolean) {
-    draft.rollup[level] = enabled ? defaultPolicy(level) : null;
-  }
-
-  function validPolicy(policy: PolicyDraft | null): boolean {
-    if (!policy) return true;
-    return [policy.degraded_when, policy.down_when].every(
-      (threshold) => threshold.kind !== 'quorum' || whole(threshold.quorum, 1),
-    );
-  }
 
   function secretReferenceError(target: string, headers: { name: string; value: string }[]): string | null {
     const hasReference = (value: string) => value.includes('${');
@@ -823,26 +551,6 @@ per_zone: draft.placement.count ?? 1,
     }
   }
 
-  async function runTest() {
-    if (testing) return;
-    testing = true;
-    evalResult = null;
-    evalError = null;
-    try {
-      evalResult = await testEval({
-        eval: draft.eval,
-        status: sample.status ?? 0,
-        latency: sample.latency ?? 0,
-        body: sample.body,
-        ...(kind === 'openmetrics' ? { metric: sample.metric ?? 0 } : {}),
-      });
-    } catch (e) {
-      evalError = fail(e);
-    } finally {
-      testing = false;
-    }
-  }
-
   async function confirmPurge() {
     if (id === null || dangerBusy) return;
     dangerBusy = true;
@@ -891,20 +599,6 @@ per_zone: draft.placement.count ?? 1,
     } catch (e) {
       dangerError = fail(e);
       dangerBusy = false;
-    }
-  }
-
-  async function copyHeartbeat() {
-    if (!heartbeatUrl) return;
-    copyError = null;
-    try {
-      await navigator.clipboard.writeText(heartbeatUrl);
-      copied = true;
-      setTimeout(() => (copied = false), 1500);
-    } catch {
-      // Clipboard access needs a secure context, which a LAN deployment over
-      // plain HTTP is not. Saying so beats a button that quietly does nothing.
-      copyError = 'Clipboard unavailable here — select the URL above and copy it.';
     }
   }
 </script>
@@ -992,310 +686,19 @@ per_zone: draft.placement.count ?? 1,
         </label>
 
         {#if kind === 'http'}
-          <label class="field wide">
-            <span class="field-label">Target URL</span>
-            <!-- The placeholder is an expression, not a literal attribute: Svelte reads
-                 `{NAME}` in attribute text as an interpolation, so writing the credential
-                 reference inline made the editor crash on an undefined variable. -->
-            <input
-              class="mono"
-              bind:value={draft.target}
-              placeholder={'https://example.com/health?token=${API_TOKEN}'}
-            />
-            <span class="field-note">Use ${'{NAME}'} for credentials; it resolves only in the probing region.</span>
-          </label>
-
-          <label class="field">
-            <span class="field-label">Timeout (s)</span>
-            <NumberField min={1} bind:value={draft.timeout_secs} />
-          </label>
-
-          <label class="field">
-            <span class="field-label">Expect status</span>
-            <NumberField
-              min={100}
-              max={599}
-              bind:value={draft.expect_status}
-              placeholder="(any 2xx–3xx)"
-            />
-          </label>
-
-          <label class="field wide">
-            <span class="field-label">Expect body contains</span>
-            <input bind:value={draft.expect_body} placeholder="(any response body)" />
-          </label>
-
-          <div class="field wide">
-            <span class="field-label">Headers</span>
-            {#if draft.headers.length === 0}
-              <span class="field-note">None. The probe sends only Warden's defaults.</span>
-            {:else}
-              <!-- Keyed by index: two headers may legitimately share a name, and
-                   a duplicate key aborts the render of the whole page. -->
-              {#each draft.headers as _header, i (i)}
-                <div class="pair-row">
-                  <input class="mono pair-name" bind:value={draft.headers[i].name} placeholder="Authorization" />
-                  <input class="mono" bind:value={draft.headers[i].value} placeholder="Bearer …" />
-                  <button class="btn danger" onclick={() => draft.headers.splice(i, 1)}>Remove</button>
-                </div>
-              {/each}
-            {/if}
-            <div class="add-row">
-              <button class="btn" onclick={addHeader}>+ Add header</button>
-            </div>
-          </div>
-
-          <div class="field wide">
-            <span class="field-label">TLS</span>
-            <label class="toggle">
-              <input type="checkbox" bind:checked={draft.allow_self_signed} />
-              <span>
-                Allow self-signed
-                <em>— accept an untrusted certificate. Off means HTTPS is verified.</em>
-              </span>
-            </label>
-          </div>
+          <HttpFields {draft} />
         {:else if kind === 'tcp'}
-          <label class="field wide">
-            <span class="field-label">Target</span>
-            <input class="mono" bind:value={draft.target} placeholder="db.internal:5432" />
-            <span class="field-note">host:port — a TCP probe with no port has nothing to connect to.</span>
-          </label>
-
-          <label class="field">
-            <span class="field-label">Timeout (s)</span>
-            <NumberField min={1} bind:value={draft.timeout_secs} />
-          </label>
-
-          <div class="field wide">
-            <span class="field-label">Additional hosts</span>
-            {#if draft.hosts.length === 0}
-              <span class="field-note">None. Only the target above is probed.</span>
-            {:else}
-              {#each draft.hosts as _host, i (i)}
-                <div class="pair-row">
-                  <input class="mono" bind:value={draft.hosts[i]} placeholder="db-replica.internal:5432" />
-                  <button class="btn danger" onclick={() => draft.hosts.splice(i, 1)}>Remove</button>
-                </div>
-              {/each}
-            {/if}
-            <div class="add-row">
-              <button class="btn" onclick={addHost}>+ Add host</button>
-            </div>
-          </div>
-
-          <label class="field">
-            <span class="field-label">Host match</span>
-            <select bind:value={draft.host_match}>
-              {#each MATCH_MODES as m (m)}
-                <option value={m}>{m}</option>
-              {/each}
-            </select>
-            <span class="field-note">
-              all = every host must connect. any = one is enough, for a redundant pool.
-            </span>
-          </label>
+          <TcpFields {draft} />
         {:else if kind === 'icmp'}
-          <label class="field wide">
-            <span class="field-label">Target host</span>
-            <input class="mono" bind:value={draft.target} placeholder="1.1.1.1" />
-            <span class="field-note">A hostname or IP, not a URL.</span>
-          </label>
-
-          <label class="field">
-            <span class="field-label">Timeout (s)</span>
-            <NumberField min={1} bind:value={draft.timeout_secs} />
-          </label>
-
-          <div class="field wide">
-            <span class="field-label">Additional hosts</span>
-            {#if draft.hosts.length === 0}
-              <span class="field-note">None. Only the target above is pinged.</span>
-            {:else}
-              {#each draft.hosts as _host, i (i)}
-                <div class="pair-row">
-                  <input class="mono" bind:value={draft.hosts[i]} placeholder="8.8.8.8" />
-                  <button class="btn danger" onclick={() => draft.hosts.splice(i, 1)}>Remove</button>
-                </div>
-              {/each}
-            {/if}
-            <div class="add-row">
-              <button class="btn" onclick={addHost}>+ Add host</button>
-            </div>
-          </div>
-
-          <label class="field">
-            <span class="field-label">Host match</span>
-            <select bind:value={draft.host_match}>
-              {#each MATCH_MODES as m (m)}
-                <option value={m}>{m}</option>
-              {/each}
-            </select>
-            <span class="field-note">all = every host must reply. any = one is enough.</span>
-          </label>
-
-          <label class="field">
-            <span class="field-label">IP type</span>
-            <select bind:value={draft.ping.ip_type}>
-              {#each IP_TYPES as t (t)}
-                <option value={t}>{t}</option>
-              {/each}
-            </select>
-            <span class="field-note">Which address family the host resolves to.</span>
-          </label>
-
-          <label class="field">
-            <span class="field-label">Ping count</span>
-            <NumberField min={1} bind:value={draft.ping.count} />
-            <span class="field-note">Echoes sent per attempt.</span>
-          </label>
+          <IcmpFields {draft} />
         {:else if kind === 'dns'}
-          <label class="field wide">
-            <span class="field-label">Target host</span>
-            <input class="mono" bind:value={draft.target} placeholder="example.com" />
-            <span class="field-note">The name to look up — not a URL.</span>
-          </label>
-
-          <label class="field">
-            <span class="field-label">Timeout (s)</span>
-            <NumberField min={1} bind:value={draft.timeout_secs} />
-          </label>
-
-          <label class="field">
-            <span class="field-label">Nameserver</span>
-            <input class="mono" bind:value={draft.dns.nameserver} placeholder="(system resolver)" />
-          </label>
-
-          <label class="field">
-            <span class="field-label">Record</span>
-            <select bind:value={draft.dns.record}>
-              {#each DNS_RECORDS as r (r)}
-                <option value={r}>{r}</option>
-              {/each}
-            </select>
-          </label>
-
-          <label class="field">
-            <span class="field-label">Match type</span>
-            <select bind:value={draft.dns.match_type}>
-              {#each MATCH_MODES as m (m)}
-                <option value={m}>{m}</option>
-              {/each}
-            </select>
-            <span class="field-note">all = every expected value must appear. any = one of them.</span>
-          </label>
-
-          <div class="field wide">
-            <span class="field-label">Expected answers</span>
-            {#if draft.dns.expected.length === 0}
-              <span class="field-note">None. Resolving at all is enough.</span>
-            {:else}
-              {#each draft.dns.expected as _value, i (i)}
-                <div class="pair-row">
-                  <input class="mono" bind:value={draft.dns.expected[i]} placeholder="93.184.216.34" />
-                  <button class="btn danger" onclick={() => draft.dns.expected.splice(i, 1)}>
-                    Remove
-                  </button>
-                </div>
-              {/each}
-            {/if}
-            <div class="add-row">
-              <button class="btn" onclick={addExpected}>+ Add value</button>
-            </div>
-          </div>
+          <DnsFields {draft} />
         {:else if kind === 'ssl'}
-          <label class="field wide">
-            <span class="field-label">Target host</span>
-            <input class="mono" bind:value={draft.target} placeholder="example.com" />
-            <span class="field-note">A hostname, not a URL. Port 443 is assumed.</span>
-          </label>
-
-          <label class="field">
-            <span class="field-label">Timeout (s)</span>
-            <NumberField min={1} bind:value={draft.timeout_secs} />
-          </label>
-
-          <label class="field">
-            <span class="field-label">Warn before expiry (days)</span>
-            <NumberField min={0} bind:value={draft.cert_warning_days} />
-            <span class="field-note">DOWN once the certificate is this close to expiring.</span>
-          </label>
+          <SslFields {draft} />
         {:else if kind === 'openmetrics'}
-          <label class="field wide">
-            <span class="field-label">Target URL</span>
-            <input class="mono" bind:value={draft.target} placeholder="https://example.com/metrics" />
-            <span class="field-note">The exporter's scrape endpoint. Only this one target is probed.</span>
-          </label>
-
-          <label class="field">
-            <span class="field-label">Timeout (s)</span>
-            <NumberField min={1} bind:value={draft.timeout_secs} />
-          </label>
-
-          <label class="field wide">
-            <span class="field-label">Metric name</span>
-            <input class="mono" bind:value={draft.metric.name} placeholder="up" />
-            <span class="field-note">The metric family to read from the scrape, e.g. "up".</span>
-          </label>
-
-          <div class="field wide">
-            <span class="field-label">Metric labels</span>
-            {#if draft.metric.labels.length === 0}
-              <span class="field-note">
-                None. If the family has more than one series, the first one wins — add labels to
-                pick a specific one.
-              </span>
-            {:else}
-              {#each draft.metric.labels as _label, i (i)}
-                <div class="pair-row">
-                  <input
-                    class="mono pair-name"
-                    bind:value={draft.metric.labels[i].name}
-                    placeholder="path"
-                  />
-                  <input class="mono" bind:value={draft.metric.labels[i].value} placeholder="/health" />
-                  <button class="btn danger" onclick={() => draft.metric.labels.splice(i, 1)}>
-                    Remove
-                  </button>
-                </div>
-              {/each}
-            {/if}
-            <div class="add-row">
-              <button class="btn" onclick={addMetricLabel}>+ Add label</button>
-            </div>
-            <span class="field-note">
-              Narrows the metric family down to one series when several share the same name — e.g.
-              <code>path="/health"</code>. All must match.
-            </span>
-          </div>
+          <OpenMetricsFields {draft} />
         {:else}
-          <label class="field">
-            <span class="field-label">Grace (s)</span>
-            <NumberField min={10} bind:value={draft.grace_secs} />
-            <span class="field-note">No ping within this window and the check goes DOWN.</span>
-          </label>
-
-          <div class="field wide">
-            <span class="field-label">Ping URL</span>
-            {#if heartbeatUrl}
-              <div class="pair-row">
-                <input class="mono" readonly value={heartbeatUrl} />
-                <button class="btn" onclick={copyHeartbeat}>{copied ? 'Copied' : 'Copy'}</button>
-              </div>
-              <span class="field-note">
-                Have the job call this URL (GET or POST) when it finishes. It needs no
-                authentication — the URL itself is the credential, so treat it like one. It is
-                built from the check's current name, so renaming and saving moves it — update the
-                job before you save a rename.
-              </span>
-              {#if copyError}<span class="admin-error">{copyError}</span>{/if}
-            {:else}
-              <span class="field-note">
-                The ping URL is built from the check's name, so it appears here once this check
-                has been saved.
-              </span>
-            {/if}
-          </div>
+          <HeartbeatFields {draft} {heartbeatUrl} />
         {/if}
 
         <!-- The schedule belongs with the probe: how often it runs is part of
@@ -1332,69 +735,7 @@ per_zone: draft.placement.count ?? 1,
         {/if}
       </div>
 
-      <details class="advanced" bind:open={probeAdvanced}>
-        <summary class="advanced-summary">
-          <span class="chev" aria-hidden="true">▸</span> Advanced — custom verdict script
-          {#if draft.eval.trim()}<span class="badge-count">Lua in use</span>{/if}
-        </summary>
-        <div class="advanced-body">
-          <div class="eval-block">
-            <div class="field-label">Custom eval (Lua)</div>
-            <textarea
-              class="mono"
-              rows="10"
-              spellcheck="false"
-              bind:value={draft.eval}
-              placeholder={'local code = math.floor(status / 100)\nif status == 429 or (code >= 2 and code <= 3) then\n  return "UP", latency\nend\nreturn "DOWN"'}
-            ></textarea>
-            <p class="field-note">
-              In scope: <code>status</code> (number, 0 when the probe never connected),
-              <code>latency</code>
-              (ms), <code>body</code> (string, truncated), <code>headers</code> (table, lowercased
-              keys). Return <code>"UP"</code> or <code>"DOWN"</code>, optionally a latency override as a
-              second value. Returning nothing — or leaving this empty — uses the built-in 2xx–3xx logic.
-              {#if kind === 'openmetrics'}
-                For OpenMetrics, <code>metric</code> is the selected sample's value (number), and
-                <code>metrics</code> is an array of every sample from the same scrape.
-              {/if}
-            </p>
-
-            <div class="try-row">
-              {#if kind === 'openmetrics'}
-                <label class="field try-num">
-                  <span class="field-label">metric</span>
-                  <NumberField bind:value={sample.metric} />
-                </label>
-              {:else}
-                <label class="field try-num">
-                  <span class="field-label">status</span>
-                  <NumberField bind:value={sample.status} />
-                </label>
-                <label class="field try-num">
-                  <span class="field-label">latency (ms)</span>
-                  <NumberField bind:value={sample.latency} />
-                </label>
-                <label class="field try-body">
-                  <span class="field-label">body</span>
-                  <input class="mono" bind:value={sample.body} />
-                </label>
-              {/if}
-              <button class="btn" onclick={runTest} disabled={testing}>
-                {testing ? 'Testing…' : 'Test script'}
-              </button>
-            </div>
-
-            {#if evalError}
-              <p class="admin-error mono">{evalError}</p>
-            {:else if evalResult}
-              <p class="verdict">
-                <span class="verdict-pill {evalResult.verdict}">{evalResult.verdict.toUpperCase()}</span>
-                <span class="admin-muted">reported latency {evalResult.latency_ms} ms</span>
-              </p>
-            {/if}
-          </div>
-        </div>
-      </details>
+      <EvaluationTester {kind} bind:evalScript={draft.eval} />
     </div>
   </details>
 
@@ -1409,147 +750,7 @@ per_zone: draft.placement.count ?? 1,
       </span>
     </summary>
     <div class="editor-body">
-      <p class="field-note lede">
-        Where this check runs, described by location rather than by machine, so growing the
-        fleet does not mean revisiting every check. Choose whether the count applies once per
-        zone or once per region; leave both lists empty to include every location.
-      </p>
-
-      {#if pinned}
-        <p class="field-note override">
-          This check is pinned to {draft.agents.length}
-          {draft.agents.length === 1 ? 'agent' : 'agents'} below, and an explicit pin wins
-          outright — the regions and zones here are ignored entirely while that list is
-          non-empty. Clear it to place this check by location instead.
-        </p>
-      {/if}
-
-      <div class="placement-axes">
-        <!-- Declared here, rendered twice below: regions and zones are the
-             same picker over a different axis. -->
-        {#snippet locations(axis: 'zones' | 'regions', noun: string, options: string[])}
-          <div class="field">
-            <span class="field-label">{noun}s</span>
-            {#if options.length > 0}
-              <div class="agent-picker">
-                <!-- Set-deduped above, so no value can repeat. -->
-                {#each options as v (v)}
-                  <label class="toggle">
-                    <input
-                      type="checkbox"
-                      checked={draft.placement[axis].includes(v)}
-                      onchange={(e) => toggleLocation(axis, v, e.currentTarget.checked)}
-                    />
-                    <span class="agent-pill">{v}</span>
-                    {#if v === UNKNOWN_LOCATION}
-                      <em
-                        class="stale"
-                        title="Agents that declare no zone or region of their own. Set them in the agent's config."
-                        >undeclared</em
-                      >
-                    {/if}
-                  </label>
-                {/each}
-              </div>
-            {/if}
-            <div class="pair-row">
-              <input class="mono" bind:value={adding[axis]} placeholder="{noun} not in the fleet yet" />
-              <button
-                class="btn"
-                onclick={() => {
-                  addLocation(axis, adding[axis]);
-                  adding[axis] = '';
-                }}
-              >
-                + Add
-              </button>
-            </div>
-            <span class="field-note">
-              {draft.placement[axis].length === 0
-                ? `None ticked — every ${noun} is allowed.`
-                : `Restricted to ${draft.placement[axis].length} ${noun}${draft.placement[axis].length === 1 ? '' : 's'}.`}
-              Offered {noun}s come from the live fleet; add one by hand for a {noun} whose agents
-              have not booted yet.
-            </span>
-          </div>
-        {/snippet}
-
-        {@render locations('regions', 'region', regionOptions)}
-        {@render locations('zones', 'zone', zoneOptions)}
-        <label class="field">
-          <span class="field-label">Placement mode</span>
-          <select bind:value={draft.placement.mode}>
-            <option value="zone">Per zone</option>
-            <option value="region">Per region</option>
-          </select>
-          <span class="field-note">The selected domain gets its own independent observer count.</span>
-        </label>
-        <label class="field">
-          <span class="field-label">Agents per {draft.placement.mode}</span>
-          <NumberField min={1} bind:value={draft.placement.count} />
-          <span class="field-note">
-            How many agents inside <em>each</em> matched {draft.placement.mode} probe this — not
-            a fleet-wide total. Raising it buys corroboration at the cost of duplicate probes.
-          </span>
-        </label>
-      </div>
-
-      <!-- The number that stops a 20x fan-out: what this spec does to the
-           fleet as it stands right now, not what it means in the abstract. -->
-      {#if pinned}
-        <p class="effect muted">
-          With pinning on, {draft.agents.length}
-          {draft.agents.length === 1 ? 'agent probes' : 'agents probe'} this check — the spec above
-          changes nothing until the pin is cleared.
-        </p>
-      {:else if effect.total === 0}
-        <p class="effect none">
-          No live agent matches this placement, so nothing probes this check. It will report
-          nothing rather than fail — silence, not an error.
-        </p>
-      {:else}
-        <p class="effect">
-          Right now this places <strong>{effect.total}</strong>
-          {effect.total === 1 ? 'probe' : 'probes'} across {effect.domains.length}
-          {draft.placement.mode}{effect.domains.length === 1 ? '' : 's'}:
-          {#each effect.domains as domain (domain.domain)}
-            <span class="effect-zone" class:short={domain.available < effect.count}>
-              {domain.domain} ×{domain.probes}{domain.available < effect.count ? ` (only ${domain.available} live)` : ''}
-            </span>
-          {/each}
-        </p>
-      {/if}
-
-      <div class="field pin-block">
-        <span class="field-label">Pin to agents</span>
-        {#if agentOptions.length === 0}
-          <span class="field-note">
-            No agent has reported yet. The placement above decides who probes this check once
-            some do.
-          </span>
-        {:else}
-          <div class="agent-picker">
-            {#each agentOptions as id (id)}
-              <label class="toggle">
-                <input type="checkbox" value={id} bind:group={draft.agents} />
-                <span class="agent-pill">{id}</span>
-                {#if !reporting.has(id)}
-                  <em
-                    class="stale"
-                    title="This agent has not reported recently. A check pinned only to silent agents is never probed."
-                    >not reporting</em
-                  >
-                {/if}
-              </label>
-            {/each}
-          </div>
-          <span class="field-note">
-            None ticked is the normal case: the placement above decides who probes this check.
-            Ticking agents pins it to exactly those and overrides placement entirely — for a
-            probe that genuinely belongs to one box, such as a machine's own loopback port.
-          </span>
-        {/if}
-      </div>
+      <PlacementEditor {draft} {pinned} {effect} {zoneOptions} {regionOptions} {agentOptions} {reporting} />
     </div>
   </details>
 
@@ -1597,31 +798,7 @@ per_zone: draft.placement.count ?? 1,
           </span>
         </label>
 
-        <div class="field wide">
-          <span class="field-label">Depends on</span>
-          {#if otherChecks.length === 0}
-            <span class="field-note">No other checks to depend on yet.</span>
-          {:else}
-            <div class="agent-picker">
-              {#each otherChecks as dep (dep.id)}
-                <label class="toggle">
-                  <input type="checkbox" value={dep.id} bind:group={draft.depends_on} />
-                  <span class="agent-pill">{dep.name}</span>
-                </label>
-              {/each}
-            </div>
-          {/if}
-          <span class="field-note">
-            {#if draft.depends_on.length === 0}
-              Nothing upstream. A failure here opens its own incident.
-            {:else}
-              When this check fails while one of these already has an open incident, it
-              joins that incident instead of opening a second one for the same root cause.
-              It still alerts and still notifies — grouping is not silence. One hop only:
-              it does not follow an upstream's own dependencies.
-            {/if}
-          </span>
-        </div>
+        <DependencyEditor {draft} {otherChecks} />
       </div>
 
       <details class="advanced" bind:open={verdictAdvanced}>
@@ -1648,51 +825,7 @@ per_zone: draft.placement.count ?? 1,
               <span class="field-note">Blank inherits. Explicit 0 publishes recovery immediately.</span>
             </label>
 
-            <div class="field rollup-editor">
-              <span class="field-label">Rollup policy overrides</span>
-              <span class="field-note">
-                Blank levels inherit stored coordinator policy, then built-ins. “Degraded” counts failing
-                children; “DOWN” counts hard-down children.
-              </span>
-              {#snippet policyLevel(level: 'zone' | 'region' | 'global', title: string, children: string)}
-                <div class="policy-level">
-                  <label class="toggle">
-                    <input
-                      type="checkbox"
-                      checked={draft.rollup[level] !== null}
-                      onchange={(e) => togglePolicy(level, e.currentTarget.checked)}
-                    />
-                    <span><strong>{title}</strong> <em>— {children}</em></span>
-                  </label>
-                  {#if draft.rollup[level]}
-                    <div class="policy-thresholds">
-                      {#each POLICY_EDGES as edge (edge.key)}
-                        <label class="field">
-                          <span class="field-label">{edge.label}</span>
-                          <select bind:value={draft.rollup[level]![edge.key].kind}>
-                            {#each THRESHOLD_KINDS as kind (kind)}
-                              <option value={kind}>{kind}</option>
-                            {/each}
-                          </select>
-                          {#if draft.rollup[level]![edge.key].kind === 'quorum'}
-                            <NumberField
-                              min={1}
-                              ariaLabel={`${edge.label} quorum`}
-                              bind:value={draft.rollup[level]![edge.key].quorum}
-                            />
-                          {/if}
-                        </label>
-                      {/each}
-                    </div>
-                  {/if}
-                </div>
-              {/snippet}
-              <div class="policy-levels">
-                {@render policyLevel('zone', 'Zone', 'agents → zone; built-in all / all')}
-                {@render policyLevel('region', 'Region', 'zones → region; built-in any / all')}
-                {@render policyLevel('global', 'Check', 'regions → check; built-in any / majority')}
-              </div>
-            </div>
+            <RollupPolicyEditor {draft} />
           </div>
         </div>
       </details>
@@ -2061,28 +1194,6 @@ per_zone: draft.placement.count ?? 1,
     grid-column: 1 / -1;
     gap: 0.35rem;
   }
-  .rollup-editor {
-    grid-column: 1 / -1;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 0.6rem 0.7rem;
-  }
-  .policy-levels {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
-    gap: 0.7rem;
-    margin-top: 0.5rem;
-  }
-  .policy-level {
-    border-top: 1px solid var(--border);
-    padding-top: 0.45rem;
-  }
-  .policy-thresholds {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 0.5rem;
-    margin-top: 0.45rem;
-  }
   .agent-picker {
     display: flex;
     flex-wrap: wrap;
@@ -2093,136 +1204,10 @@ per_zone: draft.placement.count ?? 1,
     color: var(--text);
   }
 
-  /* One repeated entry: value fields stretch, the remove button never does. */
-  .pair-row {
-    display: flex;
-    gap: 0.4rem;
-    align-items: center;
-  }
-  .pair-row + .pair-row {
-    margin-top: 0.3rem;
-  }
-  .pair-name {
-    flex: 0 1 14rem;
-  }
-  .add-row {
-    margin-top: 0.4rem;
-  }
-
-  /* The pin is the escape hatch from everything above it, so it sits below the
-     effect line with a rule between: read the placement, then the override. */
-  .pin-block {
-    margin-top: 0.9rem;
-    padding-top: 0.8rem;
-    border-top: 1px solid var(--border);
-  }
-  .placement-axes {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
-    gap: 0.7rem 1rem;
-    align-items: start;
-  }
-  .override {
-    display: block;
-    color: var(--amber);
-    line-height: 1.5;
-    margin: 0 0 0.8rem;
-    max-width: 68ch;
-  }
-
   /* A check nothing probes must not read as fine when the panel is shut. */
   .sum-note.bad {
     color: var(--down);
   }
-  .effect {
-    margin: 0.2rem 0 0;
-    font-size: 0.78rem;
-    line-height: 1.6;
-    color: var(--text);
-  }
-  .effect.none {
-    color: var(--down);
-  }
-  .effect.muted {
-    color: var(--text-dim);
-  }
-  .effect-zone {
-    display: inline-block;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 0.72rem;
-    padding: 0.05rem 0.4rem;
-    margin: 0 0.2rem;
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    color: var(--text-dim);
-  }
-  /* Fewer agents in the zone than asked for: the spec is not being met, and the
-     count above is the real one rather than the one that was typed. */
-  .effect-zone.short {
-    border-color: var(--amber);
-    color: var(--amber);
-  }
-
-  .eval-block {
-    margin-top: 0.9rem;
-    border-top: 1px solid var(--border);
-    padding-top: 0.7rem;
-  }
-  .eval-block textarea {
-    resize: vertical;
-    line-height: 1.45;
-    margin-top: 0.3rem;
-  }
-  .eval-block code {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    color: var(--text);
-  }
-  .eval-block .field-note {
-    display: block;
-    margin: 0.4rem 0 0;
-    line-height: 1.5;
-  }
-
-  .try-row {
-    display: flex;
-    align-items: flex-end;
-    gap: 0.6rem;
-    margin-top: 0.7rem;
-  }
-  .try-num {
-    width: 7rem;
-    flex: none;
-  }
-  .try-body {
-    flex: 1 1 auto;
-  }
-
-  /* A wrong verdict here is the difference between a page that alerts and one
-     that lies, so it is stated at size and in colour, not as a footnote. */
-  .verdict {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    margin: 0.6rem 0 0;
-  }
-  .verdict-pill {
-    font-size: 0.9rem;
-    font-weight: 700;
-    letter-spacing: 0.06em;
-    padding: 0.15rem 0.7rem;
-    border-radius: 6px;
-  }
-  .verdict-pill.up {
-    background: rgba(63, 185, 80, 0.16);
-    border: 1px solid var(--up);
-    color: var(--up);
-  }
-  .verdict-pill.down {
-    background: rgba(248, 81, 73, 0.16);
-    border: 1px solid var(--down);
-    color: var(--down);
-  }
-
   .interval-example {
     color: var(--text);
   }
@@ -2304,10 +1289,5 @@ per_zone: draft.placement.count ?? 1,
   .dim {
     color: var(--text-dim);
     white-space: nowrap;
-  }
-  /* Dim, beside the id rather than under it: the warning belongs to the row you
-     are ticking. */
-  .stale {
-    font-size: 0.68rem;
   }
 </style>
