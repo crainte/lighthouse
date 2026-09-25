@@ -28,6 +28,19 @@
   import type { WsStatus } from './lib/ws';
   import { applyStateChange, prependAlert, applyIncidentEvent } from './lib/live';
   import { formatDuration, worstStatus } from './lib/format';
+  import type { View } from './lib/router';
+  import {
+    viewFromHash,
+    hashForHome,
+    hashForCheck,
+    hashForIncident,
+    hashForGroup,
+    hashForAdmin,
+    hashForCheckEditor,
+    hashForIncidentEditor,
+  } from './lib/router';
+  import { createSessionChecker } from './lib/session';
+  import { debounce, debounceByKey } from './lib/debounce';
   import {
     formatAbsolute,
     openGlobalIncidents,
@@ -156,69 +169,18 @@
   /** Sidebar groups, in declaration order, so adding a panel needs no second list. */
   const NAV_GROUPS = [...new Set(ADMIN_PANELS.map((p) => p.group))];
 
-  type View =
-    | { name: 'home' }
-    | { name: 'detail'; checkId: string }
-    // The public permalink for one incident, which is what the status page and
-    // any notification link to.
-    | { name: 'incident'; incidentId: string }
-    // `edit` present = the check editor page rather than the panel's own
-    // content; `edit.id === null` is a check that does not exist yet.
-    // `incident` present = the incident editor, open on that id (or `null` for
-    // one being created).
-    | {
-        name: 'admin';
-        panel: AdminPanel;
-        edit?: { id: string | null };
-        incident?: { id: string | null };
-      }
-    // One section's own page. Carries the name, not a resolved section: the
-    // route must survive a deep link that lands before `/api/v1/sections` has.
-    | { name: 'group'; sectionName: string };
   type DayModal = { checkId: string; bucket: UptimeBucket } | null;
 
   // The view is reflected in the URL hash so the browser/mouse Back button steps
   // back into the app instead of leaving it — and a check page can be linked
-  // and survives a refresh.
-  function viewFromHash(): View {
-    // #/admin/checks/<id> — or /new — is the editor page for one check. "new"
-    // is therefore a reserved id: no check ever has the literal id "new", since
-    // ids are server-minted UUIDs. Accepted rather than paid for with a query
-    // parameter hanging off every other admin URL.
-    const editor = location.hash.match(/^#\/admin\/checks\/(.+?)\/?$/);
-    if (editor) {
-      const raw = decodeURIComponent(editor[1]);
-      return { name: 'admin', panel: 'checks', edit: { id: raw === 'new' ? null : raw } };
-    }
-    // #/admin/incidents/<id> — the editor for one incident, so the Alerts feed
-    // can link straight to the thing an operator would act on, and the URL
-    // survives a refresh. "new" is reserved the same way as for checks.
-    const incEditor = location.hash.match(/^#\/admin\/incidents\/(.+?)\/?$/);
-    if (incEditor) {
-      const raw = decodeURIComponent(incEditor[1]);
-      return {
-        name: 'admin',
-        panel: 'incidents',
-        incident: { id: raw === 'new' ? null : raw },
-      };
-    }
-    const admin = location.hash.match(/^#\/admin(?:\/([^/]*))?\/?$/);
-    if (admin) {
-      // An unknown or absent id lands on the first panel rather than rendering
-      // an empty content area.
-      const panel = ADMIN_PANELS.find((p) => p.id === admin[1])?.id ?? ADMIN_PANELS[0].id;
-      return { name: 'admin', panel };
-    }
-    const inc = location.hash.match(/^#\/incident\/(.+)$/);
-    if (inc) return { name: 'incident', incidentId: decodeURIComponent(inc[1]) };
-    // #/group/<name> — a section an admin set to render as its own page. A
-    // check page stays reachable at #/check/<id> without passing through here,
-    // so a deep link into a paged section's check still works.
-    const grp = location.hash.match(/^#\/group\/(.+)$/);
-    if (grp) return { name: 'group', sectionName: decodeURIComponent(grp[1]) };
-    const m = location.hash.match(/^#\/check\/(.+)$/);
-    return m ? { name: 'detail', checkId: decodeURIComponent(m[1]) } : { name: 'home' };
-  }
+  // and survives a refresh. Parsing and route strings live in lib/router.ts, as
+  // pure functions the panel list here feeds.
+  const currentView = () =>
+    viewFromHash(
+      location.hash,
+      ADMIN_PANELS.map((p) => p.id),
+      ADMIN_PANELS[0].id,
+    );
 
   const STATUS_PAGE_SIZE = 100;
   let statusPage = $state(0);
@@ -265,7 +227,7 @@
   // or on any websocket reconnect. It reads public endpoints that never emit a
   // 401, so without this nudge a detail page left open goes stale.
   let detailRefresh = $state(0);
-  let view = $state<View>(viewFromHash());
+  let view = $state<View<AdminPanel>>(currentView());
   let dayModal = $state<DayModal>(null);
   let authenticated = $state(false);
   // Which node the SPA is talking to. A global node has no fleet credentials of
@@ -284,7 +246,6 @@
   // Until the session probe answers, "logged out" is a guess — and on #/admin
   // acting on that guess flashes a sign-in prompt at someone already signed in.
   let sessionChecked = $state(false);
-  let sessionRequest: Promise<void> | null = null;
   let adminView = $state<'none' | 'login'>('none');
 
   // Tracks whether we pushed our own entry, so the in-app Back button never
@@ -298,13 +259,13 @@
   }
 
   function openIncident(incidentId: string) {
-    history.pushState(null, '', `#/incident/${encodeURIComponent(incidentId)}`);
+    history.pushState(null, '', hashForIncident(incidentId));
     pushedNav = true;
     view = { name: 'incident', incidentId };
   }
 
   function openGroup(sectionName: string) {
-    history.pushState(null, '', `#/group/${encodeURIComponent(sectionName)}`);
+    history.pushState(null, '', hashForGroup(sectionName));
     pushedNav = true;
     view = { name: 'group', sectionName };
   }
@@ -314,17 +275,13 @@
    *  A route rather than panel state, so the Alerts feed can link an operator
    *  straight to the thing they would act on, and a refresh stays put. */
   function openIncidentEditor(id: string | null) {
-    history.pushState(
-      null,
-      '',
-      `#/admin/incidents/${id === null ? 'new' : encodeURIComponent(id)}`,
-    );
+    history.pushState(null, '', hashForIncidentEditor(id));
     pushedNav = true;
     view = { name: 'admin', panel: 'incidents', incident: { id } };
   }
 
   function openAdmin(panel: AdminPanel = ADMIN_PANELS[0].id) {
-    history.pushState(null, '', `#/admin/${panel}`);
+    history.pushState(null, '', hashForAdmin(panel));
     pushedNav = true;
     view = { name: 'admin', panel };
   }
@@ -332,13 +289,13 @@
   /** Opens the check editor page, by immutable id. `null` is a check that does
    *  not exist yet. */
   function openCheckEditor(id: string | null) {
-    history.pushState(null, '', `#/admin/checks/${id === null ? 'new' : encodeURIComponent(id)}`);
+    history.pushState(null, '', hashForCheckEditor(id));
     pushedNav = true;
     view = { name: 'admin', panel: 'checks', edit: { id } };
   }
 
   function goHome() {
-    history.replaceState(null, '', '#/');
+    history.replaceState(null, '', hashForHome());
     pushedNav = false;
     view = { name: 'home' };
   }
@@ -537,49 +494,33 @@
   // new status and timestamp, so latency, status code, error, uptime_24h and
   // fleet health are only correct after re-reading /status. Debounced so a batch
   // of transitions costs one request, not one per check.
-  let statusTimer: ReturnType<typeof setTimeout> | null = null;
-  function refreshStatusSoon() {
-    if (statusTimer) clearTimeout(statusTimer);
-    statusTimer = setTimeout(async () => {
-      statusTimer = null;
-      try {
-        const [s, a, publicInc, adminInc] = await Promise.all([
-          fetchStatus(statusScope, statusPage, STATUS_PAGE_SIZE),
-          fetchAlerts(),
-          fetchIncidents(50, Date.now() - days * 24 * 60 * 60 * 1000),
-          fetchIncidents(),
-        ]);
-        checks = s.checks;
-        statusPage = s.page;
-        statusTotal = s.total_checks;
-        statusHasMore = s.has_more;
-        alerts = a.alerts;
-        publicIncidents = publicInc.incidents;
-        adminIncidents = adminInc.incidents;
-        publicIncidentGroups = publicInc.groups ?? [];
-        adminIncidentGroups = adminInc.groups ?? [];
-        fleet = s.agents;
-        maintenance = s.maintenance;
-      } catch {
-        // Keep the optimistic in-memory state; a later event or reconnect retries.
-      }
-    }, 600);
-  }
+  const refreshStatusSoon = debounce(async () => {
+    try {
+      const [s, a, publicInc, adminInc] = await Promise.all([
+        fetchStatus(statusScope, statusPage, STATUS_PAGE_SIZE),
+        fetchAlerts(),
+        fetchIncidents(50, Date.now() - days * 24 * 60 * 60 * 1000),
+        fetchIncidents(),
+      ]);
+      checks = s.checks;
+      statusPage = s.page;
+      statusTotal = s.total_checks;
+      statusHasMore = s.has_more;
+      alerts = a.alerts;
+      publicIncidents = publicInc.incidents;
+      adminIncidents = adminInc.incidents;
+      publicIncidentGroups = publicInc.groups ?? [];
+      adminIncidentGroups = adminInc.groups ?? [];
+      fleet = s.agents;
+      maintenance = s.maintenance;
+    } catch {
+      // Keep the optimistic in-memory state; a later event or reconnect retries.
+    }
+  }, 600);
 
   // Per-check chart refresh, coalesced: several transitions on the same check in
   // quick succession trigger one refetch each after things settle.
-  const chartTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  function refreshCheckChartsSoon(id: string) {
-    const existing = chartTimers.get(id);
-    if (existing) clearTimeout(existing);
-    chartTimers.set(
-      id,
-      setTimeout(() => {
-        chartTimers.delete(id);
-        void refreshCheckCharts(id);
-      }, 800),
-    );
-  }
+  const refreshCheckChartsSoon = debounceByKey((id: string) => void refreshCheckCharts(id), 800);
 
   // Full resync after a websocket reconnect. The server lets slow clients lag,
   // so a client that dropped may have missed events entirely; re-reading status,
@@ -771,21 +712,19 @@
   // keep serving admin screens to an expired session. Re-verify on entering
   // admin and on every panel switch rather than inferring it from failures.
   // The mount and initial admin-route paths can overlap, so share their one
-  // request rather than probing the same cookie twice.
-  function checkSession(): Promise<void> {
-    if (sessionRequest) return sessionRequest;
-    sessionRequest = fetchSession()
-      .then((s) => {
-        authenticated = s.authenticated;
-        nodeMode = s.mode;
-        if (!s.authenticated && view.name === 'admin') adminView = 'login';
-      })
-      .finally(() => {
-        sessionChecked = true;
-        sessionRequest = null;
-      });
-    return sessionRequest;
-  }
+  // request rather than probing the same cookie twice — createSessionChecker
+  // (lib/session.ts) is the de-duplication; only the fields to set are ours.
+  const checkSession = createSessionChecker({
+    fetchSession,
+    onResolved: (s) => {
+      authenticated = s.authenticated;
+      nodeMode = s.mode;
+      if (!s.authenticated && view.name === 'admin') adminView = 'login';
+    },
+    onSettled: () => {
+      sessionChecked = true;
+    },
+  });
 
   $effect(() => {
     if (view.name !== 'admin') return;
@@ -829,7 +768,7 @@
     });
     // Back/forward (including the mouse's back button) drives the view.
     const onPop = () => {
-      view = viewFromHash();
+      view = currentView();
       if (view.name === 'home') pushedNav = false;
       dayModal = null;
     };
@@ -837,9 +776,8 @@
     return () => {
       conn.close();
       window.removeEventListener('popstate', onPop);
-      if (statusTimer) clearTimeout(statusTimer);
-      for (const t of chartTimers.values()) clearTimeout(t);
-      chartTimers.clear();
+      refreshStatusSoon.cancel();
+      refreshCheckChartsSoon.cancelAll();
     };
   });
 </script>
