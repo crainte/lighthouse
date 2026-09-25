@@ -44,9 +44,9 @@ pub(in crate::coordinator) struct CheckMeta {
     pub(in crate::coordinator) min_incident_secs: u64,
     pub(in crate::coordinator) min_recovery_secs: u64,
     pub(in crate::coordinator) notify_degraded: bool,
-    // Retained as the effective per-check SLA interpretation for consumers that
-    // do not have the original CheckConfig override available.
-    #[allow(dead_code)]
+    /// Effective per-check SLA interpretation, for consumers that do not have
+    /// the original `CheckConfig` override available. Read by
+    /// `Coordinator::degraded_is_downtime`.
     pub(in crate::coordinator) degraded_is_downtime: bool,
 }
 
