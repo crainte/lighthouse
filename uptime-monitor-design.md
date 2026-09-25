@@ -1184,34 +1184,53 @@ misses it, with nothing retried. Anti-entropy is the backstop, run every
 ```
 GET /internal/digest
   → { node_id,
-      checks: [(check_id, max_ts, count)],   // over a bounded recent window
-      alerts_hwm: i64, incidents_hwm: i64,    // high-water marks
-      config: [(kind, max_hlc, count)] }      // one row per config kind
+      checks: [(check_id, min_ts, max_ts, count)],  // from a maintained
+                                                      // watermark, not a raw scan
+      alerts / incidents / incident_tombstones:
+        { max_millis, max_id, count },                // append-only stream digests
+      latency_minute_rollups / latency_hour_rollups:
+        { max_bucket_start, count, attempts_sum, up_sum, latency_sum_sum },
+      config: [(kind, max_hlc, count)] }              // one row per config kind
 
-GET /internal/backfill?check_id=&since=&until=&limit=
-  → results, paged; `since` is the cursor for the next page
+GET /internal/backfill/{results,alerts,incidents,incident-tombstones,
+                        latency-minute,latency-hour}?since=&limit=
+  → one page for that stream; the response's tail is the cursor for the next page
 
-GET /internal/config?kind=
-  → every entry of that kind, tombstones included; unpaged
+GET /internal/config?kind=&after=&limit=
+  → entries of that kind, tombstones included; paged, 1,000 per page
 ```
 
-A node compares the digest to its own and asks for exactly the ranges it is
-behind on, not a full resync. `backfill` is deliberately paged rather than a
-single streamed dump: DuckDB is single-writer, and a long backfill held under
-the storage mutex would starve the ingest path it shares it with. Paging
-yields between batches so catching up never becomes an outage of its own.
+A node compares the digest to its own and asks for exactly the streams and
+ranges it is behind on, not a full resync. Each stream backfills from its own
+paged, cursored endpoint rather than one streamed dump: DuckDB is
+single-writer, and a long backfill held under the storage mutex would starve
+the ingest path it shares it with. Every sweep spends a small, fixed page
+budget shared across results and the alert/incident/tombstone streams, so one
+very-behind check or stream cannot stall the others; rollup catch-up gets
+whatever pages that leaves, since `derived_results_sql` already keeps rollups
+converged as a side effect of ordinary result replication and this path only
+matters once a peer is behind raw retention. A raw-result gap that reaches
+back past the peer's own retention horizon cannot be repaired by anti-entropy
+at all; it is recorded durably as a `raw_data_gaps` row (`GET
+/api/v1/admin/raw-data-gaps`) rather than retried forever. The minute/hour
+latency rollups replicate on their own digest/backfill pair too, so a peer
+that lost the raw window can still recover the *summarized* latency history
+for it even though the individual probes are gone. See `storage::RollupDigest`
+and `replication::ANTI_ENTROPY_PAGES_PER_SWEEP`.
 
 The config plane is reconciled in the same sweep but by a different rule. A
 kind is pulled when the peer's `max_hlc` is ahead of ours **or** the counts
 disagree. The count half is not redundant: config rows are updated in place,
 so a peer can hold a row we never received while our own `max_hlc` is higher
 because of some unrelated row — a high-water mark alone would call that pair
-converged forever. The pull is unpaged, because config is bounded by how many
-checks an operator has written rather than by uptime, and a partially applied
-config is worse than a slow one. Over-pulling is harmless: every entry goes
-through the same last-writer-wins `apply_config_entry` the push path uses, so
-an entry older than what is already stored loses, and a redundant pull
-converges on identical state.
+converged forever. The pull is paged (1,000 entries per request) but applied
+per page rather than deferred until the walk completes, because config is
+bounded by how many checks an operator has written rather than by uptime, and
+a partially applied config is worse than a slow one — and safely so, since
+each page is independently idempotent. Over-pulling is harmless: every entry
+goes through the same last-writer-wins `apply_config_entry` the push path
+uses, so an entry older than what is already stored loses, and a redundant
+pull converges on identical state.
 
 #### Admin sessions
 

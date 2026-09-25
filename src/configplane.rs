@@ -1,6 +1,6 @@
 //! The config plane's wire shapes and reconciliation walk, shared by two
 //! callers: a coordinator's intra-region peer anti-entropy
-//! (`coordinator::mod::reconcile_config`/`backfill_config`) and the global
+//! (`coordinator::replication::reconcile_config`/`backfill_config`) and the global
 //! tier's own peer anti-entropy (`global::cluster`), which replicates the
 //! same `ConfigEntry`/`ConfigKind` rows between global nodes for the same
 //! reason (SCALING.md "Placement-scoped configuration", Phases 1 and 4).
