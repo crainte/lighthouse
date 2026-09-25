@@ -13,6 +13,16 @@ export default defineConfig({
     outDir: 'dist',
   },
   server: {
+    // Vite's dev server denies any path under a `.git` directory by
+    // default (`server.fs.deny` includes `**/.git/**`). That is the right
+    // default for `vite dev`, but Vitest reuses the same dev server to
+    // transform every module under test — including setupFiles — and a
+    // checkout living in a git worktree (e.g. this repo's `.git/wt/<name>`
+    // convention) has `.git` as a literal path component, so every file
+    // would be denied and Vitest would fail with a misleading "Cannot find
+    // module" instead of a permissions error. Only relax it under Vitest,
+    // which sets `process.env.VITEST` itself and has no network exposure.
+    fs: process.env.VITEST ? { deny: [] } : undefined,
     proxy: {
       // ws entry must come first and carry ws:true.
       '/api/v1/ws': { target: BACKEND, ws: true },

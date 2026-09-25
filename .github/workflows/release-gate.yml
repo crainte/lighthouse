@@ -1,0 +1,26 @@
+name: Release gate
+
+# Runs the same checks as `scripts/release-gate.sh` (see TODO.md "Establish
+# release gates"): clean check/clippy, Rust and frontend tests, Rust and
+# frontend dependency audits, production frontend and container builds, and
+# a backup/restore smoke test against the real binary. Supersedes the old
+# dependency-audit workflow, which covered a subset of this.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  release-gate:
+    name: Release gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: taiki-e/install-action@cargo-audit
+      - uses: oven-sh/setup-bun@v2
+      - run: scripts/release-gate.sh
