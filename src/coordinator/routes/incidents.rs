@@ -22,9 +22,8 @@
 //! `create_incident_handler` mints one only for an incident opened by hand,
 //! on the node the admin happened to be talking to.
 
-use super::super::{
-    error_response, internal_error, storage, Coordinator, DeletedResponse, WsEvent,
-};
+use super::super::router::{error_response, internal_error, DeletedResponse};
+use super::super::{storage, Coordinator, WsEvent};
 use super::session::require_admin;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};

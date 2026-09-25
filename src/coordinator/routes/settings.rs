@@ -22,9 +22,9 @@
 //! form, so neither has a per-item id to address; the alternative would be
 //! inventing one for no reader that needs it.
 
-use super::super::{
-    alert, error_response, fleet_members, internal_error, Coordinator, FleetMemberDto,
-};
+use super::super::fleet::FleetMemberDto;
+use super::super::router::{error_response, fleet_members, internal_error};
+use super::super::{alert, Coordinator};
 use super::session::require_admin;
 use crate::models::NodeState;
 use axum::extract::State;

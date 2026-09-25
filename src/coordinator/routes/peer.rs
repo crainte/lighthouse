@@ -16,7 +16,8 @@
 //! membership and is gated by `require_admin` instead, because it is a human
 //! in a browser asking, not a peer — see its own doc comment.
 
-use super::super::{alert, cluster, error_response, gossip, internal_error};
+use super::super::router::{error_response, internal_error};
+use super::super::{alert, cluster, gossip};
 use super::super::{storage, Coordinator, WsEvent};
 use super::session::{bearer, require_admin};
 use crate::configplane::{ConfigBatch, ConfigDigestDto};
@@ -681,7 +682,7 @@ pub(in crate::coordinator) async fn alerts_backfill_handler(
     if let Some(denied) = require_peer(&coord, &headers) {
         return denied;
     }
-    let limit = q.limit.min(super::super::ANTI_ENTROPY_PAGE);
+    let limit = q.limit.min(super::super::replication::ANTI_ENTROPY_PAGE);
     match coord
         .db(move |s| s.alerts_since(q.since, &q.since_id, limit))
         .await
@@ -704,7 +705,7 @@ pub(in crate::coordinator) async fn incidents_backfill_handler(
     if let Some(denied) = require_peer(&coord, &headers) {
         return denied;
     }
-    let limit = q.limit.min(super::super::ANTI_ENTROPY_PAGE);
+    let limit = q.limit.min(super::super::replication::ANTI_ENTROPY_PAGE);
     match coord
         .db(move |s| s.incidents_since(q.since, &q.since_id, limit))
         .await
@@ -727,7 +728,7 @@ pub(in crate::coordinator) async fn incident_tombstones_backfill_handler(
     if let Some(denied) = require_peer(&coord, &headers) {
         return denied;
     }
-    let limit = q.limit.min(super::super::ANTI_ENTROPY_PAGE);
+    let limit = q.limit.min(super::super::replication::ANTI_ENTROPY_PAGE);
     match coord
         .db(move |s| s.incident_tombstones_since(q.since, &q.since_node_id, &q.since_id, limit))
         .await
@@ -786,7 +787,7 @@ pub(in crate::coordinator) async fn results_backfill_handler(
         None => None,
     };
     let since_agent_id = q.since_agent_id.filter(|id| !id.is_empty());
-    let limit = q.limit.min(super::super::ANTI_ENTROPY_PAGE);
+    let limit = q.limit.min(super::super::replication::ANTI_ENTROPY_PAGE);
     match coord
         .db(move |storage| {
             storage.results_after(q.since, since_check_id, since_agent_id.as_deref(), limit)
@@ -848,7 +849,7 @@ async fn rollup_backfill(
         None => None,
     };
     let since_agent_id = q.since_agent_id.filter(|id| !id.is_empty());
-    let limit = q.limit.min(super::super::ANTI_ENTROPY_PAGE);
+    let limit = q.limit.min(super::super::replication::ANTI_ENTROPY_PAGE);
     match coord
         .db(move |storage| {
             fetch(
@@ -924,7 +925,7 @@ pub(in crate::coordinator) async fn backfill_handler(
     let since = q.since;
     let since_agent_id = q.since_agent_id;
     let until = q.until;
-    let limit = q.limit.min(super::super::ANTI_ENTROPY_PAGE);
+    let limit = q.limit.min(super::super::replication::ANTI_ENTROPY_PAGE);
     let rows = coord
         .db(move |storage| {
             storage.results_since(check_id, since, since_agent_id.as_deref(), until, limit)

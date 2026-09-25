@@ -22,7 +22,8 @@
 //! secret `authenticate_agent` checks: the two halves of one mechanism.
 
 use super::super::fleet::{unreachable_after_ms, AGENT_RETIRED_AFTER_MS, AGENT_STALE_AFTER_MS};
-use super::super::{error_response, internal_error, storage, Coordinator, SeenAgent};
+use super::super::router::{error_response, internal_error};
+use super::super::{storage, Coordinator, SeenAgent};
 use super::checks::PurgedResponse;
 use super::session::{bearer, require_admin};
 use crate::config::CheckConfig;

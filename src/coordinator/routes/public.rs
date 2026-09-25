@@ -19,7 +19,8 @@
 //! otherwise turn into a leak by accident.
 
 use super::super::fleet::FleetRowDto;
-use super::super::{error_response, fleet_health, internal_error, storage, Coordinator};
+use super::super::router::{error_response, fleet_health, internal_error};
+use super::super::{storage, Coordinator};
 use super::session::{require_admin, session_token};
 use super::settings::{announced_maintenance, MaintenanceNoticeDto};
 use crate::models::{CheckId, NodeState, Status};

@@ -16,7 +16,8 @@
 //! why all three are `pub(in crate::coordinator)` rather than staying
 //! file-private the way a helper used once would.
 
-use super::super::{error_response, Coordinator};
+use super::super::router::error_response;
+use super::super::Coordinator;
 use super::public::is_admin;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};

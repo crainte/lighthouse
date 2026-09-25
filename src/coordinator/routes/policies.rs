@@ -5,7 +5,8 @@
 //! type beside the key in the request lets us reject a policy that would never
 //! be selected by the rollup tree.
 
-use super::super::{error_response, internal_error, storage, Coordinator, DeletedResponse};
+use super::super::router::{error_response, internal_error, DeletedResponse};
+use super::super::{storage, Coordinator};
 use super::session::require_admin;
 use crate::models::NodeState;
 use crate::rollup::RollupPolicy;

@@ -26,9 +26,8 @@
 //! and only resets history. These operations stay separate because their
 //! replication and retention consequences are deliberately different.
 
-use super::super::{
-    error_response, internal_error, storage, Coordinator, DeletedResponse, WsEvent,
-};
+use super::super::router::{error_response, internal_error, DeletedResponse};
+use super::super::{storage, Coordinator, WsEvent};
 use super::session::{bearer, require_admin};
 use crate::config::CheckConfig;
 use crate::models::{CheckId, CheckResult};

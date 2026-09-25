@@ -13,7 +13,8 @@
 //! position — not about how a row is persisted. `storage` stores whatever
 //! name it is given; this module is what refuses to store a bad one.
 
-use super::super::{error_response, internal_error, storage, Coordinator, DeletedResponse};
+use super::super::router::{error_response, internal_error, DeletedResponse};
+use super::super::{storage, Coordinator};
 use super::session::require_admin;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
