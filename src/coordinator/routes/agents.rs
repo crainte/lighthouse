@@ -149,7 +149,10 @@ pub(in crate::coordinator) async fn ingest_handler(
         r.region.clone_from(&caller.region);
     }
     let n = batch.results.len();
-    coord.ingest(batch.results).await;
+    if let Err(e) = coord.try_ingest(batch.results).await {
+        warn!(error = %e, rejected = n, "ingest refused; agent will retry");
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "ingest unavailable, retry");
+    }
     info!(accepted = n, "ingested results");
     StatusCode::ACCEPTED.into_response()
 }

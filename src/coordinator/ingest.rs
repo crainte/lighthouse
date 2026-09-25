@@ -430,18 +430,22 @@ impl Coordinator {
         Ok(resolved)
     }
 
+    /// `try_ingest` for callers with nobody to hand a failure back to.
+    pub async fn ingest(&self, results: Vec<CheckResult>) {
+        if let Err(error) = self.try_ingest(results).await {
+            warn!(%error, "ingest batch not recorded");
+        }
+    }
+
     /// Evaluate and persist observations, then publish one rolled-up root per
     /// affected check. Everything downstream is driven solely by root changes.
-    pub async fn ingest(&self, mut results: Vec<CheckResult>) {
+    /// An `Err` means nothing was recorded, so the sender must keep the batch.
+    pub async fn try_ingest(&self, mut results: Vec<CheckResult>) -> anyhow::Result<()> {
         let inflight = self.inner.ingest_inflight.fetch_add(1, Ordering::Relaxed) + 1;
         if inflight > MAX_INGEST_INFLIGHT {
             self.inner.ingest_inflight.fetch_sub(1, Ordering::Relaxed);
             self.inner.ingest_rejected.fetch_add(1, Ordering::Relaxed);
-            warn!(
-                inflight,
-                "shedding an ingest batch: too many batches already in flight"
-            );
-            return;
+            anyhow::bail!("shedding: {inflight} ingest batches already in flight");
         }
         let _inflight_guard = InflightGuard {
             inflight: &self.inner.ingest_inflight,
@@ -856,7 +860,7 @@ impl Coordinator {
                         );
                     }
                     tracing::error!(%error, "failed to persist ingest batch");
-                    return;
+                    return Err(error);
                 }
             };
         self.inner
@@ -960,6 +964,7 @@ impl Coordinator {
                 state_hold_started.elapsed(),
             );
         }
+        Ok(())
     }
 }
 
@@ -1039,7 +1044,10 @@ mod tests {
             .inner
             .ingest_inflight
             .store(MAX_INGEST_INFLIGHT, Ordering::Relaxed);
-        coord.ingest(vec![result]).await;
+        assert!(
+            coord.try_ingest(vec![result]).await.is_err(),
+            "a shed batch must be refused, or the agent drops it as delivered"
+        );
         assert_eq!(
             coord.db(|store| store.count_results()).await.unwrap(),
             0,
