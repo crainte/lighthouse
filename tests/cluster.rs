@@ -89,6 +89,16 @@ struct Node {
     coord: Coordinator,
     addr: SocketAddr,
     sink: Sink,
+    /// Aborted on drop, so a test that wants a peer to stop answering mid-test
+    /// (rather than merely leave `Cluster`'s membership view unpinged) can do
+    /// so with an ordinary `drop(node)` instead of a bespoke shutdown path.
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
 }
 
 /// Build and serve one coordinator. `advertise_url` is derived from a
@@ -142,10 +152,15 @@ async fn spawn_node(node_id: &str, peers: Vec<String>, peer_timeout_secs: u64) -
         .clone()
         .router()
         .into_make_service_with_connect_info::<SocketAddr>();
-    tokio::spawn(async move {
+    let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    Node { coord, addr, sink }
+    Node {
+        coord,
+        addr,
+        sink,
+        server,
+    }
 }
 
 /// Two hours: long enough that no test which does not deliberately shorten it
@@ -834,6 +849,68 @@ async fn anti_entropy_signals_peer_behind_raw_retention() {
         .value,
         1.0,
         "the signal must state that receiving the retained page did not complete backfill"
+    );
+    assert!(
+        warden::openmetrics::select(
+            &b.coord.metrics(),
+            "warden_replication_anti_entropy_last_success_timestamp_seconds",
+            &[]
+        )
+        .unwrap()
+        .value
+            > 0.0,
+        "a sweep that reached reconciliation counts as a success even though this check's gap remains"
+    );
+}
+
+/// The counterpart of the success timestamp above: a sweep that never reaches
+/// reconciliation because there is nobody to reach must say so on the
+/// failures counter, so reconciliation lag is visible even when a peer never
+/// answers at all — not only when it answers but is behind.
+#[tokio::test]
+async fn anti_entropy_failure_is_counted_when_no_peer_answers() {
+    let a = spawn_node("a", vec![], NO_TIMEOUT).await;
+    let b = spawn_node("b", vec![], NO_TIMEOUT).await;
+    let session_a = login(a.addr).await;
+    gossip_step(a.addr, &session_a, b.addr).await;
+    // Kill the peer's socket so B's sweep has a member to target but nobody
+    // answers, rather than short-circuiting on an empty member list.
+    drop(a);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    assert_eq!(
+        warden::openmetrics::select(
+            &b.coord.metrics(),
+            "warden_replication_anti_entropy_failures_total",
+            &[]
+        )
+        .unwrap()
+        .value,
+        0.0,
+        "no sweep has run yet"
+    );
+    b.coord.anti_entropy_sweep().await;
+    assert_eq!(
+        warden::openmetrics::select(
+            &b.coord.metrics(),
+            "warden_replication_anti_entropy_failures_total",
+            &[]
+        )
+        .unwrap()
+        .value,
+        1.0,
+        "a sweep against an unreachable peer must count as a failure"
+    );
+    assert_eq!(
+        warden::openmetrics::select(
+            &b.coord.metrics(),
+            "warden_replication_anti_entropy_last_success_timestamp_seconds",
+            &[]
+        )
+        .unwrap()
+        .value,
+        0.0,
+        "a failed sweep must not advance the last-success timestamp"
     );
 }
 

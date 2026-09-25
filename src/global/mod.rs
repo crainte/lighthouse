@@ -163,6 +163,60 @@ impl GlobalNode {
     pub fn router(self) -> Router {
         routes::router(self)
     }
+
+    /// The subset of a coordinator's `/metrics` that is cheap and meaningful
+    /// here: this node's own catalogue database, and global-to-global
+    /// membership when `global.peers` is configured. It has no ingest,
+    /// per-region replication, or retention of its own to report.
+    pub fn metrics(&self) -> Vec<crate::openmetrics::MetricSample> {
+        let database = self.inner.store.database_metrics();
+        let mut samples = vec![
+            crate::openmetrics::MetricSample::new(
+                "warden_database_queries_total",
+                vec![],
+                database.queries_total as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_database_query_errors_total",
+                vec![],
+                database.query_errors_total as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_database_query_duration_seconds_total",
+                vec![],
+                database.query_duration_us as f64 / 1_000_000.0,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_database_queue_wait_seconds_total",
+                vec![],
+                database.queue_wait_us as f64 / 1_000_000.0,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_database_queue_depth",
+                vec![],
+                database.queue_depth as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_database_logical_rows",
+                vec![],
+                database.logical_rows as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_database_file_bytes",
+                vec![],
+                database.database_bytes as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_database_wal_bytes",
+                vec![],
+                database.wal_bytes as f64,
+            ),
+        ];
+        if let Some(cluster) = &self.inner.cluster {
+            samples.extend(cluster.metrics());
+        }
+        samples
+    }
 }
 
 #[cfg(test)]
@@ -862,5 +916,36 @@ mod tests {
             1,
             "still placed with no global reachable at all"
         );
+    }
+
+    /// The global tier reuses the coordinator's own `Database`, so its
+    /// `/metrics` should carry the same series names at no extra cost — this
+    /// is the "relevant subset" for a node with no ingest or per-region
+    /// replication of its own, per SCALING.md's observability section.
+    #[tokio::test]
+    async fn global_metrics_report_its_own_catalogue_database_activity() {
+        let node = GlobalNode::new(&GlobalConfig {
+            token: Some("global-token".into()),
+            admin_password: Some("secret".into()),
+            db_path: ":memory:".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        node.inner
+            .store
+            .list_checks(0, 10)
+            .await
+            .expect("a read exercises the catalogue database");
+
+        let metrics = node.metrics();
+        assert!(
+            crate::openmetrics::select(&metrics, "warden_database_queries_total", &[])
+                .unwrap()
+                .value
+                > 0.0,
+            "the read above must show up on the same counters a coordinator exposes"
+        );
+        assert!(crate::openmetrics::select(&metrics, "warden_database_queue_depth", &[]).is_ok());
     }
 }

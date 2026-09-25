@@ -1,6 +1,27 @@
 use super::*;
 use crate::models::{eval, CheckResult, Status};
 
+/// Concurrent `ingest` calls admitted at once. Set well above any steady-state
+/// concurrency a real deployment produces (agents batch and post every few
+/// seconds; this is not per-check) so it only trips under genuine overload —
+/// matching the shared database worker's own 256-slot queue (`database.rs`)
+/// is a deliberate, easy-to-explain choice rather than a tuned value.
+const MAX_INGEST_INFLIGHT: u64 = 256;
+
+/// Decrements `ingest_inflight` on every exit from `ingest`, admitted or not,
+/// including its early return on a failed persist. A plain `fetch_sub` at
+/// each return point would work today but silently stop matching on the next
+/// one added; a guard cannot go stale that way.
+struct InflightGuard<'a> {
+    inflight: &'a AtomicU64,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.inflight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Configured metadata for a check, looked up by its immutable id. The store
 /// only knows check ids, so anything declared in config (grouping,
 /// expectations, probe type) has to be joined back in here.
@@ -409,9 +430,26 @@ impl Coordinator {
         Ok(resolved)
     }
 
+    /// `try_ingest` for callers with nobody to hand a failure back to.
+    pub async fn ingest(&self, results: Vec<CheckResult>) {
+        if let Err(error) = self.try_ingest(results).await {
+            warn!(%error, "ingest batch not recorded");
+        }
+    }
+
     /// Evaluate and persist observations, then publish one rolled-up root per
     /// affected check. Everything downstream is driven solely by root changes.
-    pub async fn ingest(&self, mut results: Vec<CheckResult>) {
+    /// An `Err` means nothing was recorded, so the sender must keep the batch.
+    pub async fn try_ingest(&self, mut results: Vec<CheckResult>) -> anyhow::Result<()> {
+        let inflight = self.inner.ingest_inflight.fetch_add(1, Ordering::Relaxed) + 1;
+        if inflight > MAX_INGEST_INFLIGHT {
+            self.inner.ingest_inflight.fetch_sub(1, Ordering::Relaxed);
+            self.inner.ingest_rejected.fetch_add(1, Ordering::Relaxed);
+            anyhow::bail!("shedding: {inflight} ingest batches already in flight");
+        }
+        let _inflight_guard = InflightGuard {
+            inflight: &self.inner.ingest_inflight,
+        };
         let state_wait_started = Instant::now();
         let _state_write = self.inner.state_write.lock().await;
         if self.inner.timings.enabled {
@@ -822,7 +860,7 @@ impl Coordinator {
                         );
                     }
                     tracing::error!(%error, "failed to persist ingest batch");
-                    return;
+                    return Err(error);
                 }
             };
         self.inner
@@ -926,6 +964,7 @@ impl Coordinator {
                 state_hold_started.elapsed(),
             );
         }
+        Ok(())
     }
 }
 
@@ -961,6 +1000,123 @@ mod tests {
                 .expect("benchmark ceiling must be an integer");
             assert!(actual <= ceiling, "{name}: {actual} exceeded {ceiling}");
         }
+    }
+
+    /// Admission control sheds a batch instead of piling every caller behind
+    /// the same serialized write path once `MAX_INGEST_INFLIGHT` is already
+    /// reached, and says so on both new series: `warden_ingest_rejected_total`
+    /// moves, and the batch's result never reaches storage.
+    #[tokio::test]
+    async fn ingest_sheds_a_batch_once_inflight_is_saturated() {
+        let coord = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let check = coord
+            .create_check_for_test(CheckConfig {
+                name: "shed-test".into(),
+                target: "https://example.invalid".into(),
+                ..Default::default()
+            })
+            .await;
+        let result = CheckResult {
+            check_id: check,
+            agent_id: "agent".into(),
+            zone: "zone".into(),
+            region: "region".into(),
+            kind: CheckKind::Http,
+            timestamp: chrono::DateTime::from_timestamp_millis(1_000).unwrap(),
+            latency_ms: 1,
+            status_code: Some(200),
+            body_matched: None,
+            error: None,
+            failure: None,
+            body: None,
+            headers: None,
+            metric: None,
+            metrics: None,
+        };
+        // Saturate admission directly rather than racing real concurrency:
+        // deterministic, and exercises exactly the check `ingest` makes.
+        coord
+            .inner
+            .ingest_inflight
+            .store(MAX_INGEST_INFLIGHT, Ordering::Relaxed);
+        assert!(
+            coord.try_ingest(vec![result]).await.is_err(),
+            "a shed batch must be refused, or the agent drops it as delivered"
+        );
+        assert_eq!(
+            coord.db(|store| store.count_results()).await.unwrap(),
+            0,
+            "a shed batch must never reach storage"
+        );
+        assert_eq!(
+            crate::openmetrics::select(&coord.metrics(), "warden_ingest_rejected_total", &[])
+                .unwrap()
+                .value,
+            1.0
+        );
+        assert_eq!(
+            crate::openmetrics::select(&coord.metrics(), "warden_ingest_inflight", &[])
+                .unwrap()
+                .value,
+            MAX_INGEST_INFLIGHT as f64,
+            "a rejected batch must not touch the counter it never entered"
+        );
+    }
+
+    /// The common case: an admitted batch's `warden_ingest_inflight` returns
+    /// to zero once `ingest` finishes, via the guard's `Drop`, not a manual
+    /// decrement that a future early return could bypass.
+    #[tokio::test]
+    async fn ingest_inflight_returns_to_zero_after_a_normal_batch() {
+        let coord = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let check = coord
+            .create_check_for_test(CheckConfig {
+                name: "inflight-test".into(),
+                target: "https://example.invalid".into(),
+                ..Default::default()
+            })
+            .await;
+        coord
+            .ingest(vec![CheckResult {
+                check_id: check,
+                agent_id: "agent".into(),
+                zone: "zone".into(),
+                region: "region".into(),
+                kind: CheckKind::Http,
+                timestamp: chrono::DateTime::from_timestamp_millis(1_000).unwrap(),
+                latency_ms: 1,
+                status_code: Some(200),
+                body_matched: None,
+                error: None,
+                failure: None,
+                body: None,
+                headers: None,
+                metric: None,
+                metrics: None,
+            }])
+            .await;
+        assert_eq!(
+            crate::openmetrics::select(&coord.metrics(), "warden_ingest_inflight", &[])
+                .unwrap()
+                .value,
+            0.0
+        );
+        assert_eq!(
+            crate::openmetrics::select(&coord.metrics(), "warden_ingest_rejected_total", &[])
+                .unwrap()
+                .value,
+            0.0
+        );
     }
 
     #[tokio::test]

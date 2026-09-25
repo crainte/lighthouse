@@ -22,6 +22,18 @@ pub(super) fn router(node: GlobalNode) -> Router {
     Router::new()
         // Aggregated reads served from cache — the shapes the SPA already
         // consumes, so the dashboard renders with no frontend change.
+        .route(
+            "/metrics",
+            get(|State(node): State<GlobalNode>| async move {
+                (
+                    [(
+                        header::CONTENT_TYPE,
+                        "application/openmetrics-text; version=1.0.0; charset=utf-8",
+                    )],
+                    crate::openmetrics::render(&node.metrics()),
+                )
+            }),
+        )
         .route("/api/v1/status", get(status_handler))
         .route("/api/v1/cluster", get(cluster_handler))
         .route("/api/v1/admin/region-tree", get(region_tree_handler))

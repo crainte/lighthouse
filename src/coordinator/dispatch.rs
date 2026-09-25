@@ -173,6 +173,9 @@ impl Coordinator {
                 let next =
                     (attempts < MAX_DELIVERY_ATTEMPTS).then(|| now_millis + backoff_ms(attempts));
                 if next.is_none() {
+                    self.inner
+                        .notification_giveups
+                        .fetch_add(1, Ordering::Relaxed);
                     warn!(
                         check = %row.check_id,
                         notifier = %row.notifier,
@@ -180,6 +183,10 @@ impl Coordinator {
                         error = %e,
                         "giving up on a notification; nobody was paged for this transition"
                     );
+                } else {
+                    self.inner
+                        .notification_retries
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 let next_row = storage::QueuedRow {
                     attempts,

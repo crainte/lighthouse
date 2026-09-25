@@ -1246,6 +1246,64 @@ and ingest/query health. Do not reduce raw retention or advertise peer recovery
 as supported until this path has been exercised under the configured retention
 policy.
 
+## Production observability
+
+`GET /metrics` on a coordinator (and, for the subset that applies, a global
+node) exposes OpenMetrics samples over the counters `Timings`/`Metrics`
+already accumulated in-process — atomics only, no lock or extra query per
+scrape (`Coordinator::metrics`, `database::Database::metrics_snapshot`).
+Every series below is low-cardinality by construction: no check id, agent id,
+or peer id ever appears as a label, only bounded, admin-known sets (a
+membership `state`, for example).
+
+- **Database latency and lock wait**: `warden_database_queries_total`,
+  `warden_database_query_duration_seconds_total` (execution),
+  `warden_database_queue_wait_seconds_total` (time queued behind the single
+  worker before execution — the "lock wait" half), and
+  `warden_database_queue_depth` (current backlog, gauge). Alert on
+  `queue_depth` sustained near 256 (`QUEUE_CAPACITY`) — SCALING.md's own
+  "Read path" section documents that overrunning this queue turns into
+  backpressure on result ingest — or on `queue_wait_seconds_total` growing
+  faster than `queries_total` (jobs increasingly wait rather than run).
+- **Ingest backpressure**: `warden_ingest_inflight` (gauge, concurrent
+  `ingest` calls admitted) and `warden_ingest_rejected_total` (batches shed
+  once `MAX_INGEST_INFLIGHT` — 256, matching the database queue's own budget
+  — is already reached). Any nonzero rate on the rejected counter means the
+  coordinator is shedding agent data under overload; alert on it directly
+  rather than waiting for the queue-depth signal above.
+- **Replication health**: existing `warden_replication_raw_data_gaps_total`
+  and `warden_replication_alert_identity_conflicts_total`, plus
+  `warden_replication_anti_entropy_failures_total` (a sweep that never
+  reached reconciliation: no reachable peer, a malformed response, or a
+  failed local digest read) and
+  `warden_replication_anti_entropy_last_success_timestamp_seconds` (unix
+  seconds, gauge). Alert on `time() -
+  warden_replication_anti_entropy_last_success_timestamp_seconds` exceeding
+  a few multiples of `anti_entropy_secs` — reconciliation lag stated
+  directly, not inferred from the failure counter's absence.
+- **Notification retry/give-up**: `warden_notification_retries_total` and
+  `warden_notification_giveups_total`. A give-up means the admin panel's
+  "nobody was paged" case actually happened; alert on any increase.
+- **Cluster membership**: `warden_cluster_membership_transitions_total{state="suspect"|"dead"}`
+  (counter, demotions only — a resurrection through gossip shows up in the
+  gauge below on its own) and `warden_cluster_members{state="alive"|"suspect"|"dead"}`
+  (gauge). Alert on `dead` staying above zero, or on a transition rate that
+  outpaces expected restarts.
+- **Retention**: existing `warden_retention_prune_duration_seconds_total`,
+  plus `warden_retention_rows_removed_total`. Alert if a day passes with no
+  movement on either — the daily job did not run — or if prune duration grows
+  without bound relative to rows removed.
+
+The global tier has no ingest, per-region replication, or retention of its
+own, so its `/metrics` carries only what is cheap and meaningful there: the
+same database series (it shares `coordinator::database::Database` verbatim
+via `GlobalStore`) and, when `global.peers` is configured, the same cluster
+membership series (it shares `coordinator::cluster::Cluster` verbatim too).
+Global-to-global config reconciliation (`reconcile.rs`) and region push
+staleness are not yet instrumented as metrics; both already page through
+`GlobalAlerter`'s region-down and existing digest-mismatch logging, so the
+gap is metrics parity, not a blind spot in alerting.
+
 ## Scaling milestones
 
 ### Now: identity correctness

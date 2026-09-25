@@ -39,7 +39,7 @@ use serde::Serialize;
 use state::StateTracker;
 use std::{
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicI64, AtomicU64, Ordering},
         Arc,
     },
     time::Instant,
@@ -181,6 +181,32 @@ struct Inner {
     /// This is deliberately ephemeral like repair cursors: it is an operational
     /// signal, never repair state, and a later sweep re-detects any gap.
     replication_raw_data_gaps: AtomicU64,
+    /// Anti-entropy sweeps that aborted before reaching reconciliation: no
+    /// client, an unreachable or malformed-response peer, or a failed local
+    /// digest read. Distinct from `replication_raw_data_gaps`, which fires
+    /// only once a sweep *did* complete a comparison and found one peer
+    /// behind retention.
+    replication_anti_entropy_failures: AtomicU64,
+    /// Epoch milliseconds of the last anti-entropy sweep that reached
+    /// reconciliation (got both digests and started comparing), so an
+    /// operator can alert on reconciliation lag directly rather than
+    /// inferring it from the absence of other signals. `0` until the first
+    /// sweep succeeds.
+    replication_anti_entropy_last_success_ms: AtomicI64,
+    /// Rows removed by the retention job, lifetime. Paired with
+    /// `timings.prune_duration_us` for "how long, how much" on each sweep.
+    retention_rows_removed: AtomicU64,
+    /// Queued notifications rescheduled for another attempt, and rows that
+    /// exhausted `MAX_DELIVERY_ATTEMPTS` with nobody paged.
+    notification_retries: AtomicU64,
+    notification_giveups: AtomicU64,
+    /// Concurrent `ingest` calls admitted right now, and batches shed because
+    /// `MAX_INGEST_INFLIGHT` was already reached. Bounding this protects the
+    /// shared database worker queue (see `database::Database`'s doc) from an
+    /// unbounded pile-up of callers all awaiting the same serialized write
+    /// path; a caller sees its batch dropped rather than queued indefinitely.
+    ingest_inflight: AtomicU64,
+    ingest_rejected: AtomicU64,
     /// One bounded, coalescing queue per peer for `/internal/replicate`, so a
     /// busy node never aims more than one concurrent request at a receiver's
     /// single write path.
@@ -520,6 +546,13 @@ impl Coordinator {
                 timings: Arc::new(Timings::new()),
                 alert_identity_conflicts: AtomicU64::new(0),
                 replication_raw_data_gaps: AtomicU64::new(0),
+                replication_anti_entropy_failures: AtomicU64::new(0),
+                replication_anti_entropy_last_success_ms: AtomicI64::new(0),
+                retention_rows_removed: AtomicU64::new(0),
+                notification_retries: AtomicU64::new(0),
+                notification_giveups: AtomicU64::new(0),
+                ingest_inflight: AtomicU64::new(0),
+                ingest_rejected: AtomicU64::new(0),
                 replication_out: replication_out::Outbox::default(),
                 tracker: Mutex::new(tracker),
                 state_write: tokio::sync::Mutex::new(()),
@@ -1027,6 +1060,9 @@ impl Coordinator {
             started.elapsed().as_micros().min(u64::MAX as u128) as u64,
             Ordering::Relaxed,
         );
+        self.inner
+            .retention_rows_removed
+            .fetch_add(removed, Ordering::Relaxed);
         Ok(removed)
     }
 
@@ -1287,7 +1323,7 @@ impl Coordinator {
     /// to the single DuckDB worker and therefore cannot add a scan to ingestion.
     pub fn metrics(&self) -> Vec<crate::openmetrics::MetricSample> {
         let database = self.inner.database.metrics_snapshot();
-        vec![
+        let mut samples = vec![
             crate::openmetrics::MetricSample::new(
                 "warden_database_queries_total",
                 vec![],
@@ -1302,6 +1338,20 @@ impl Coordinator {
                 "warden_database_query_duration_seconds_total",
                 vec![],
                 database.query_duration_us as f64 / 1_000_000.0,
+            ),
+            // Lock/queue wait vs execution: both counted against the same
+            // `queries_total` denominator, so an operator can see whether a
+            // slow scrape's cost is jobs waiting behind a busy worker or the
+            // queries themselves getting slower.
+            crate::openmetrics::MetricSample::new(
+                "warden_database_queue_wait_seconds_total",
+                vec![],
+                database.queue_wait_us as f64 / 1_000_000.0,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_database_queue_depth",
+                vec![],
+                database.queue_depth as f64,
             ),
             crate::openmetrics::MetricSample::new(
                 "warden_database_logical_rows",
@@ -1324,6 +1374,11 @@ impl Coordinator {
                 self.inner.timings.prune_duration_us.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ),
             crate::openmetrics::MetricSample::new(
+                "warden_retention_rows_removed_total",
+                vec![],
+                self.inner.retention_rows_removed.load(Ordering::Relaxed) as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
                 "warden_replication_alert_identity_conflicts_total",
                 vec![],
                 self.inner.alert_identity_conflicts.load(Ordering::Relaxed) as f64,
@@ -1333,7 +1388,51 @@ impl Coordinator {
                 vec![],
                 self.inner.replication_raw_data_gaps.load(Ordering::Relaxed) as f64,
             ),
-        ]
+            crate::openmetrics::MetricSample::new(
+                "warden_replication_anti_entropy_failures_total",
+                vec![],
+                self.inner
+                    .replication_anti_entropy_failures
+                    .load(Ordering::Relaxed) as f64,
+            ),
+            // Absolute timestamp rather than a server-computed age: an age
+            // goes stale between scrapes, while `time() - this` in the
+            // alerting rule is always current. `0` (unix epoch) until the
+            // first sweep succeeds, which reads as "always overdue" rather
+            // than a false "just happened".
+            crate::openmetrics::MetricSample::new(
+                "warden_replication_anti_entropy_last_success_timestamp_seconds",
+                vec![],
+                self.inner
+                    .replication_anti_entropy_last_success_ms
+                    .load(Ordering::Relaxed) as f64
+                    / 1_000.0,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_notification_retries_total",
+                vec![],
+                self.inner.notification_retries.load(Ordering::Relaxed) as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_notification_giveups_total",
+                vec![],
+                self.inner.notification_giveups.load(Ordering::Relaxed) as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_ingest_inflight",
+                vec![],
+                self.inner.ingest_inflight.load(Ordering::Relaxed) as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_ingest_rejected_total",
+                vec![],
+                self.inner.ingest_rejected.load(Ordering::Relaxed) as f64,
+            ),
+        ];
+        if let Some(cluster) = &self.inner.cluster {
+            samples.extend(cluster.metrics());
+        }
+        samples
     }
 }
 
@@ -1418,6 +1517,13 @@ mod tests {
             .unwrap()
             .value
                 > 0.0
+        );
+        assert_eq!(
+            crate::openmetrics::select(&metrics, "warden_retention_rows_removed_total", &[])
+                .unwrap()
+                .value,
+            23.0,
+            "lifetime rows removed must track the actual prune, not just exist"
         );
     }
 

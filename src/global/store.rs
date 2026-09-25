@@ -99,6 +99,15 @@ impl GlobalStore {
         &self.node_id
     }
 
+    /// Same counters a coordinator's own `Database` keeps: queries, errors,
+    /// duration, queue wait/depth, file sizes. The global tier has no ingest,
+    /// replication-to-regions, or retention of its own, but it shares this
+    /// exact worker, so its latency and backpressure are worth the same
+    /// signal at no extra cost.
+    pub fn database_metrics(&self) -> crate::coordinator::database::MetricsSnapshot {
+        self.database.metrics_snapshot()
+    }
+
     #[track_caller]
     fn db<T, F>(&self, operation: F) -> impl std::future::Future<Output = Result<T>> + Send + '_
     where
