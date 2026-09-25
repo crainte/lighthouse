@@ -10,7 +10,7 @@
 use crate::global::wire::{CheckSummary, RegionStatePush};
 use crate::models::{CheckId, NodeState};
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// One region's last known state, as cached from its most recent push.
 #[derive(Debug, Clone)]
@@ -79,6 +79,14 @@ pub struct AggregatedCheck {
     pub group: Option<String>,
     pub latency_graph: bool,
     pub position: i32,
+}
+
+/// Per-check facts the incident grouping reads; see `GlobalCache::check_facts`.
+#[derive(Debug, Clone, Default)]
+pub struct CheckFacts {
+    pub name: Option<String>,
+    pub depends_on: Vec<CheckId>,
+    pub regions: BTreeSet<String>,
 }
 
 /// A region as summarised for the roster view (stands in for the cluster panel).
@@ -327,25 +335,31 @@ impl GlobalCache {
         }
     }
 
-    /// Every configured check's upstreams, as most recently reported by any
-    /// live region. `depends_on` is a `CheckConfig` field, identical wherever
-    /// a check is placed by the same convention that keeps its display name
-    /// consistent, so any one reporting region names the edge accurately
-    /// enough for the presentation-only cross-region attribution this feeds
-    /// (`incidents::group_and_attribute`). A stale region contributes nothing,
-    /// matching `aggregate`. Checks with no upstreams are simply absent from
-    /// the map rather than mapped to an empty `Vec`.
-    pub fn depends_on_map(&self, now: i64) -> HashMap<CheckId, Vec<CheckId>> {
+    /// What the global tier's incident presentation needs to know about each
+    /// check, gathered in one pass over the region cache.
+    ///
+    /// `name` and `depends_on` are `CheckConfig` fields, identical wherever a
+    /// check is placed, so any one live region states them accurately; a stale
+    /// region contributes neither, matching `aggregate`. `regions` is different:
+    /// it is where the check is placed, and a region that has gone quiet is
+    /// still placed. Counting only live regions would let one dark region turn
+    /// "partial outage" into "is down" merely by no longer being heard from.
+    pub fn check_facts(&self, now: i64) -> HashMap<CheckId, CheckFacts> {
         let guard = self.regions.read();
-        let mut out: HashMap<CheckId, Vec<CheckId>> = HashMap::new();
-        for region in guard.values() {
-            if region.is_stale(now, self.staleness_ms) {
-                continue;
-            }
+        let mut out: HashMap<CheckId, CheckFacts> = HashMap::new();
+        for (region_name, region) in guard.iter() {
+            let live = !region.is_stale(now, self.staleness_ms);
             for (check_id, summary) in &region.checks {
-                if !summary.depends_on.is_empty() {
-                    out.entry(*check_id)
-                        .or_insert_with(|| summary.depends_on.clone());
+                let facts = out.entry(*check_id).or_default();
+                facts.regions.insert(region_name.clone());
+                if !live {
+                    continue;
+                }
+                if facts.name.is_none() && !summary.name.is_empty() {
+                    facts.name = Some(summary.name.clone());
+                }
+                if facts.depends_on.is_empty() {
+                    facts.depends_on = summary.depends_on.clone();
                 }
             }
         }

@@ -1213,6 +1213,21 @@ async fn relay_merge(
 /// `IncidentEditor`) is unaffected. See `incidents::group_and_attribute` for
 /// the rules.
 fn attach_incident_groups(node: &GlobalNode, response: &mut serde_json::Value) {
+    let now = chrono::Utc::now().timestamp_millis();
+    // Repair any incident whose title still names its origin check by raw UUID,
+    // which happens when a region opened the incident before that check's name
+    // had reached its in-memory catalogue. The global tier holds every live
+    // region's name for the check, so it can put the display name back before
+    // anyone sees it — in the flat list a regional dashboard would fall back
+    // to, and in the groups derived from it below. A title that already carries
+    // a name is left untouched: only a leading raw id is swapped.
+    let facts = node.inner.cache.check_facts(now);
+    if let Some(items) = response.get_mut("incidents").and_then(|v| v.as_array_mut()) {
+        for item in items.iter_mut() {
+            resolve_incident_title(item, &facts);
+        }
+    }
+
     let Some(items) = response.get("incidents").and_then(|v| v.as_array()) else {
         return;
     };
@@ -1223,11 +1238,41 @@ fn attach_incident_groups(node: &GlobalNode, response: &mut serde_json::Value) {
     if raw.is_empty() {
         return;
     }
-    let now = chrono::Utc::now().timestamp_millis();
-    let depends_on = node.inner.cache.depends_on_map(now);
-    let groups = incidents::group_and_attribute(&raw, &depends_on, now);
+    let groups = incidents::group_and_attribute(&raw, &facts, now);
     response["groups"] =
         serde_json::to_value(groups).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+}
+
+/// Swap a leading raw origin-check id in an incident title for the check's
+/// display name. Only the exact `<origin_check> ...` prefix is replaced, so a
+/// title that already reads "dns is down" — or one a human wrote — is left
+/// exactly as it is. A check the global tier has never heard a name for (every
+/// region holding it is stale) keeps the id, which is still better than
+/// inventing one.
+fn resolve_incident_title(
+    incident: &mut serde_json::Value,
+    facts: &std::collections::HashMap<crate::models::CheckId, cache::CheckFacts>,
+) {
+    let Some(origin) = incident.get("origin_check").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let Ok(id) = origin.parse::<crate::models::CheckId>() else {
+        return;
+    };
+    let Some(title) = incident.get("title").and_then(|v| v.as_str()) else {
+        return;
+    };
+    // Only a title that still leads with the raw id is rewritten, so a title
+    // that already carries a name — or one a human typed — is left exactly as
+    // it is. An id the global tier has no live name for resolves to the shared
+    // "deleted check" label rather than staying a UUID.
+    if let Some(rest) = title.strip_prefix(origin) {
+        let name = facts
+            .get(&id)
+            .and_then(|f| f.name.clone())
+            .unwrap_or_else(|| crate::models::DELETED_CHECK_LABEL.to_string());
+        incident["title"] = serde_json::Value::String(format!("{name}{rest}"));
+    }
 }
 
 /// Remove status-page selectors before fanning a batched chart request out.
@@ -1899,6 +1944,68 @@ fn error_response(code: StatusCode, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A region can bake a raw check id into an incident title when it opens
+    /// the incident before the check's name has reached its catalogue. The
+    /// global tier holds every live region's name for the check, so it puts the
+    /// name back before anyone sees it — and a title that already carries a
+    /// name, or one a human wrote, is left untouched.
+    #[test]
+    fn incident_titles_leading_with_a_raw_id_are_resolved_to_the_name() {
+        let id = crate::models::new_check_id();
+        let names = std::collections::HashMap::from([(
+            id,
+            cache::CheckFacts {
+                name: Some("dns".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        // The bug: title is `<id> is down`.
+        let mut baked = serde_json::json!({
+            "origin_check": id.to_string(),
+            "title": format!("{id} is down"),
+        });
+        resolve_incident_title(&mut baked, &names);
+        assert_eq!(baked["title"], "dns is down");
+
+        // A correct title is not touched.
+        let mut good = serde_json::json!({
+            "origin_check": id.to_string(),
+            "title": "dns is down",
+        });
+        resolve_incident_title(&mut good, &names);
+        assert_eq!(good["title"], "dns is down");
+
+        // A degraded suffix is preserved — only the leading id is swapped.
+        let mut degraded = serde_json::json!({
+            "origin_check": id.to_string(),
+            "title": format!("{id} partial outage in us, tw"),
+        });
+        resolve_incident_title(&mut degraded, &names);
+        assert_eq!(degraded["title"], "dns partial outage in us, tw");
+
+        // An id no live region names resolves to the shared label, never the
+        // raw UUID.
+        let orphan = crate::models::new_check_id();
+        let mut deleted = serde_json::json!({
+            "origin_check": orphan.to_string(),
+            "title": format!("{orphan} is down"),
+        });
+        resolve_incident_title(&mut deleted, &names);
+        assert_eq!(
+            deleted["title"],
+            format!("{} is down", crate::models::DELETED_CHECK_LABEL)
+        );
+
+        // A hand-opened incident (no origin check) keeps its human title.
+        let mut manual = serde_json::json!({
+            "origin_check": serde_json::Value::Null,
+            "title": "Scheduled maintenance",
+        });
+        resolve_incident_title(&mut manual, &names);
+        assert_eq!(manual["title"], "Scheduled maintenance");
+    }
 
     /// The status page asks one question for the whole estate, but a check is
     /// only observed where its agents are. Relaying that question to a single

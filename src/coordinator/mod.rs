@@ -2266,13 +2266,48 @@ impl Coordinator {
     /// between the observation and this lookup, or one this node has not
     /// replicated config for yet. Never fails: this is for human-facing text,
     /// not identity.
+    /// A check's display name, or `DELETED_CHECK_LABEL` when the id resolves to
+    /// nothing. It never falls back to the raw UUID: this feeds incident and
+    /// notification titles, and a user should never be shown an id where a name
+    /// belongs — the same choice `alert_name` already makes. A missing name is
+    /// almost always a check deleted after the event it names; the one other
+    /// cause, a config-reconciliation window where the id is probeable before
+    /// its name has reached this map, heals on the next read now that titles
+    /// are resolved at read time rather than trusted from when they were baked.
     fn check_name(&self, check_id: crate::models::CheckId) -> String {
         self.inner
             .checks
             .read()
             .get(&check_id)
             .map(|m| m.name.clone())
-            .unwrap_or_else(|| check_id.to_string())
+            .unwrap_or_else(|| crate::models::DELETED_CHECK_LABEL.to_string())
+    }
+
+    /// Rewrite incident DTO titles that still lead with their origin check's
+    /// raw id, putting the current display name back. Read-time rather than
+    /// stored, so a title baked during a config-reconciliation window (id known
+    /// before name) heals the moment the name is present, and a check renamed
+    /// after an incident opened shows its new name if the stored title had
+    /// fallen back to the id. A title that already carries a name, or one a
+    /// human wrote, never leads with the id and is left untouched. Mirrors the
+    /// global tier's `resolve_incident_title`.
+    pub(in crate::coordinator) fn resolve_incident_titles(
+        &self,
+        incidents: &mut [routes::incidents::IncidentDto],
+    ) {
+        for dto in incidents.iter_mut() {
+            let Some(origin) = dto.origin_check.as_deref() else {
+                continue;
+            };
+            let Some(rest) = dto.title.strip_prefix(origin) else {
+                continue;
+            };
+            let name = origin
+                .parse()
+                .map(|id| self.check_name(id))
+                .unwrap_or_else(|_| crate::models::DELETED_CHECK_LABEL.to_string());
+            dto.title = format!("{name}{rest}");
+        }
     }
 
     fn alert_name(&self, scope: storage::AlertScope, node_id: &str) -> String {
@@ -2282,7 +2317,7 @@ impl Coordinator {
                 .read()
                 .get(&id)
                 .map(|meta| meta.name.clone())
-                .unwrap_or_else(|| "Deleted check".to_string())
+                .unwrap_or_else(|| crate::models::DELETED_CHECK_LABEL.to_string())
         };
 
         if scope == storage::AlertScope::Check {
@@ -4741,6 +4776,11 @@ fn error_response(code: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
+#[derive(Serialize)]
+struct DeletedResponse {
+    deleted: String,
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -5620,7 +5660,95 @@ mod tests {
     }
 }
 
-#[derive(Serialize)]
-struct DeletedResponse {
-    deleted: String,
+#[cfg(test)]
+mod title_tests {
+    use super::*;
+
+    /// A title stored with the origin check's raw id — what a region bakes when
+    /// it opens an incident before the check's name has reached its catalogue —
+    /// is resolved to the current name at read time, and follows a rename. A
+    /// title that already names its check, and a hand-opened incident's human
+    /// title, are left untouched. An id with no known check resolves to the
+    /// shared label, never a UUID.
+    #[tokio::test]
+    async fn incident_titles_resolve_to_the_current_name_at_read_time() {
+        let coord = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let id = coord
+            .create_check_for_test(CheckConfig {
+                name: "dns".into(),
+                target: "https://example.invalid".into(),
+                ..Default::default()
+            })
+            .await;
+
+        let dto = |origin: Option<String>, title: &str| IncidentDto {
+            id: "i-1".into(),
+            title: title.into(),
+            state: "detected",
+            started_at: 0,
+            resolved_at: None,
+            duration_ms: 0,
+            global: false,
+            origin_check: origin,
+            checks: Vec::new(),
+            acknowledged: false,
+            updates: None,
+        };
+        let title_of = |coord: &Coordinator, d: IncidentDto| {
+            let mut one = [d];
+            coord.resolve_incident_titles(&mut one);
+            one[0].title.clone()
+        };
+
+        // The bug: a raw id where the name belongs.
+        assert_eq!(
+            title_of(&coord, dto(Some(id.to_string()), &format!("{id} is down"))),
+            "dns is down"
+        );
+        // A correct title is untouched.
+        assert_eq!(
+            title_of(&coord, dto(Some(id.to_string()), "dns is down")),
+            "dns is down"
+        );
+        // The name follows a rename, because it is resolved at read time.
+        let mut renamed = coord
+            .db(move |store| {
+                Ok(store
+                    .list_checks()?
+                    .into_iter()
+                    .find(|c| c.id == id)
+                    .unwrap())
+            })
+            .await
+            .unwrap();
+        renamed.name = "domain".into();
+        coord
+            .db(move |store| store.upsert_check(&renamed, 1))
+            .await
+            .unwrap();
+        coord.reload_checks().await.unwrap();
+        assert_eq!(
+            title_of(&coord, dto(Some(id.to_string()), &format!("{id} is down"))),
+            "domain is down"
+        );
+        // An unknown id never leaks as a UUID.
+        let orphan = crate::models::new_check_id();
+        assert_eq!(
+            title_of(
+                &coord,
+                dto(Some(orphan.to_string()), &format!("{orphan} is down"))
+            ),
+            format!("{} is down", crate::models::DELETED_CHECK_LABEL)
+        );
+        // A hand-opened incident keeps its human title.
+        assert_eq!(
+            title_of(&coord, dto(None, "Scheduled maintenance")),
+            "Scheduled maintenance"
+        );
+    }
 }

@@ -225,12 +225,18 @@ pub(in crate::coordinator) async fn incidents_handler(
                             let ack = storage.is_acknowledged(&row.id).unwrap_or(false);
                             IncidentDto::from_row(row, now, ack)
                         })
-                        .collect()
+                        .collect::<Vec<_>>()
                 })
         })
         .await
     {
-        Ok(incidents) => Json(IncidentsResponse { incidents }).into_response(),
+        Ok(mut incidents) => {
+            // Titles are resolved against the live catalogue here rather than
+            // trusted from when they were written, so a name learned after the
+            // incident opened — or changed since — is the one shown.
+            coord.resolve_incident_titles(&mut incidents);
+            Json(IncidentsResponse { incidents }).into_response()
+        }
         Err(e) => internal_error(e),
     }
 }
@@ -257,7 +263,10 @@ pub(in crate::coordinator) async fn incident_handler(
         })
         .await
     {
-        Ok(Some(dto)) => Json(serde_json::json!({ "incident": dto })).into_response(),
+        Ok(Some(mut dto)) => {
+            coord.resolve_incident_titles(std::slice::from_mut(&mut dto));
+            Json(serde_json::json!({ "incident": dto })).into_response()
+        }
         Ok(None) => error_response(StatusCode::NOT_FOUND, "no incident with that id"),
         Err(e) => internal_error(e),
     }

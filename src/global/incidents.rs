@@ -10,7 +10,9 @@
 //! probe anyway. This module only reshapes what an operator reading the
 //! global dashboard is shown.
 
-use crate::models::CheckId;
+use super::cache::CheckFacts;
+use crate::models::{CheckId, NodeState};
+use crate::rollup::{rollup, RollupPolicy, Threshold};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -141,15 +143,26 @@ pub struct IncidentGroup {
 /// `origin_check` incident for global to re-derive.
 pub fn group_and_attribute(
     raw: &[RawIncident],
-    depends_on: &HashMap<CheckId, Vec<CheckId>>,
+    facts: &HashMap<CheckId, CheckFacts>,
     now: i64,
 ) -> Vec<IncidentGroup> {
-    let mut groups = group(raw, now);
-    attribute(&mut groups, depends_on);
+    let mut groups = group(raw, facts, now);
+    attribute(&mut groups, facts);
     groups
 }
 
-fn group(raw: &[RawIncident], now: i64) -> Vec<IncidentGroup> {
+/// How a group's headline grades region coverage: any affected placed region
+/// is a partial outage, every placed region affected is the check down. This is
+/// deliberately stricter than `RollupPolicy::CHECK_DEFAULT`'s majority — a
+/// title saying "is down" is a claim about everywhere the check runs, and one
+/// healthy region falsifies it.
+const HEADLINE_POLICY: RollupPolicy = RollupPolicy::new(Threshold::Any, Threshold::All);
+
+fn group(
+    raw: &[RawIncident],
+    facts: &HashMap<CheckId, CheckFacts>,
+    now: i64,
+) -> Vec<IncidentGroup> {
     let mut by_check: HashMap<CheckId, Vec<&RawIncident>> = HashMap::new();
     let mut unowned: Vec<&RawIncident> = Vec::new();
     for incident in raw {
@@ -160,8 +173,15 @@ fn group(raw: &[RawIncident], now: i64) -> Vec<IncidentGroup> {
     }
 
     let mut groups = Vec::new();
-    for (_check_id, mut members) in by_check {
-        members.sort_by_key(|m| m.started_at);
+    for (check_id, mut members) in by_check {
+        // Regions routinely confirm the same outage in the same millisecond,
+        // and the relay merges their answers in arrival order. Breaking the
+        // start tie on region and id is what keeps a group's id and headline
+        // from changing between two refreshes of the same data.
+        members.sort_by(|a, b| {
+            (a.started_at, &a.region, &a.id).cmp(&(b.started_at, &b.region, &b.id))
+        });
+        let check_facts = facts.get(&check_id);
         let mut current: Vec<&RawIncident> = Vec::new();
         let mut current_end = i64::MIN;
         for member in members {
@@ -170,43 +190,51 @@ fn group(raw: &[RawIncident], now: i64) -> Vec<IncidentGroup> {
                 current.push(member);
                 current_end = current_end.max(end);
             } else {
-                groups.push(build_group(&current));
+                groups.push(build_group(&current, check_facts));
                 current = vec![member];
                 current_end = end;
             }
         }
         if !current.is_empty() {
-            groups.push(build_group(&current));
+            groups.push(build_group(&current, check_facts));
         }
     }
     for incident in unowned {
-        groups.push(build_group(&[incident]));
+        groups.push(build_group(&[incident], None));
     }
 
-    groups.sort_by_key(|g| std::cmp::Reverse(g.started_at));
+    groups.sort_by(|a, b| (b.started_at, &a.id).cmp(&(a.started_at, &b.id)));
     groups
 }
 
-fn build_group(members: &[&RawIncident]) -> IncidentGroup {
+/// `members` arrive sorted by start, region, id, so the first is the earliest
+/// and every choice below is independent of merge order.
+fn build_group(members: &[&RawIncident], facts: Option<&CheckFacts>) -> IncidentGroup {
     let earliest = members
-        .iter()
-        .min_by_key(|m| m.started_at)
+        .first()
         .expect("build_group is never called with an empty slice");
-    let started_at = earliest.started_at;
-    let resolved_at = members
+    let open: Vec<&RawIncident> = members
         .iter()
-        .all(|m| m.resolved_at.is_some())
+        .copied()
+        .filter(|m| m.resolved_at.is_none())
+        .collect();
+    let resolved_at = open
+        .is_empty()
         .then(|| members.iter().filter_map(|m| m.resolved_at).max())
         .flatten();
-    // The headline favours a still-open member over a resolved one: an
-    // operator opening a group that is still affecting one region wants to
-    // know what is happening now, not what a region that has since recovered
-    // called it first.
-    let headline = members
+    // The state favours a still-open member over a resolved one: an operator
+    // opening a group that is still affecting one region wants to know what is
+    // happening now, not what a region that has since recovered called it.
+    let headline = open.first().copied().unwrap_or(earliest);
+    // While open, only the regions still down count; once over, the outage is
+    // described by every region it reached.
+    let affected: Vec<&str> = if open.is_empty() { members } else { &open[..] }
         .iter()
-        .find(|m| m.resolved_at.is_none())
-        .copied()
-        .unwrap_or(earliest);
+        .map(|m| m.region.as_str())
+        .collect();
+    let title = facts
+        .and_then(|f| coverage_title(f, &affected))
+        .unwrap_or_else(|| headline.title.clone());
     let mut regions: Vec<RegionIncident> = members
         .iter()
         .map(|m| RegionIncident {
@@ -218,20 +246,46 @@ fn build_group(members: &[&RawIncident]) -> IncidentGroup {
             resolved_at: m.resolved_at,
         })
         .collect();
-    regions.sort_by(|a, b| a.region.cmp(&b.region));
+    regions.sort_by(|a, b| (&a.region, &a.id).cmp(&(&b.region, &b.id)));
     IncidentGroup {
         id: earliest.id.clone(),
         origin_check: earliest.origin_check.map(|c| c.to_string()),
-        title: headline.title.clone(),
+        title,
         state: headline.state.clone(),
-        started_at,
+        started_at: earliest.started_at,
         resolved_at,
         regions,
         attributed_to: None,
     }
 }
 
-fn attribute(groups: &mut [IncidentGroup], depends_on: &HashMap<CheckId, Vec<CheckId>>) {
+/// The group's headline graded from which placed regions the outage covers,
+/// rather than copied from whichever region's title happened to be first —
+/// each region can only title what it sees, so none of their titles speaks for
+/// the check as a whole. `None` when the check's name or placement is unknown
+/// (deleted, or every region holding it is stale), leaving the caller to the
+/// region's own title.
+fn coverage_title(facts: &CheckFacts, affected: &[&str]) -> Option<String> {
+    let name = facts.name.as_deref()?;
+    let per_region: Vec<NodeState> = facts
+        .regions
+        .iter()
+        .map(|r| {
+            if affected.contains(&r.as_str()) {
+                NodeState::Down
+            } else {
+                NodeState::Up
+            }
+        })
+        .collect();
+    match rollup(&HEADLINE_POLICY, &per_region) {
+        NodeState::Down => Some(format!("{name} is down")),
+        NodeState::Degraded => Some(format!("{name} partial outage")),
+        NodeState::Up | NodeState::Unknown => None,
+    }
+}
+
+fn attribute(groups: &mut [IncidentGroup], facts: &HashMap<CheckId, CheckFacts>) {
     struct Snapshot {
         check_id: Option<CheckId>,
         start: i64,
@@ -260,7 +314,7 @@ fn attribute(groups: &mut [IncidentGroup], depends_on: &HashMap<CheckId, Vec<Che
         let Some(check_id) = dependent.check_id else {
             continue;
         };
-        let Some(upstreams) = depends_on.get(&check_id) else {
+        let Some(upstreams) = facts.get(&check_id).map(|f| &f.depends_on) else {
             continue;
         };
         // First upstream with an overlapping, cross-region group wins — the
@@ -323,6 +377,89 @@ mod tests {
         CheckId::from_u128(n)
     }
 
+    fn depends(dependent: CheckId, upstream: CheckId) -> HashMap<CheckId, CheckFacts> {
+        let facts = CheckFacts {
+            depends_on: vec![upstream],
+            ..CheckFacts::default()
+        };
+        HashMap::from([(dependent, facts)])
+    }
+
+    fn placed(check: CheckId, name: &str, regions: &[&str]) -> HashMap<CheckId, CheckFacts> {
+        let facts = CheckFacts {
+            name: Some(name.to_string()),
+            depends_on: Vec::new(),
+            regions: regions.iter().map(|r| r.to_string()).collect(),
+        };
+        HashMap::from([(check, facts)])
+    }
+
+    fn headline(raw: &[RawIncident], facts: &HashMap<CheckId, CheckFacts>) -> String {
+        let groups = group_and_attribute(raw, facts, 10_000);
+        assert_eq!(groups.len(), 1);
+        groups[0].title.clone()
+    }
+
+    /// Only some placed regions affected reads as a partial outage, whatever
+    /// the affected region called it locally.
+    #[test]
+    fn headline_is_partial_while_some_placed_regions_are_affected() {
+        let dns = cid(1);
+        let facts = placed(dns, "dns", &["tw", "us"]);
+        let raw = vec![incident("tw", dns, 1_000, None)];
+        assert_eq!(headline(&raw, &facts), "dns partial outage");
+    }
+
+    /// Every placed region affected upgrades to "is down" — even when one
+    /// region itself only saw a partial outage among its own agents.
+    #[test]
+    fn headline_is_down_once_every_placed_region_is_affected() {
+        let dns = cid(1);
+        let facts = placed(dns, "dns", &["tw", "us"]);
+        let mut us = incident("us", dns, 1_000, None);
+        us.title = "dns partial outage in us".to_string();
+        let raw = vec![us, incident("tw", dns, 1_000, None)];
+        assert_eq!(headline(&raw, &facts), "dns is down");
+    }
+
+    /// One region recovering while another is still down downgrades the open
+    /// group back to partial: the headline describes now, not the peak.
+    #[test]
+    fn headline_downgrades_when_a_region_recovers() {
+        let dns = cid(1);
+        let facts = placed(dns, "dns", &["tw", "us"]);
+        let raw = vec![
+            incident("us", dns, 1_000, None),
+            incident("tw", dns, 1_000, Some(2_000)),
+        ];
+        assert_eq!(headline(&raw, &facts), "dns partial outage");
+    }
+
+    /// Once over, the group is described by every region the outage reached.
+    #[test]
+    fn resolved_headline_describes_every_region_it_reached() {
+        let dns = cid(1);
+        let facts = placed(dns, "dns", &["tw", "us"]);
+        let raw = vec![
+            incident("us", dns, 1_000, Some(3_000)),
+            incident("tw", dns, 1_000, Some(2_000)),
+        ];
+        assert_eq!(headline(&raw, &facts), "dns is down");
+    }
+
+    /// A placed region that has gone quiet still counts as placed, so one
+    /// affected region out of two stays partial rather than reading as down.
+    #[test]
+    fn a_region_without_an_incident_keeps_the_headline_partial() {
+        let dns = cid(1);
+        let facts = placed(dns, "dns", &["tw", "us", "eu"]);
+        let raw = vec![
+            incident("us", dns, 1_000, None),
+            incident("tw", dns, 1_000, None),
+        ];
+        assert_eq!(headline(&raw, &facts), "dns partial outage");
+    }
+
     /// The exact TODO.md case: `dns` detected DOWN in `us` at 16:23:00 and in
     /// `tw` a minute later, both still open. One group, both regions present.
     #[test]
@@ -362,6 +499,24 @@ mod tests {
         assert_eq!(tw.resolved_at, Some(2_000), "tw's own recovery is kept");
         let us = groups[0].regions.iter().find(|r| r.region == "us").unwrap();
         assert!(us.resolved_at.is_none(), "us's own outage is kept");
+    }
+
+    /// The live toggle: `us` and `tw` confirmed `dns` in the same millisecond,
+    /// and the relay merges region answers in whatever order they arrive. The
+    /// group a user sees must not depend on that order.
+    #[test]
+    fn group_is_independent_of_merge_order_on_a_start_tie() {
+        let dns = cid(1);
+        let mut us = incident("us", dns, 1_000, None);
+        us.title = "dns partial outage in us".to_string();
+        let mut tw = incident("tw", dns, 1_000, None);
+        tw.title = "dns is down".to_string();
+        let a = group_and_attribute(&[us.clone(), tw.clone()], &HashMap::new(), 2_000);
+        let b = group_and_attribute(&[tw, us], &HashMap::new(), 2_000);
+        assert_eq!(
+            serde_json::to_value(&a).unwrap(),
+            serde_json::to_value(&b).unwrap()
+        );
     }
 
     /// A later, disjoint outage of the same check must not be absorbed into
@@ -425,9 +580,7 @@ mod tests {
             incident("us", upstream, 1_000, None),
             incident("tw", dependent, 1_005, None),
         ];
-        let mut depends_on = HashMap::new();
-        depends_on.insert(dependent, vec![upstream]);
-        let groups = group_and_attribute(&raw, &depends_on, 2_000);
+        let groups = group_and_attribute(&raw, &depends(dependent, upstream), 2_000);
         let dependent_group = groups
             .iter()
             .find(|g| g.origin_check.as_deref() == Some(&dependent.to_string()))
@@ -450,9 +603,7 @@ mod tests {
             incident("us", upstream, 1_000, Some(1_100)),
             incident("tw", dependent, 5_000, None),
         ];
-        let mut depends_on = HashMap::new();
-        depends_on.insert(dependent, vec![upstream]);
-        let groups = group_and_attribute(&raw, &depends_on, 6_000);
+        let groups = group_and_attribute(&raw, &depends(dependent, upstream), 6_000);
         let dependent_group = groups
             .iter()
             .find(|g| g.origin_check.as_deref() == Some(&dependent.to_string()))
@@ -472,9 +623,7 @@ mod tests {
             incident("us", upstream, 1_000, None),
             incident("us", dependent, 1_005, None),
         ];
-        let mut depends_on = HashMap::new();
-        depends_on.insert(dependent, vec![upstream]);
-        let groups = group_and_attribute(&raw, &depends_on, 2_000);
+        let groups = group_and_attribute(&raw, &depends(dependent, upstream), 2_000);
         let dependent_group = groups
             .iter()
             .find(|g| g.origin_check.as_deref() == Some(&dependent.to_string()))

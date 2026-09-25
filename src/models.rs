@@ -109,6 +109,13 @@ impl CheckKind {
 /// listed.
 pub const HEARTBEAT_AGENT: &str = "heartbeat";
 
+/// What a check id resolves to for display when no name is known — a check
+/// deleted after the alert or incident that names it, or, transiently, one
+/// whose config reached a node before its name did. Shown in incident and
+/// alert titles in place of the raw UUID, which a user should never see where
+/// a name belongs. Centralised so both tiers and every title path agree.
+pub const DELETED_CHECK_LABEL: &str = "Deleted check";
+
 /// Raw check result sent from agent to coordinator.
 /// The agent is a dumb probe: it reports what it observed, not a verdict.
 /// The coordinator runs eval logic to derive UP/DOWN.
