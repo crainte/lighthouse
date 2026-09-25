@@ -4,13 +4,11 @@ import {
   formatUptime,
   formatLatency,
   formatRelativeTime,
-  sortChecks,
   overallStatus,
   worstStatus,
   barColor,
   dayStatusText,
 } from './format';
-import type { Check } from './api';
 
 describe('statusColor', () => {
   it('maps each status to a distinct color', () => {
@@ -125,58 +123,5 @@ describe('formatRelativeTime', () => {
   });
   it('treats future timestamps as "just now"', () => {
     expect(formatRelativeTime(now + 10_000, now)).toBe('just now');
-  });
-});
-
-describe('sortChecks', () => {
-  // check_id is the immutable identity (opaque, unrelated to display order);
-  // `name` is the mutable label sorting actually reads.
-  const checks: Check[] = [
-    { check_id: 'id-2', name: 'beta', status: 'up', latency_ms: 10, last_check: 3, uptime_24h: 0.9 },
-    { check_id: 'id-4', name: 'alpha', status: 'down', latency_ms: 20, last_check: 1, uptime_24h: 0.5 },
-    { check_id: 'id-1', name: 'gamma', status: 'unknown', latency_ms: 30, last_check: 2, uptime_24h: 0.99 },
-    { check_id: 'id-3', name: 'delta', status: 'degraded', latency_ms: 15, last_check: 4, uptime_24h: 0.8 },
-  ];
-
-  it('sorts by name ascending and descending without mutating input', () => {
-    const asc = sortChecks(checks, 'name', 'asc');
-    expect(asc.map((c) => c.name)).toEqual(['alpha', 'beta', 'delta', 'gamma']);
-    const desc = sortChecks(checks, 'name', 'desc');
-    expect(desc.map((c) => c.name)).toEqual(['gamma', 'delta', 'beta', 'alpha']);
-    // input untouched
-    expect(checks.map((c) => c.name)).toEqual(['beta', 'alpha', 'gamma', 'delta']);
-  });
-
-  it('sorts by status rank up < unknown < degraded < down ascending', () => {
-    const asc = sortChecks(checks, 'status', 'asc');
-    expect(asc.map((c) => c.status)).toEqual(['up', 'unknown', 'degraded', 'down']);
-    const desc = sortChecks(checks, 'status', 'desc');
-    expect(desc.map((c) => c.status)).toEqual(['down', 'degraded', 'unknown', 'up']);
-  });
-
-  it('sorts by uptime numerically', () => {
-    const asc = sortChecks(checks, 'uptime', 'asc');
-    expect(asc.map((c) => c.uptime_24h)).toEqual([0.5, 0.8, 0.9, 0.99]);
-    const desc = sortChecks(checks, 'uptime', 'desc');
-    expect(desc.map((c) => c.uptime_24h)).toEqual([0.99, 0.9, 0.8, 0.5]);
-  });
-
-  it('ranks unmeasured checks last in both directions', () => {
-    const list = [
-      { check_id: 'measured-bad', name: 'a', status: 'down', latency_ms: 1, last_check: 1, uptime_24h: 0 },
-      { check_id: 'unmeasured', name: 'b', status: 'up', latency_ms: 0, last_check: 0, uptime_24h: null },
-      { check_id: 'measured-good', name: 'c', status: 'up', latency_ms: 1, last_check: 1, uptime_24h: 1 },
-    ] as Parameters<typeof sortChecks>[0];
-
-    expect(sortChecks(list, 'uptime', 'asc').map((c) => c.check_id)).toEqual([
-      'measured-bad',
-      'measured-good',
-      'unmeasured',
-    ]);
-    expect(sortChecks(list, 'uptime', 'desc').map((c) => c.check_id)).toEqual([
-      'measured-good',
-      'measured-bad',
-      'unmeasured',
-    ]);
   });
 });

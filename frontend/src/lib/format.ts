@@ -1,9 +1,6 @@
 // Pure display/logic helpers. No DOM, no side effects — unit-tested in format.test.ts.
 import type { Status, Health, Check, UptimeBucket } from './api';
 
-export type SortKey = 'name' | 'status' | 'uptime';
-export type SortDir = 'asc' | 'desc';
-
 // Degraded checks and partially healthy fleet rows share the same amber used
 // by partial-outage history bars.
 const STATUS_COLORS: Record<Status | Health, string> = {
@@ -101,34 +98,6 @@ export function formatDuration(ms: number): string {
   const h = Math.floor(m / 60);
   if (h < 24) return `${h}h ${m % 60}m`;
   return `${Math.floor(h / 24)}d ${h % 24}h`;
-}
-
-// Lower rank sorts first ascending: healthy first, problems last.
-const STATUS_RANK: Record<Status, number> = {
-  up: 0,
-  unknown: 1,
-  degraded: 2,
-  down: 3,
-};
-
-export function sortChecks(list: Check[], key: SortKey, dir: SortDir): Check[] {
-  const sign = dir === 'desc' ? -1 : 1;
-  return [...list].sort((a, b) => {
-    let cmp: number;
-    if (key === 'name') cmp = a.name.localeCompare(b.name);
-    else if (key === 'status') cmp = STATUS_RANK[a.status] - STATUS_RANK[b.status];
-    else {
-      // An unmeasured check has no place on an uptime ranking: sorting it as
-      // 0% would put "we never looked" above a genuine outage in one direction
-      // and below a perfect record in the other. It goes last either way.
-      if (a.uptime_24h == null || b.uptime_24h == null) {
-        if (a.uptime_24h == null && b.uptime_24h == null) return 0;
-        return a.uptime_24h == null ? 1 : -1;
-      }
-      cmp = a.uptime_24h - b.uptime_24h;
-    }
-    return cmp * sign;
-  });
 }
 
 // A short human explanation of why an attempt failed, or null when there is
