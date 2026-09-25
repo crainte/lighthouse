@@ -8,6 +8,7 @@
   } from '../lib/api';
   import { fetchHistory, fetchLatencyWindow } from '../lib/api';
   import { barColor, dayStatusText, formatLatency, failureReason, statusColor } from '../lib/format';
+  import { bandParts, computeProbeRows, probeTone } from '../lib/probeGrid';
   import LatencyChart from './LatencyChart.svelte';
 
   let {
@@ -102,26 +103,9 @@
   });
 
   /** One labelled block per agent, oldest→newest, trimmed to whole rows of
-   *  `COLS` — identical shape to CheckDetail's probe grid, but derived from this
-   *  modal's exact-window `log` instead of the check's newest-N history. */
-  const probeRows = $derived.by(() => {
-    // The API serves newest-first, so the first N per agent are the newest.
-    const byAgent = new Map<string, HistoryPoint[]>();
-    for (const p of log) {
-      const row = byAgent.get(p.agent_id);
-      if (row === undefined) byAgent.set(p.agent_id, [p]);
-      else if (row.length < MAX_PER_AGENT) row.push(p);
-    }
-    return [...byAgent]
-      .sort((a, b) => a[0].localeCompare(b[0]))
-      .map(([agent_id, newestFirst]) => {
-        const whole =
-          newestFirst.length >= COLS
-            ? Math.floor(newestFirst.length / COLS) * COLS
-            : newestFirst.length;
-        return { agent_id, probes: newestFirst.slice(0, whole).reverse() };
-      });
-  });
+   *  `COLS`. lib/probeGrid.ts also backs CheckDetail's identically-shaped grid,
+   *  over its newest-N history rather than this modal's exact-window `log`. */
+  const probeRows = $derived(computeProbeRows(log, COLS, MAX_PER_AGENT));
   const probeCount = $derived(probeRows.reduce((n, r) => n + r.probes.length, 0));
 
   /** Hovered square, positioned from the square's own box rather than the
@@ -131,12 +115,6 @@
   function hoverSquare(e: MouseEvent, p: HistoryPoint) {
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
     hovered = { p, x: r.left + r.width / 2, y: r.top };
-  }
-
-  /** `.tt-status` has no `unknown` tone — an unrecorded probe reads the same as
-   *  an empty bucket on the strip. */
-  function tone(s: HistoryPoint['status']): string {
-    return s === 'up' || s === 'down' ? s : 'nodata';
   }
 
   function toggleLog() {
@@ -149,16 +127,6 @@
         logLoading = false;
       })
       .catch(() => (logLoading = false));
-  }
-
-  // Three separate numbers, not one string: "7/19/109" reads as a date.
-  function bandParts(
-    min: number | null,
-    avg: number | null,
-    max: number | null,
-  ): string[] | null {
-    if (avg === null) return null;
-    return [String(min), String(Math.round(avg)), String(max)];
   }
 
   function onBackdrop(e: MouseEvent) {
@@ -348,7 +316,7 @@
   <!-- Same tooltip as the uptime strip's, so a square and a bar read alike. -->
   <div class="bar-tooltip" style="left:{hovered.x}px; top:{hovered.y}px">
     <div class="tt-date">{stampFmt.format(new Date(p.timestamp))}</div>
-    <div class="tt-status {tone(p.status)}">{p.status}</div>
+    <div class="tt-status {probeTone(p.status)}">{p.status}</div>
     <!-- No agent here: the block this square sits in is already labelled with it. -->
     <div class="tt-detail">{formatLatency(p.latency_ms)}</div>
     {#if failureReason(p)}

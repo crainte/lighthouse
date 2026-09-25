@@ -16,6 +16,7 @@
     barColor,
   } from '../lib/format';
   import { stateTone } from '../lib/incident';
+  import { bandParts, computeProbeRows, probeTone } from '../lib/probeGrid';
   import LatencyChart from './LatencyChart.svelte';
 
   let {
@@ -111,16 +112,6 @@
   const attempts = $derived(series?.overall.attempts ?? 0);
   const failed = $derived(attempts - (series?.overall.up ?? 0));
 
-  // Three separate numbers, not one string: "7/19/109" reads as a date.
-  function bandParts(
-    min: number | null,
-    avg: number | null,
-    max: number | null,
-  ): string[] | null {
-    if (avg === null) return null;
-    return [String(min), String(Math.round(avg)), String(max)];
-  }
-
   /** Squares per row. Fixed rather than "however many fit", so a block of
    *  probes is either whole rows or nothing — a wrapping flex row left a
    *  12-square tail hanging off the bottom. */
@@ -131,30 +122,10 @@
    *  agent, so a big fleet gets shorter rows rather than some agents none. */
   const PROBES = COLS * 12;
 
-  /** One labelled block per agent. A single chronological grid mixed the agents
-   *  together, where ten of them turn one region's outage into scattered noise
-   *  and the reader cannot tell "one probe location is down" from "everything is
-   *  flapping". Each block is that agent's own newest probes, oldest to newest,
-   *  trimmed to whole rows of `COLS` — so rows are flush, and are deliberately
-   *  not a shared time axis across agents, which is why each is labelled. */
-  const probeRows = $derived.by(() => {
-    // The API serves newest-first, so the first N per agent are the newest.
-    const byAgent = new Map<string, HistoryPoint[]>();
-    for (const p of history) {
-      const row = byAgent.get(p.agent_id);
-      if (row === undefined) byAgent.set(p.agent_id, [p]);
-      else if (row.length < MAX_PER_AGENT) row.push(p);
-    }
-    return [...byAgent]
-      .sort((a, b) => a[0].localeCompare(b[0]))
-      .map(([agent_id, newestFirst]) => {
-        const whole =
-          newestFirst.length >= COLS
-            ? Math.floor(newestFirst.length / COLS) * COLS
-            : newestFirst.length;
-        return { agent_id, probes: newestFirst.slice(0, whole).reverse() };
-      });
-  });
+  /** One labelled block per agent, so ten of them turn one region's outage into
+   *  scattered noise instead of a readable page. lib/probeGrid.ts also backs
+   *  DayDetailModal's identically-shaped grid over one bucket's exact window. */
+  const probeRows = $derived(computeProbeRows(history, COLS, MAX_PER_AGENT));
   const probeCount = $derived(probeRows.reduce((n, r) => n + r.probes.length, 0));
 
   const stampFmt = new Intl.DateTimeFormat(undefined, {
@@ -174,12 +145,6 @@
   function hoverSquare(e: MouseEvent, p: HistoryPoint) {
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
     hovered = { p, x: r.left + r.width / 2, y: r.top };
-  }
-
-  /** `.tt-status` has no `unknown` tone — an unrecorded probe reads the same as
-   *  an empty bucket on the strip. */
-  function tone(s: HistoryPoint['status']): string {
-    return s === 'up' || s === 'down' ? s : 'nodata';
   }
 
   function setHours(next: number) {
@@ -394,7 +359,7 @@
   <!-- Same tooltip as the uptime strip's, so a square and a bar read alike. -->
   <div class="bar-tooltip" style="left:{hovered.x}px; top:{hovered.y}px">
     <div class="tt-date">{stampFmt.format(new Date(p.timestamp))}</div>
-    <div class="tt-status {tone(p.status)}">{p.status}</div>
+    <div class="tt-status {probeTone(p.status)}">{p.status}</div>
     <!-- No agent here: the block this square sits in is already labelled with it. -->
     <div class="tt-detail">{formatLatency(p.latency_ms)}</div>
     {#if failureReason(p)}
