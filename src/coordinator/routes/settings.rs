@@ -25,10 +25,10 @@
 use super::super::fleet::FleetMemberDto;
 use super::super::router::{error_response, fleet_members, internal_error};
 use super::super::{alert, Coordinator};
-use super::session::require_admin;
+use crate::http::{AdminJson, AdminSession};
 use crate::models::NodeState;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -47,11 +47,8 @@ struct AgentsDisplayResponse {
 
 pub(in crate::coordinator) async fn agents_display_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
+    _admin: AdminSession,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     let now = chrono::Utc::now().timestamp_millis();
     let agents = coord.inner.status_agents.read().clone();
     let fleet = fleet_members(&coord, now).await;
@@ -62,12 +59,8 @@ pub(in crate::coordinator) async fn agents_display_handler(
 /// is told about where monitoring runs from.
 pub(in crate::coordinator) async fn update_agents_display_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
-    Json(body): Json<crate::config::AgentsDisplay>,
+    AdminJson(body): AdminJson<crate::config::AgentsDisplay>,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     let next = body.sanitized();
     if let Err(reason) = next.validate() {
         return error_response(StatusCode::BAD_REQUEST, &reason);
@@ -193,11 +186,8 @@ async fn notifiers_response(coord: &Coordinator) -> Response {
 /// is the entire authentication for posting to that channel.
 pub(in crate::coordinator) async fn notifiers_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
+    _admin: AdminSession,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     notifiers_response(&coord).await
 }
 
@@ -206,12 +196,8 @@ pub(in crate::coordinator) async fn notifiers_handler(
 /// identity, which is exactly why it has to be unique.
 pub(in crate::coordinator) async fn update_notifiers_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
-    Json(body): Json<NotifiersRequest>,
+    AdminJson(body): AdminJson<NotifiersRequest>,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     let existing: std::collections::HashMap<_, _> = coord
         .inner
         .notifiers
@@ -331,11 +317,8 @@ fn maintenance_response(coord: &Coordinator) -> Response {
 
 pub(in crate::coordinator) async fn maintenance_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
+    _admin: AdminSession,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     maintenance_response(&coord)
 }
 
@@ -343,12 +326,8 @@ pub(in crate::coordinator) async fn maintenance_handler(
 /// whole, and a window has no identity beyond its span.
 pub(in crate::coordinator) async fn update_maintenance_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
-    Json(body): Json<MaintenanceRequest>,
+    AdminJson(body): AdminJson<MaintenanceRequest>,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     let next: Vec<crate::maintenance::MaintenanceWindow> = body
         .windows
         .into_iter()
@@ -383,13 +362,9 @@ struct NotifierTestResponse {
 /// a wrong ntfy topic is completely silent — the POST succeeds, ntfy answers
 /// 404, and nothing ever looks.
 pub(in crate::coordinator) async fn test_notifier_handler(
-    State(coord): State<Coordinator>,
-    headers: HeaderMap,
-    Json(notifier): Json<crate::notify::Notifier>,
+    State(_coord): State<Coordinator>,
+    AdminJson(notifier): AdminJson<crate::notify::Notifier>,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     let notifier = notifier.sanitized();
     if let Err(reason) = notifier.validate() {
         return error_response(StatusCode::BAD_REQUEST, &reason);

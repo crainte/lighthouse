@@ -10,15 +10,15 @@
 //! the caller out just as well by simply expiring. Expiry is the real
 //! control; the logout call is a courtesy that shortens the wait.
 //!
-//! **`require_admin`, `session_token`, and `bearer` live here because this is
-//! the module that owns what a session *is*.** Every other route module
-//! calls at least one of them to gate a write or an admin-only read, which is
-//! why all three are `pub(in crate::coordinator)` rather than staying
-//! file-private the way a helper used once would.
+//! **`session_token` and `bearer` live here because this is the module that
+//! owns what a session *is*.** Every other route module calls at least one
+//! of them to gate a write or an admin-only read, which is why both are
+//! `pub(in crate::coordinator)` rather than staying file-private the way a
+//! helper used once would. Admin routes gate on `crate::http::AdminSession`
+//! instead, an extractor backed by `routes::public::is_admin`.
 
 use super::super::router::error_response;
 use super::super::Coordinator;
-use super::public::is_admin;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -39,15 +39,6 @@ struct SessionResponse {
 pub(in crate::coordinator) fn session_token(headers: &HeaderMap) -> Option<&str> {
     let cookies = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
     crate::auth::cookie_value(cookies, crate::auth::SESSION_COOKIE)
-}
-
-/// Gate for every `/admin` route. Returns the 401 body the frontend expects.
-pub(in crate::coordinator) fn require_admin(
-    coord: &Coordinator,
-    headers: &HeaderMap,
-) -> Option<Response> {
-    (!is_admin(coord, headers))
-        .then(|| error_response(StatusCode::UNAUTHORIZED, "authentication required"))
 }
 
 /// The bearer credential on a request, if it carries one.

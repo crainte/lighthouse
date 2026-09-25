@@ -28,8 +28,9 @@
 
 use super::super::router::{error_response, internal_error, DeletedResponse};
 use super::super::{storage, Coordinator, WsEvent};
-use super::session::{bearer, require_admin};
+use super::session::bearer;
 use crate::config::CheckConfig;
+use crate::http::{AdminJson, AdminSession};
 use crate::models::{CheckId, CheckResult};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -58,7 +59,7 @@ fn is_peer_request(coord: &Coordinator, headers: &HeaderMap) -> bool {
 
 /// Parse a path id after auth has already been checked, never before.
 /// `Path<CheckId>` would reject a non-UUID id at extraction time — before the
-/// handler body, and so before `require_admin` ever runs — which would let
+/// handler body, and so before `crate::http::AdminSession` ever runs — which would let
 /// an anonymous caller learn "that wasn't even a valid id" (400) instead of
 /// the uniform "authentication required" (401) every other admin route gives
 /// them. Taking the id as a plain `String` and parsing it here keeps auth the
@@ -109,12 +110,9 @@ pub(in crate::coordinator) struct CheckResponse {
 
 pub(in crate::coordinator) async fn list_checks_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
+    _admin: AdminSession,
     Query(q): Query<AdminChecksQuery>,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     let (page, limit) = (
         q.page.unwrap_or(0),
         crate::page::bounded(q.limit, crate::page::MAX_PAGE_SIZE),
@@ -136,11 +134,8 @@ pub(in crate::coordinator) async fn list_checks_handler(
 pub(in crate::coordinator) async fn create_check_handler(
     State(coord): State<Coordinator>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    AdminJson(body): AdminJson<Value>,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     let trusted_global = is_peer_request(&coord, &headers);
     let mut check = match CheckConfig::from_submitted(body, !trusted_global) {
         Ok(check) => check.normalised(),
@@ -179,12 +174,8 @@ pub(in crate::coordinator) async fn create_check_handler(
 pub(in crate::coordinator) async fn update_check_handler(
     State(coord): State<Coordinator>,
     Path(id): Path<String>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
+    AdminJson(body): AdminJson<Value>,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     let id = match parse_check_id(&id) {
         Ok(id) => id,
         Err(denied) => return *denied,
@@ -230,11 +221,8 @@ pub(in crate::coordinator) async fn update_check_handler(
 pub(in crate::coordinator) async fn unplace_check_handler(
     State(coord): State<Coordinator>,
     Path(id): Path<String>,
-    headers: HeaderMap,
+    _admin: AdminSession,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     let id = match parse_check_id(&id) {
         Ok(id) => id,
         Err(denied) => return *denied,
@@ -258,11 +246,8 @@ pub(in crate::coordinator) struct UnplacedResponse {
 pub(in crate::coordinator) async fn delete_check_handler(
     State(coord): State<Coordinator>,
     Path(id): Path<String>,
-    headers: HeaderMap,
+    _admin: AdminSession,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     let id = match parse_check_id(&id) {
         Ok(id) => id,
         Err(denied) => return *denied,
@@ -314,13 +299,9 @@ struct EvalTestResponse {
 }
 
 pub(in crate::coordinator) async fn eval_test_handler(
-    State(coord): State<Coordinator>,
-    headers: HeaderMap,
-    Json(body): Json<EvalTestRequest>,
+    State(_coord): State<Coordinator>,
+    AdminJson(body): AdminJson<EvalTestRequest>,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     let input = crate::script::EvalInput {
         status: body.status,
         latency_ms: body.latency,
@@ -346,12 +327,8 @@ pub(in crate::coordinator) struct CheckOrderRequest {
 
 pub(in crate::coordinator) async fn reorder_checks_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
-    Json(body): Json<CheckOrderRequest>,
+    AdminJson(body): AdminJson<CheckOrderRequest>,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     let before_pos: std::collections::HashMap<CheckId, i32> = coord
         .inner
         .checks
@@ -435,11 +412,8 @@ pub(in crate::coordinator) async fn heartbeat_handler(
 pub(in crate::coordinator) async fn purge_check_everything_handler(
     State(coord): State<Coordinator>,
     Path(id): Path<String>,
-    headers: HeaderMap,
+    _admin: AdminSession,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     let id = match parse_check_id(&id) {
         Ok(id) => id,
         Err(denied) => return *denied,
@@ -498,11 +472,8 @@ struct ErasedResponse {
 pub(in crate::coordinator) async fn purge_check_data_handler(
     State(coord): State<Coordinator>,
     Path(id): Path<String>,
-    headers: HeaderMap,
+    _admin: AdminSession,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     let id = match parse_check_id(&id) {
         Ok(id) => id,
         Err(denied) => return *denied,

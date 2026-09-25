@@ -13,14 +13,15 @@
 //! **Peer-gated, because these endpoints rewrite published state.** Every
 //! handler here calls `require_peer` before touching anything, with one
 //! exception: `cluster_view_handler` answers the admin UI's read of
-//! membership and is gated by `require_admin` instead, because it is a human
-//! in a browser asking, not a peer — see its own doc comment.
+//! membership and is gated by `crate::http::AdminSession` instead, because it
+//! is a human in a browser asking, not a peer — see its own doc comment.
 
 use super::super::router::{error_response, internal_error};
 use super::super::{alert, cluster, gossip};
 use super::super::{storage, Coordinator, WsEvent};
-use super::session::{bearer, require_admin};
+use super::session::bearer;
 use crate::configplane::{ConfigBatch, ConfigDigestDto};
+use crate::http::AdminSession;
 use crate::models::{CheckResult, NodeState, Status};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -984,11 +985,8 @@ struct ClusterViewResponse {
 
 pub(in crate::coordinator) async fn cluster_view_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
+    _admin: AdminSession,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     let now = chrono::Utc::now().timestamp_millis();
     // A node with clustering unconfigured still has an identity worth
     // showing, just no membership beyond itself.
@@ -1091,12 +1089,9 @@ pub(in crate::coordinator) struct RawDataGapsResponse {
 /// anti-entropy. See SCALING.md's "Data retention tiers".
 pub(in crate::coordinator) async fn raw_data_gaps_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
+    _admin: AdminSession,
     Query(q): Query<RawDataGapsQuery>,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     let limit = crate::page::bounded(q.limit, 100);
     let page = q.page.unwrap_or(0);
     match coord.db(|storage| storage.list_raw_data_gaps()).await {

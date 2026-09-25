@@ -19,11 +19,12 @@
 //! hit it.
 
 use super::store::AdminError;
-use super::{error_response, reconcile, require_admin, GlobalNode};
+use super::{error_response, reconcile, GlobalNode};
 use crate::coordinator::storage::{Section, SectionDisplay};
+use crate::http::{AdminJson, AdminSession};
 use crate::models::CheckId;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -67,12 +68,9 @@ struct CheckResponse {
 
 pub(super) async fn list_checks_handler(
     State(node): State<GlobalNode>,
-    headers: HeaderMap,
+    _admin: AdminSession,
     Query(q): Query<ChecksQuery>,
 ) -> Response {
-    if let Some(denied) = require_admin(&node, &headers) {
-        return denied;
-    }
     let (page, limit) = (
         q.page.unwrap_or(0),
         crate::page::bounded(q.limit, crate::page::MAX_PAGE_SIZE),
@@ -90,12 +88,8 @@ pub(super) async fn list_checks_handler(
 
 pub(super) async fn create_check_handler(
     State(node): State<GlobalNode>,
-    headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    AdminJson(body): AdminJson<serde_json::Value>,
 ) -> Response {
-    if let Some(denied) = require_admin(&node, &headers) {
-        return denied;
-    }
     match node.inner.store.create_check(body).await {
         Ok((check, entry)) => {
             reconcile::push_now(&node, vec![entry]);
@@ -108,12 +102,8 @@ pub(super) async fn create_check_handler(
 pub(super) async fn update_check_handler(
     State(node): State<GlobalNode>,
     Path(id): Path<String>,
-    headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    AdminJson(body): AdminJson<serde_json::Value>,
 ) -> Response {
-    if let Some(denied) = require_admin(&node, &headers) {
-        return denied;
-    }
     let id = match parse_check_id(&id) {
         Ok(id) => id,
         Err(denied) => return *denied,
@@ -130,11 +120,8 @@ pub(super) async fn update_check_handler(
 pub(super) async fn delete_check_handler(
     State(node): State<GlobalNode>,
     Path(id): Path<String>,
-    headers: HeaderMap,
+    _admin: AdminSession,
 ) -> Response {
-    if let Some(denied) = require_admin(&node, &headers) {
-        return denied;
-    }
     let id = match parse_check_id(&id) {
         Ok(id) => id,
         Err(denied) => return *denied,
@@ -155,12 +142,8 @@ pub(super) struct CheckOrderRequest {
 
 pub(super) async fn reorder_checks_handler(
     State(node): State<GlobalNode>,
-    headers: HeaderMap,
-    Json(body): Json<CheckOrderRequest>,
+    AdminJson(body): AdminJson<CheckOrderRequest>,
 ) -> Response {
-    if let Some(denied) = require_admin(&node, &headers) {
-        return denied;
-    }
     match node.inner.store.reorder_checks(body.order).await {
         Ok((checks, entries)) => {
             let total = checks.len();
@@ -204,11 +187,8 @@ pub(super) async fn public_sections_handler(State(node): State<GlobalNode>) -> R
 
 pub(super) async fn list_sections_handler(
     State(node): State<GlobalNode>,
-    headers: HeaderMap,
+    _admin: AdminSession,
 ) -> Response {
-    if let Some(denied) = require_admin(&node, &headers) {
-        return denied;
-    }
     sections_response(&node).await
 }
 
@@ -221,12 +201,8 @@ pub(super) struct SectionNameRequest {
 
 pub(super) async fn create_section_handler(
     State(node): State<GlobalNode>,
-    headers: HeaderMap,
-    Json(body): Json<SectionNameRequest>,
+    AdminJson(body): AdminJson<SectionNameRequest>,
 ) -> Response {
-    if let Some(denied) = require_admin(&node, &headers) {
-        return denied;
-    }
     let collapsed = body.collapsed.unwrap_or(false);
     let display = body.display.unwrap_or_default();
     match node
@@ -246,12 +222,8 @@ pub(super) async fn create_section_handler(
 pub(super) async fn rename_section_handler(
     State(node): State<GlobalNode>,
     Path(current): Path<String>,
-    headers: HeaderMap,
-    Json(body): Json<SectionNameRequest>,
+    AdminJson(body): AdminJson<SectionNameRequest>,
 ) -> Response {
-    if let Some(denied) = require_admin(&node, &headers) {
-        return denied;
-    }
     match node
         .inner
         .store
@@ -269,11 +241,8 @@ pub(super) async fn rename_section_handler(
 pub(super) async fn delete_section_handler(
     State(node): State<GlobalNode>,
     Path(name): Path<String>,
-    headers: HeaderMap,
+    _admin: AdminSession,
 ) -> Response {
-    if let Some(denied) = require_admin(&node, &headers) {
-        return denied;
-    }
     match node.inner.store.delete_section(&name).await {
         Ok(entries) => {
             reconcile::push_now(&node, entries);
@@ -290,12 +259,8 @@ pub(super) struct SectionOrderRequest {
 
 pub(super) async fn reorder_sections_handler(
     State(node): State<GlobalNode>,
-    headers: HeaderMap,
-    Json(body): Json<SectionOrderRequest>,
+    AdminJson(body): AdminJson<SectionOrderRequest>,
 ) -> Response {
-    if let Some(denied) = require_admin(&node, &headers) {
-        return denied;
-    }
     match node.inner.store.reorder_sections(body.order).await {
         Ok((sections, entries)) => {
             reconcile::push_now(&node, entries);

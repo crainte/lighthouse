@@ -6,8 +6,8 @@
 //! it.** `is_admin` decides whether `status_handler` and `history_handler`
 //! hand back a probe's raw error text or the summary everyone else gets; it
 //! never decides whether the response is sent at all. `results_handler` is
-//! the one handler in this file that *is* gated, by `require_admin`, and it
-//! lives here anyway because "recent results, filtered" is the same shape of
+//! the one handler in this file that *is* gated, by `crate::http::AdminSession`,
+//! and it lives here anyway because "recent results, filtered" is the same shape of
 //! read as the public ones, just with the redaction switched permanently on.
 //! The rule this file exists to hold is simple to state and easy to get
 //! backwards under pressure to add a field: an admin session may only ever
@@ -21,8 +21,9 @@
 use super::super::fleet::FleetRowDto;
 use super::super::router::{error_response, fleet_health, internal_error};
 use super::super::{storage, Coordinator};
-use super::session::{require_admin, session_token};
+use super::session::session_token;
 use super::settings::{announced_maintenance, MaintenanceNoticeDto};
+use crate::http::AdminSession;
 use crate::models::{CheckId, NodeState, Status};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -599,12 +600,9 @@ pub(in crate::coordinator) async fn history_handler(
 /// that quote what the probe saw, so an anonymous caller must never reach here.
 pub(in crate::coordinator) async fn results_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
+    _admin: AdminSession,
     Query(q): Query<ResultsQuery>,
 ) -> Response {
-    if let Some(rejection) = require_admin(&coord, &headers) {
-        return rejection;
-    }
     let limit = crate::page::bounded(q.limit, 200);
     // An unrecognised value filters nothing rather than silently returning empty.
     let status = q.status.as_deref().and_then(|s| match s {
@@ -657,9 +655,9 @@ pub(in crate::coordinator) async fn results_handler(
 
 /// Whether this request carries a valid admin session.
 ///
-/// `pub(in crate::coordinator)` because `require_admin`, in `session.rs`,
-/// widens the same question into a gate: this function only ever decides
-/// how much detail a public response gets, never whether it is sent.
+/// `pub(in crate::coordinator)` because `crate::http::AdminSession` widens
+/// the same question into a gate: this function only ever decides how much
+/// detail a public response gets, never whether it is sent.
 pub(in crate::coordinator) fn is_admin(coord: &Coordinator, headers: &HeaderMap) -> bool {
     let now = chrono::Utc::now().timestamp_millis();
     if session_token(headers).is_some_and(|t| coord.inner.auth.validate(t, now)) {

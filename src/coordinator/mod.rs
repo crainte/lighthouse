@@ -338,6 +338,12 @@ struct SeenAgent {
     build: Option<String>,
 }
 
+impl crate::http::AdminGate for Coordinator {
+    fn is_admin_request(&self, headers: &axum::http::HeaderMap) -> bool {
+        routes::public::is_admin(self, headers)
+    }
+}
+
 impl Coordinator {
     /// Every database job in the coordinator goes through here, so the slow-job
     /// log would name this one line for all of them unless the real call site

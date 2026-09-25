@@ -7,11 +7,11 @@
 
 use super::super::router::{error_response, internal_error, DeletedResponse};
 use super::super::{storage, Coordinator};
-use super::session::require_admin;
+use crate::http::{AdminJson, AdminSession};
 use crate::models::NodeState;
 use crate::rollup::RollupPolicy;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -93,12 +93,8 @@ struct AgentStateDto {
 /// Snapshot the effective credential-authoritative rollup tree for every check.
 pub(in crate::coordinator) async fn region_tree_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
+    _admin: AdminSession,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
-
     let now = chrono::Utc::now().timestamp_millis();
     let checks = coord.inner.checks.read().clone();
     let mut check_ids: Vec<_> = checks.keys().cloned().collect();
@@ -176,12 +172,8 @@ fn validate_node_id(node_id: &str, node_type: storage::NodeType) -> Result<(), &
 
 pub(in crate::coordinator) async fn list_rollup_policies_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
+    _admin: AdminSession,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
-
     match coord.db(|storage| storage.list_rollup_policies()).await {
         Ok(rows) => Json(RollupPoliciesResponse {
             policies: rows.into_iter().map(Into::into).collect(),
@@ -193,12 +185,8 @@ pub(in crate::coordinator) async fn list_rollup_policies_handler(
 
 pub(in crate::coordinator) async fn upsert_rollup_policy_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
-    Json(body): Json<RollupPolicyDto>,
+    AdminJson(body): AdminJson<RollupPolicyDto>,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     if let Err(reason) = validate_node_id(&body.node_id, body.node_type) {
         return error_response(StatusCode::BAD_REQUEST, reason);
     }
@@ -218,12 +206,8 @@ pub(in crate::coordinator) async fn upsert_rollup_policy_handler(
 
 pub(in crate::coordinator) async fn delete_rollup_policy_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
-    Json(body): Json<RollupPolicyDeleteRequest>,
+    AdminJson(body): AdminJson<RollupPolicyDeleteRequest>,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     if let Err(reason) = validate_node_id(&body.node_id, body.node_type) {
         return error_response(StatusCode::BAD_REQUEST, reason);
     }

@@ -15,44 +15,22 @@
 
 use super::super::router::{error_response, internal_error, DeletedResponse};
 use super::super::{storage, Coordinator};
-use super::session::require_admin;
+use crate::http::{AdminJson, AdminSession};
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 #[derive(Serialize)]
-struct SectionDto {
-    name: String,
-    position: i32,
-    /// Whether the public page renders this section collapsed on first load.
-    collapsed: bool,
-    /// `inline` or `page`. The public page needs it to decide between rendering
-    /// the section's rows and rendering a tile that links to them.
-    display: storage::SectionDisplay,
-}
-
-impl From<storage::Section> for SectionDto {
-    fn from(s: storage::Section) -> Self {
-        Self {
-            name: s.name,
-            position: s.position,
-            collapsed: s.collapsed,
-            display: s.display,
-        }
-    }
-}
-
-#[derive(Serialize)]
 struct SectionsResponse {
-    sections: Vec<SectionDto>,
+    sections: Vec<storage::Section>,
 }
 
 #[derive(Serialize)]
 struct SectionResponse {
-    section: SectionDto,
+    section: storage::Section,
 }
 
 #[derive(Deserialize)]
@@ -75,10 +53,7 @@ pub(in crate::coordinator) struct ReorderRequest {
 
 async fn sections_response(coord: &Coordinator) -> Response {
     match coord.db(|storage| storage.list_sections()).await {
-        Ok(sections) => Json(SectionsResponse {
-            sections: sections.into_iter().map(Into::into).collect(),
-        })
-        .into_response(),
+        Ok(sections) => Json(SectionsResponse { sections }).into_response(),
         Err(e) => internal_error(e),
     }
 }
@@ -93,22 +68,15 @@ pub(in crate::coordinator) async fn public_sections_handler(
 
 pub(in crate::coordinator) async fn list_sections_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
+    _admin: AdminSession,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     sections_response(&coord).await
 }
 
 pub(in crate::coordinator) async fn create_section_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
-    Json(body): Json<SectionNameRequest>,
+    AdminJson(body): AdminJson<SectionNameRequest>,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     let name = match storage::Section::valid_name(&body.name) {
         Ok(n) => n,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
@@ -133,7 +101,7 @@ pub(in crate::coordinator) async fn create_section_handler(
         .restamp_and_push(storage::ConfigKind::Section, &name)
         .await;
     Json(SectionResponse {
-        section: SectionDto {
+        section: storage::Section {
             name,
             position: 0,
             collapsed,
@@ -146,12 +114,8 @@ pub(in crate::coordinator) async fn create_section_handler(
 pub(in crate::coordinator) async fn rename_section_handler(
     State(coord): State<Coordinator>,
     Path(current): Path<String>,
-    headers: HeaderMap,
-    Json(body): Json<SectionNameRequest>,
+    AdminJson(body): AdminJson<SectionNameRequest>,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     let name = match storage::Section::valid_name(&body.name) {
         Ok(n) => n,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
@@ -236,7 +200,7 @@ pub(in crate::coordinator) async fn rename_section_handler(
         .ok()
         .and_then(|all| all.into_iter().find(|s| s.name == name));
     Json(SectionResponse {
-        section: SectionDto {
+        section: storage::Section {
             name,
             position: 0,
             collapsed: stored.as_ref().is_some_and(|s| s.collapsed),
@@ -249,11 +213,8 @@ pub(in crate::coordinator) async fn rename_section_handler(
 pub(in crate::coordinator) async fn delete_section_handler(
     State(coord): State<Coordinator>,
     Path(name): Path<String>,
-    headers: HeaderMap,
+    _admin: AdminSession,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     // Captured before the delete moves them: the checks that are about to be
     // loosened, so every one of them can be stamped and pushed too — its
     // document changed (`group` is now `None`), the same as any other edit.
@@ -301,12 +262,8 @@ pub(in crate::coordinator) async fn delete_section_handler(
 
 pub(in crate::coordinator) async fn reorder_sections_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
-    Json(body): Json<ReorderRequest>,
+    AdminJson(body): AdminJson<ReorderRequest>,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     let order = body.order;
     let (before, after) = match coord
         .db(move |storage| {

@@ -36,12 +36,18 @@ use tokio::sync::broadcast;
 use tracing::warn;
 
 pub(crate) use relay::parse_composite_incident_id;
-pub(crate) use routes::{error_response, require_admin};
+pub(crate) use routes::error_response;
 
 /// Shared global-node state for axum handlers.
 #[derive(Clone)]
 pub struct GlobalNode {
     inner: Arc<Inner>,
+}
+
+impl crate::http::AdminGate for GlobalNode {
+    fn is_admin_request(&self, headers: &axum::http::HeaderMap) -> bool {
+        routes::is_admin(self, headers)
+    }
 }
 
 struct Inner {

@@ -25,9 +25,10 @@ use super::super::fleet::{unreachable_after_ms, AGENT_RETIRED_AFTER_MS, AGENT_ST
 use super::super::router::{error_response, internal_error};
 use super::super::{storage, Coordinator, SeenAgent};
 use super::checks::PurgedResponse;
-use super::session::{bearer, require_admin};
+use super::session::bearer;
 use crate::config::CheckConfig;
 use crate::credential::AgentCredential;
+use crate::http::{AdminJson, AdminSession};
 use crate::models::{ResultBatch, Status};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -166,11 +167,8 @@ pub(in crate::coordinator) async fn ingest_handler(
 /// something an anonymous visitor to the status page should be able to read.
 pub(in crate::coordinator) async fn agents_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
+    _admin: AdminSession,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     let now = chrono::Utc::now().timestamp_millis();
     let (rows, polls) = match coord
         .db(move |storage| Ok((storage.list_agents(now)?, storage.list_agent_polls()?)))
@@ -327,11 +325,8 @@ pub(in crate::coordinator) async fn agents_handler(
 pub(in crate::coordinator) async fn purge_agent_handler(
     State(coord): State<Coordinator>,
     Path(agent_id): Path<String>,
-    headers: HeaderMap,
+    _admin: AdminSession,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     let still_assigned: Vec<String> = coord
         .inner
         .checks
@@ -709,11 +704,8 @@ struct MintedCredentialResponse {
 
 pub(in crate::coordinator) async fn list_agent_credentials_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
+    _admin: AdminSession,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     match coord.db(|storage| storage.list_agent_credentials()).await {
         Ok(rows) => Json(AgentCredentialsResponse {
             credentials: rows.iter().map(AgentCredentialDto::from).collect(),
@@ -729,12 +721,8 @@ pub(in crate::coordinator) async fn list_agent_credentials_handler(
 /// would defeat hashing it, so the UI has to make the operator copy it now.
 pub(in crate::coordinator) async fn mint_agent_credential_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
-    Json(body): Json<MintCredentialRequest>,
+    AdminJson(body): AdminJson<MintCredentialRequest>,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     let zone = body.zone.trim();
     let region = body.region.trim();
     // A blank location would bind the credential to nothing and place its
@@ -765,11 +753,8 @@ pub(in crate::coordinator) async fn mint_agent_credential_handler(
 pub(in crate::coordinator) async fn revoke_agent_credential_handler(
     State(coord): State<Coordinator>,
     Path(id): Path<String>,
-    headers: HeaderMap,
+    _admin: AdminSession,
 ) -> Response {
-    if let Some(denied) = require_admin(&coord, &headers) {
-        return denied;
-    }
     let now = chrono::Utc::now().timestamp_millis();
     let revoke_id = id.clone();
     let revoked = coord

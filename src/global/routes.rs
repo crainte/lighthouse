@@ -372,10 +372,10 @@ struct ClusterLinkDto {
     outcome: &'static str,
 }
 
-async fn cluster_handler(State(node): State<GlobalNode>, headers: HeaderMap) -> Response {
-    if let Some(denied) = require_admin(&node, &headers) {
-        return denied;
-    }
+async fn cluster_handler(
+    State(node): State<GlobalNode>,
+    _admin: crate::http::AdminSession,
+) -> Response {
     let now = chrono::Utc::now().timestamp_millis();
     let roster = node.inner.cache.roster(now);
     let members = roster
@@ -448,10 +448,10 @@ struct RegionNodeDto {
     zones: Vec<serde_json::Value>,
 }
 
-async fn region_tree_handler(State(node): State<GlobalNode>, headers: HeaderMap) -> Response {
-    if let Some(denied) = require_admin(&node, &headers) {
-        return denied;
-    }
+async fn region_tree_handler(
+    State(node): State<GlobalNode>,
+    _admin: crate::http::AdminSession,
+) -> Response {
     let now = chrono::Utc::now().timestamp_millis();
     let checks = node
         .inner
@@ -495,10 +495,10 @@ async fn region_tree_handler(State(node): State<GlobalNode>, headers: HeaderMap)
 /// `region_endpoints` orders regions deterministically). The two check-name
 /// lists are unioned, since a check unrunnable in one region is worth surfacing
 /// even if another region can run it.
-async fn agents_handler(State(node): State<GlobalNode>, headers: HeaderMap) -> Response {
-    if let Some(denied) = require_admin(&node, &headers) {
-        return denied;
-    }
+async fn agents_handler(
+    State(node): State<GlobalNode>,
+    _admin: crate::http::AdminSession,
+) -> Response {
     let now = chrono::Utc::now().timestamp_millis();
     let regions = node.inner.cache.region_endpoints(now);
     if regions.is_empty() {
@@ -726,11 +726,6 @@ fn session_token(headers: &HeaderMap) -> Option<&str> {
 pub(super) fn is_admin(node: &GlobalNode, headers: &HeaderMap) -> bool {
     let now = chrono::Utc::now().timestamp_millis();
     session_token(headers).is_some_and(|t| node.inner.auth.validate(t, now))
-}
-
-pub(crate) fn require_admin(node: &GlobalNode, headers: &HeaderMap) -> Option<Response> {
-    (!is_admin(node, headers))
-        .then(|| error_response(StatusCode::UNAUTHORIZED, "authentication required"))
 }
 
 pub(crate) use crate::http::error_response;

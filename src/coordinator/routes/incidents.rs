@@ -11,9 +11,9 @@
 //! **Public narrative, gated edits.** Anyone can read an incident and its
 //! whole update history — the story is the point of writing one down — but
 //! opening, editing, retitling, attaching a check, or posting an update all
-//! require an admin session. Each write handler checks `require_admin` for
-//! itself, the same way the check editor does, rather than the router gating
-//! a whole path prefix.
+//! require an admin session. Each write handler takes `crate::http::AdminSession`
+//! as a parameter, the same way the check editor does, rather than the router
+//! gating a whole path prefix.
 //!
 //! **An incident's id belongs to whichever node opened it.** Local
 //! confirmation mints an id once; gossip, `/internal/replicate`, and
@@ -24,9 +24,9 @@
 
 use super::super::router::{error_response, internal_error, DeletedResponse};
 use super::super::{storage, Coordinator, WsEvent};
-use super::session::require_admin;
+use crate::http::{AdminBytes, AdminJson, AdminSession};
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -276,17 +276,12 @@ pub(in crate::coordinator) async fn incident_handler(
 /// from it: nothing auto-attaches and nothing auto-resolves.
 pub(in crate::coordinator) async fn create_incident_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
+    AdminBytes(body): AdminBytes,
 ) -> Response {
-    if let Some(rejection) = require_admin(&coord, &headers) {
-        return rejection;
-    }
     // Parsed only once the session has checked out: `Json<T>` as an argument
-    // would reject a body shaped wrong before this handler's own code — and
-    // so `require_admin` above — ever ran, letting an anonymous caller learn
-    // the body was malformed instead of the uniform "authentication
-    // required" every other admin route gives them.
+    // would reject a body shaped wrong before `AdminSession` above ever ran,
+    // letting an anonymous caller learn the body was malformed instead of the
+    // uniform "authentication required" every other admin route gives them.
     let req: CreateIncidentRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
@@ -340,12 +335,8 @@ pub(in crate::coordinator) async fn create_incident_handler(
 pub(in crate::coordinator) async fn edit_incident_handler(
     State(coord): State<Coordinator>,
     Path(id): Path<String>,
-    headers: HeaderMap,
-    Json(req): Json<EditIncidentRequest>,
+    AdminJson(req): AdminJson<EditIncidentRequest>,
 ) -> Response {
-    if let Some(rejection) = require_admin(&coord, &headers) {
-        return rejection;
-    }
     let title = req.title.trim();
     if title.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "title is required");
@@ -387,11 +378,8 @@ pub(in crate::coordinator) async fn edit_incident_handler(
 pub(in crate::coordinator) async fn delete_incident_handler(
     State(coord): State<Coordinator>,
     Path(id): Path<String>,
-    headers: HeaderMap,
+    _admin: AdminSession,
 ) -> Response {
-    if let Some(rejection) = require_admin(&coord, &headers) {
-        return rejection;
-    }
     let now = chrono::Utc::now().timestamp_millis();
     let node_id = coord.inner.node_id.clone();
     let delete_id = id.clone();
@@ -418,11 +406,8 @@ pub(in crate::coordinator) async fn delete_incident_handler(
 /// This is separate from the explorer's filtered result list.
 pub(in crate::coordinator) async fn results_count_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
+    _admin: AdminSession,
 ) -> Response {
-    if let Some(rejection) = require_admin(&coord, &headers) {
-        return rejection;
-    }
     match coord.db(|storage| storage.count_results()).await {
         Ok(raw_results) => Json(ResultsCountResponse { raw_results }).into_response(),
         Err(e) => internal_error(e),
@@ -433,11 +418,8 @@ pub(in crate::coordinator) async fn results_count_handler(
 /// intact because they represent the coordinator's last announced state.
 pub(in crate::coordinator) async fn purge_results_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
+    _admin: AdminSession,
 ) -> Response {
-    if let Some(rejection) = require_admin(&coord, &headers) {
-        return rejection;
-    }
     let deleted = match coord.db(|storage| storage.purge_results()).await {
         Ok(deleted) => deleted,
         Err(e) => return internal_error(e),
@@ -453,12 +435,9 @@ pub(in crate::coordinator) async fn purge_results_handler(
 /// cleanup for a known short-incident bug, not a general history-retention API.
 pub(in crate::coordinator) async fn purge_short_incidents_handler(
     State(coord): State<Coordinator>,
-    headers: HeaderMap,
+    _admin: AdminSession,
     Query(q): Query<ShortIncidentPurgeQuery>,
 ) -> Response {
-    if let Some(rejection) = require_admin(&coord, &headers) {
-        return rejection;
-    }
     let max_secs = q.max_secs.unwrap_or(DEFAULT_SHORT_INCIDENT_MAX_SECS);
     if !(1..=MAX_SHORT_INCIDENT_MAX_SECS).contains(&max_secs) {
         return error_response(
@@ -484,12 +463,8 @@ pub(in crate::coordinator) async fn purge_short_incidents_handler(
 pub(in crate::coordinator) async fn incident_checks_handler(
     State(coord): State<Coordinator>,
     Path(id): Path<String>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
+    AdminBytes(body): AdminBytes,
 ) -> Response {
-    if let Some(rejection) = require_admin(&coord, &headers) {
-        return rejection;
-    }
     // See `create_incident_handler`: parsed after auth, not before, so a
     // caller with no session learns nothing about whether the body would
     // even have been valid.
@@ -527,12 +502,8 @@ pub(in crate::coordinator) async fn incident_checks_handler(
 pub(in crate::coordinator) async fn incident_update_handler(
     State(coord): State<Coordinator>,
     Path(id): Path<String>,
-    headers: HeaderMap,
-    Json(req): Json<IncidentUpdateRequest>,
+    AdminJson(req): AdminJson<IncidentUpdateRequest>,
 ) -> Response {
-    if let Some(rejection) = require_admin(&coord, &headers) {
-        return rejection;
-    }
     let Some(state) = parse_incident_state(Some(&req.state)) else {
         return error_response(
             StatusCode::BAD_REQUEST,
