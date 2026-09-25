@@ -561,6 +561,54 @@ docker run --rm --ulimit nofile=65536:65536 \
 
 Do not use the existing global Compose volumes for this test.
 
+### Regression-gated benchmarks: ingest, query latency, anti-entropy, retention, restart
+
+The runs above measure and report; nothing failed the run if a change regressed them.
+`tests/release_benchmark.rs` adds five further `#[ignore]`d benchmarks, each with a
+hard, environment-overridable regression threshold (`assert_ceiling`/`assert_floor` in
+that file — unlike `coordinator::router::tests::assert_ceiling`, which only checks
+anything when its variable is explicitly set, these always enforce a default so a
+regression cannot pass silently just because nobody configured a ceiling). All five
+default to 10,000 checks and are independently runnable:
+
+```
+cargo build --release --test release_benchmark
+cargo test --release --test release_benchmark -- --ignored --nocapture \
+  benchmark_sustained_ingest_throughput_threshold \
+  benchmark_status_uptime_history_latency_query_thresholds \
+  benchmark_anti_entropy_reconciliation_threshold \
+  benchmark_retention_cleanup_threshold \
+  benchmark_startup_recovery_threshold
+```
+
+Measured on 2026-09-20 with a release build on the same workstation as the numbers
+above (single coordinator per benchmark, in-memory database except the restart
+benchmark, which is on-disk). Thresholds are set at roughly 2x each measured number
+(5x for retention, which is the most disk-dependent of the five); see the
+`WARDEN_BENCH_*` names in `tests/release_benchmark.rs` to override any of them for
+different hardware or a stricter release gate:
+
+| Benchmark | Measurement | Threshold (env var) |
+|---|---:|---|
+| Sustained ingest (`Coordinator::ingest`, 10,000 checks) | 29,847 results/s | ≥ 14,000 (`WARDEN_BENCH_MIN_INGEST_RESULTS_PER_SEC`) |
+| Public status page, p50 / p99 | 53 / 65 ms | ≤ 120 / 150 ms (`WARDEN_BENCH_MAX_STATUS_P50_MS` / `_P99_MS`) |
+| 24h uptime strips, p50 / p99 | 36 / 52 ms | ≤ 80 / 120 ms (`WARDEN_BENCH_MAX_UPTIME_P50_MS` / `_P99_MS`) |
+| Single-check history (100 rows), p50 / p99 | 3 / 7 ms | ≤ 20 / 30 ms (`WARDEN_BENCH_MAX_HISTORY_P50_MS` / `_P99_MS`) |
+| Latency-points strips, p50 / p99 | 45 / 67 ms | ≤ 100 / 150 ms (`WARDEN_BENCH_MAX_LATENCY_POINTS_P50_MS` / `_P99_MS`) |
+| Anti-entropy: late joiner converges catalogue + results, 10,000 checks | 61 s | ≤ 130 s (`WARDEN_BENCH_ANTI_ENTROPY_MAX_SECS`) |
+| Retention: `prune_results` over a 3-day/720K-row backlog | 80 ms | ≤ 400 ms (`WARDEN_BENCH_RETENTION_MAX_MS`) |
+| Startup recovery: reopen a 10,000-check/24h-history database | 9.6 s | ≤ 20 s (`WARDEN_BENCH_STARTUP_MAX_MS`) |
+
+The query-latency benchmark seeds one shared 10,000-check/24h-history fixture rather
+than a separate one per endpoint, so status, uptime, history, and latency-points cost
+one setup instead of four. The anti-entropy benchmark is the same late-joiner shape as
+`cluster.rs::a_late_joiner_backfills_history_via_digest_and_backfill`, measured instead
+of only asserted correct. The startup-recovery benchmark is the integration-level,
+HTTP-serving analog of
+`storage::results::tests::restart_recovers_committed_rows_and_backup_restore_preserves_them`,
+which measures the same WAL-replay boundary directly against `Storage` with no
+`Coordinator` or router around it.
+
 The remaining measured stall is the config plane, not the data plane: applying a bulk
 config push still costs one upsert per entry and holds the worker for up to ~4.6 s per
 batch while provisioning 10,000 checks, and a peer's full `config_entries` read costs
