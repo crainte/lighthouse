@@ -85,12 +85,15 @@ test-send and the per-check `notify` opt-out below; only the payload differs.
 its own test.
 
 **Failed deliveries are queued, not lost** (`notification_queue`,
-`Coordinator::retry_due` / `spawn_retries`). Dispatch tries once inline; a
-failure writes the transition and the notifier *name* to DuckDB and a 30s job
-retries with doubling backoff — six attempts including the first, ≈32 minutes.
-Success deletes the row; exhausted attempts leave it with `next_attempt` NULL,
-which is what the panel renders as "reached nobody". Given-up rows age out on
-`alerts_days`; waiting rows are never pruned.
+`Coordinator::retry_due` / `spawn_retries`). The outbox row is written inside
+the same transaction as the alert, before any delivery is attempted, and only
+then does a wake channel prod a background task to send it — closing the
+crash-between-send-and-insert gap at the cost of one write per alert whether
+or not delivery succeeds. A failure leaves the notifier *name* in DuckDB and
+a 30s job retries with doubling backoff — six attempts including the first,
+≈32 minutes. Success deletes the row; exhausted attempts leave it with
+`next_attempt` NULL, which is what the panel renders as "reached nobody".
+Given-up rows age out on `alerts_days`; waiting rows are never pruned.
 
 - The row holds the **name**, resolved against the live list per attempt, so
   correcting a URL in the panel fixes what is queued for it and deleting a
@@ -101,10 +104,10 @@ which is what the panel renders as "reached nobody". Given-up rows age out on
   method directly.
 - No `status` column: pending vs given up is `next_attempt IS NULL`. Same
   argument as `alert_type` and `IncidentState`.
-- Enqueued on failure only, so the happy path is still one HTTP request and no
-  write. A crash between the failed send and the insert loses the retry —
-  marked `ponytail:` in `storage.rs`; closing it means writing every
-  notification twice.
+- Enqueued unconditionally in `src/coordinator/storage/alerts.rs`
+  (`enqueue_notification`), so the happy path is still one durable write; the
+  actual send happens off the request path, in `spawn_dispatcher`'s
+  background task.
 - `GET /api/v1/admin/notifiers` now also returns `undelivered` (newest 20:
   check, state, notifier, attempts, `given_up`, error), rendered under the
   unrouted-checks warning.
@@ -553,11 +556,15 @@ listed under item 2 above.
 
 ### 5. Smaller, known
 - Closed: anti-entropy now exists. Every `anti_entropy_secs` a node pulls one
-  random alive peer's digest (`GET /internal/digest` — per-check max-ts/count
-  over a bounded window, plus high-water marks for alerts/incidents and
-  config) and backfills exactly the ranges it is behind on
-  (`GET /internal/backfill`, paged so a catch-up cannot starve ingest under
-  the storage mutex). A peer unreachable when a write happens is caught up on
+  random alive peer's digest (`GET /internal/digest` — per-check min/max-ts and
+  count from a maintained watermark, not a raw-history scan, plus a
+  count/max-position digest for each of alerts, incidents, incident
+  tombstones, and minute/hour latency rollups) and backfills exactly the
+  streams it is behind on from their own cursored, paged endpoints
+  (`/internal/backfill/results`, `/alerts`, `/incidents`,
+  `/incident-tombstones`, `/latency-minute`, `/latency-hour`), bounded to a
+  few pages per sweep so a catch-up cannot starve ingest under the storage
+  mutex. A peer unreachable when a write happens is caught up on
   the next sweep instead of missing it permanently. The same sweep reconciles
   the config plane, pulling a kind from `GET /internal/config` when the peer's
   stamp is ahead *or* the row counts disagree — config rows are updated in

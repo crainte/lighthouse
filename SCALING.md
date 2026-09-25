@@ -103,7 +103,7 @@ New result/state/config data is generally sent incrementally, and anti-entropy c
 - State-transition gossip can send one request per transition per peer.
 - Fleet-presence snapshots are resent periodically even without changes.
 - Replicated-result deduplication performs an anti-join without an efficient unique key/index.
-- Anti-entropy computes broad raw-history digests instead of maintaining incremental stream metadata.
+- Config anti-entropy still scans every row of the config tables per sweep instead of maintaining incremental metadata (fixed for results/alerts/incidents/tombstones/rollups, which read from maintained watermarks — see "Storage architecture" below).
 - There is no transport compression.
 
 ### Alert identity conflict health and safe repair
@@ -194,7 +194,7 @@ Known storage failure points:
 3. Result batches use row-by-row prepared inserts inside a transaction rather than DuckDB's bulk Appender/Arrow paths.
 4. Current-status lookup scans raw results with a partitioned window operation.
 5. Status assembly performs per-check state-history queries.
-6. Broad anti-entropy digests repeatedly scan raw history.
+6. Config anti-entropy repeatedly scans every row of the config tables (results/alerts/incidents/tombstones/rollup digests already read from maintained watermarks instead).
 7. Replication deduplication lacks a supporting uniqueness/index strategy.
 8. Daily retention deletes millions of rows from one large table rather than dropping time partitions.
 9. Single-check history and latency filtering rely on table organization/zone maps without a demonstrated large-data plan.
@@ -207,7 +207,7 @@ Required storage changes before claiming 10,000-check support:
 - Batch leaf/current-state/history updates in the result transaction.
 - Move blocking database operations to a bounded storage executor and measure queue time.
 - Benchmark the Appender or Arrow batches against current inserts.
-- Replace raw-table digest scans with maintained replication metadata.
+- Replace the config digest's full-table scan with maintained replication metadata, as already done for results, alerts/incidents/tombstones, and rollups.
 - Establish efficient replay deduplication.
 - Add time-bucket latency rollups.
 - Use shorter raw retention than summary retention where appropriate.
