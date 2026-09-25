@@ -1,0 +1,71 @@
+// Fast subsets of `scripts/release-gate.sh`, which is the full release gate
+// (adds Rust/frontend dependency audits, production and container builds,
+// and a backup/restore smoke test) run before a release rather than on
+// every commit. The clippy and test invocations below use the same flags
+// as the gate script's equivalent steps on purpose — this is a smaller,
+// quicker slice of it, not a different check.
+amends "package://github.com/jdx/hk/releases/download/v1.49.0/hk@1.49.0#/Config.pkl"
+import "package://github.com/jdx/hk/releases/download/v1.49.0/hk@1.49.0#/Builtins.pkl"
+
+local rust = List("**/*.rs", "Cargo.toml", "Cargo.lock", "build.rs")
+local frontend = List("frontend/src/**", "frontend/*.json", "frontend/*.ts", "frontend/bun.lock")
+
+local linters = new Mapping<String, Step> {
+  // `cargo fmt` rather than bare `rustfmt`: it reads the crate's edition from
+  // Cargo.toml, where per-file rustfmt defaults to its own and reorders imports.
+  ["fmt"] = Builtins.cargo_fmt
+  ["whitespace"] {
+    glob = "**/*"
+    check = "git diff --cached --check"
+  }
+  // Check-only: the builtin's `clippy --fix` would rewrite code mid-commit.
+  ["clippy"] {
+    glob = rust
+    depends = "fmt"
+    check = "cargo clippy --locked --all-targets -- -D warnings"
+  }
+  // Unit tests only: ~20s. The integration suites (cluster, gossip, restart)
+  // take minutes of compiling and server spin-up, so they gate the push instead.
+  ["unit-test"] {
+    glob = rust
+    depends = "clippy"
+    check = "cargo test --locked --lib"
+  }
+  ["svelte-check"] {
+    glob = frontend
+    check = "cd frontend && npx svelte-check --threshold error"
+  }
+  ["vitest"] {
+    glob = frontend
+    depends = "svelte-check"
+    check = "cd frontend && npx vitest run"
+  }
+}
+
+hooks {
+  ["pre-commit"] {
+    fix = true
+    stash = "git"
+    steps = linters
+  }
+  ["pre-push"] {
+    steps = new Mapping<String, Step> {
+      ["test"] {
+        glob = rust
+        check = "cargo test --locked"
+      }
+    }
+  }
+  ["commit-msg"] {
+    steps = new Mapping<String, Step> {
+      ["conventional-commit"] = Builtins.check_conventional_commit
+    }
+  }
+  ["fix"] {
+    fix = true
+    steps = linters
+  }
+  ["check"] {
+    steps = linters
+  }
+}
