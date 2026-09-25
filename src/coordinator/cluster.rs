@@ -26,6 +26,7 @@ use futures_util::{stream, StreamExt};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
@@ -158,6 +159,11 @@ pub struct Cluster {
     /// Peers authenticate as agents do; see `CoordinatorConfig::resolved_peer_token`.
     token: Option<String>,
     peer_timeout_ms: i64,
+    /// Lifetime counts of `sweep`-driven demotions, by the state reached.
+    /// Never resurrections: those happen through `merge` regaining contact,
+    /// which the state-count gauge already reflects on the next scrape.
+    transitions_to_suspect: AtomicU64,
+    transitions_to_dead: AtomicU64,
 }
 
 impl Cluster {
@@ -182,6 +188,8 @@ impl Cluster {
             client: reqwest::Client::new(),
             token,
             peer_timeout_ms: peer_timeout_secs as i64 * 1000,
+            transitions_to_suspect: AtomicU64::new(0),
+            transitions_to_dead: AtomicU64::new(0),
         }
     }
 
@@ -442,6 +450,15 @@ impl Cluster {
             };
             if let Some(next) = next {
                 m.state = next;
+                match next {
+                    MemberState::Suspect => {
+                        self.transitions_to_suspect.fetch_add(1, Ordering::Relaxed);
+                    }
+                    MemberState::Dead => {
+                        self.transitions_to_dead.fetch_add(1, Ordering::Relaxed);
+                    }
+                    MemberState::Alive => {}
+                }
                 changed.push((m.node_id.clone(), next));
             }
         }
@@ -480,6 +497,51 @@ impl Cluster {
 
     pub fn link_stale_after_ms(&self) -> i64 {
         self.peer_timeout_ms
+    }
+
+    /// Membership observability shared by the coordinator and the global
+    /// node, since both run this same `Cluster`: lifetime transition counts
+    /// (demotions only — a resurrection shows up in the state-count gauge
+    /// on its own) plus how many peers are currently believed alive,
+    /// suspect, and dead. Counting is a single pass over the in-memory map,
+    /// cheap enough for every scrape since cluster size is peer count, never
+    /// check or agent count.
+    pub fn metrics(&self) -> Vec<crate::openmetrics::MetricSample> {
+        let (mut alive, mut suspect, mut dead) = (0u64, 0u64, 0u64);
+        for m in self.members.read().values() {
+            match m.state {
+                MemberState::Alive => alive += 1,
+                MemberState::Suspect => suspect += 1,
+                MemberState::Dead => dead += 1,
+            }
+        }
+        vec![
+            crate::openmetrics::MetricSample::new(
+                "warden_cluster_membership_transitions_total",
+                vec![("state".into(), "suspect".into())],
+                self.transitions_to_suspect.load(Ordering::Relaxed) as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_cluster_membership_transitions_total",
+                vec![("state".into(), "dead".into())],
+                self.transitions_to_dead.load(Ordering::Relaxed) as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_cluster_members",
+                vec![("state".into(), "alive".into())],
+                alive as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_cluster_members",
+                vec![("state".into(), "suspect".into())],
+                suspect as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_cluster_members",
+                vec![("state".into(), "dead".into())],
+                dead as f64,
+            ),
+        ]
     }
 
     /// POST a JSON body to one peer at `path`, returning whether it accepted.
@@ -748,17 +810,48 @@ mod tests {
         let c = cluster("a", "http://a", 1);
         c.restore(vec![member("b", "http://b", 1, 0, MemberState::Alive)]);
 
+        let transitions = |c: &Cluster, state: &str| {
+            crate::openmetrics::select(
+                &c.metrics(),
+                "warden_cluster_membership_transitions_total",
+                &[("state".into(), state.into())],
+            )
+            .unwrap()
+            .value
+        };
+        let members = |c: &Cluster, state: &str| {
+            crate::openmetrics::select(
+                &c.metrics(),
+                "warden_cluster_members",
+                &[("state".into(), state.into())],
+            )
+            .unwrap()
+            .value
+        };
+        assert_eq!(members(&c, "alive"), 1.0);
+        assert_eq!(transitions(&c, "suspect"), 0.0);
+
         // Exactly at the timeout: still alive, `>` not `>=`.
         assert!(c.sweep(15_000).is_empty());
         // Just past it: suspect.
         let changed = c.sweep(15_001);
         assert_eq!(changed, vec![("b".into(), MemberState::Suspect)]);
+        assert_eq!(
+            transitions(&c, "suspect"),
+            1.0,
+            "the transition counter must move on the event, not just exist"
+        );
+        assert_eq!(members(&c, "alive"), 0.0);
+        assert_eq!(members(&c, "suspect"), 1.0);
 
         // Exactly at 2x from the original last_seen: still suspect.
         assert!(c.sweep(30_000).is_empty());
         // Just past it: dead.
         let changed = c.sweep(30_001);
         assert_eq!(changed, vec![("b".into(), MemberState::Dead)]);
+        assert_eq!(transitions(&c, "dead"), 1.0);
+        assert_eq!(members(&c, "suspect"), 0.0);
+        assert_eq!(members(&c, "dead"), 1.0);
     }
 
     #[test]

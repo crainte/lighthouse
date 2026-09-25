@@ -953,10 +953,19 @@ impl Coordinator {
             Ok(client) => client,
             Err(error) => {
                 tracing::warn!(%error, "anti-entropy: failed to build HTTP client");
+                self.inner
+                    .replication_anti_entropy_failures
+                    .fetch_add(1, Ordering::Relaxed);
                 return;
             }
         };
         let Some(their) = self.fetch_digest(&client, &peer).await else {
+            // `fetch_digest` already logged the specific cause (rejected or
+            // unreachable); this is the one place that turns "a sweep found
+            // nobody to compare against" into a signal an alert can fire on.
+            self.inner
+                .replication_anti_entropy_failures
+                .fetch_add(1, Ordering::Relaxed);
             return;
         };
         let node_id = self.inner.node_id.clone();
@@ -971,9 +980,20 @@ impl Coordinator {
             Ok(digest) => digest,
             Err(error) => {
                 tracing::warn!(%error, "anti-entropy: failed to read local digest");
+                self.inner
+                    .replication_anti_entropy_failures
+                    .fetch_add(1, Ordering::Relaxed);
                 return;
             }
         };
+        // Both digests are in hand and the sweep is about to compare and
+        // reconcile: "success" for reconciliation-lag purposes, independent
+        // of whether an individual page below hits its own transient error —
+        // those are already `replication_raw_data_gaps` or a logged warning,
+        // not a sign this sweep never ran.
+        self.inner
+            .replication_anti_entropy_last_success_ms
+            .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
         {
             let mut cursors = self.inner.repair_cursors.lock();
             cursors.for_peer(&peer);

@@ -786,6 +786,20 @@ async fn a_notification_that_fails_is_queued_and_retried_until_it_lands() {
         undelivered(&base, &session).await.is_empty(),
         "delivered means gone: there is no 'sent' row to accumulate"
     );
+    assert_eq!(
+        warden::openmetrics::select(&coord.metrics(), "warden_notification_retries_total", &[])
+            .unwrap()
+            .value,
+        1.0,
+        "the first failed attempt was rescheduled, which is a retry, not a give-up"
+    );
+    assert_eq!(
+        warden::openmetrics::select(&coord.metrics(), "warden_notification_giveups_total", &[])
+            .unwrap()
+            .value,
+        0.0,
+        "it landed on the retry, nobody was ever given up on"
+    );
 }
 
 /// The channel only wakes the dispatcher and is intentionally bounded. Once it
@@ -981,6 +995,20 @@ async fn attempts_run_out_and_the_queue_records_that_nobody_was_paged() {
         queued[0]["next_attempt"].is_null(),
         "given up means no next attempt: {}",
         queued[0]
+    );
+    assert_eq!(
+        warden::openmetrics::select(&coord.metrics(), "warden_notification_giveups_total", &[])
+            .unwrap()
+            .value,
+        1.0,
+        "the panel's 'given_up' row must be visible as a metric too"
+    );
+    assert_eq!(
+        warden::openmetrics::select(&coord.metrics(), "warden_notification_retries_total", &[])
+            .unwrap()
+            .value,
+        5.0,
+        "five of the six attempts were rescheduled before the sixth gave up"
     );
 
     // A given-up row is not picked up again, however far the clock moves.
