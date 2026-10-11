@@ -148,18 +148,190 @@ impl Storage {
     }
 
     pub fn put_setting(&self, key: &str, value: &str) -> Result<()> {
-        // Delete-then-insert, like `upsert_check`: DuckDB's ON CONFLICT wants
-        // the column list twice and this table has one row per page.
-        self.conn
-            .execute("DELETE FROM settings WHERE key = ?", duckdb::params![key])?;
-        self.conn.execute(
-            "INSERT INTO settings (key, value) VALUES (?, ?)",
-            duckdb::params![key, value],
+        self.transaction(|store| {
+            store
+                .conn
+                .execute("DELETE FROM settings WHERE key = ?", duckdb::params![key])?;
+            store.conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?)",
+                duckdb::params![key, value],
+            )?;
+            store.sync_config_watermark(ConfigKind::Setting, key)
+        })
+    }
+
+    // ---- Anti-entropy ----
+
+    pub(super) fn prepare_config_watermarks(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS config_watermark_entries (
+                 kind VARCHAR NOT NULL, id VARCHAR NOT NULL, origin VARCHAR NOT NULL,
+                  scope_kind INTEGER NOT NULL, scope_region VARCHAR NOT NULL, millis BIGINT NOT NULL,
+                  node VARCHAR NOT NULL, PRIMARY KEY (kind, id, origin, scope_kind, scope_region)
+             );
+              CREATE TEMP TABLE IF NOT EXISTS config_watermarks (
+                  kind VARCHAR NOT NULL, scope_kind INTEGER NOT NULL, scope_region VARCHAR NOT NULL,
+                  count BIGINT NOT NULL, max_millis BIGINT NOT NULL, max_node VARCHAR NOT NULL,
+                  PRIMARY KEY (kind, scope_kind, scope_region)
+              );
+              CREATE TEMP TABLE IF NOT EXISTS config_watermark_touched (kind VARCHAR, id VARCHAR, PRIMARY KEY (kind, id));
+              CREATE TEMP TABLE IF NOT EXISTS config_watermark_previous AS SELECT * FROM config_watermark_entries LIMIT 0;
+              CREATE TEMP TABLE IF NOT EXISTS config_watermark_affected (kind VARCHAR, scope_kind INTEGER, scope_region VARCHAR, PRIMARY KEY (kind, scope_kind, scope_region));
+              DELETE FROM config_watermark_entries;
+             DELETE FROM config_watermarks;
+              INSERT INTO config_watermark_entries
+               SELECT 'check', id::VARCHAR, 'live', 0, '', COALESCE(updated_at, 0), COALESCE(updated_by, '') FROM checks
+               UNION ALL SELECT 'section', name, 'live', 0, '', COALESCE(updated_at, 0), COALESCE(updated_by, '') FROM sections
+               UNION ALL SELECT 'setting', key, 'live', 0, '', COALESCE(updated_at, 0), COALESCE(updated_by, '') FROM settings
+               UNION ALL SELECT 'credential', id, 'live', 0, '', COALESCE(updated_at, 0), COALESCE(updated_by, '') FROM agent_credentials
+               UNION ALL SELECT 'rollup_policy', node_id, 'live', 0, '', COALESCE(updated_at, 0), COALESCE(updated_by, '') FROM rollup_policy
+               UNION ALL SELECT kind, id, 'tombstone', 0, '', deleted_at, node_id FROM config_tombstones;
+              INSERT INTO config_watermark_entries
+              SELECT 'check', c.id::VARCHAR, 'live', 1, '', COALESCE(c.updated_at, 0), COALESCE(c.updated_by, '')
+               FROM checks c WHERE NOT EXISTS (SELECT 1 FROM check_placement_regions r WHERE r.check_id = c.id)
+               UNION ALL
+               SELECT 'check', c.id::VARCHAR, 'live', 2, r.region, COALESCE(c.updated_at, 0), COALESCE(c.updated_by, '')
+               FROM checks c JOIN check_placement_regions r ON r.check_id = c.id
+               UNION ALL
+               SELECT 'check', id, 'tombstone', 3, '', deleted_at, node_id FROM config_tombstones WHERE kind = 'check';
+             INSERT INTO config_watermarks
+             SELECT kind, scope_kind, scope_region, COUNT(*), MAX(millis), MAX_BY(node, (millis, node))
+             FROM config_watermark_entries GROUP BY kind, scope_kind, scope_region;"
         )?;
         Ok(())
     }
 
-    // ---- Anti-entropy ----
+    pub(super) fn sync_config_watermark(&self, kind: ConfigKind, id: &str) -> Result<()> {
+        self.sync_config_watermarks(&[(kind, id.to_owned())])
+    }
+
+    fn sync_config_watermarks(&self, touched: &[(ConfigKind, String)]) -> Result<()> {
+        if touched.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute_batch(
+            "DELETE FROM config_watermark_touched; DELETE FROM config_watermark_previous; DELETE FROM config_watermark_affected;",
+        )?;
+        let mut stage = self
+            .conn
+            .prepare("INSERT OR IGNORE INTO config_watermark_touched VALUES (?, ?)")?;
+        for (kind, id) in touched {
+            stage.execute(duckdb::params![kind.as_str(), id])?;
+        }
+        drop(stage);
+        self.conn.execute_batch(
+            "INSERT INTO config_watermark_previous SELECT e.* FROM config_watermark_entries e JOIN config_watermark_touched t USING (kind, id);
+             INSERT INTO config_watermark_affected SELECT DISTINCT kind, scope_kind, scope_region FROM config_watermark_previous;
+             DELETE FROM config_watermark_entries WHERE EXISTS (SELECT 1 FROM config_watermark_touched t WHERE t.kind = config_watermark_entries.kind AND t.id = config_watermark_entries.id);
+             INSERT INTO config_watermark_entries
+             SELECT 'check', c.id::VARCHAR, 'live', 0, '', COALESCE(c.updated_at, 0), COALESCE(c.updated_by, '') FROM checks c JOIN config_watermark_touched t ON t.kind = 'check' AND t.id = c.id::VARCHAR
+             UNION ALL SELECT 'section', s.name, 'live', 0, '', COALESCE(s.updated_at, 0), COALESCE(s.updated_by, '') FROM sections s JOIN config_watermark_touched t ON t.kind = 'section' AND t.id = s.name
+             UNION ALL SELECT 'setting', s.key, 'live', 0, '', COALESCE(s.updated_at, 0), COALESCE(s.updated_by, '') FROM settings s JOIN config_watermark_touched t ON t.kind = 'setting' AND t.id = s.key
+             UNION ALL SELECT 'credential', c.id, 'live', 0, '', COALESCE(c.updated_at, 0), COALESCE(c.updated_by, '') FROM agent_credentials c JOIN config_watermark_touched t ON t.kind = 'credential' AND t.id = c.id
+             UNION ALL SELECT 'rollup_policy', p.node_id, 'live', 0, '', COALESCE(p.updated_at, 0), COALESCE(p.updated_by, '') FROM rollup_policy p JOIN config_watermark_touched t ON t.kind = 'rollup_policy' AND t.id = p.node_id
+             UNION ALL SELECT x.kind, x.id, 'tombstone', 0, '', x.deleted_at, x.node_id FROM config_tombstones x JOIN config_watermark_touched t USING (kind, id);
+             INSERT INTO config_watermark_entries
+             SELECT 'check', c.id::VARCHAR, 'live', 1, '', COALESCE(c.updated_at, 0), COALESCE(c.updated_by, '') FROM checks c JOIN config_watermark_touched t ON t.kind = 'check' AND t.id = c.id::VARCHAR WHERE NOT EXISTS (SELECT 1 FROM check_placement_regions r WHERE r.check_id = c.id)
+             UNION ALL SELECT 'check', c.id::VARCHAR, 'live', 2, r.region, COALESCE(c.updated_at, 0), COALESCE(c.updated_by, '') FROM checks c JOIN check_placement_regions r ON r.check_id = c.id JOIN config_watermark_touched t ON t.kind = 'check' AND t.id = c.id::VARCHAR
+             UNION ALL SELECT 'check', x.id, 'tombstone', 3, '', x.deleted_at, x.node_id FROM config_tombstones x JOIN config_watermark_touched t ON t.kind = 'check' AND t.id = x.id WHERE x.kind = 'check';
+             INSERT OR IGNORE INTO config_watermark_affected SELECT DISTINCT e.kind, e.scope_kind, e.scope_region FROM config_watermark_entries e JOIN config_watermark_touched t USING (kind, id);",
+        )?;
+        let affected = self
+            .conn
+            .prepare("SELECT kind, scope_kind, scope_region FROM config_watermark_affected")?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i32>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (kind, scope_kind, scope_region) in affected {
+            let previous: (i64, i64, String) = self.conn.query_row(
+                "SELECT COUNT(*), COALESCE(MAX(millis), 0),
+                        COALESCE(MAX_BY(node, (millis, node)), '')
+                 FROM config_watermark_previous
+                 WHERE kind = ? AND scope_kind = ? AND scope_region = ?",
+                duckdb::params![kind, scope_kind, scope_region],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            let replacement: (i64, i64, String) = self.conn.query_row(
+                "SELECT COUNT(*), COALESCE(MAX(e.millis), 0),
+                        COALESCE(MAX_BY(e.node, (e.millis, e.node)), '')
+                 FROM config_watermark_entries e
+                 JOIN config_watermark_touched t USING (kind, id)
+                 WHERE e.kind = ? AND e.scope_kind = ? AND e.scope_region = ?",
+                duckdb::params![kind, scope_kind, scope_region],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            let watermark: Option<(i64, i64, String)> = self
+                .conn
+                .query_row(
+                    "SELECT count, max_millis, max_node FROM config_watermarks
+                 WHERE kind = ? AND scope_kind = ? AND scope_region = ?",
+                    duckdb::params![kind, scope_kind, scope_region],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let count =
+                watermark.as_ref().map_or(0, |watermark| watermark.0) - previous.0 + replacement.0;
+            if count == 0 {
+                self.conn.execute(
+                    "DELETE FROM config_watermarks WHERE kind = ? AND scope_kind = ? AND scope_region = ?",
+                    duckdb::params![kind, scope_kind, scope_region],
+                )?;
+                continue;
+            }
+            let old_max = watermark.map(|watermark| (watermark.1, watermark.2));
+            let previous_removed_max = old_max
+                .as_ref()
+                .is_some_and(|max| *max == (previous.1, previous.2));
+            let replacement_reaches_old_max = old_max.as_ref().is_some_and(|max| {
+                (replacement.1, replacement.2.as_str()) >= (max.0, max.1.as_str())
+            });
+            let old_max_survives = if previous_removed_max && !replacement_reaches_old_max {
+                if let Some((millis, node)) = old_max.as_ref() {
+                    self.conn.query_row(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM config_watermark_entries
+                             WHERE kind = ? AND scope_kind = ? AND scope_region = ?
+                               AND millis = ? AND node = ?
+                          )",
+                        duckdb::params![kind, scope_kind, scope_region, millis, node],
+                        |row| row.get::<_, bool>(0),
+                    )?
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            let (max_millis, max_node) =
+                if previous_removed_max && !replacement_reaches_old_max && !old_max_survives {
+                    self.conn.query_row(
+                        "SELECT MAX(millis), MAX_BY(node, (millis, node))
+                     FROM config_watermark_entries
+                     WHERE kind = ? AND scope_kind = ? AND scope_region = ?",
+                        duckdb::params![kind, scope_kind, scope_region],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?
+                } else {
+                    old_max
+                        .into_iter()
+                        .chain(std::iter::once((replacement.1, replacement.2)))
+                        .max()
+                        .unwrap()
+                };
+            self.conn.execute(
+                "INSERT INTO config_watermarks VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT (kind, scope_kind, scope_region) DO UPDATE SET
+                     count = excluded.count, max_millis = excluded.max_millis, max_node = excluded.max_node",
+                duckdb::params![kind, scope_kind, scope_region, count, max_millis, max_node],
+            )?;
+        }
+        Ok(())
+    }
 
     /// A fixed-cost summary of everything replicated, for a peer to compare
     /// against its own. Full retained-history digests read compact metadata
@@ -228,22 +400,17 @@ impl Storage {
     /// missing an edit — the digest must not be able to look "caught up" while
     /// still missing a tombstone.
     pub(super) fn config_digest_for(&self, kind: ConfigKind) -> Result<ConfigDigest> {
-        let (table, _) = kind.table_and_pk();
-        let sql = format!(
-            "SELECT millis, node FROM (
-                 SELECT updated_at AS millis, updated_by AS node FROM {table}
-                 UNION ALL
-                 SELECT deleted_at AS millis, node_id AS node FROM config_tombstones
-                 WHERE kind = ?
-             )"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(duckdb::params![kind.as_str()], |r| {
-                Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?))
-            })?
-            .collect::<duckdb::Result<Vec<_>>>()?;
-        Ok(Self::digest_from_stamp_rows(kind, rows))
+        Ok(self.conn.query_row(
+            "SELECT count, max_millis, max_node FROM config_watermarks WHERE kind = ? AND scope_kind = 0 AND scope_region = ''",
+            duckdb::params![kind.as_str()],
+            |row| {
+                Ok(ConfigDigest {
+                    kind,
+                    count: row.get(0)?,
+                    max_hlc: Some(Hlc::new(row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
+                })
+            },
+        ).optional()?.unwrap_or(ConfigDigest { kind, max_hlc: None, count: 0 }))
     }
 
     /// `region`'s placement-scoped contribution to a Check-kind digest: the
@@ -264,55 +431,31 @@ impl Storage {
     /// digest that matches this one, so a converged region costs one HTTP
     /// digest comparison per sweep and nothing else.
     pub fn config_digest_for_region(&self, region: &str) -> Result<ConfigDigest> {
-        let sql = "
-            SELECT millis, node FROM (
-                SELECT c.updated_at AS millis, c.updated_by AS node
-                FROM checks c
-                WHERE NOT EXISTS (
-                          SELECT 1 FROM check_placement_regions r WHERE r.check_id = c.id
-                      )
-                   OR EXISTS (
-                          SELECT 1 FROM check_placement_regions r
-                          WHERE r.check_id = c.id AND r.region = ?
-                      )
-                UNION ALL
-                SELECT deleted_at AS millis, node_id AS node
-                FROM config_tombstones WHERE kind = 'check'
-            )";
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt
-            .query_map(duckdb::params![region], |r| {
-                Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?))
-            })?
-            .collect::<duckdb::Result<Vec<_>>>()?;
-        Ok(Self::digest_from_stamp_rows(ConfigKind::Check, rows))
-    }
-
-    /// Folds `(millis, node)` stamp pairs — a row or tombstone's contribution
-    /// — into the count/max-stamp shape every digest query above produces.
-    /// Shared so the two queries above cannot silently compute "caught up"
-    /// differently from one another.
-    pub(super) fn digest_from_stamp_rows(
-        kind: ConfigKind,
-        rows: Vec<(Option<i64>, Option<String>)>,
-    ) -> ConfigDigest {
-        let mut count = 0i64;
-        let mut max_hlc: Option<Hlc> = None;
-        for (millis, node) in rows {
-            count += 1;
-            // NULL here is a row written before stamps existed: the oldest
-            // possible HLC, so it never wins a max() against a real one.
-            let hlc = Hlc::new(millis.unwrap_or(0), node.unwrap_or_default());
-            max_hlc = Some(match max_hlc {
-                Some(m) if m >= hlc => m,
-                _ => hlc,
-            });
+        let mut count = 0;
+        let mut max_hlc = None;
+        let mut stmt = self.conn.prepare(
+            "SELECT count, max_millis, max_node FROM config_watermarks
+              WHERE kind = 'check' AND ((scope_kind = 1 AND scope_region = '') OR scope_kind = 3 OR (scope_kind = 2 AND scope_region = ?))",
+        )?;
+        for row in stmt.query_map(duckdb::params![region], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (row_count, millis, node) = row?;
+            count += row_count;
+            let hlc = Hlc::new(millis, node);
+            if max_hlc.as_ref().is_none_or(|current| current < &hlc) {
+                max_hlc = Some(hlc);
+            }
         }
-        ConfigDigest {
-            kind,
-            max_hlc,
+        Ok(ConfigDigest {
+            kind: ConfigKind::Check,
+            max_hlc: (count > 0).then_some(max_hlc).flatten(),
             count,
-        }
+        })
     }
 
     // ---- Config replication ----
@@ -433,7 +576,7 @@ impl Storage {
                         config.id
                     );
                 }
-                self.upsert_check(&config, hlc.millis)?;
+                self.upsert_check_uncommitted(&config, hlc.millis)?;
                 self.conn.execute(
                     "UPDATE checks SET updated_by = ? WHERE id = ?",
                     duckdb::params![hlc.node_id, id],
@@ -500,7 +643,7 @@ impl Storage {
                 doc.policy
                     .validate()
                     .map_err(|e| anyhow::anyhow!("invalid rollup policy for {id}: {e}"))?;
-                self.upsert_rollup_policy(id, doc.node_type, &doc.policy, hlc)?;
+                self.upsert_rollup_policy_uncommitted(id, doc.node_type, &doc.policy, hlc)?;
             }
         }
         Ok(())
@@ -524,40 +667,44 @@ impl Storage {
     /// per entry, but a crash can never expose only a prefix of accepted writes.
     /// Callers use the returned flags to update only caches whose rows changed.
     pub fn apply_config_entries(&self, entries: &[ConfigEntry]) -> Result<Vec<bool>> {
-        self.conn.execute_batch("BEGIN")?;
-        let write = || -> Result<Vec<bool>> {
-            let mut stamps = self.local_config_stamps(entries)?;
-            let mut deletes = self.prepare_config_delete_statements()?;
-            let mut tombstone_deletes = self
-                .conn
-                .prepare("DELETE FROM config_tombstones WHERE kind = ? AND id = ?")?;
-            let mut tombstone_inserts = self.conn.prepare(
-                "INSERT INTO config_tombstones (kind, id, deleted_at, node_id)
+        self.transaction(|_| {
+            let write = || -> Result<Vec<bool>> {
+                let mut stamps = self.local_config_stamps(entries)?;
+                let mut deletes = self.prepare_config_delete_statements()?;
+                let mut tombstone_deletes = self
+                    .conn
+                    .prepare("DELETE FROM config_tombstones WHERE kind = ? AND id = ?")?;
+                let mut tombstone_inserts = self.conn.prepare(
+                    "INSERT INTO config_tombstones (kind, id, deleted_at, node_id)
                  VALUES (?, ?, ?, ?)",
-            )?;
-            entries
-                .iter()
-                .map(|entry| {
-                    self.apply_config_entry_uncommitted(
-                        entry,
-                        &mut stamps,
-                        &mut deletes[entry.kind as usize],
-                        &mut tombstone_deletes,
-                        &mut tombstone_inserts,
-                    )
-                })
-                .collect()
-        };
-        match write() {
-            Ok(applied) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(applied)
+                )?;
+                entries
+                    .iter()
+                    .map(|entry| {
+                        self.apply_config_entry_uncommitted(
+                            entry,
+                            &mut stamps,
+                            &mut deletes[entry.kind as usize],
+                            &mut tombstone_deletes,
+                            &mut tombstone_inserts,
+                        )
+                    })
+                    .collect()
+            };
+            match write() {
+                Ok(applied) => {
+                    let touched = entries
+                        .iter()
+                        .zip(&applied)
+                        .filter(|(_, accepted)| **accepted)
+                        .map(|(entry, _)| (entry.kind, entry.id.clone()))
+                        .collect::<Vec<_>>();
+                    self.sync_config_watermarks(&touched)?;
+                    Ok(applied)
+                }
+                Err(error) => Err(error),
             }
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(error)
-            }
-        }
+        })
     }
 
     fn apply_config_entry_uncommitted(
@@ -851,6 +998,10 @@ impl Storage {
     /// Stamp an existing row without changing it — used by paths that mutate
     /// a row through an older helper that doesn't know about replication.
     pub fn stamp_config(&self, kind: ConfigKind, id: &str, hlc: &Hlc) -> Result<()> {
+        self.transaction(|store| store.stamp_config_uncommitted(kind, id, hlc))
+    }
+
+    fn stamp_config_uncommitted(&self, kind: ConfigKind, id: &str, hlc: &Hlc) -> Result<()> {
         let (table, pk) = kind.table_and_pk();
         if kind == ConfigKind::Check {
             let Ok(id) = id.parse::<CheckId>() else {
@@ -866,6 +1017,7 @@ impl Storage {
                 duckdb::params![hlc.millis, hlc.node_id, id],
             )?;
         }
+        self.sync_config_watermark(kind, id)?;
         Ok(())
     }
 
@@ -878,10 +1030,25 @@ impl Storage {
     /// prevent, so it must outlive every window a node could plausibly be
     /// offline for.
     pub fn prune_tombstones(&self, before_millis: i64) -> Result<usize> {
+        self.transaction(|store| store.prune_tombstones_uncommitted(before_millis))
+    }
+
+    pub(super) fn prune_tombstones_uncommitted(&self, before_millis: i64) -> Result<usize> {
+        let removed = self
+            .conn
+            .prepare("SELECT kind, id FROM config_tombstones WHERE deleted_at < ?")?
+            .query_map(duckdb::params![before_millis], |row| {
+                Ok((
+                    ConfigKind::from_db(&row.get::<_, String>(0)?).unwrap(),
+                    row.get(1)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<(ConfigKind, String)>, _>>()?;
         let n = self.conn.execute(
             "DELETE FROM config_tombstones WHERE deleted_at < ?",
             duckdb::params![before_millis],
         )?;
+        self.sync_config_watermarks(&removed)?;
         Ok(n)
     }
 }
@@ -1165,23 +1332,49 @@ mod tests {
             .is_none());
     }
 
-    /// Manual provisioning benchmark for the config write path. Run with
-    /// `cargo test benchmark_apply_config_entries_10k -- --ignored --nocapture`.
     #[test]
     #[ignore = "benchmark"]
-    fn benchmark_apply_config_entries_10k() {
+    fn benchmark_provision_and_digest_10k_checks() {
         let s = Storage::open(":memory:").unwrap();
         let entries = (0..10_000)
-            .map(|i| setting_entry(&format!("setting-{i}"), i, "n1", "value"))
+            .map(|i| {
+                let config = check_config(&format!("check-{i}"), "https://example.com");
+                ConfigEntry {
+                    kind: ConfigKind::Check,
+                    id: config.id.to_string(),
+                    hlc: Hlc::new(i, "benchmark"),
+                    document: Some(serde_json::to_string(&config).unwrap()),
+                }
+            })
             .collect::<Vec<_>>();
-        let start = std::time::Instant::now();
+        let provision_started = std::time::Instant::now();
         let applied = s.apply_config_entries(&entries).unwrap();
+        let provision = provision_started.elapsed();
+        let mut samples = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let started = std::time::Instant::now();
+            let digest = s.config_digest_for(ConfigKind::Check).unwrap();
+            samples.push(started.elapsed());
+            assert_eq!(digest.count, 10_000);
+        }
+        samples.sort_unstable();
+        let p95 = samples[19];
+        let max_digest_ms = std::env::var("WARDEN_BENCH_MAX_CONFIG_DIGEST_MS")
+            .ok()
+            .and_then(|value| value.parse::<u128>().ok())
+            .unwrap_or(100);
         eprintln!(
-            "applied {} config entries in {:?}",
-            applied.iter().filter(|applied| **applied).count(),
-            start.elapsed()
+            "checks=10000 provision_ms={} digest_p50_ms={} digest_p95_ms={} digest_max_ms={}",
+            provision.as_millis(),
+            samples[10].as_millis(),
+            p95.as_millis(),
+            samples[19].as_millis()
         );
         assert!(applied.iter().all(|applied| *applied));
+        assert!(
+            p95.as_millis() <= max_digest_ms,
+            "config digest p95 {p95:?} exceeded {max_digest_ms}ms"
+        );
     }
 
     #[test]
@@ -1293,6 +1486,108 @@ mod tests {
         assert_eq!(s.config_entry(ConfigKind::Check, "nope").unwrap(), None);
     }
 
+    fn assert_config_watermarks_match_reference(store: &Storage) {
+        for kind in ConfigKind::ALL {
+            let (table, _) = kind.table_and_pk();
+            let sql = format!(
+                "SELECT COUNT(*), MAX(millis), MAX_BY(node, (millis, node)) FROM (SELECT COALESCE(updated_at, 0) AS millis, COALESCE(updated_by, '') AS node FROM {table} UNION ALL SELECT deleted_at, node_id FROM config_tombstones WHERE kind = ?)"
+            );
+            let expected: (i64, Option<i64>, Option<String>) = store
+                .conn
+                .query_row(&sql, duckdb::params![kind.as_str()], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .unwrap();
+            let actual = store.config_digest_for(kind).unwrap();
+            assert_eq!(actual.count, expected.0, "{kind:?}");
+            assert_eq!(
+                actual.max_hlc,
+                expected
+                    .1
+                    .zip(expected.2)
+                    .map(|(millis, node)| Hlc::new(millis, node)),
+                "{kind:?}"
+            );
+        }
+        for region in ["", "us", "tw"] {
+            let expected: (i64, Option<i64>, Option<String>) = store.conn.query_row(
+                "SELECT COUNT(*), MAX(millis), MAX_BY(node, (millis, node)) FROM (SELECT COALESCE(c.updated_at, 0) AS millis, COALESCE(c.updated_by, '') AS node FROM checks c WHERE NOT EXISTS (SELECT 1 FROM check_placement_regions r WHERE r.check_id = c.id) OR EXISTS (SELECT 1 FROM check_placement_regions r WHERE r.check_id = c.id AND r.region = ?) UNION ALL SELECT deleted_at, node_id FROM config_tombstones WHERE kind = 'check')",
+                duckdb::params![region],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            let actual = store.config_digest_for_region(region).unwrap();
+            assert_eq!(actual.count, expected.0, "region {region}");
+            assert_eq!(
+                actual.max_hlc,
+                expected
+                    .1
+                    .zip(expected.2)
+                    .map(|(millis, node)| Hlc::new(millis, node)),
+                "region {region}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_watermarks_match_reference_scan_for_every_kind_after_direct_writes_reopen_and_rollback(
+    ) {
+        let path = std::env::temp_dir().join(format!(
+            "warden-config-watermarks-{}.duckdb",
+            uuid::Uuid::new_v4()
+        ));
+        let path = path.to_string_lossy().into_owned();
+        {
+            let s = Storage::open(&path).unwrap();
+            let check = check_config("check", "https://example.com");
+            s.upsert_check(&check, 10).unwrap();
+            s.create_section("section", false, SectionDisplay::Inline)
+                .unwrap();
+            s.put_setting("setting", "value").unwrap();
+            s.insert_agent_credential(&AgentCredential {
+                id: "credential".into(),
+                zone: "zone".into(),
+                region: "region".into(),
+                secret_hash: "hash".into(),
+                salt: "salt".into(),
+                created_at: 1,
+                revoked_at: None,
+            })
+            .unwrap();
+            s.upsert_rollup_policy(
+                "global",
+                NodeType::Global,
+                &crate::rollup::RollupPolicy::new(
+                    crate::rollup::Threshold::Any,
+                    crate::rollup::Threshold::All,
+                ),
+                &Hlc::new(20, "node"),
+            )
+            .unwrap();
+            assert!(s
+                .transaction(|store| -> Result<()> {
+                    store.put_setting("rolled-back", "value")?;
+                    anyhow::bail!("rollback")
+                })
+                .is_err());
+            assert_eq!(s.get_setting("rolled-back").unwrap(), None);
+            assert_config_watermarks_match_reference(&s);
+            s.prepare_config_watermarks().unwrap();
+            assert_config_watermarks_match_reference(&s);
+        }
+        let s = Storage::open(&path).unwrap();
+        s.prepare_config_watermarks().unwrap();
+        for kind in ConfigKind::ALL {
+            let entries = s.config_entries(kind).unwrap();
+            assert_eq!(
+                s.config_digest_for(kind).unwrap().count as usize,
+                entries.len(),
+                "{kind:?}"
+            );
+        }
+        drop(s);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn config_entries_includes_tombstones_alongside_live_rows() {
         let s = Storage::open(":memory:").unwrap();
@@ -1391,6 +1686,48 @@ mod tests {
     }
 
     #[test]
+    fn watermark_maxima_repair_after_placement_and_tombstone_removal() {
+        let s = Storage::open(":memory:").unwrap();
+        let first = placed_check("first", &["us"]);
+        let second = placed_check("second", &["us"]);
+        s.upsert_check(&first, 10).unwrap();
+        s.upsert_check(&second, 20).unwrap();
+        s.delete_check(second.id).unwrap();
+        assert_eq!(
+            s.config_digest_for_region("us").unwrap().max_hlc,
+            Some(Hlc::new(10, ""))
+        );
+        s.apply_config_entry(&ConfigEntry {
+            kind: ConfigKind::Check,
+            id: second.id.to_string(),
+            hlc: Hlc::new(30, "n"),
+            document: None,
+        })
+        .unwrap();
+        s.prune_tombstones(31).unwrap();
+        assert_eq!(
+            s.config_digest_for_region("us").unwrap().max_hlc,
+            Some(Hlc::new(10, ""))
+        );
+    }
+
+    #[test]
+    fn config_digest_scopes_do_not_collide_with_region_names() {
+        let s = Storage::open(":memory:").unwrap();
+        for (name, regions, stamp) in [
+            ("universal", &[][..], 10),
+            ("star", &["*"][..], 20),
+            ("bang", &["!"][..], 30),
+            ("empty", &[""][..], 40),
+        ] {
+            s.upsert_check(&placed_check(name, regions), stamp).unwrap();
+        }
+        assert_eq!(s.config_digest_for_region("*").unwrap().count, 2);
+        assert_eq!(s.config_digest_for_region("!").unwrap().count, 2);
+        assert_eq!(s.config_digest_for_region("").unwrap().count, 2);
+    }
+
+    #[test]
     fn config_digest_for_region_counts_tombstones_unscoped() {
         let s = Storage::open(":memory:").unwrap();
         let us_only = placed_check("us-only", &["us"]);
@@ -1421,6 +1758,45 @@ mod tests {
         assert_eq!(s.get_setting("k").unwrap().as_deref(), Some("value"));
         let entry = s.config_entry(ConfigKind::Setting, "k").unwrap().unwrap();
         assert_eq!(entry.hlc, hlc);
+        assert_eq!(
+            s.config_digest_for(ConfigKind::Setting).unwrap(),
+            ConfigDigest {
+                kind: ConfigKind::Setting,
+                count: 1,
+                max_hlc: Some(hlc)
+            }
+        );
+    }
+
+    #[test]
+    fn config_watermarks_follow_prune_and_rollback() {
+        let s = Storage::open(":memory:").unwrap();
+        s.apply_config_entry(&ConfigEntry {
+            kind: ConfigKind::Setting,
+            id: "old".into(),
+            hlc: Hlc::new(10, "a"),
+            document: None,
+        })
+        .unwrap();
+        s.apply_config_entry(&ConfigEntry {
+            kind: ConfigKind::Setting,
+            id: "new".into(),
+            hlc: Hlc::new(20, "a"),
+            document: None,
+        })
+        .unwrap();
+        s.prune_tombstones(15).unwrap();
+        assert_eq!(
+            s.config_digest_for(ConfigKind::Setting).unwrap().max_hlc,
+            Some(Hlc::new(20, "a"))
+        );
+        assert!(s
+            .transaction(|store| -> Result<()> {
+                store.put_setting("live", "value")?;
+                anyhow::bail!("rollback")
+            })
+            .is_err());
+        assert_eq!(s.config_digest_for(ConfigKind::Setting).unwrap().count, 1);
     }
 
     #[test]

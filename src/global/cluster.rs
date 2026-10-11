@@ -188,6 +188,9 @@ pub(super) async fn reconcile_with_peer(node: &GlobalNode, peer: &str) {
         Ok(d) => d.iter().map(ConfigDigestDto::from).collect::<Vec<_>>(),
         Err(e) => {
             tracing::warn!(%peer, error = %e, "global cluster: could not read local config digest");
+            node.inner
+                .peer_reconcile_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
         }
     };
@@ -204,19 +207,33 @@ pub(super) async fn reconcile_with_peer(node: &GlobalNode, peer: &str) {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!(%peer, error = %e, "global cluster: malformed digest response");
+                node.inner
+                    .peer_reconcile_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
         },
         Ok(r) => {
             tracing::warn!(%peer, status = %r.status(), "global cluster: digest request rejected");
+            node.inner
+                .peer_reconcile_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
         }
         Err(e) => {
             tracing::warn!(%peer, error = %e, "global cluster: digest request failed");
+            node.inner
+                .peer_reconcile_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
         }
     };
-    for kind in configplane::kinds_behind(&their, &our) {
+    let kinds_behind = configplane::kinds_behind(&their, &our);
+    node.inner.peer_reconcile_last_success_ms.store(
+        chrono::Utc::now().timestamp_millis(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    for kind in kinds_behind {
         let config_url = Cluster::endpoint(peer, "/internal/config");
         let peer_token = node.inner.peer_token.clone();
         let result = configplane::backfill_config_kind(
@@ -234,6 +251,10 @@ pub(super) async fn reconcile_with_peer(node: &GlobalNode, peer: &str) {
             }
             Err(e) => {
                 tracing::warn!(%peer, kind = kind.as_str(), error = %e, "global cluster: config pull failed");
+                node.inner
+                    .peer_reconcile_repair_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
             }
         }
     }

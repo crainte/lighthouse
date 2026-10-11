@@ -10,7 +10,7 @@ use crate::coordinator::hlc::Hlc;
 use crate::credential::AgentCredential;
 use crate::models::{CheckId, CheckKind, CheckResult, NodeState, Status};
 use anyhow::{bail, Result};
-use duckdb::{Connection, Statement};
+use duckdb::{Connection, OptionalExt, Statement};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -31,6 +31,7 @@ const HOUR_ROLLUP_RETENTION_MILLIS: i64 = 13 * 30 * 24 * MILLIS_PER_HOUR;
 pub struct Storage {
     conn: Connection,
     incident_node_id: parking_lot::RwLock<String>,
+    transaction_depth: parking_lot::Mutex<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -274,6 +275,7 @@ impl Storage {
         let store = Self {
             conn,
             incident_node_id: parking_lot::RwLock::new("local".to_string()),
+            transaction_depth: parking_lot::Mutex::new(0),
         };
         // Self-heals `replication_stream_watermarks` after a crash between an
         // alerts/incidents write and its incremental watermark update in
@@ -293,6 +295,7 @@ impl Storage {
         // the replication path runs inside an explicit transaction, and DDL
         // interleaved with DML there is a needless thing to depend on.
         store.prepare_ingest()?;
+        store.prepare_config_watermarks()?;
         Ok(store)
     }
 
@@ -328,8 +331,25 @@ impl Storage {
     }
 
     pub(crate) fn transaction<T>(&self, operation: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
-        self.conn.execute_batch("BEGIN")?;
-        match operation(self) {
+        let outermost = {
+            let mut depth = self.transaction_depth.lock();
+            if *depth > 0 {
+                false
+            } else {
+                *depth = 1;
+                true
+            }
+        };
+        if !outermost {
+            return operation(self);
+        }
+        if let Err(error) = self.conn.execute_batch("BEGIN") {
+            *self.transaction_depth.lock() = 0;
+            return Err(error.into());
+        }
+        let result = operation(self);
+        *self.transaction_depth.lock() = 0;
+        match result {
             Ok(value) => {
                 if let Err(error) = self.conn.execute_batch("COMMIT") {
                     let _ = self.conn.execute_batch("ROLLBACK");
@@ -467,7 +487,7 @@ impl Storage {
         )? as u64;
         let tombstone_days = results_days.max(alerts_days);
         let tombstone_before = now_millis - (tombstone_days as i64) * 86_400_000;
-        removed += self.prune_tombstones(tombstone_before)? as u64;
+        removed += self.prune_tombstones_uncommitted(tombstone_before)? as u64;
         removed += self.prune_incident_tombstones(tombstone_before)? as u64;
         // A gap not redetected in an entire alert window is either fixed (a
         // snapshot restore, an extended catch-up store) or the peer that

@@ -31,7 +31,10 @@ use alert::GlobalAlerter;
 use axum::Router;
 use cache::GlobalCache;
 use routes::GlobalWsEvent;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicI64, AtomicU64, Ordering},
+    Arc,
+};
 use tokio::sync::broadcast;
 use tracing::warn;
 
@@ -89,6 +92,12 @@ struct Inner {
     /// How often `spawn_background`'s anti-entropy loop reconciles the
     /// catalogue with a peer global node and with every known region.
     anti_entropy_secs: u64,
+    peer_reconcile_failures: AtomicU64,
+    peer_reconcile_repair_failures: AtomicU64,
+    peer_reconcile_last_success_ms: AtomicI64,
+    region_reconcile_failures: AtomicU64,
+    region_reconcile_repair_failures: AtomicU64,
+    region_reconcile_last_success_ms: AtomicI64,
 }
 impl GlobalNode {
     /// Opens the durable catalogue and, when `global.peers` is configured,
@@ -152,6 +161,12 @@ impl GlobalNode {
                 peer_token,
                 gossip_interval_secs: cfg.gossip_interval_secs,
                 anti_entropy_secs: cfg.anti_entropy_secs,
+                peer_reconcile_failures: AtomicU64::new(0),
+                peer_reconcile_repair_failures: AtomicU64::new(0),
+                peer_reconcile_last_success_ms: AtomicI64::new(0),
+                region_reconcile_failures: AtomicU64::new(0),
+                region_reconcile_repair_failures: AtomicU64::new(0),
+                region_reconcile_last_success_ms: AtomicI64::new(0),
             }),
         })
     }
@@ -212,6 +227,69 @@ impl GlobalNode {
                 database.wal_bytes as f64,
             ),
         ];
+        let now = chrono::Utc::now().timestamp_millis();
+        let (stale, never_received, oldest_received_at) = self.inner.cache.staleness_snapshot(now);
+        samples.extend([
+            crate::openmetrics::MetricSample::new(
+                "warden_global_reconciliation_failures_total",
+                vec![("scope".into(), "peer".into())],
+                self.inner.peer_reconcile_failures.load(Ordering::Relaxed) as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_global_reconciliation_last_success_timestamp_seconds",
+                vec![("scope".into(), "peer".into())],
+                self.inner
+                    .peer_reconcile_last_success_ms
+                    .load(Ordering::Relaxed) as f64
+                    / 1_000.0,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_global_reconciliation_failures_total",
+                vec![("scope".into(), "region".into())],
+                self.inner.region_reconcile_failures.load(Ordering::Relaxed) as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_global_reconciliation_last_success_timestamp_seconds",
+                vec![("scope".into(), "region".into())],
+                self.inner
+                    .region_reconcile_last_success_ms
+                    .load(Ordering::Relaxed) as f64
+                    / 1_000.0,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_global_reconciliation_repair_failures_total",
+                vec![("scope".into(), "peer".into())],
+                self.inner
+                    .peer_reconcile_repair_failures
+                    .load(Ordering::Relaxed) as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_global_reconciliation_repair_failures_total",
+                vec![("scope".into(), "region".into())],
+                self.inner
+                    .region_reconcile_repair_failures
+                    .load(Ordering::Relaxed) as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_global_regions_stale",
+                vec![],
+                stale as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_global_regions_never_received",
+                vec![],
+                never_received as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "warden_global_max_received_push_age_seconds",
+                vec![],
+                if oldest_received_at == 0 {
+                    0.0
+                } else {
+                    now.saturating_sub(oldest_received_at).max(0) as f64 / 1_000.0
+                },
+            ),
+        ]);
         if let Some(cluster) = &self.inner.cluster {
             samples.extend(cluster.metrics());
         }
@@ -224,6 +302,9 @@ mod tests {
     use super::*;
     use axum::http::StatusCode;
     use axum::response::Response;
+    use axum::routing::{get, post};
+    use axum::Json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // ---- Placement-scoped configuration, Phase 1 & 4 (SCALING.md) ----
 
@@ -915,6 +996,244 @@ mod tests {
             coord.list_checks_for_test().await.len(),
             1,
             "still placed with no global reachable at all"
+        );
+    }
+
+    fn reconciliation_metric(node: &GlobalNode, name: &str, scope: &str) -> f64 {
+        crate::openmetrics::select(
+            &node.metrics(),
+            name,
+            &[("scope".to_string(), scope.to_string())],
+        )
+        .unwrap()
+        .value
+    }
+
+    #[tokio::test]
+    async fn regional_reconciliation_succeeds_through_one_fallback_per_endpoint() {
+        let rejected = Arc::new(AtomicUsize::new(0));
+        let rejected_count = rejected.clone();
+        let rejected_addr = serve_router(Router::new().route(
+            "/internal/global/config-digest",
+            get(move || {
+                let rejected_count = rejected_count.clone();
+                async move {
+                    rejected_count.fetch_add(1, Ordering::Relaxed);
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        ))
+        .await;
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_count = accepted.clone();
+        let accepted_addr = serve_router(Router::new().route(
+            "/internal/global/config-digest",
+            get(move || {
+                let accepted_count = accepted_count.clone();
+                async move {
+                    accepted_count.fetch_add(1, Ordering::Relaxed);
+                    Json(Vec::<crate::configplane::ConfigDigestDto>::new())
+                }
+            }),
+        ))
+        .await;
+        let node = GlobalNode::new(&GlobalConfig {
+            token: Some("global-token".into()),
+            db_path: ":memory:".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        reconcile::reconcile_region(
+            &node,
+            "us",
+            &[
+                format!("http://{rejected_addr}"),
+                format!("http://{accepted_addr}"),
+            ],
+        )
+        .await;
+
+        assert_eq!(rejected.load(Ordering::Relaxed), 1);
+        assert_eq!(accepted.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            reconciliation_metric(
+                &node,
+                "warden_global_reconciliation_failures_total",
+                "region"
+            ),
+            0.0
+        );
+        assert!(
+            reconciliation_metric(
+                &node,
+                "warden_global_reconciliation_last_success_timestamp_seconds",
+                "region"
+            ) > 0.0
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_transport_and_malformed_failures_are_scoped() {
+        let malformed_addr = serve_router(Router::new().route(
+            "/internal/global/config-digest",
+            get(|| async { "not json" }),
+        ))
+        .await;
+        let node = GlobalNode::new(&GlobalConfig {
+            token: Some("global-token".into()),
+            peer_token: Some("peer-token".into()),
+            advertise_url: Some("http://global.invalid".into()),
+            db_path: ":memory:".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        reconcile::reconcile_region(&node, "empty", &[]).await;
+        assert_eq!(
+            reconciliation_metric(
+                &node,
+                "warden_global_reconciliation_failures_total",
+                "region"
+            ),
+            0.0
+        );
+        reconcile::reconcile_region(&node, "us", &["http://127.0.0.1:1".into()]).await;
+        reconcile::reconcile_region(&node, "us", &[format!("http://{malformed_addr}")]).await;
+        cluster::reconcile_with_peer(&node, "http://127.0.0.1:1").await;
+        let peer_malformed =
+            serve_router(Router::new().route("/internal/digest", get(|| async { "not json" })))
+                .await;
+        cluster::reconcile_with_peer(&node, &format!("http://{peer_malformed}")).await;
+
+        assert_eq!(
+            reconciliation_metric(
+                &node,
+                "warden_global_reconciliation_failures_total",
+                "region"
+            ),
+            2.0
+        );
+        assert_eq!(
+            reconciliation_metric(&node, "warden_global_reconciliation_failures_total", "peer"),
+            2.0
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_repair_failures_are_scoped_for_regions_and_peers() {
+        let region_addr = serve_router(
+            Router::new()
+                .route(
+                    "/internal/global/config-digest",
+                    get(|| async { Json(Vec::<crate::configplane::ConfigDigestDto>::new()) }),
+                )
+                .route(
+                    "/internal/global/config",
+                    post(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+                ),
+        )
+        .await;
+        let node = GlobalNode::new(&GlobalConfig {
+            token: Some("global-token".into()),
+            peer_token: Some("peer-token".into()),
+            advertise_url: Some("http://global.invalid".into()),
+            db_path: ":memory:".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert!(node
+            .inner
+            .store
+            .create_section(
+                "section",
+                false,
+                crate::coordinator::storage::SectionDisplay::default(),
+            )
+            .await
+            .is_ok());
+        reconcile::reconcile_region(&node, "us", &[format!("http://{region_addr}")]).await;
+        assert_eq!(
+            reconciliation_metric(
+                &node,
+                "warden_global_reconciliation_repair_failures_total",
+                "region"
+            ),
+            1.0
+        );
+        assert_eq!(
+            reconciliation_metric(
+                &node,
+                "warden_global_reconciliation_repair_failures_total",
+                "peer"
+            ),
+            0.0
+        );
+
+        let peer_digest = vec![crate::configplane::ConfigDigestDto {
+            kind: crate::coordinator::storage::ConfigKind::Section,
+            max_hlc: Some(crate::coordinator::hlc::Hlc::new(i64::MAX, "peer")),
+            count: 1,
+        }];
+        let peer_addr = serve_router(
+            Router::new()
+                .route(
+                    "/internal/digest",
+                    get(move || {
+                        let peer_digest = peer_digest.clone();
+                        async move { Json(peer_digest) }
+                    }),
+                )
+                .route(
+                    "/internal/config",
+                    get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+                ),
+        )
+        .await;
+        cluster::reconcile_with_peer(&node, &format!("http://{peer_addr}")).await;
+
+        assert_eq!(
+            reconciliation_metric(
+                &node,
+                "warden_global_reconciliation_repair_failures_total",
+                "region"
+            ),
+            1.0
+        );
+        assert_eq!(
+            reconciliation_metric(
+                &node,
+                "warden_global_reconciliation_repair_failures_total",
+                "peer"
+            ),
+            1.0
+        );
+        assert_eq!(
+            reconciliation_metric(
+                &node,
+                "warden_global_reconciliation_failures_total",
+                "region"
+            ),
+            0.0
+        );
+        assert_eq!(
+            reconciliation_metric(&node, "warden_global_reconciliation_failures_total", "peer"),
+            0.0
+        );
+        assert!(
+            reconciliation_metric(
+                &node,
+                "warden_global_reconciliation_last_success_timestamp_seconds",
+                "region"
+            ) > 0.0
+        );
+        assert!(
+            reconciliation_metric(
+                &node,
+                "warden_global_reconciliation_last_success_timestamp_seconds",
+                "peer"
+            ) > 0.0
         );
     }
 

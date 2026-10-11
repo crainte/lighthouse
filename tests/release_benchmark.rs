@@ -1,7 +1,7 @@
 //! Opt-in release-mode benchmark. It uses only localhost services and a unique
 //! temporary DuckDB directory; run it explicitly with the command below.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -145,20 +145,106 @@ where
     }
 }
 
-async fn status_checks(client: &reqwest::Client, base: &str) -> usize {
+async fn status_page(
+    client: &reqwest::Client,
+    base: &str,
+    page: usize,
+    limit: usize,
+) -> serde_json::Value {
     client
-        .get(format!("{base}/api/v1/status"))
+        .get(format!("{base}/api/v1/status?page={page}&limit={limit}"))
         .send()
         .await
         .unwrap()
         .error_for_status()
         .unwrap()
-        .json::<serde_json::Value>()
+        .json()
         .await
-        .unwrap()["checks"]
-        .as_array()
         .unwrap()
-        .len()
+}
+
+fn status_page_summary(status: &serde_json::Value) -> String {
+    format!(
+        "total_checks={} page={} limit={} returned={} has_more={}",
+        status["total_checks"],
+        status["page"],
+        status["limit"],
+        status["checks"].as_array().map_or(0, Vec::len),
+        status["has_more"],
+    )
+}
+
+async fn wait_for_status_page(client: &reqwest::Client, base: &str, expected: usize, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last: String;
+    loop {
+        match client
+            .get(format!("{base}/api/v1/status?page=0&limit=100"))
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let response_status = response.status();
+                match response.json::<serde_json::Value>().await {
+                    Ok(status) => {
+                        last = format!(
+                            "http_status={response_status} {}",
+                            status_page_summary(&status)
+                        );
+                        if status["total_checks"] == expected
+                            && status["page"] == 0
+                            && status["limit"] == 100
+                            && status["checks"]
+                                .as_array()
+                                .is_some_and(|rows| rows.len() == expected.min(100))
+                            && status["has_more"] == (expected > 100)
+                        {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        last = format!("http_status={response_status} decode_error={error}")
+                    }
+                }
+            }
+            Err(error) => last = format!("request_error={error}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what}: {last}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn status_ids(client: &reqwest::Client, base: &str, expected: usize) -> HashSet<CheckId> {
+    let mut ids = HashSet::with_capacity(expected);
+    let mut page = 0;
+    loop {
+        let status = status_page(client, base, page, 1_000).await;
+        assert_eq!(status["page"], page, "{}", status_page_summary(&status));
+        assert_eq!(status["limit"], 1_000, "{}", status_page_summary(&status));
+        assert_eq!(
+            status["total_checks"],
+            expected,
+            "{}",
+            status_page_summary(&status)
+        );
+        let checks = status["checks"].as_array().unwrap();
+        assert!(
+            !checks.is_empty() || !status["has_more"].as_bool().unwrap(),
+            "{}",
+            status_page_summary(&status)
+        );
+        for check in checks {
+            ids.insert(check["check_id"].as_str().unwrap().parse().unwrap());
+        }
+        if !status["has_more"].as_bool().unwrap() {
+            break;
+        }
+        page += 1;
+    }
+    ids
 }
 
 async fn coverage(
@@ -518,12 +604,9 @@ async fn release_benchmark_three_peers_one_region_global_live_agents_and_retenti
     // expensive at 10k checks, but must eventually expose the replicated set.
     for region in &regions {
         let base = format!("http://{}", region.addr);
-        wait_until("public check status", Duration::from_secs(30), || {
-            let client = client.clone();
-            let base = base.clone();
-            async move { status_checks(&client, &base).await == checks }
-        })
-        .await;
+        wait_for_status_page(&client, &base, checks, "regional public check status").await;
+        let found = status_ids(&client, &base, checks).await;
+        assert_eq!(found, ids.iter().copied().collect());
     }
 
     // One properly provisioned agent per zone, all in the same region. Explicit
@@ -595,12 +678,9 @@ async fn release_benchmark_three_peers_one_region_global_live_agents_and_retenti
         }
     }
 
-    wait_until("non-empty global summary", Duration::from_secs(30), || {
-        let client = client.clone();
-        let global_base = global_base.clone();
-        async move { status_checks(&client, &global_base).await == checks }
-    })
-    .await;
+    wait_for_status_page(&client, &global_base, checks, "global public check status").await;
+    let global_ids = status_ids(&client, &global_base, checks).await;
+    assert_eq!(global_ids, ids.iter().copied().collect());
 
     // Exercise public reads while retention and all agents remain live.
     let latencies = Arc::new(Mutex::new(Vec::new()));
@@ -640,9 +720,13 @@ async fn release_benchmark_three_peers_one_region_global_live_agents_and_retenti
                         .as_array()
                         .is_some_and(|rows| !rows.is_empty())
                 } else {
-                    body["checks"]
-                        .as_array()
-                        .is_some_and(|rows| rows.len() == checks)
+                    body["total_checks"] == checks
+                        && body["page"] == 0
+                        && body["limit"] == 100
+                        && body["checks"]
+                            .as_array()
+                            .is_some_and(|rows| rows.len() == checks.min(100))
+                        && body["has_more"] == (checks > 100)
                 };
                 assert!(
                     non_empty,
@@ -878,6 +962,81 @@ fn bench_check(id: CheckId, number: usize) -> CheckConfig {
     }
 }
 
+#[tokio::test]
+async fn status_pagination_covers_over_100_checks_regionally_and_globally() {
+    let checks = 101;
+    let token = "status-pagination-global-token";
+    let coord = Coordinator::new(&CoordinatorConfig {
+        db_path: ":memory:".into(),
+        region: "status-pagination-region".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let ids = seed_checks(&coord, checks).await;
+    let (regional_addr, regional_server) = serve(coord.router()).await;
+    let (global_addr, global_server) = serve(
+        GlobalNode::new(&GlobalConfig {
+            token: Some(token.into()),
+            db_path: ":memory:".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .router(),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let regional_base = format!("http://{regional_addr}");
+    let global_base = format!("http://{global_addr}");
+    wait_for_status_page(&client, &regional_base, checks, "regional paginated status").await;
+    let regional_ids = status_ids(&client, &regional_base, checks).await;
+    assert_eq!(regional_ids, ids.iter().copied().collect());
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let push = warden::global::wire::RegionStatePush {
+        region: "status-pagination-region".into(),
+        origin: "status-pagination-node".into(),
+        advertise_url: Some(regional_base),
+        pushed_at: now,
+        region_health: warden::models::NodeState::Unknown,
+        agents_healthy: 0,
+        agents_total: 0,
+        checks: ids
+            .iter()
+            .enumerate()
+            .map(|(number, check_id)| warden::global::wire::CheckSummary {
+                check_id: *check_id,
+                name: format!("bench-check-{number}"),
+                state: warden::models::NodeState::Unknown,
+                latency_ms: 0,
+                last_check: 0,
+                uptime_24h: None,
+                status_code: None,
+                error: None,
+                kind: Some(CheckKind::Http),
+                group: None,
+                latency_graph: true,
+                position: number as i32,
+                depends_on: Vec::new(),
+            })
+            .collect(),
+    };
+    let response = client
+        .post(format!("{global_base}/internal/global/state"))
+        .bearer_auth(token)
+        .json(&push)
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success(), "{}", response.status());
+    wait_for_status_page(&client, &global_base, checks, "global paginated status").await;
+    let global_ids = status_ids(&client, &global_base, checks).await;
+    assert_eq!(global_ids, ids.into_iter().collect());
+    regional_server.abort();
+    global_server.abort();
+}
+
 fn bench_result(id: CheckId, ts_millis: i64) -> CheckResult {
     CheckResult {
         check_id: id,
@@ -1012,14 +1171,11 @@ async fn benchmark_status_uptime_history_latency_query_thresholds() {
     let (addr, server) = serve(coord.clone().router()).await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
-    wait_until(
+    wait_for_status_page(
+        &client,
+        &base,
+        checks,
         "seeded history to publish on the status page",
-        Duration::from_secs(60),
-        || {
-            let client = client.clone();
-            let base = base.clone();
-            async move { status_checks(&client, &base).await > 0 }
-        },
     )
     .await;
 

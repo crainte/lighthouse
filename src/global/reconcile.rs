@@ -165,6 +165,9 @@ pub fn spawn_region_reconciler(node: GlobalNode) {
 /// `pub(super)`: exercised directly by tests in `global::mod::tests` to drive
 /// one reconciliation pass without waiting on `RECONCILE_INTERVAL`.
 pub(super) async fn reconcile_region(node: &GlobalNode, region: &str, endpoints: &[String]) {
+    if endpoints.is_empty() {
+        return;
+    }
     let Some(token) = node.inner.token.as_deref() else {
         return;
     };
@@ -172,6 +175,9 @@ pub(super) async fn reconcile_region(node: &GlobalNode, region: &str, endpoints:
         Ok(d) => d,
         Err(e) => {
             tracing::warn!(%region, error = %e, "global: could not read local config digest");
+            node.inner
+                .region_reconcile_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
         }
     };
@@ -201,18 +207,31 @@ pub(super) async fn reconcile_region(node: &GlobalNode, region: &str, endpoints:
         // `our` is `their` from `kinds_behind`'s point of view: it answers
         // "which of the first argument's kinds are ahead of the second's",
         // and here the region is the one that might be behind.
-        for kind in configplane::kinds_behind(&our, &their) {
-            match kind {
+        let kinds_behind = configplane::kinds_behind(&our, &their);
+        node.inner.region_reconcile_last_success_ms.store(
+            chrono::Utc::now().timestamp_millis(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        for kind in kinds_behind {
+            let result = match kind {
                 // Checks converge by id-set diff against a placement-scoped
                 // desired set, never a whole-table repush — see
                 // `reconcile_checks`'s doc for why.
                 ConfigKind::Check => reconcile_checks(node, region, base, token).await,
                 _ => push_kind(node, region, base, kind).await,
+            };
+            if result.is_err() {
+                node.inner
+                    .region_reconcile_repair_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
             }
         }
-        // One endpoint answering is enough for this region this sweep.
         return;
     }
+    node.inner
+        .region_reconcile_failures
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// This node's digest as compared against `region`: every other
@@ -269,29 +288,35 @@ fn scoped(digests: &[ConfigDigestDto]) -> Vec<ConfigDigestDto> {
 /// mismatched, so a converged region never pays for this — the id-set reads
 /// below are the *repair* cost, proportional to how much actually drifted,
 /// not a steady-state one.
-async fn reconcile_checks(node: &GlobalNode, region: &str, base: &str, token: &str) {
+async fn reconcile_checks(
+    node: &GlobalNode,
+    region: &str,
+    base: &str,
+    token: &str,
+) -> anyhow::Result<()> {
     let our_ids: HashSet<CheckId> = match node.inner.store.check_ids_for_region(region).await {
         Ok(ids) => ids.into_iter().collect(),
         Err(e) => {
             tracing::warn!(%region, error = %e, "global: could not read local placement-scoped check ids");
-            return;
+            return Err(e);
         }
     };
     let their_ids: HashSet<CheckId> = match fetch_check_ids(node, base, token).await {
         Ok(ids) => ids.into_iter().collect(),
         Err(e) => {
             tracing::warn!(%region, %base, error = %e, "global: could not read region's check ids");
-            return;
+            return Err(e);
         }
     };
     let missing: Vec<CheckId> = our_ids.difference(&their_ids).copied().collect();
     let excess: Vec<CheckId> = their_ids.difference(&our_ids).copied().collect();
     if !missing.is_empty() {
-        push_check_ids(node, region, base, token, &missing).await;
+        push_check_ids(node, region, base, token, &missing).await?;
     }
     if !excess.is_empty() {
-        unplace_checks(node, region, base, token, &excess).await;
+        unplace_checks(node, region, base, token, &excess).await?;
     }
+    Ok(())
 }
 
 async fn fetch_check_ids(
@@ -314,7 +339,13 @@ async fn fetch_check_ids(
 /// `push_kind`'s whole-table page, scoped to a caller-computed set instead
 /// of everything of one kind, chunked the same way so one region's repair
 /// stays a bounded request size regardless of how many ids are missing.
-async fn push_check_ids(node: &GlobalNode, region: &str, base: &str, token: &str, ids: &[CheckId]) {
+async fn push_check_ids(
+    node: &GlobalNode,
+    region: &str,
+    base: &str,
+    token: &str,
+    ids: &[CheckId],
+) -> anyhow::Result<()> {
     let url = format!("{}/internal/global/config", base.trim_end_matches('/'));
     let mut total = 0usize;
     for chunk in ids.chunks(configplane::CONFIG_BACKFILL_PAGE) {
@@ -333,6 +364,7 @@ async fn push_check_ids(node: &GlobalNode, region: &str, base: &str, token: &str
                 Ok(None) => {}
                 Err(e) => {
                     tracing::warn!(%region, %id, error = %e, "global: could not read a check to push");
+                    return Err(e);
                 }
             }
         }
@@ -356,17 +388,18 @@ async fn push_check_ids(node: &GlobalNode, region: &str, base: &str, token: &str
             Ok(r) if r.status().is_success() => total += n,
             Ok(r) => {
                 tracing::warn!(%region, status = %r.status(), "global: scoped check push rejected");
-                return;
+                anyhow::bail!("scoped check push rejected: {}", r.status());
             }
             Err(e) => {
                 tracing::warn!(%region, error = %e, "global: scoped check push failed");
-                return;
+                return Err(e.into());
             }
         }
     }
     if total > 0 {
         tracing::info!(%region, checks = total, "global: pushed placement-scoped checks to region");
     }
+    Ok(())
 }
 
 /// Removes ids `region` holds but its placement no longer admits, through
@@ -375,7 +408,13 @@ async fn push_check_ids(node: &GlobalNode, region: &str, base: &str, token: &str
 /// a region that still probes it. The handler is idempotent (404 on an id
 /// already gone), so a race with the region unplacing it by some other path
 /// is silent rather than a warning.
-async fn unplace_checks(node: &GlobalNode, region: &str, base: &str, token: &str, ids: &[CheckId]) {
+async fn unplace_checks(
+    node: &GlobalNode,
+    region: &str,
+    base: &str,
+    token: &str,
+    ids: &[CheckId],
+) -> anyhow::Result<()> {
     let mut total = 0usize;
     for id in ids {
         let url = format!(
@@ -393,10 +432,8 @@ async fn unplace_checks(node: &GlobalNode, region: &str, base: &str, token: &str
             Ok(r) if r.status().is_success() || r.status() == reqwest::StatusCode::NOT_FOUND => {
                 total += 1;
             }
-            Ok(r) => {
-                tracing::warn!(%region, %id, status = %r.status(), "global: unplace rejected")
-            }
-            Err(e) => tracing::warn!(%region, %id, error = %e, "global: unplace request failed"),
+            Ok(r) => anyhow::bail!("unplace rejected: {}", r.status()),
+            Err(e) => return Err(e.into()),
         }
     }
     if total > 0 {
@@ -405,6 +442,7 @@ async fn unplace_checks(node: &GlobalNode, region: &str, base: &str, token: &str
             "global: unplaced checks the region's placement no longer admits"
         );
     }
+    Ok(())
 }
 
 /// Pages this node's own store for `kind` and pushes every page to `base`,
@@ -414,9 +452,14 @@ async fn unplace_checks(node: &GlobalNode, region: &str, base: &str, token: &str
 ///
 /// Used for `ConfigKind::Section` only now that `ConfigKind::Check` has its
 /// own placement-scoped repair in `reconcile_checks` — see the module doc.
-async fn push_kind(node: &GlobalNode, region: &str, base: &str, kind: ConfigKind) {
+async fn push_kind(
+    node: &GlobalNode,
+    region: &str,
+    base: &str,
+    kind: ConfigKind,
+) -> anyhow::Result<()> {
     let Some(token) = node.inner.token.as_deref() else {
-        return;
+        anyhow::bail!("missing regional token");
     };
     let url = format!("{}/internal/global/config", base.trim_end_matches('/'));
     let mut after: Option<String> = None;
@@ -431,7 +474,7 @@ async fn push_kind(node: &GlobalNode, region: &str, base: &str, kind: ConfigKind
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(%region, kind = kind.as_str(), error = %e, "global: could not page local config");
-                return;
+                return Err(e);
             }
         };
         let n = page.len();
@@ -455,11 +498,11 @@ async fn push_kind(node: &GlobalNode, region: &str, base: &str, kind: ConfigKind
             Ok(r) if r.status().is_success() => {}
             Ok(r) => {
                 tracing::warn!(%region, kind = kind.as_str(), status = %r.status(), "global: config push rejected");
-                return;
+                anyhow::bail!("config push rejected: {}", r.status());
             }
             Err(e) => {
                 tracing::warn!(%region, kind = kind.as_str(), error = %e, "global: config push failed");
-                return;
+                return Err(e.into());
             }
         }
         total += n;
@@ -471,6 +514,7 @@ async fn push_kind(node: &GlobalNode, region: &str, base: &str, kind: ConfigKind
     if total > 0 {
         tracing::info!(%region, kind = kind.as_str(), entries = total, "global: catalogue reconciled to region");
     }
+    Ok(())
 }
 
 #[cfg(test)]

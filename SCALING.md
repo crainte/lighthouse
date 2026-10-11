@@ -103,7 +103,6 @@ New result/state/config data is generally sent incrementally, and anti-entropy c
 - State-transition gossip can send one request per transition per peer.
 - Fleet-presence snapshots are resent periodically even without changes.
 - Replicated-result deduplication performs an anti-join without an efficient unique key/index.
-- Config anti-entropy still scans every row of the config tables per sweep instead of maintaining incremental metadata (fixed for results/alerts/incidents/tombstones/rollups, which read from maintained watermarks — see "Storage architecture" below).
 - There is no transport compression.
 
 ### Alert identity conflict health and safe repair
@@ -194,7 +193,7 @@ Known storage failure points:
 3. Result batches use row-by-row prepared inserts inside a transaction rather than DuckDB's bulk Appender/Arrow paths.
 4. Current-status lookup scans raw results with a partitioned window operation.
 5. Status assembly performs per-check state-history queries.
-6. Config anti-entropy repeatedly scans every row of the config tables (results/alerts/incidents/tombstones/rollup digests already read from maintained watermarks instead).
+6. ~~Config anti-entropy repeatedly scans every row of the config tables.~~ Fixed: config digests, including the placement-scoped check digest, read connection-local watermarks rebuilt once on open and maintained per touched key inside the writing transaction.
 7. Replication deduplication lacks a supporting uniqueness/index strategy.
 8. Daily retention deletes millions of rows from one large table rather than dropping time partitions.
 9. Single-check history and latency filtering rely on table organization/zone maps without a demonstrated large-data plan.
@@ -207,7 +206,7 @@ Required storage changes before claiming 10,000-check support:
 - Batch leaf/current-state/history updates in the result transaction.
 - Move blocking database operations to a bounded storage executor and measure queue time.
 - Benchmark the Appender or Arrow batches against current inserts.
-- Replace the config digest's full-table scan with maintained replication metadata, as already done for results, alerts/incidents/tombstones, and rollups.
+- ~~Replace the config digest's full-table scan with maintained replication metadata.~~ Done.
 - Establish efficient replay deduplication.
 - Add time-bucket latency rollups.
 - Use shorter raw retention than summary retention where appropriate.
@@ -1347,10 +1346,18 @@ own, so its `/metrics` carries only what is cheap and meaningful there: the
 same database series (it shares `coordinator::database::Database` verbatim
 via `GlobalStore`) and, when `global.peers` is configured, the same cluster
 membership series (it shares `coordinator::cluster::Cluster` verbatim too).
-Global-to-global config reconciliation (`reconcile.rs`) and region push
-staleness are not yet instrumented as metrics; both already page through
-`GlobalAlerter`'s region-down and existing digest-mismatch logging, so the
-gap is metrics parity, not a blind spot in alerting.
+Global reconciliation is labelled by a fixed `scope="peer"|"region"`:
+`warden_global_reconciliation_failures_total` (local digest read, digest
+transport/status, or malformed response; a region counts once after every
+endpoint fails), `warden_global_reconciliation_repair_failures_total` (a
+repair after a valid comparison failed), and
+`warden_global_reconciliation_last_success_timestamp_seconds` (last valid
+digest comparison, recorded before repair). Region push staleness is derived
+at scrape time from the cache's receiver-side timestamps, with no extra
+state: `warden_global_regions_stale`, `warden_global_regions_never_received`,
+and `warden_global_max_received_push_age_seconds` (0 when no region has
+pushed). Only global-a receives pushes in the Compose fixture, so the
+staleness gauges are meaningful there only.
 
 ## Scaling milestones
 

@@ -377,9 +377,11 @@ Follow-ups implemented in P1:
 
 ### P2 follow-ups
 
-- [ ] The config digest still full-scans the config tables on every sweep; back it with watermarks like the results/stream digests.
-- [ ] Instrument global-tier reconciliation and region-push staleness (the coordinator-side metrics exist; the global tier exposes only DB and membership metrics).
-- [ ] `release_benchmark_three_peers_one_region_global_live_agents_and_retention` times out waiting for public check status on this machine; it predates P2.
+- [x] The config digest still full-scans the config tables on every sweep; back it with watermarks like the results/stream digests.
+  Connection-local watermarks rebuilt on open and maintained transactionally per touched key; whole-kind and placement-scoped check digests are point reads.
+- [x] Instrument global-tier reconciliation and region-push staleness (the coordinator-side metrics exist; the global tier exposes only DB and membership metrics).
+- [x] `release_benchmark_three_peers_one_region_global_live_agents_and_retention` times out waiting for public check status on this machine; it predates P2.
+  The benchmark expected 10,000 rows from a paginated endpoint; it now checks `total_checks` and pages for full coverage. Passes twice at 10,000 checks in Docker with `nofile=65536`.
 
 ## Existing product issues
 

@@ -1010,6 +1010,19 @@ impl Coordinator {
                 Err(_) => true,
             }
         });
+        // Collected rather than logged and written one check at a time: at
+        // benchmark scale (thousands of checks still converging for the
+        // first time, each with no local watermark row yet) every one of
+        // them matches this condition on every sweep, and a per-check
+        // `warn!` plus a per-check awaited DB round trip turn one sweep into
+        // thousands of serialized trips through the single database worker
+        // thread (see `Database::open`) — starving every other query on this
+        // node, including the ones the rest of this very sweep depends on.
+        // One aggregated log line and one batched DB call preserve the same
+        // signal (the per-check rows this upserts, the metric counted once
+        // per check as before) without that blocking cost.
+        let observed_at = chrono::Utc::now().timestamp_millis();
+        let mut gaps = Vec::new();
         for theirs in &their.checks {
             let local_max_ts = our
                 .checks
@@ -1020,37 +1033,39 @@ impl Coordinator {
                 self.inner
                     .replication_raw_data_gaps
                     .fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    peer,
-                    check_id = %theirs.check_id,
-                    peer_retained_min_ts = theirs.min_ts,
-                    ?local_max_ts,
-                    "anti-entropy: peer is behind the source raw-data retention horizon; backfill is incomplete"
-                );
-                // Durable, not just a counter and a log line: an operator
-                // needs to know *which* checks have holes and over what
-                // range, and a restart must not lose that a gap was ever
-                // seen. `record_raw_data_gap` upserts on `(check_id, peer)`,
-                // so a standing gap redetected every sweep does not grow this
-                // table without bound.
-                if let (Ok(check_id), from_ts, to_ts, observed_at) = (
-                    theirs.check_id.parse::<crate::models::CheckId>(),
-                    local_max_ts.unwrap_or(0),
-                    theirs.min_ts,
-                    chrono::Utc::now().timestamp_millis(),
-                ) {
-                    let peer = peer.clone();
-                    let gap = storage::RawDataGapRow {
+                if let Ok(check_id) = theirs.check_id.parse::<crate::models::CheckId>() {
+                    gaps.push(storage::RawDataGapRow {
                         check_id,
-                        peer,
-                        from_ts,
-                        to_ts,
+                        peer: peer.clone(),
+                        from_ts: local_max_ts.unwrap_or(0),
+                        to_ts: theirs.min_ts,
                         observed_at,
-                    };
-                    if let Err(error) = self.db(move |s| s.record_raw_data_gap(&gap)).await {
-                        tracing::warn!(%error, "anti-entropy: failed to record a raw-data gap");
-                    }
+                    });
                 }
+            }
+        }
+        if !gaps.is_empty() {
+            warn!(
+                peer,
+                gaps = gaps.len(),
+                "anti-entropy: peer is behind the source raw-data retention horizon on one or more checks; backfill is incomplete"
+            );
+            // Durable, not just a counter and a log line: an operator needs
+            // to know *which* checks have holes and over what range, and a
+            // restart must not lose that a gap was ever seen.
+            // `record_raw_data_gap` upserts on `(check_id, peer)`, so a
+            // standing gap redetected every sweep does not grow this table
+            // without bound.
+            if let Err(error) = self
+                .db(move |s| {
+                    for gap in &gaps {
+                        s.record_raw_data_gap(gap)?;
+                    }
+                    Ok(())
+                })
+                .await
+            {
+                tracing::warn!(%error, "anti-entropy: failed to record a raw-data gap");
             }
         }
         let stream_pages = [
@@ -1790,5 +1805,107 @@ mod tests {
         let catalogue = coord.inner.check_catalogue.read();
         assert_eq!(catalogue.len(), 1);
         assert_eq!(catalogue[0].id, second.id);
+    }
+
+    /// Regression for the release benchmark's "huge warnings every check"
+    /// failure mode: a brand-new peer catching up on many checks at once
+    /// used to log and `.await` a database round trip once per gapped check
+    /// *inside* the same sweep, which at thousands of simultaneously
+    /// converging checks turned one sweep into thousands of serialized hits
+    /// on the single database worker thread. The fix batches detection into
+    /// one aggregated log line and one database call per sweep; this proves
+    /// that batching did not silently drop any check's durable gap row or
+    /// undercount the per-check metric.
+    #[tokio::test]
+    async fn anti_entropy_batches_many_simultaneous_raw_data_gaps_into_one_sweep() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = listener.local_addr().unwrap();
+        let a = Coordinator::new(&CoordinatorConfig {
+            listen: "127.0.0.1:0".into(),
+            db_path: ":memory:".into(),
+            peer_token: Some("gap-test-token".into()),
+            advertise_url: Some(format!("http://{a_addr}")),
+            node_id: Some("gap-test-a".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let app = a.clone().router();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // Several distinct checks, each with exactly one result on `a`: a
+        // brand-new peer `b` has no watermark for any of them yet, so a
+        // single sweep must detect all of these at once, not just one.
+        let check_ids: Vec<_> = (0..5).map(|_| crate::models::new_check_id()).collect();
+        let results = check_ids
+            .iter()
+            .map(|id| CheckResult {
+                check_id: *id,
+                agent_id: "agent-a".into(),
+                zone: "z".into(),
+                region: "r".into(),
+                kind: crate::models::CheckKind::Http,
+                timestamp: chrono::DateTime::from_timestamp_millis(1_000).unwrap(),
+                latency_ms: 5,
+                status_code: Some(200),
+                body_matched: None,
+                error: None,
+                failure: None,
+                body: None,
+                headers: None,
+                metric: None,
+                metrics: None,
+            })
+            .collect::<Vec<_>>();
+        a.ingest(results).await;
+
+        let b = Coordinator::new(&CoordinatorConfig {
+            listen: "127.0.0.1:0".into(),
+            db_path: ":memory:".into(),
+            peer_token: Some("gap-test-token".into()),
+            advertise_url: Some("http://127.0.0.1:0".into()),
+            node_id: Some("gap-test-b".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // Seed `b`'s view of `a` as alive through the merge rule
+        // `Cluster::handle_ping`'s own doc calls out as testable without a
+        // server, instead of a real gossip round trip this test has no
+        // other use for.
+        b.inner.cluster.as_ref().unwrap().merge(
+            &cluster::PingBody {
+                node_id: "gap-test-a".into(),
+                url: format!("http://{a_addr}"),
+                generation: 0,
+                members: Vec::new(),
+                links: Vec::new(),
+            },
+            chrono::Utc::now().timestamp_millis(),
+        );
+
+        b.anti_entropy_sweep().await;
+
+        let gaps = b.db(|storage| storage.list_raw_data_gaps()).await.unwrap();
+        assert_eq!(
+            gaps.len(),
+            check_ids.len(),
+            "every simultaneously-converging check must still get its own durable gap row: {gaps:?}"
+        );
+        for id in &check_ids {
+            assert!(
+                gaps.iter().any(|g| g.check_id == *id),
+                "missing a recorded gap for {id}: {gaps:?}"
+            );
+        }
+        assert_eq!(
+            crate::openmetrics::select(&b.metrics(), "warden_replication_raw_data_gaps_total", &[])
+                .unwrap()
+                .value,
+            check_ids.len() as f64,
+            "the counter must still increment once per check, not once per sweep"
+        );
+
+        server.abort();
     }
 }

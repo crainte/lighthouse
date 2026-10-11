@@ -192,8 +192,13 @@ impl Storage {
     /// `config` is the definition; the other columns are a projection of it so
     /// SQL can order and filter without parsing every document.
     pub fn upsert_check(&self, c: &CheckConfig, now_millis: i64) -> Result<()> {
-        // DuckDB's ON CONFLICT needs the same column list twice; deleting first
-        // is shorter and the two statements are cheap at this table's size.
+        self.transaction(|store| {
+            store.upsert_check_uncommitted(c, now_millis)?;
+            store.sync_config_watermark(ConfigKind::Check, &c.id.to_string())
+        })
+    }
+
+    pub(super) fn upsert_check_uncommitted(&self, c: &CheckConfig, now_millis: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM checks WHERE id = ?", duckdb::params![c.id])?;
         self.conn.execute(
@@ -267,51 +272,57 @@ impl Storage {
     /// Apply an explicit display order, by id. Ids not listed keep their
     /// relative order after the listed ones.
     pub fn reorder_checks(&self, order: &[CheckId], now_millis: i64) -> Result<()> {
-        // Rewrite whole rows rather than UPDATE-ing the position column: the
-        // document is authoritative, so touching only the column would reorder
-        // the index and leave every reader seeing the old order.
-        let mut checks = self.list_checks()?;
-        let rank = |id: CheckId| {
-            order
-                .iter()
-                .position(|n| *n == id)
-                // Ids the caller didn't mention keep their relative order
-                // after the ones it did.
-                .unwrap_or(usize::MAX)
-        };
-        checks.sort_by(|a, b| {
-            rank(a.id)
-                .cmp(&rank(b.id))
-                .then_with(|| a.position.cmp(&b.position))
-                .then_with(|| a.name.cmp(&b.name))
-        });
-        for (i, mut check) in checks.into_iter().enumerate() {
-            check.position = i as i32;
-            self.upsert_check(&check, now_millis)?;
-        }
-        Ok(())
+        self.transaction(|store| {
+            // Rewrite whole rows rather than UPDATE-ing the position column: the
+            // document is authoritative, so touching only the column would reorder
+            // the index and leave every reader seeing the old order.
+            let mut ranks = std::collections::HashMap::new();
+            for (rank, id) in order.iter().copied().enumerate() {
+                ranks.entry(id).or_insert(rank);
+            }
+            let mut checks = store.list_checks()?;
+            checks.sort_by(|a, b| {
+                ranks
+                    .get(&a.id)
+                    .unwrap_or(&usize::MAX)
+                    .cmp(ranks.get(&b.id).unwrap_or(&usize::MAX))
+                    .then_with(|| a.position.cmp(&b.position))
+                    .then_with(|| a.name.cmp(&b.name))
+            });
+            for (position, mut check) in checks.into_iter().enumerate() {
+                let position = position as i32;
+                if check.position != position {
+                    check.position = position;
+                    store.upsert_check(&check, now_millis)?;
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Delete a check's recorded results and alerts, keeping its definition.
     /// Returns how many result rows went, so the UI can say what it did.
     pub fn purge_check_data(&self, check_id: CheckId) -> Result<u64> {
-        let rows = self.conn.execute(
-            "DELETE FROM check_results WHERE check_id = ?",
-            duckdb::params![check_id],
-        )?;
-        self.conn.execute(
-            "DELETE FROM result_replication_watermarks WHERE check_id = ?",
-            duckdb::params![check_id],
-        )?;
-        self.conn.execute(
-            "DELETE FROM latest_check_results WHERE check_id = ?",
-            duckdb::params![check_id],
-        )?;
-        self.conn.execute(
-            "DELETE FROM alerts WHERE node_id = ?",
-            duckdb::params![check_id.to_string()],
-        )?;
-        Ok(rows as u64)
+        self.transaction(|store| {
+            let rows = store.conn.execute(
+                "DELETE FROM check_results WHERE check_id = ?",
+                duckdb::params![check_id],
+            )?;
+            store.conn.execute(
+                "DELETE FROM result_replication_watermarks WHERE check_id = ?",
+                duckdb::params![check_id],
+            )?;
+            store.conn.execute(
+                "DELETE FROM latest_check_results WHERE check_id = ?",
+                duckdb::params![check_id],
+            )?;
+            store.conn.execute(
+                "DELETE FROM alerts WHERE node_id = ?",
+                duckdb::params![check_id.to_string()],
+            )?;
+            store.rebuild_stream_watermarks()?;
+            Ok(rows as u64)
+        })
     }
 
     /// Remove a check definition and the state derived from its local placement,
@@ -337,6 +348,7 @@ impl Storage {
                 "DELETE FROM check_placement_regions WHERE check_id = ?",
                 duckdb::params![check_id],
             )?;
+            store.sync_config_watermark(ConfigKind::Check, &check_id.to_string())?;
             Ok(true)
         })
     }
@@ -344,14 +356,19 @@ impl Storage {
     /// Returns whether a row was actually removed, so the handler can 404
     /// instead of reporting success for an id that never existed.
     pub fn delete_check(&self, check_id: CheckId) -> Result<bool> {
-        let n = self
-            .conn
-            .execute("DELETE FROM checks WHERE id = ?", duckdb::params![check_id])?;
-        self.conn.execute(
-            "DELETE FROM check_placement_regions WHERE check_id = ?",
-            duckdb::params![check_id],
-        )?;
-        Ok(n > 0)
+        self.transaction(|store| {
+            let n = store
+                .conn
+                .execute("DELETE FROM checks WHERE id = ?", duckdb::params![check_id])?;
+            store.conn.execute(
+                "DELETE FROM check_placement_regions WHERE check_id = ?",
+                duckdb::params![check_id],
+            )?;
+            if n > 0 {
+                store.sync_config_watermark(ConfigKind::Check, &check_id.to_string())?;
+            }
+            Ok(n > 0)
+        })
     }
 
     /// Sections in display order.
@@ -380,112 +397,139 @@ impl Storage {
         collapsed: bool,
         display: SectionDisplay,
     ) -> Result<bool> {
-        let exists: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM sections WHERE name = ?",
-            duckdb::params![name],
-            |r| r.get(0),
-        )?;
-        if exists > 0 {
-            return Ok(false);
-        }
-        let next: i32 = self.conn.query_row(
-            "SELECT COALESCE(MAX(position), -1) + 1 FROM sections",
-            [],
-            |r| r.get(0),
-        )?;
-        self.conn.execute(
-            "INSERT INTO sections (name, position, collapsed, display) VALUES (?, ?, ?, ?)",
-            duckdb::params![name, next, collapsed, display.as_str()],
-        )?;
-        Ok(true)
+        self.transaction(|store| {
+            let exists: i64 = store.conn.query_row(
+                "SELECT COUNT(*) FROM sections WHERE name = ?",
+                duckdb::params![name],
+                |r| r.get(0),
+            )?;
+            if exists > 0 {
+                return Ok(false);
+            }
+            let next: i32 = store.conn.query_row(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM sections",
+                [],
+                |r| r.get(0),
+            )?;
+            store.conn.execute(
+                "INSERT INTO sections (name, position, collapsed, display) VALUES (?, ?, ?, ?)",
+                duckdb::params![name, next, collapsed, display.as_str()],
+            )?;
+            store.sync_config_watermark(ConfigKind::Section, name)?;
+            Ok(true)
+        })
     }
 
     /// Rename a section, carrying its checks with it. Without the second update
     /// every check in the section would silently become loose.
     pub fn rename_section(&self, from: &str, to: &str, now_millis: i64) -> Result<bool> {
-        let n = self.conn.execute(
-            "UPDATE sections SET name = ? WHERE name = ?",
-            duckdb::params![to, from],
-        )?;
-        if n == 0 {
-            return Ok(false);
-        }
-        // Each affected check is rewritten whole: its group lives in the
-        // document, so updating only the column would leave readers on the old
-        // name and the check apparently orphaned.
-        for mut check in self.list_checks()? {
-            if check.group.as_deref() == Some(from) {
-                check.group = Some(to.to_string());
-                self.upsert_check(&check, now_millis)?;
+        self.transaction(|store| {
+            let n = store.conn.execute(
+                "UPDATE sections SET name = ? WHERE name = ?",
+                duckdb::params![to, from],
+            )?;
+            if n == 0 {
+                return Ok(false);
             }
-        }
-        Ok(true)
+            store.sync_config_watermark(ConfigKind::Section, from)?;
+            store.sync_config_watermark(ConfigKind::Section, to)?;
+            // Each affected check is rewritten whole: its group lives in the
+            // document, so updating only the column would leave readers on the old
+            // name and the check apparently orphaned.
+            for mut check in store.list_checks()? {
+                if check.group.as_deref() == Some(from) {
+                    check.group = Some(to.to_string());
+                    store.upsert_check(&check, now_millis)?;
+                }
+            }
+            Ok(true)
+        })
     }
 
     /// Set whether a section starts collapsed on the public page.
     pub fn set_section_collapsed(&self, name: &str, collapsed: bool) -> Result<bool> {
-        let n = self.conn.execute(
-            "UPDATE sections SET collapsed = ? WHERE name = ?",
-            duckdb::params![collapsed, name],
-        )?;
-        Ok(n > 0)
+        self.transaction(|store| {
+            let n = store.conn.execute(
+                "UPDATE sections SET collapsed = ? WHERE name = ?",
+                duckdb::params![collapsed, name],
+            )?;
+            if n > 0 {
+                store.sync_config_watermark(ConfigKind::Section, name)?;
+            }
+            Ok(n > 0)
+        })
     }
 
     /// Set whether the public page renders a section inline or as its own page.
     pub fn set_section_display(&self, name: &str, display: SectionDisplay) -> Result<bool> {
-        let n = self.conn.execute(
-            "UPDATE sections SET display = ? WHERE name = ?",
-            duckdb::params![display.as_str(), name],
-        )?;
-        Ok(n > 0)
+        self.transaction(|store| {
+            let n = store.conn.execute(
+                "UPDATE sections SET display = ? WHERE name = ?",
+                duckdb::params![display.as_str(), name],
+            )?;
+            if n > 0 {
+                store.sync_config_watermark(ConfigKind::Section, name)?;
+            }
+            Ok(n > 0)
+        })
     }
 
     /// Delete a section. Its checks are kept and become loose — deleting a
     /// heading must never delete the monitoring underneath it.
     pub fn delete_section(&self, name: &str, now_millis: i64) -> Result<bool> {
-        let n = self
-            .conn
-            .execute("DELETE FROM sections WHERE name = ?", duckdb::params![name])?;
-        if n == 0 {
-            return Ok(false);
-        }
-        for mut check in self.list_checks()? {
-            if check.group.as_deref() == Some(name) {
-                check.group = None;
-                self.upsert_check(&check, now_millis)?;
+        self.transaction(|store| {
+            let n = store
+                .conn
+                .execute("DELETE FROM sections WHERE name = ?", duckdb::params![name])?;
+            if n == 0 {
+                return Ok(false);
             }
-        }
-        Ok(true)
+            store.sync_config_watermark(ConfigKind::Section, name)?;
+            for mut check in store.list_checks()? {
+                if check.group.as_deref() == Some(name) {
+                    check.group = None;
+                    store.upsert_check(&check, now_millis)?;
+                }
+            }
+            Ok(true)
+        })
     }
 
     /// Apply an explicit order. Names not listed keep their relative order after
     /// the listed ones, so a stale client can't silently drop a section.
     pub fn reorder_sections(&self, order: &[String]) -> Result<()> {
-        let mut position = 0i32;
-        for name in order {
-            self.conn.execute(
-                "UPDATE sections SET position = ? WHERE name = ?",
-                duckdb::params![position, name],
-            )?;
-            position += 1;
-        }
-        // Anything the caller didn't mention is appended in its existing order,
-        // so a client working from a stale list can't strand a section at
-        // position 0 alongside the ones it did name.
-        let remaining: Vec<String> = self
-            .list_sections()?
-            .into_iter()
-            .map(|s| s.name)
-            .filter(|n| !order.contains(n))
-            .collect();
-        for name in remaining {
-            self.conn.execute(
-                "UPDATE sections SET position = ? WHERE name = ?",
-                duckdb::params![position, name],
-            )?;
-            position += 1;
-        }
-        Ok(())
+        self.transaction(|store| {
+            let listed: std::collections::HashSet<&str> =
+                order.iter().map(String::as_str).collect();
+            let mut position = 0i32;
+            for name in order {
+                let changed = store.conn.execute(
+                    "UPDATE sections SET position = ? WHERE name = ? AND position <> ?",
+                    duckdb::params![position, name, position],
+                )?;
+                if changed > 0 {
+                    store.sync_config_watermark(ConfigKind::Section, name)?;
+                }
+                position += 1;
+            }
+            let remaining: Vec<String> = store
+                .list_sections()?
+                .into_iter()
+                .map(|section| section.name)
+                .filter(|name| !listed.contains(name.as_str()))
+                .collect();
+            for name in remaining {
+                let changed = store.conn.execute(
+                    "UPDATE sections SET position = ? WHERE name = ? AND position <> ?",
+                    duckdb::params![position, name, position],
+                )?;
+                if changed > 0 {
+                    store.sync_config_watermark(ConfigKind::Section, &name)?;
+                }
+                position += 1;
+            }
+            Ok(())
+        })
     }
 
     /// Adopt the section names already present on checks, so a deployment that
@@ -555,6 +599,19 @@ impl Storage {
         policy: &crate::rollup::RollupPolicy,
         hlc: &Hlc,
     ) -> Result<()> {
+        self.transaction(|store| {
+            store.upsert_rollup_policy_uncommitted(node_id, node_type, policy, hlc)?;
+            store.sync_config_watermark(ConfigKind::RollupPolicy, node_id)
+        })
+    }
+
+    pub(super) fn upsert_rollup_policy_uncommitted(
+        &self,
+        node_id: &str,
+        node_type: NodeType,
+        policy: &crate::rollup::RollupPolicy,
+        hlc: &Hlc,
+    ) -> Result<()> {
         use crate::rollup::Threshold;
         let mut config = serde_json::Map::new();
         if let Threshold::Quorum(q) = policy.degraded_when {
@@ -571,7 +628,7 @@ impl Storage {
         self.conn.execute(
             "INSERT OR REPLACE INTO rollup_policy
                  (node_id, node_type, degraded_when, down_when, config, updated_at, updated_by)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+              VALUES (?, ?, ?, ?, ?, ?, ?)",
             duckdb::params![
                 node_id,
                 node_type.as_str(),
@@ -587,11 +644,16 @@ impl Storage {
 
     /// Drop a node's policy, returning it to its level's default.
     pub fn delete_rollup_policy(&self, node_id: &str) -> Result<bool> {
-        let n = self.conn.execute(
-            "DELETE FROM rollup_policy WHERE node_id = ?",
-            duckdb::params![node_id],
-        )?;
-        Ok(n > 0)
+        self.transaction(|store| {
+            let n = store.conn.execute(
+                "DELETE FROM rollup_policy WHERE node_id = ?",
+                duckdb::params![node_id],
+            )?;
+            if n > 0 {
+                store.sync_config_watermark(ConfigKind::RollupPolicy, node_id)?;
+            }
+            Ok(n > 0)
+        })
     }
 
     /// Erase everything a check ever produced: its results, its alerts, every

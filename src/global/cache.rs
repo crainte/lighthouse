@@ -138,6 +138,26 @@ impl GlobalCache {
         self.staleness_ms
     }
 
+    pub fn staleness_snapshot(&self, now: i64) -> (u64, u64, i64) {
+        let guard = self.regions.read();
+        let mut stale = 0;
+        let mut never_received = 0;
+        let mut oldest_received_at = 0;
+        for state in guard.values() {
+            if state.received_at == 0 {
+                never_received += 1;
+            } else {
+                if state.is_stale(now, self.staleness_ms) {
+                    stale += 1;
+                }
+                if oldest_received_at == 0 || state.received_at < oldest_received_at {
+                    oldest_received_at = state.received_at;
+                }
+            }
+        }
+        (stale, never_received, oldest_received_at)
+    }
+
     /// Apply one push. Last-writer-wins by `pushed_at`, `origin` breaking a tie,
     /// so three identical pushes from a region cluster collapse to one entry and
     /// a delayed push never overwrites a newer one. This is the single mutation
@@ -491,6 +511,23 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn staleness_snapshot_counts_seeded_received_and_expired_regions() {
+        use crate::config::GlobalRegion;
+        let cache = GlobalCache::new(
+            20,
+            &[GlobalRegion {
+                name: "seeded".into(),
+                endpoints: vec![],
+            }],
+        );
+        assert_eq!(cache.staleness_snapshot(1_000), (0, 1, 0));
+        cache.apply_push(push("fresh", "a", 1, NodeState::Up, &[]), 1_000);
+        cache.apply_push(push("expired", "b", 1, NodeState::Up, &[]), 1);
+        assert_eq!(cache.staleness_snapshot(1_000), (0, 1, 1));
+        assert_eq!(cache.staleness_snapshot(21_001), (2, 1, 1));
     }
 
     #[test]

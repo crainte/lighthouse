@@ -125,16 +125,18 @@ impl Storage {
     /// Delete every result an agent reported. The agent list is derived from
     /// these rows, so this is what makes an agent disappear.
     pub fn purge_agent(&self, agent_id: &str) -> Result<u64> {
-        let rows = self.conn.execute(
-            "DELETE FROM check_results WHERE agent_id = ?",
-            duckdb::params![agent_id],
-        )?;
-        self.rebuild_result_watermarks()?;
-        self.rebuild_latest_check_results()?;
-        // The fleet view is the union of results and poll rows, so leaving the
-        // poll row behind would purge an agent that then reappeared, healthy.
-        self.delete_agent_poll(agent_id)?;
-        Ok(rows as u64)
+        self.transaction(|store| {
+            let rows = store.conn.execute(
+                "DELETE FROM check_results WHERE agent_id = ?",
+                duckdb::params![agent_id],
+            )?;
+            store.rebuild_result_watermarks()?;
+            store.rebuild_latest_check_results()?;
+            // The fleet view is the union of results and poll rows, so leaving the
+            // poll row behind would purge an agent that then reappeared, healthy.
+            store.delete_agent_poll(agent_id)?;
+            Ok(rows as u64)
+        })
     }
 
     // ---- Agent credentials ----
@@ -164,24 +166,31 @@ impl Storage {
     }
 
     pub fn insert_agent_credential(&self, c: &AgentCredential) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO agent_credentials
-                 (id, zone, region, secret_hash, salt, created_at, revoked_at)
-             VALUES (?, ?, ?, ?, ?, ?, NULL)",
-            duckdb::params![c.id, c.zone, c.region, c.secret_hash, c.salt, c.created_at],
-        )?;
-        Ok(())
+        self.transaction(|store| {
+            store.conn.execute(
+                "INSERT INTO agent_credentials
+                     (id, zone, region, secret_hash, salt, created_at, revoked_at)
+                  VALUES (?, ?, ?, ?, ?, ?, NULL)",
+                duckdb::params![c.id, c.zone, c.region, c.secret_hash, c.salt, c.created_at],
+            )?;
+            store.sync_config_watermark(ConfigKind::Credential, &c.id)
+        })
     }
 
     /// Returns whether a live credential was actually revoked, so the handler
     /// can 404 rather than report success for an id that never existed — or
     /// report success twice for one already revoked.
     pub fn revoke_agent_credential(&self, id: &str, now: i64) -> Result<bool> {
-        let n = self.conn.execute(
-            "UPDATE agent_credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
-            duckdb::params![now, id],
-        )?;
-        Ok(n > 0)
+        self.transaction(|store| {
+            let n = store.conn.execute(
+                "UPDATE agent_credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+                duckdb::params![now, id],
+            )?;
+            if n > 0 {
+                store.sync_config_watermark(ConfigKind::Credential, id)?;
+            }
+            Ok(n > 0)
+        })
     }
 
     /// Every agent that has ever reported, newest-seen first. Agents are not
@@ -240,34 +249,26 @@ impl Storage {
         &self,
         members: &[crate::coordinator::cluster::Member],
     ) -> Result<()> {
-        self.conn.execute_batch("BEGIN")?;
-        let write = || -> Result<()> {
-            self.conn.execute_batch("DELETE FROM cluster_members")?;
-            let mut stmt = self.conn.prepare(
-                "INSERT INTO cluster_members (node_id, url, generation, last_seen, state)
+        self.transaction(|_| {
+            let write = || -> Result<()> {
+                self.conn.execute_batch("DELETE FROM cluster_members")?;
+                let mut stmt = self.conn.prepare(
+                    "INSERT INTO cluster_members (node_id, url, generation, last_seen, state)
                  VALUES (?, ?, ?, ?, ?)",
-            )?;
-            for m in members {
-                stmt.execute(duckdb::params![
-                    m.node_id,
-                    m.url,
-                    m.generation,
-                    m.last_seen,
-                    m.state.as_str(),
-                ])?;
-            }
-            Ok(())
-        };
-        match write() {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
+                )?;
+                for m in members {
+                    stmt.execute(duckdb::params![
+                        m.node_id,
+                        m.url,
+                        m.generation,
+                        m.last_seen,
+                        m.state.as_str(),
+                    ])?;
+                }
                 Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
+            };
+            write()
+        })
     }
 
     /// Every persisted member, for rejoining the cluster on restart.

@@ -404,45 +404,37 @@ impl Storage {
     pub fn insert_results(&self, rows: &[(CheckResult, Status)]) -> Result<()> {
         // One transaction for the whole batch: DuckDB otherwise commits per
         // statement, which makes large seeds (100k+ rows) crawl.
-        self.conn.execute_batch("BEGIN")?;
-        let insert = || -> Result<()> {
-            let mut stmt = self.conn.prepare(
-                "INSERT INTO check_results
+        self.transaction(|_| {
+            let insert = || -> Result<()> {
+                let mut stmt = self.conn.prepare(
+                    "INSERT INTO check_results
                     (check_id, agent_id, ts_millis, status, latency_ms, status_code,
                      error, failure, zone, region)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )?;
-            for (r, status) in rows {
-                stmt.execute(duckdb::params![
-                    r.check_id,
-                    r.agent_id,
-                    r.timestamp.timestamp_millis(),
-                    status.as_str(),
-                    r.latency_ms as i64,
-                    r.status_code.map(|c| c as i32),
-                    r.error,
-                    r.failure.as_ref().map(serde_json::to_string).transpose()?,
-                    non_empty(&r.zone),
-                    non_empty(&r.region),
-                ])?;
-            }
-            self.conn
-                .execute_batch("DELETE FROM ingest_results_stage;")?;
-            self.stage_results(rows)?;
-            self.conn
-                .execute_batch(&derived_results_sql("ingest_results_stage"))?;
-            Ok(())
-        };
-        match insert() {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
+                )?;
+                for (r, status) in rows {
+                    stmt.execute(duckdb::params![
+                        r.check_id,
+                        r.agent_id,
+                        r.timestamp.timestamp_millis(),
+                        status.as_str(),
+                        r.latency_ms as i64,
+                        r.status_code.map(|c| c as i32),
+                        r.error,
+                        r.failure.as_ref().map(serde_json::to_string).transpose()?,
+                        non_empty(&r.zone),
+                        non_empty(&r.region),
+                    ])?;
+                }
+                self.conn
+                    .execute_batch("DELETE FROM ingest_results_stage;")?;
+                self.stage_results(rows)?;
+                self.conn
+                    .execute_batch(&derived_results_sql("ingest_results_stage"))?;
                 Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
+            };
+            insert()
+        })
     }
 
     /// Same rows as `insert_results`, loaded through DuckDB's Appender rather
