@@ -1024,6 +1024,10 @@ async fn status_pagination_covers_over_100_checks_regionally_and_globally() {
                 },
             )
             .collect(),
+        epoch: 1,
+        seq: 1,
+        delta_base: None,
+        removed: Vec::new(),
     };
     let response = client
         .post(format!("{global_base}/internal/global/state"))

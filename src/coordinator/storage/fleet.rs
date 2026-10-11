@@ -121,6 +121,23 @@ pub struct AgentPollRow {
     pub kinds: Option<String>,
 }
 
+impl AgentPollRow {
+    /// Whether this row must be persisted and sent to peers when `previous`
+    /// is what was last sent. A poll advances `at`/`rtt_ms` on every request,
+    /// so an unchanged fleet is resent only once `at` has moved a third of the
+    /// agent's own silence window: often enough that no peer sees a live
+    /// agent go stale, rarely enough that a steady fleet costs nothing per tick.
+    pub fn supersedes(&self, previous: &Self) -> bool {
+        let presence = |row: &Self| Self {
+            at: 0,
+            rtt_ms: None,
+            ..row.clone()
+        };
+        self.at.saturating_sub(previous.at) >= (self.window_ms / 3).max(1)
+            || presence(self) != presence(previous)
+    }
+}
+
 impl Storage {
     /// Delete every result an agent reported. The agent list is derived from
     /// these rows, so this is what makes an agent disappear.
@@ -376,6 +393,28 @@ impl Storage {
 mod tests {
     use super::*;
     use crate::coordinator::storage::test_support::*;
+
+    #[test]
+    fn presence_is_resent_only_on_change_or_a_third_of_the_window() {
+        let sent = poll("a", "z", "r", 1_000, 30_000);
+        let mut polled = AgentPollRow {
+            at: 10_999,
+            rtt_ms: Some(4),
+            ..sent.clone()
+        };
+        assert!(!polled.supersedes(&sent), "a routine poll is not news");
+        polled.at = 11_000;
+        assert!(
+            polled.supersedes(&sent),
+            "refresh before peers see it stale"
+        );
+        let moved = AgentPollRow {
+            zone: "z2".into(),
+            at: 1_001,
+            ..sent.clone()
+        };
+        assert!(moved.supersedes(&sent), "a material change is sent at once");
+    }
 
     #[test]
     fn list_agents_reports_each_reporting_agent_once() {

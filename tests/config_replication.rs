@@ -978,3 +978,39 @@ async fn peer_replication_and_config_transfer_enforce_their_route_specific_limit
         );
     }
 }
+
+/// The catalogue round trip: exported from a running node, applied to a
+/// fresh one, it reproduces every check exactly, and node identity is not
+/// carried across.
+#[tokio::test]
+async fn catalogue_backup_restores_checks_into_a_fresh_node() {
+    use lighthouse::coordinator::backup;
+    let source = spawn_node("source", vec![], vec![check_cfg("web"), check_cfg("api")]).await;
+    let source_url = format!("http://{}", source.addr);
+    let catalogue = backup::export_catalogue(&source_url, Some(PEER_TOKEN))
+        .await
+        .unwrap();
+    assert!(catalogue.entries.iter().all(|e| e.id != "cluster.node_id"));
+
+    let target = spawn_node("target", vec![], vec![]).await;
+    let target_url = format!("http://{}", target.addr);
+    let applied = backup::import_catalogue(&target_url, Some(PEER_TOKEN), &catalogue)
+        .await
+        .unwrap();
+    assert_eq!(applied, catalogue.entries.len());
+
+    let sorted = |mut checks: Vec<CheckConfig>| {
+        checks.sort_by_key(|c| c.id);
+        checks
+    };
+    assert_eq!(
+        sorted(target.coord.list_checks_for_test().await),
+        sorted(source.coord.list_checks_for_test().await)
+    );
+    assert!(
+        backup::import_catalogue(&target_url, Some("wrong"), &catalogue)
+            .await
+            .is_err(),
+        "the peer API refuses a catalogue without the peer token"
+    );
+}

@@ -6,6 +6,7 @@ mod ssl;
 mod tcp;
 
 use crate::config::{AgentConfig, CheckConfig};
+use crate::http::ZstdJson;
 use crate::models::{CheckKind, CheckResult, ResultBatch, Status};
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -824,7 +825,7 @@ async fn post_pending(
         let coordinator = cfg.coordinator().to_string();
         let mut req = client
             .post(format!("{coordinator}/api/v1/results"))
-            .json(&body);
+            .zstd_json(&body);
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
@@ -1078,6 +1079,7 @@ mod sync_tests {
                 ),
             )
             .with_state((received.clone(), reject));
+        let app = crate::http::compressed(app);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {

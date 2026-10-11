@@ -199,14 +199,21 @@ impl Storage {
     }
 
     pub(super) fn upsert_check_uncommitted(&self, c: &CheckConfig, now_millis: i64) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM checks WHERE id = ?", duckdb::params![c.id])?;
         self.conn.execute(
             "INSERT INTO checks
                 (id, name, kind, target, interval_secs, timeout_secs, group_name,
                  latency_graph, enabled, expect_status, expect_body_contains,
-                 visible, eval, position, agents, config, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 visible, eval, position, agents, config, updated_at, updated_by)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+             ON CONFLICT (id) DO UPDATE SET
+                 name = excluded.name, kind = excluded.kind, target = excluded.target,
+                 interval_secs = excluded.interval_secs, timeout_secs = excluded.timeout_secs,
+                 group_name = excluded.group_name, latency_graph = excluded.latency_graph,
+                 enabled = excluded.enabled, expect_status = excluded.expect_status,
+                 expect_body_contains = excluded.expect_body_contains,
+                 visible = excluded.visible, eval = excluded.eval, position = excluded.position,
+                 agents = excluded.agents, config = excluded.config,
+                 updated_at = excluded.updated_at, updated_by = excluded.updated_by",
             duckdb::params![
                 c.id,
                 c.name,
@@ -234,8 +241,9 @@ impl Storage {
     }
 
     /// Rewrites `check_placement_regions` for one check from its placement's
-    /// `regions` list, the same delete-then-insert shape `upsert_check` uses
-    /// for the row itself. An empty list leaves no rows behind, matching
+    /// `regions` list: regions no longer named are deleted and the rest are
+    /// inserted idempotently, so no key is deleted and re-inserted within one
+    /// transaction (a DuckDB ART-index fault pattern). An empty list leaves no rows behind, matching
     /// `Placement`'s "empty means every region" rule so a reader never has to
     /// special-case "no rows yet" against "explicitly no regions".
     pub(super) fn project_placement_regions(
@@ -243,17 +251,23 @@ impl Storage {
         check_id: CheckId,
         regions: &[String],
     ) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM check_placement_regions WHERE check_id = ?",
-            duckdb::params![check_id],
-        )?;
-        // Deduplicated so a placement that (however it happened) names the
-        // same region twice cannot violate the table's primary key.
-        let unique: std::collections::BTreeSet<&String> = regions.iter().collect();
-        for region in unique {
+        use std::collections::BTreeSet;
+        let wanted: BTreeSet<&str> = regions.iter().map(String::as_str).collect();
+        let existing: BTreeSet<String> = self
+            .conn
+            .prepare("SELECT region FROM check_placement_regions WHERE check_id = ?")?
+            .query_map(duckdb::params![check_id], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        for stale in existing.iter().filter(|r| !wanted.contains(r.as_str())) {
+            self.conn.execute(
+                "DELETE FROM check_placement_regions WHERE check_id = ? AND region = ?",
+                duckdb::params![check_id, stale],
+            )?;
+        }
+        for added in wanted.into_iter().filter(|r| !existing.contains(*r)) {
             self.conn.execute(
                 "INSERT INTO check_placement_regions (check_id, region) VALUES (?, ?)",
-                duckdb::params![check_id, region],
+                duckdb::params![check_id, added],
             )?;
         }
         Ok(())
@@ -626,9 +640,13 @@ impl Storage {
             Some(serde_json::Value::Object(config).to_string())
         };
         self.conn.execute(
-            "INSERT OR REPLACE INTO rollup_policy
+            "INSERT INTO rollup_policy
                  (node_id, node_type, degraded_when, down_when, config, updated_at, updated_by)
-              VALUES (?, ?, ?, ?, ?, ?, ?)",
+              VALUES (?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT (node_id) DO UPDATE SET
+                  node_type = excluded.node_type, degraded_when = excluded.degraded_when,
+                  down_when = excluded.down_when, config = excluded.config,
+                  updated_at = excluded.updated_at, updated_by = excluded.updated_by",
             duckdb::params![
                 node_id,
                 node_type.as_str(),
@@ -764,6 +782,31 @@ mod tests {
             },
             "tw must not see the us-only check"
         );
+    }
+
+    /// Same-key rewrites inside one transaction are the shape that used to
+    /// be delete-then-insert; as upserts they must leave exactly the last
+    /// definition, renamed and re-placed, with nothing stale behind.
+    #[test]
+    fn repeated_same_key_upserts_in_one_transaction_keep_the_last_definition() {
+        let s = Storage::open(":memory:").unwrap();
+        let mut check = placed_check("first", &["us", "eu"]);
+        s.transaction(|store| {
+            for (n, regions) in [&["us", "eu"][..], &["eu", "tw"], &["tw"]]
+                .iter()
+                .enumerate()
+            {
+                check.name = format!("name-{n}");
+                check.placement.regions = regions.iter().map(|r| r.to_string()).collect();
+                store.upsert_check(&check, n as i64 + 1)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(s.list_checks().unwrap(), vec![check.clone()]);
+        assert!(s.check_ids_for_region("us").unwrap().is_empty());
+        assert!(s.check_ids_for_region("eu").unwrap().is_empty());
+        assert_eq!(s.check_ids_for_region("tw").unwrap(), vec![check.id]);
     }
 
     #[test]

@@ -401,7 +401,7 @@ pub(in crate::coordinator) async fn global_check_ids_handler(
 /// `Storage::config_entry` only ever sees the live table, so it reads back
 /// `None` for an id whose latest write was a delete — the tombstone that
 /// delete left behind lives in a different table entirely. Falling back to a
-/// scan of `config_entries` for that one tombstone is what lets deletes and
+/// point read of that one tombstone is what lets deletes and
 /// upserts share `replicate_config` as one path instead of the delete
 /// handlers needing a second, parallel push of their own.
 pub(in crate::coordinator) fn read_config_entry_for_replication(
@@ -411,8 +411,8 @@ pub(in crate::coordinator) fn read_config_entry_for_replication(
 ) -> Option<storage::ConfigEntry> {
     match store.config_entry(kind, id) {
         Ok(Some(e)) => Some(e),
-        Ok(None) => match store.config_entries(kind) {
-            Ok(all) => all.into_iter().find(|e| e.is_tombstone() && e.id == id),
+        Ok(None) => match store.config_tombstone(kind, id) {
+            Ok(tombstone) => tombstone,
             Err(e) => {
                 tracing::warn!(
                     error = %e,

@@ -34,6 +34,7 @@
 use super::GlobalNode;
 use crate::configplane::{self, ConfigBatch, ConfigDigestDto};
 use crate::coordinator::storage::{ConfigEntry, ConfigKind};
+use crate::http::ZstdJson;
 use crate::models::CheckId;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -134,7 +135,7 @@ async fn push_batch(
             .client
             .post(&url)
             .bearer_auth(token)
-            .json(&batch)
+            .zstd_json(&batch)
             .send()
             .await
         {
@@ -381,7 +382,7 @@ async fn push_check_ids(
             .client
             .post(&url)
             .bearer_auth(token)
-            .json(&batch)
+            .zstd_json(&batch)
             .send()
             .await
         {
@@ -491,7 +492,7 @@ async fn push_kind(
             .client
             .post(&url)
             .bearer_auth(token)
-            .json(&batch)
+            .zstd_json(&batch)
             .send()
             .await
         {

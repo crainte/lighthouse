@@ -241,7 +241,7 @@ pub(in crate::coordinator) struct DaysQuery {
     /// How many segments to split the window into; the strip keeps a constant
     /// bar count across ranges.
     buckets: Option<usize>,
-    /// Scope the request to one section. See [`in_scope`].
+    /// Scope the request to one section. See [`storage::StatusScope`].
     section: Option<String>,
     /// Must match the status request's bounded page.
     page: Option<usize>,
@@ -361,34 +361,32 @@ pub(in crate::coordinator) struct HoursQuery {
     /// segment it actually covers instead of a `now`-anchored guess.
     from: Option<i64>,
     to: Option<i64>,
-    /// Scope the request to one section. See [`in_scope`].
+    /// Scope the request to one section. See [`storage::StatusScope`].
     section: Option<String>,
     /// Must match the status request's bounded page.
     page: Option<usize>,
     limit: Option<usize>,
 }
 
-/// Whether a check belongs in a chart request scoped to `scope`.
-///
-/// `None` is the primary page: loose checks, plus the checks of sections that
-/// render inline. A section set to render as its own page is excluded, and that
-/// exclusion is the entire point of the mode — its strips cost nothing until a
-/// visitor opens it. `Some(name)` is that page, and matches exactly the named
-/// section's checks.
-///
-/// A group with no section row counts as inline. Such a check is a name a
-/// section table never had, and the page renders it expanded rather than hiding
-/// it; dropping its chart here would leave a visible row with a blank strip.
-fn in_scope(sections: &[storage::Section], scope: Option<&str>, group: Option<&str>) -> bool {
-    match scope {
-        Some(want) => group == Some(want),
-        None => group.is_none_or(|g| {
-            sections
-                .iter()
-                .find(|s| s.name == g)
-                .is_none_or(|s| s.display == storage::SectionDisplay::Inline)
-        }),
-    }
+/// One page of visible checks in `scope`, each paired with its resolved
+/// `degraded_is_downtime`. Scope, order and paging run in SQL over the
+/// catalogue; only the page's ids are resolved against cached metadata.
+pub(in crate::coordinator) fn check_page(
+    coord: &Coordinator,
+    storage: &storage::Storage,
+    scope: &storage::StatusScope,
+    latency_graph_only: bool,
+    page: usize,
+    limit: usize,
+) -> anyhow::Result<(Vec<(CheckId, bool)>, usize)> {
+    let found = storage.visible_check_page(scope, latency_graph_only, page, limit)?;
+    let by_id = coord.inner.checks.read();
+    let checks = found
+        .ids
+        .into_iter()
+        .map(|id| (id, by_id.get(&id).is_some_and(|m| m.degraded_is_downtime)))
+        .collect();
+    Ok((checks, found.total))
 }
 
 // ---- Handlers ----
@@ -402,114 +400,64 @@ pub(in crate::coordinator) async fn status_handler(
     // The status page is public; raw probe errors name resolved addresses and
     // expected values, so only an admin sees them verbatim.
     let detailed = is_admin(&coord, &headers);
-    let (rows, confirmed) = match coord
-        .db(move |storage| Ok((storage.list_status(now), storage.list_current_state())))
+    let scope = storage::StatusScope::from_section(q.section);
+    let (page, limit) = (q.page.unwrap_or(0), crate::page::bounded(q.limit, 100));
+    let reader = coord.clone();
+    let (statuses, total_checks, section_states) = match coord
+        .db(move |storage| {
+            let (checks, total) = check_page(&reader, storage, &scope, false, page, limit)?;
+            Ok((
+                storage.status_for(&checks, now)?,
+                total,
+                storage.section_states()?,
+            ))
+        })
         .await
     {
         Ok(value) => value,
         Err(e) => return internal_error(e),
     };
-    let confirmed: std::collections::HashMap<CheckId, NodeState> = confirmed
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| (r.check_id, r.state))
-        .collect();
-    match rows {
-        Ok(rows) => {
-            let by_id = coord.inner.checks.read().clone();
-            let mut checks: Vec<CheckStatusDto> = rows
-                .into_iter()
-                // Only currently-configured, published checks. A row with no
-                // config was deleted; its history stays queryable, but a status
-                // page claiming "blackhole — Down" for something nobody is
-                // monitoring any more is worse than saying nothing.
-                .filter(|r| by_id.get(&r.check_id).is_some_and(|m| m.visible))
-                .map(|r| {
-                    let meta = by_id.get(&r.check_id);
-                    CheckStatusDto {
-                        kind: meta.map(|m| m.kind),
-                        group: meta.and_then(|m| m.group.clone()),
-                        latency_graph: meta.is_some_and(|m| m.latency_graph),
-                        cron: meta.map(|m| m.cron.clone()),
-                        position: meta.map_or(i32::MAX, |m| m.position),
-                        name: meta.map_or_else(|| r.check_id.to_string(), |m| m.name.clone()),
-                        check_id: r.check_id,
-                        state: r.state,
-                        latency_ms: r.latency_ms,
-                        last_check: r.last_check,
-                        uptime_24h: Some(r.uptime_24h),
-                        status_code: r.status_code,
-                        error: public_error(r.error, r.failure, detailed),
-                    }
+    let checks: Vec<CheckStatusDto> = {
+        let by_id = coord.inner.checks.read();
+        statuses
+            .into_iter()
+            .filter_map(|status| {
+                let check_id = status.check_id();
+                let meta = by_id.get(&check_id)?;
+                // A configured check that hasn't reported yet still belongs on
+                // the page, carrying any state a peer gossiped.
+                let r = status.resolve(meta.default_status.into());
+                Some(CheckStatusDto {
+                    check_id,
+                    name: meta.name.clone(),
+                    state: r.state,
+                    latency_ms: r.latency_ms,
+                    last_check: r.last_check,
+                    uptime_24h: r.uptime_24h,
+                    status_code: r.status_code,
+                    error: public_error(r.error, r.failure, detailed),
+                    kind: Some(meta.kind),
+                    group: meta.group.clone(),
+                    latency_graph: meta.latency_graph,
+                    cron: Some(meta.cron.clone()),
+                    position: meta.position,
                 })
-                .collect();
-
-            // A configured check that hasn't reported yet still belongs on the
-            // page. Omitting it means adding a five-minute check looks like
-            // nothing happened until its first run — the monitor is missing
-            // exactly when someone is watching for it to appear.
-            let reported: std::collections::HashSet<CheckId> =
-                checks.iter().map(|c| c.check_id).collect();
-            let pending: Vec<CheckStatusDto> = by_id
-                .iter()
-                .filter(|(id, m)| m.visible && !reported.contains(id))
-                .map(|(id, m)| CheckStatusDto {
-                    check_id: *id,
-                    name: m.name.clone(),
-                    // A check with no measurements here still has a confirmed
-                    // state if a peer gossiped one to us. Prefer it over the
-                    // configured default: a cluster that knows a service is
-                    // DOWN must not read "unknown" on the node that heard it
-                    // second-hand. Falls back to `default_status`, which is what
-                    // a check reads as before its first result.
-                    state: confirmed
-                        .get(id)
-                        .copied()
-                        .unwrap_or_else(|| m.default_status.into()),
-                    latency_ms: 0,
-                    last_check: 0,
-                    uptime_24h: None,
-                    status_code: None,
-                    error: None,
-                    kind: Some(m.kind),
-                    group: m.group.clone(),
-                    latency_graph: m.latency_graph,
-                    cron: Some(m.cron.clone()),
-                    position: m.position,
-                })
-                .collect();
-            checks.extend(pending);
-            let sections = section_rollups(&coord, &checks);
-            let scope = q.section;
-            let (page, limit) = (q.page.unwrap_or(0), crate::page::bounded(q.limit, 100));
-            let section_rows = match coord.db(|storage| storage.list_sections()).await {
-                Ok(sections) => sections,
-                Err(e) => return internal_error(e),
-            };
-            checks
-                .retain(|check| in_scope(&section_rows, scope.as_deref(), check.group.as_deref()));
-            checks.sort_by(|a, b| {
-                a.position
-                    .cmp(&b.position)
-                    .then_with(|| a.name.cmp(&b.name))
-                    .then_with(|| a.check_id.cmp(&b.check_id))
-            });
-            let (total_checks, has_more) = crate::page::take(&mut checks, page, limit);
-            let agents = fleet_health(&coord, now).await;
-            Json(StatusResponse {
-                checks,
-                page,
-                limit,
-                total_checks,
-                has_more,
-                agents,
-                maintenance: announced_maintenance(&coord, now),
-                sections,
             })
-            .into_response()
-        }
-        Err(e) => internal_error(e),
-    }
+            .collect()
+    };
+    let has_more = page.saturating_add(1).saturating_mul(limit) < total_checks;
+    let agents = fleet_health(&coord, now).await;
+    Json(StatusResponse {
+        checks,
+        page,
+        limit,
+        total_checks,
+        has_more,
+        agents,
+        maintenance: announced_maintenance(&coord, now),
+        sections: section_rollups(&coord, section_states),
+    })
+    .into_response()
 }
 
 /// Fold each section's checks into one state, using the same policy lookup the
@@ -523,30 +471,43 @@ pub(in crate::coordinator) async fn status_handler(
 ///
 /// Loose checks are deliberately absent: they render as their own rows, and a
 /// rollup over "everything with no section" is not a thing the page shows.
-fn section_rollups(coord: &Coordinator, checks: &[CheckStatusDto]) -> Vec<SectionRollupDto> {
-    use std::collections::BTreeMap;
-
-    let mut by_section: BTreeMap<&str, Vec<NodeState>> = BTreeMap::new();
-    for check in checks {
-        if let Some(group) = check.group.as_deref() {
-            by_section.entry(group).or_default().push(check.state);
-        }
-    }
-
+fn section_rollups(
+    coord: &Coordinator,
+    sections: std::collections::BTreeMap<String, storage::SectionStates>,
+) -> Vec<SectionRollupDto> {
+    let by_id = coord.inner.checks.read();
     let policies = coord.inner.rollup_policies.read();
-    by_section
+    sections
         .into_iter()
-        .map(|(name, states)| {
+        .map(|(name, counts)| {
+            let states: Vec<(NodeState, usize)> = counts
+                .states
+                .into_iter()
+                .chain(
+                    counts
+                        .pending
+                        .iter()
+                        .filter_map(|id| by_id.get(id))
+                        .map(|m| (NodeState::from(m.default_status), 1)),
+                )
+                .collect();
+            let count = |wanted: NodeState| -> usize {
+                states
+                    .iter()
+                    .filter(|(s, _)| *s == wanted)
+                    .map(|(_, n)| n)
+                    .sum()
+            };
             let policy = policies
                 .get(&format!("section:{name}"))
                 .copied()
                 .unwrap_or(crate::rollup::RollupPolicy::CHECK_DEFAULT);
             SectionRollupDto {
-                name: name.to_string(),
-                state: crate::rollup::rollup(&policy, &states),
-                checks: states.len(),
-                degraded: states.iter().filter(|s| **s == NodeState::Degraded).count(),
-                down: states.iter().filter(|s| **s == NodeState::Down).count(),
+                state: crate::rollup::rollup_counts(&policy, states.iter().copied()),
+                checks: states.iter().map(|(_, n)| n).sum(),
+                degraded: count(NodeState::Degraded),
+                down: count(NodeState::Down),
+                name,
             }
         })
         .collect()
@@ -811,53 +772,13 @@ pub(in crate::coordinator) async fn uptime_strips_handler(
     let days = q.days.unwrap_or(90).clamp(1, 365);
     let buckets = q.buckets.unwrap_or(90).clamp(1, 500);
     let now = chrono::Utc::now().timestamp_millis();
-    // Resolved metadata, not the persisted override: a check inherits the
-    // coordinator default when its own setting is absent, exactly as the
-    // single-check route does.
-    let candidates: Vec<(CheckId, bool, Option<String>, i32, String)> = {
-        let by_id = coord.inner.checks.read();
-        by_id
-            .iter()
-            .filter(|(_, meta)| meta.visible)
-            .map(|(id, meta)| {
-                (
-                    *id,
-                    meta.degraded_is_downtime,
-                    meta.group.clone(),
-                    meta.position,
-                    meta.name.clone(),
-                )
-            })
-            .collect()
-    };
-    let scope = q.section;
+    let scope = storage::StatusScope::from_section(q.section);
     let page = q.page.unwrap_or(0);
     let limit = crate::page::bounded(q.limit, 100);
+    let reader = coord.clone();
     match coord
-        // Sections are read inside this closure rather than in their own call:
-        // scoping needs them before the scan, and a second `db` hop would put
-        // an extra job on the single database worker for a handful of rows.
         .db(move |storage| {
-            let sections = storage.list_sections()?;
-            let mut wanted: Vec<(CheckId, bool, i32, String)> = candidates
-                .into_iter()
-                .filter(|(_, _, group, _, _)| {
-                    in_scope(&sections, scope.as_deref(), group.as_deref())
-                })
-                .map(|(id, degraded_is_downtime, _, position, name)| {
-                    (id, degraded_is_downtime, position, name)
-                })
-                .collect();
-            wanted.sort_by(|a, b| {
-                a.2.cmp(&b.2)
-                    .then_with(|| a.3.cmp(&b.3))
-                    .then_with(|| a.0.cmp(&b.0))
-            });
-            let mut wanted: Vec<(CheckId, bool)> = wanted
-                .into_iter()
-                .map(|(id, downtime, _, _)| (id, downtime))
-                .collect();
-            crate::page::take(&mut wanted, page, limit);
+            let (wanted, _) = check_page(&reader, storage, &scope, false, page, limit)?;
             storage.uptime_strips(&wanted, days, buckets, now)
         })
         .await
@@ -907,33 +828,13 @@ pub(in crate::coordinator) async fn latency_points_handler(
             (now - hours * 3_600_000, now)
         }
     };
-    let candidates: Vec<(CheckId, Option<String>, i32, String)> = {
-        let by_id = coord.inner.checks.read();
-        by_id
-            .iter()
-            .filter(|(_, meta)| meta.visible && meta.latency_graph)
-            .map(|(id, meta)| (*id, meta.group.clone(), meta.position, meta.name.clone()))
-            .collect()
-    };
-    let scope = q.section;
+    let scope = storage::StatusScope::from_section(q.section);
     let page = q.page.unwrap_or(0);
     let limit = crate::page::bounded(q.limit, 100);
     match coord
         .db(move |storage| {
-            let sections = storage.list_sections()?;
-            let mut wanted: Vec<(CheckId, i32, String)> = candidates
-                .into_iter()
-                .filter(|(_, group, _, _)| in_scope(&sections, scope.as_deref(), group.as_deref()))
-                .map(|(id, _, position, name)| (id, position, name))
-                .collect();
-            wanted.sort_by(|a, b| {
-                a.1.cmp(&b.1)
-                    .then_with(|| a.2.cmp(&b.2))
-                    .then_with(|| a.0.cmp(&b.0))
-            });
-            let mut wanted: Vec<CheckId> = wanted.into_iter().map(|(id, _, _)| id).collect();
-            crate::page::take(&mut wanted, page, limit);
-            storage.latency_points_for(&wanted, from, to, buckets)
+            let ids = storage.visible_check_page(&scope, true, page, limit)?.ids;
+            storage.latency_points_for(&ids, from, to, buckets)
         })
         .await
     {
@@ -980,46 +881,5 @@ pub(in crate::coordinator) async fn alerts_handler(
             Json(AlertsResponse { alerts }).into_response()
         }
         Err(e) => internal_error(e),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use storage::{Section, SectionDisplay};
-
-    fn section(name: &str, display: SectionDisplay) -> Section {
-        Section {
-            name: name.into(),
-            position: 0,
-            collapsed: false,
-            display,
-        }
-    }
-
-    #[test]
-    fn a_paged_section_costs_nothing_until_it_is_opened() {
-        let sections = vec![
-            section("edge", SectionDisplay::Page),
-            section("core", SectionDisplay::Inline),
-        ];
-
-        // The primary page charts what it renders, and a paged section renders
-        // as a tile. Including it here would defeat the mode entirely: the
-        // server would still scan every one of its checks on every page load.
-        assert!(in_scope(&sections, None, None), "loose checks are rendered");
-        assert!(in_scope(&sections, None, Some("core")));
-        assert!(!in_scope(&sections, None, Some("edge")));
-
-        // The section's own page charts exactly its checks, and nothing else —
-        // opening one section must not re-fetch the whole page's strips.
-        assert!(in_scope(&sections, Some("edge"), Some("edge")));
-        assert!(!in_scope(&sections, Some("edge"), Some("core")));
-        assert!(!in_scope(&sections, Some("edge"), None));
-
-        // A group naming a section that does not exist renders expanded, so it
-        // must be charted. Excluding it would leave a visible row whose strip
-        // never arrives.
-        assert!(in_scope(&sections, None, Some("ghost")));
     }
 }

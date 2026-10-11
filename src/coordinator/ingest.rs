@@ -38,8 +38,6 @@ pub(in crate::coordinator) struct CheckMeta {
     /// When the probe runs, as cron. The target lives in storage and is served
     /// only to authenticated admins and agents, never on the public endpoint.
     pub(in crate::coordinator) cron: String,
-    /// Published on the public status page.
-    pub(in crate::coordinator) visible: bool,
     /// Lua deciding UP/DOWN, replacing the built-in rule when present.
     pub(in crate::coordinator) eval: Option<String>,
     /// Display order within the section.
@@ -176,7 +174,6 @@ pub(in crate::coordinator) fn check_meta(
         latency_graph: c.latency_graph,
         expect_status: c.expect.status,
         cron: c.cron.clone(),
-        visible: c.visible,
         eval: c.eval.clone(),
         position: c.position,
         failures_before_down: c.failures_before_down,

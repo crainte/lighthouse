@@ -154,6 +154,7 @@ Required changes:
 - Acknowledge sequence positions and support replay from a cursor.
 - Use full compressed snapshots only for bootstrap, detected gaps, and periodic repair.
 - Avoid three equivalent publishers per regional cluster; use deterministic ownership with failover, not necessarily consensus leadership.
+- *Done for the push (P3):* one lowest-id publisher per region, zstd, sequence-numbered deltas acknowledged by the receiver with `resync` on a gap, and a snapshot every twelfth push. See "Transport" under "Storage robustness and scaling past 10,000 checks".
 - Replicate received global state among global coordinators instead of requiring every regional node to publish every snapshot to every global node.
 - Allow partial regional read results with explicit unavailable-region metadata where product semantics permit it.
 
@@ -195,7 +196,7 @@ Known storage failure points:
 5. Status assembly performs per-check state-history queries.
 6. ~~Config anti-entropy repeatedly scans every row of the config tables.~~ Fixed: config digests, including the placement-scoped check digest, read connection-local watermarks rebuilt once on open and maintained per touched key inside the writing transaction.
 7. Replication deduplication lacks a supporting uniqueness/index strategy.
-8. Daily retention deletes millions of rows from one large table rather than dropping time partitions.
+8. Daily retention deletes millions of rows from one large table rather than dropping time partitions. Bounded, not removed: retention runs in five-minute slices measured at ~76 ns per row, so no slice stalls the worker; see "Raw-result storage evolution".
 9. Single-check history and latency filtering rely on table organization/zone maps without a demonstrated large-data plan.
 10. Long storage lock holds can delay unrelated ingest and HTTP processing.
 
@@ -925,8 +926,10 @@ global-push p95 and payload bytes. Optional `LIGHTHOUSE_BENCH_MAX_REGIONAL_STATU
 `LIGHTHOUSE_BENCH_MAX_STATUS_PAGE_MAX_P95_MS`, `LIGHTHOUSE_BENCH_MAX_STATUS_PAGE_MAX_BYTES`,
 `LIGHTHOUSE_BENCH_MAX_GLOBAL_PUSH_P95_MS`, `LIGHTHOUSE_BENCH_MAX_GLOBAL_STATUS_P95_MS`, and
 `LIGHTHOUSE_BENCH_MAX_PUSH_BYTES` variables enforce local acceptance ceilings. The global
-push route has an explicit 16 MiB limit so supported 10,000-check snapshots are not
-rejected by Axum's 2 MiB default. This validates cardinality, not sustained concurrent
+push route has an explicit 64 MiB decoded-body limit so 100,000-check snapshots are not
+rejected by Axum's 2 MiB default. It also reports the zstd snapshot size, a steady-state
+delta's size, and the delta build time (see "Storage robustness and scaling past 10,000
+checks"). This validates cardinality, not sustained concurrent
 load or the full production capacity envelope.
 
 ## Placement-scoped configuration
@@ -1358,6 +1361,150 @@ state: `lighthouse_global_regions_stale`, `lighthouse_global_regions_never_recei
 and `lighthouse_global_max_received_push_age_seconds` (0 when no region has
 pushed). Only global-a receives pushes in the Compose fixture, so the
 staleness gauges are meaningful there only.
+
+## Storage robustness and scaling past 10,000 checks (P3)
+
+### DuckDB operational safety
+
+- **Invalidation exits.** After a fatal error DuckDB invalidates the database instance
+  and every later statement fails. The database worker now treats any error carrying
+  `FATAL Error` or `database has been invalidated` as fatal for the process
+  (`coordinator::database::is_invalidated`), logs it, and exits non-zero. The restart
+  policy reopens the file from its WAL and anti-entropy backfills whatever the restart
+  window missed. Serving 500s forever is no longer a possible state.
+- **Container-aware resource bounds.** `coordinator::db_limits` sets DuckDB
+  `memory_limit` to half of `min(cgroup limit, host MemTotal)` and `threads` to the CPU
+  quota rounded up. It reads cgroup v2 `memory.max`/`cpu.max` first, then v1
+  `memory.limit_in_bytes`/`cpu.cfs_quota_us`; the v1 "unlimited" sentinel is absorbed
+  by the host-total `min`, and with no quota it falls back to `available_parallelism`.
+  `[coordinator.database]`/`[global.database]` `memory_limit`/`threads` or
+  `LIGHTHOUSE_DB_MEMORY_LIMIT`/`LIGHTHOUSE_DB_THREADS` pin explicit values for a
+  Kubernetes `resources.limits`. The values DuckDB reports back
+  (`current_setting`) are logged at startup. Parsing is tested against fixture trees.
+- **No same-key delete-then-insert.** Check, setting, section, credential, rollup
+  policy, tombstone, incident, and watermark rewrites use `INSERT … ON CONFLICT DO
+  UPDATE`. Set-valued children (placement regions, incident checks/updates, config
+  watermark entries) delete only the keys that vanished and upsert the rest. The
+  derived-table rebuilds (`result_replication_watermarks`, `latest_check_results`,
+  `replication_stream_watermarks`) upsert plus anti-join delete, because they run
+  inside purge/incident transactions. One narrow case remains: a single replicated
+  batch carrying a tombstone and then a newer re-create of the same id.
+
+### Read path
+
+`/api/v1/status`, `/api/v1/uptime` and `/api/v1/latency-points` used to build or scan
+every check and then slice the page. They now resolve scope, order (`position`, `name`,
+`id`) and `LIMIT/OFFSET` in SQL over `checks` (`Storage::visible_check_page`), stage
+the page's ids in a temp table, and run per-check work (latest row, published state,
+24h spans, strip buckets, latency points) as a semi-join against that page only
+(`status_for`, `uptime_strips`, `latency_points_for`). Before this, strips read all of
+`state_history` and every raw row in the window and filtered in Rust. Section tiles are
+one `GROUP BY` over `checks ⋈ current_state ⋈ latest_check_results` folded through
+`rollup::rollup_counts`, never a per-check status build. `CheckMeta.visible` is gone:
+visibility is a SQL predicate now.
+
+Release build, `benchmark_status_and_global_push_production_cardinality`, 3 regions,
+10 samples, p95 ms (before → after):
+
+| Checks | Regional status | Full page (3 req, 100) | Page at 1,000 ceiling | Global status |
+|---:|---:|---:|---:|---:|
+| 10,000 | 79 → 14 | 94 → 30 | 157 → 79 | 19 → 16 |
+| 30,000 | 157 → 21 | 212 → 32 | 205 → 74 | 81 → 68 |
+| 100,000 | ≈500 (extrapolated) → 43 | → 101 | → 86 | → 241 |
+
+The config pull was already paged (`GET /internal/config?kind=&after=&limit=`). Check
+documents are now projected in the page query itself rather than read back per id, and
+replicating one delete reads its tombstone by key (`config_tombstone`) instead of
+scanning a kind's whole history. The unpaged `config_entries` is test-only.
+
+**Read-only connections: not added.** The TODO gated them on SQL paging not removing
+the ceiling, and it did: at 100k checks a status request is 43 ms p95. Config
+watermarks therefore stay connection-local on the single writer.
+
+### Transport
+
+- **zstd everywhere between nodes.** Servers decode `Content-Encoding: zstd` request
+  bodies and zstd-encode responses for clients that accept it (`http::compressed`,
+  tower-http). reqwest negotiates and decodes responses, and `ZstdJson::zstd_json`
+  compresses request bodies for replication and config pushes, anti-entropy pulls,
+  global reconcile, catalogue import, agent result batches, and the global push. Body
+  limits apply to the decoded size. The global push limit is now 64 MiB decoded, since
+  a 100k-check snapshot is about 23 MB of JSON.
+- **Incremental region→global push** (`coordinator::global_push`). One publisher per
+  region: the lowest-id live member (`Cluster::is_lowest_live`), with failover when
+  membership sweeps the owner dead. That publisher sends a delta carrying `epoch`
+  (process generation), `seq`, `delta_base` and `removed`. A delta lists only checks
+  whose summary changed materially: `latency_ms`/`last_check` are excluded and uptime
+  is compared at 0.01%. The global cache applies a delta only on exactly the chain
+  position it names (same origin, epoch and `seq == delta_base`); otherwise it answers
+  `resync`, and the next push is a full snapshot. Every twelfth push (a minute at the
+  default 5 s) is a snapshot anyway, which refreshes per-probe fields and repairs any
+  divergence the chain cannot see. Failover takes up to `peer_timeout_secs +
+  gossip_interval_secs + push_secs` (25 s with defaults; ~18 s measured in the Compose
+  stack after stopping `coordinator-us-a`), so `region_staleness_secs` now defaults to 30
+  rather than 20. Otherwise a publisher restart would read as a dark region.
+- **Fleet presence** is persisted and broadcast only when an agent's row changes
+  materially, or when its `at` has advanced a third of its own silence window. That
+  is often enough that no peer sees a live agent go stale, and it makes a steady
+  fleet cost nothing per tick (`AgentPollRow::supersedes`).
+
+| Checks | Snapshot JSON | Snapshot zstd | Steady-state delta (zstd) | Delta build (DB job) |
+|---:|---:|---:|---:|---:|
+| 10,000 | 2.30 MB | 277 KB | 166 B | 70 ms |
+| 30,000 | 6.94 MB | 844 KB | 169 B | 98 ms |
+| 100,000 | 23.2 MB | 2.82 MB | 169 B | 396 ms |
+
+Per region and push interval, the wire cost went from the full JSON snapshot to the
+envelope, plus about one compressed snapshot a minute (~47 KB/s at 100k checks).
+
+**gRPC/protobuf: not adopted.** After compression and deltas, transport is not
+material: steady state is ~170 B per region per push. What remains is CPU on both
+ends (building the summary, aggregating on the global node), and a serialization
+change would not move that.
+
+### Raw-result storage evolution
+
+Release build, `benchmark_representative_storage_capacity_baseline`, one domain, 30 s
+cadence, two days seeded (rollups rebuilt so retention may delete), one day pruned in a
+single job:
+
+| Checks | Rows deleted | Prune | Database | Restore (open + count) |
+|---:|---:|---:|---:|---:|
+| 1,000 | 2.88 M | 413 ms | 171 MB | 0.8 s |
+| 3,000 | 8.64 M | 1,297 ms | 585 MB | 2.5 s |
+| 10,000 | 28.8 M | 2,186 ms | 2.87 GB | 12.5 s |
+
+At scale a delete costs ~76 ns per row and about 50 bytes are stored per row. Prune
+does not shrink the file; freed blocks are reused, so steady-state size tracks retained
+rows. Retention is now sliced into five-minute jobs instead of 24 per day, and empty
+gaps are skipped. Each job stays near 230 ms (3M rows) even at 100k checks × 3 domains ×
+30 s, so one expiry unit no longer blocks ingest at any measured or extrapolated scale.
+
+**Per-day Parquet: not required by measurement; left open.** The "require partitioning"
+trigger from "Data retention tiers" is not met. What does bind at 100k × 3 domains × 30
+days is volume: ~7.8 B rows, ~390 GB per replica, and a restore near half an hour.
+DuckDB is already columnar-compressed, so Parquet would not change bytes materially.
+The levers are the raw window, which rollups now make safe to shorten, and the
+catalogue backup below. Revisit Parquet if a full-scale retention slice, a backup, or
+restore time exceeds its budget. The S3 archive depends on it and is likewise not
+built.
+
+**Catalogue backup.** `lighthouse backup --catalogue --output <file.json>` exports, with
+no downtime, the irreplaceable state of a running node: checks, sections, settings,
+credentials (salted hashes), rollup policies and tombstones, as HLC-stamped
+`ConfigEntry` rows read through the paged `GET /internal/config`.
+`lighthouse restore --catalogue --from <file.json>` pushes them through
+`POST /internal/config`, so they apply last-writer-wins: a replay is harmless, a newer
+edit is never overwritten, and peers converge through anti-entropy. Node identity
+(`cluster.node_id`) is excluded. Raw metrics are not part of it, and the file-level
+`lighthouse backup` remains for full-node recovery.
+
+### Next ceilings measured here
+
+- The global node's `/api/v1/status` aggregates every region's checks per request:
+  241 ms p95 at 100k checks × 3 regions.
+- Building the push summary is still an O(checks) database job per push interval on
+  the publisher: 396 ms every 5 s at 100k, about 8% of the worker.
 
 ## Scaling milestones
 

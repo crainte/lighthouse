@@ -187,7 +187,7 @@ fn non_empty(s: &str) -> Option<&str> {
 /// Return known UP and total duration for the half-open interval `[from, to)`.
 /// `Unknown` is deliberately no-data, while Degraded follows the check's
 /// already-resolved SLA setting.
-fn uptime_counts(
+pub(super) fn uptime_counts(
     spans: &[StateSpan],
     from: i64,
     to: i64,
@@ -220,10 +220,14 @@ fn uptime_counts(
 impl Storage {
     pub(super) fn rebuild_result_watermarks(&self) -> Result<()> {
         self.conn.execute_batch(
-            "DELETE FROM result_replication_watermarks;
+            "DELETE FROM result_replication_watermarks w
+                 WHERE NOT EXISTS (SELECT 1 FROM check_results r WHERE r.check_id = w.check_id);
              INSERT INTO result_replication_watermarks
                  SELECT check_id, MIN(ts_millis), MAX(ts_millis), COUNT(*)
-                 FROM check_results GROUP BY check_id;",
+                 FROM check_results GROUP BY check_id
+             ON CONFLICT (check_id) DO UPDATE SET
+                 min_ts = excluded.min_ts, max_ts = excluded.max_ts,
+                 result_count = excluded.result_count;",
         )?;
         Ok(())
     }
@@ -235,19 +239,20 @@ impl Storage {
     /// the same bulk-load scenarios as `rebuild_latency_rollups`.
     pub(super) fn rebuild_latest_check_results(&self) -> Result<()> {
         self.conn.execute_batch(
-            "DELETE FROM latest_check_results;
+            "DELETE FROM latest_check_results l
+                 WHERE NOT EXISTS (SELECT 1 FROM check_results r WHERE r.check_id = l.check_id);
              INSERT INTO latest_check_results
                  (check_id, agent_id, ts_millis, status, latency_ms, status_code, error, failure)
              SELECT check_id, agent_id, ts_millis, status, latency_ms, status_code, error, failure
-             FROM (
-                 SELECT check_id, agent_id, ts_millis, status, latency_ms, status_code, error,
-                        failure,
-                        row_number() OVER (
-                            PARTITION BY check_id ORDER BY ts_millis DESC, agent_id DESC
-                        ) AS rn
-                 FROM check_results
-             ) ranked
-             WHERE rn = 1;",
+             FROM check_results
+             QUALIFY row_number() OVER (
+                 PARTITION BY check_id ORDER BY ts_millis DESC, agent_id DESC
+             ) = 1
+             ON CONFLICT (check_id) DO UPDATE SET
+                 agent_id = excluded.agent_id, ts_millis = excluded.ts_millis,
+                 status = excluded.status, latency_ms = excluded.latency_ms,
+                 status_code = excluded.status_code, error = excluded.error,
+                 failure = excluded.failure;",
         )?;
         Ok(())
     }
@@ -662,113 +667,6 @@ impl Storage {
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    /// One StatusRow per check_id: the latest result's latency/code/error, the
-    /// coordinator's published state, and time-weighted uptime over the 24h
-    /// window `(now-24h, now]`. A check with no results at all is absent.
-    ///
-    /// **Uptime is no longer the UP fraction of raw result rows.** That figure
-    /// was agent-blind in exactly the way the state machine used to be: a check
-    /// probed by four agents with one permanently broken read 75% uptime
-    /// forever, because every agent's rows landed in the same numerator. It was
-    /// also count-weighted, so changing a check's interval retroactively
-    /// reweighted its history, and it had no way to express Degraded because
-    /// raw results cannot be Degraded. It is now computed from `state_history`
-    /// spans — the same states the status page actually displayed.
-    pub fn list_status(&self, now_millis: i64) -> Result<Vec<StatusRow>> {
-        let window_start = now_millis - 86_400_000;
-        // Which checks count Degraded minutes against their SLA. Read once per
-        // call rather than per check: the config document is authoritative for
-        // every field that is not a projected column, and this is one of them.
-        let degraded_downtime: std::collections::HashSet<CheckId> = self
-            .list_checks()?
-            .into_iter()
-            .filter(|c| c.degraded_is_downtime.unwrap_or(false))
-            .map(|c| c.id)
-            .collect();
-
-        // Every "latest" field is read from one materialized row. Keeping the
-        // complete row avoids both a full-history window scan and the stale NULL
-        // behavior of per-column `arg_max`.
-        //
-        // The displayed status is the coordinator's PUBLISHED state
-        // (`current_state`), not the raw last observation: it already accounts
-        // for per-agent confirmation, the rollup and hold-down, and that
-        // decision must survive a restart. Checks with no row yet (pre-upgrade
-        // data) fall back to the raw latest status, lifted into a NodeState.
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                 latest.check_id,
-                 COALESCE(cs.status, latest.status) AS status,
-                 latest.latency_ms,
-                 latest.ts_millis,
-                 latest.status_code,
-                 latest.error,
-                 latest.failure
-             FROM latest_check_results latest
-             LEFT JOIN current_state cs ON cs.check_id = latest.check_id",
-        )?;
-        let mut rows = stmt
-            .query_map([], |row| {
-                Ok(StatusRow {
-                    check_id: row.get::<_, CheckId>(0)?,
-                    state: NodeState::from_db(&row.get::<_, String>(1)?),
-                    latency_ms: row.get::<_, i64>(2)? as u64,
-                    last_check: row.get::<_, i64>(3)?,
-                    // Filled below: uptime needs a per-check window walk that
-                    // does not belong inside a row mapper.
-                    uptime_24h: 0.0,
-                    status_code: row.get::<_, Option<i32>>(4)?.map(|c| c as u16),
-                    error: row.get::<_, Option<String>>(5)?,
-                    failure: row
-                        .get::<_, Option<String>>(6)?
-                        .and_then(|f| serde_json::from_str(&f).ok()),
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        let mut spans_by_check = BTreeMap::<CheckId, Vec<StateSpan>>::new();
-        let mut span_stmt = self.conn.prepare(
-            "SELECT check_id, state, since
-             FROM state_history
-             WHERE since >= ?
-               AND check_id IN (SELECT check_id FROM latest_check_results)
-             UNION ALL
-             SELECT check_id, arg_max(state, since) AS state, MAX(since) AS since
-             FROM state_history
-             WHERE since < ?
-               AND check_id IN (SELECT check_id FROM latest_check_results)
-             GROUP BY check_id
-             ORDER BY check_id, since",
-        )?;
-        let spans = span_stmt.query_map(duckdb::params![window_start, window_start], |row| {
-            Ok((
-                row.get::<_, CheckId>(0)?,
-                StateSpan {
-                    state: NodeState::from_db(&row.get::<_, String>(1)?),
-                    since: row.get::<_, i64>(2)?,
-                },
-            ))
-        })?;
-        for span in spans {
-            let (check_id, span) = span?;
-            spans_by_check.entry(check_id).or_default().push(span);
-        }
-        for row in &mut rows {
-            let degraded_counts = degraded_downtime.contains(&row.check_id);
-            row.uptime_24h = spans_by_check
-                .get(&row.check_id)
-                .and_then(|spans| uptime_counts(spans, window_start, now_millis, degraded_counts))
-                .map(|(up_ms, known_ms)| up_ms as f64 / known_ms as f64)
-                // No spans in the window at all — a check upgraded into this
-                // scheme moments ago, or one nobody was probing. Reads as fully
-                // up rather than fully down: an absence of recorded outage is
-                // not an outage, and 0% on every check after an upgrade would
-                // be a worse lie than 100%.
-                .unwrap_or(1.0);
-        }
         Ok(rows)
     }
 
@@ -1207,12 +1105,14 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
         now_millis: i64,
     ) -> Result<BTreeMap<CheckId, CheckUptime>> {
         let grid = BucketGrid::new(now_millis, days, buckets);
-        let wanted: std::collections::HashMap<CheckId, bool> = checks.iter().copied().collect();
+        self.stage_check_ids(checks)?;
 
         let mut spans: BTreeMap<CheckId, Vec<StateSpan>> = BTreeMap::new();
         {
             let mut stmt = self.conn.prepare(
-                "SELECT check_id, state, since FROM state_history ORDER BY check_id, since",
+                "SELECT check_id, state, since FROM state_history
+                 WHERE check_id IN (SELECT check_id FROM status_check_ids)
+                 ORDER BY check_id, since",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((
@@ -1223,12 +1123,10 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
             })?;
             for row in rows {
                 let (check_id, state, since) = row?;
-                if wanted.contains_key(&check_id) {
-                    spans
-                        .entry(check_id)
-                        .or_default()
-                        .push(StateSpan { state, since });
-                }
+                spans
+                    .entry(check_id)
+                    .or_default()
+                    .push(StateSpan { state, since });
             }
         }
 
@@ -1239,6 +1137,7 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
                         COUNT(*), COUNT(*) FILTER (WHERE status = 'up')
                  FROM check_results
                  WHERE ts_millis > ? AND ts_millis <= ?
+                   AND check_id IN (SELECT check_id FROM status_check_ids)
                  GROUP BY 1, 2",
             )?;
             let rows = stmt.query_map(
@@ -1254,9 +1153,6 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
             )?;
             for row in rows {
                 let (check_id, index, total, up) = row?;
-                if !wanted.contains_key(&check_id) {
-                    continue;
-                }
                 let entry = counts
                     .entry(check_id)
                     .or_insert_with(|| (vec![0; grid.buckets], vec![0; grid.buckets]));
@@ -3292,6 +3188,9 @@ mod tests {
             .unwrap();
         store.rebuild_result_watermarks().unwrap();
         store.rebuild_latest_check_results().unwrap();
+        // Retention deletes only what rollups already summarize, so the
+        // seeded raw rows need their rollups for prune to exercise anything.
+        store.rebuild_latency_rollups().unwrap();
         store.conn.execute_batch("CHECKPOINT").unwrap();
         let seed_ms = seed_started.elapsed().as_millis();
         assert_eq!(store.count_results().unwrap(), rows);

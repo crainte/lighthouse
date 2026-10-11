@@ -19,7 +19,7 @@ use tokio::sync::broadcast;
 use tracing::warn;
 
 pub(super) fn router(node: GlobalNode) -> Router {
-    Router::new()
+    let router = Router::new()
         // Aggregated reads served from cache — the shapes the SPA already
         // consumes, so the dashboard renders with no frontend change.
         .route(
@@ -85,7 +85,9 @@ pub(super) fn router(node: GlobalNode) -> Router {
         // Push ingest from regional coordinators. Token-gated.
         .route(
             "/internal/global/state",
-            post(push_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+            // Decoded size: a 100k-check snapshot is ~23 MB of JSON (~2.8 MB
+            // on the wire, zstd-compressed).
+            post(push_handler).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
         // Global-to-global config plane (Phase 4): the same shape a
         // coordinator's own `/internal/config`/`/internal/digest` are,
@@ -107,8 +109,8 @@ pub(super) fn router(node: GlobalNode) -> Router {
         // the relay.
         .fallback(any(relay::relay_handler))
         .layer(DefaultBodyLimit::max(1024 * 1024))
-        .layer(axum::middleware::from_fn(crate::security::security_headers))
-        .with_state(node)
+        .layer(axum::middleware::from_fn(crate::security::security_headers));
+    crate::http::compressed(router).with_state(node)
 }
 
 /// A live event pushed to dashboard WebSocket clients. Only `state_change` is
@@ -144,14 +146,18 @@ async fn push_handler(
     // churn that does not move the rollup emits nothing, which is correct: the
     // aggregated dashboard has not changed.
     let before = node.inner.cache.state_snapshot(now);
-    node.inner.cache.apply_push(push, now);
+    let outcome = node.inner.cache.apply_push(push, now);
     let after = node.inner.cache.state_snapshot(now);
     broadcast_state_changes(&node, &before, &after, now);
     // Re-evaluate global alerts on every push: it is the only thing that
     // changes cached state, and staleness is checked here too so a region that
     // stops pushing is still noticed on the next surviving region's push.
     node.inner.alerter.evaluate(&node.inner.cache, now).await;
-    Json(PushAck { accepted: true }).into_response()
+    Json(PushAck {
+        accepted: outcome == super::cache::PushOutcome::Applied,
+        resync: outcome == super::cache::PushOutcome::Resync,
+    })
+    .into_response()
 }
 
 /// Emit a `state_change` for every check whose cross-region rollup moved. A

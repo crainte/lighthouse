@@ -567,7 +567,7 @@ async fn broadcast_presents_the_agent_token() {
                 ),
             )
             .with_state(seen.clone());
-    let addr = serve(app).await;
+    let addr = serve(lighthouse::http::compressed(app)).await;
 
     let (_sink, addr_sink) = alert_sink().await;
     let coord = coordinator(addr_sink, vec![format!("http://{addr}")]).await;

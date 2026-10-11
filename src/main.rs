@@ -33,6 +33,16 @@ struct Cli {
     /// exist; restore into a replacement location, never over a live database.
     #[arg(long)]
     into: Option<PathBuf>,
+    /// `backup`/`restore`: operate on the config catalogue (checks, sections,
+    /// settings, credentials, policies) of a *running* node over its peer
+    /// API instead of on the database file. `backup --catalogue --output
+    /// <file.json>`; `restore --catalogue --from <file.json>`.
+    #[arg(long)]
+    catalogue: bool,
+    /// `--catalogue` only: the node's base URL. Defaults to
+    /// `coordinator.advertise_url`, else `http://127.0.0.1:<listen port>`.
+    #[arg(long)]
+    url: Option<String>,
 }
 
 /// `--version` output. Leaked because clap wants a `&'static str` and the
@@ -97,6 +107,8 @@ async fn main() -> Result<()> {
         Mode::Agent => run_agent(cfg).await,
         Mode::Coordinator => run_coordinator(cfg).await,
         Mode::Global => run_global(cfg).await,
+        Mode::Backup if cli.catalogue => run_catalogue_backup(&cfg, cli.url, cli.output).await,
+        Mode::Restore if cli.catalogue => run_catalogue_restore(&cfg, cli.url, cli.from).await,
         Mode::Backup => run_backup(&cfg, cli.output),
         Mode::Restore => run_restore(cli.from, cli.into),
     }
@@ -148,6 +160,59 @@ fn run_restore(from: Option<PathBuf>, into: Option<PathBuf>) -> Result<()> {
         report.raw_results,
         report.current_states,
         report.oldest_result_ts
+    );
+    Ok(())
+}
+
+/// The running node a catalogue operation talks to, and the peer token it
+/// presents.
+fn catalogue_target(cfg: &Config, url: Option<String>) -> (String, Option<String>) {
+    let url = url
+        .or_else(|| cfg.coordinator.resolved_advertise_url())
+        .unwrap_or_else(|| {
+            let port = cfg.coordinator.listen.rsplit(':').next().unwrap_or("8080");
+            format!("http://127.0.0.1:{port}")
+        });
+    (url, cfg.coordinator.resolved_peer_token())
+}
+
+/// `lighthouse backup --catalogue --output <file.json>`: export the config
+/// catalogue from a running node, with no downtime.
+async fn run_catalogue_backup(
+    cfg: &Config,
+    url: Option<String>,
+    output: Option<PathBuf>,
+) -> Result<()> {
+    let output = output.ok_or_else(|| anyhow::anyhow!("backup mode requires --output <path>"))?;
+    let (url, token) = catalogue_target(cfg, url);
+    let catalogue =
+        lighthouse::coordinator::backup::export_catalogue(&url, token.as_deref()).await?;
+    lighthouse::coordinator::backup::write_catalogue(&catalogue, &output)?;
+    println!(
+        "catalogue from {url} written to {} ({} entries)",
+        output.display(),
+        catalogue.entries.len()
+    );
+    Ok(())
+}
+
+/// `lighthouse restore --catalogue --from <file.json>`: apply a catalogue to
+/// a running node by HLC; its peers converge through anti-entropy.
+async fn run_catalogue_restore(
+    cfg: &Config,
+    url: Option<String>,
+    from: Option<PathBuf>,
+) -> Result<()> {
+    let from =
+        from.ok_or_else(|| anyhow::anyhow!("restore mode requires --from <catalogue path>"))?;
+    let (url, token) = catalogue_target(cfg, url);
+    let catalogue = lighthouse::coordinator::backup::read_catalogue(&from)?;
+    let applied =
+        lighthouse::coordinator::backup::import_catalogue(&url, token.as_deref(), &catalogue)
+            .await?;
+    println!(
+        "catalogue {} applied to {url} ({applied} entries)",
+        from.display()
     );
     Ok(())
 }

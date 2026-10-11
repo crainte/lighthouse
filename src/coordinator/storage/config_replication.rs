@@ -149,11 +149,10 @@ impl Storage {
 
     pub fn put_setting(&self, key: &str, value: &str) -> Result<()> {
         self.transaction(|store| {
-            store
-                .conn
-                .execute("DELETE FROM settings WHERE key = ?", duckdb::params![key])?;
             store.conn.execute(
-                "INSERT INTO settings (key, value) VALUES (?, ?)",
+                "INSERT INTO settings (key, value) VALUES (?, ?)
+                 ON CONFLICT (key) DO UPDATE SET
+                     value = excluded.value, updated_at = NULL, updated_by = NULL",
                 duckdb::params![key, value],
             )?;
             store.sync_config_watermark(ConfigKind::Setting, key)
@@ -176,6 +175,7 @@ impl Storage {
               );
               CREATE TEMP TABLE IF NOT EXISTS config_watermark_touched (kind VARCHAR, id VARCHAR, PRIMARY KEY (kind, id));
               CREATE TEMP TABLE IF NOT EXISTS config_watermark_previous AS SELECT * FROM config_watermark_entries LIMIT 0;
+              CREATE TEMP TABLE IF NOT EXISTS config_watermark_next AS SELECT * FROM config_watermark_entries LIMIT 0;
               CREATE TEMP TABLE IF NOT EXISTS config_watermark_affected (kind VARCHAR, scope_kind INTEGER, scope_region VARCHAR, PRIMARY KEY (kind, scope_kind, scope_region));
               DELETE FROM config_watermark_entries;
              DELETE FROM config_watermarks;
@@ -210,7 +210,7 @@ impl Storage {
             return Ok(());
         }
         self.conn.execute_batch(
-            "DELETE FROM config_watermark_touched; DELETE FROM config_watermark_previous; DELETE FROM config_watermark_affected;",
+            "DELETE FROM config_watermark_touched; DELETE FROM config_watermark_previous; DELETE FROM config_watermark_affected; DELETE FROM config_watermark_next;",
         )?;
         let mut stage = self
             .conn
@@ -222,18 +222,25 @@ impl Storage {
         self.conn.execute_batch(
             "INSERT INTO config_watermark_previous SELECT e.* FROM config_watermark_entries e JOIN config_watermark_touched t USING (kind, id);
              INSERT INTO config_watermark_affected SELECT DISTINCT kind, scope_kind, scope_region FROM config_watermark_previous;
-             DELETE FROM config_watermark_entries WHERE EXISTS (SELECT 1 FROM config_watermark_touched t WHERE t.kind = config_watermark_entries.kind AND t.id = config_watermark_entries.id);
-             INSERT INTO config_watermark_entries
+             INSERT INTO config_watermark_next
              SELECT 'check', c.id::VARCHAR, 'live', 0, '', COALESCE(c.updated_at, 0), COALESCE(c.updated_by, '') FROM checks c JOIN config_watermark_touched t ON t.kind = 'check' AND t.id = c.id::VARCHAR
              UNION ALL SELECT 'section', s.name, 'live', 0, '', COALESCE(s.updated_at, 0), COALESCE(s.updated_by, '') FROM sections s JOIN config_watermark_touched t ON t.kind = 'section' AND t.id = s.name
              UNION ALL SELECT 'setting', s.key, 'live', 0, '', COALESCE(s.updated_at, 0), COALESCE(s.updated_by, '') FROM settings s JOIN config_watermark_touched t ON t.kind = 'setting' AND t.id = s.key
              UNION ALL SELECT 'credential', c.id, 'live', 0, '', COALESCE(c.updated_at, 0), COALESCE(c.updated_by, '') FROM agent_credentials c JOIN config_watermark_touched t ON t.kind = 'credential' AND t.id = c.id
              UNION ALL SELECT 'rollup_policy', p.node_id, 'live', 0, '', COALESCE(p.updated_at, 0), COALESCE(p.updated_by, '') FROM rollup_policy p JOIN config_watermark_touched t ON t.kind = 'rollup_policy' AND t.id = p.node_id
              UNION ALL SELECT x.kind, x.id, 'tombstone', 0, '', x.deleted_at, x.node_id FROM config_tombstones x JOIN config_watermark_touched t USING (kind, id);
-             INSERT INTO config_watermark_entries
+             INSERT INTO config_watermark_next
              SELECT 'check', c.id::VARCHAR, 'live', 1, '', COALESCE(c.updated_at, 0), COALESCE(c.updated_by, '') FROM checks c JOIN config_watermark_touched t ON t.kind = 'check' AND t.id = c.id::VARCHAR WHERE NOT EXISTS (SELECT 1 FROM check_placement_regions r WHERE r.check_id = c.id)
              UNION ALL SELECT 'check', c.id::VARCHAR, 'live', 2, r.region, COALESCE(c.updated_at, 0), COALESCE(c.updated_by, '') FROM checks c JOIN check_placement_regions r ON r.check_id = c.id JOIN config_watermark_touched t ON t.kind = 'check' AND t.id = c.id::VARCHAR
              UNION ALL SELECT 'check', x.id, 'tombstone', 3, '', x.deleted_at, x.node_id FROM config_tombstones x JOIN config_watermark_touched t ON t.kind = 'check' AND t.id = x.id WHERE x.kind = 'check';
+             DELETE FROM config_watermark_entries e
+             WHERE EXISTS (SELECT 1 FROM config_watermark_touched t WHERE t.kind = e.kind AND t.id = e.id)
+               AND NOT EXISTS (SELECT 1 FROM config_watermark_next n
+                               WHERE n.kind = e.kind AND n.id = e.id AND n.origin = e.origin
+                                 AND n.scope_kind = e.scope_kind AND n.scope_region = e.scope_region);
+             INSERT INTO config_watermark_entries SELECT * FROM config_watermark_next
+             ON CONFLICT (kind, id, origin, scope_kind, scope_region) DO UPDATE SET
+                 millis = excluded.millis, node = excluded.node;
              INSERT OR IGNORE INTO config_watermark_affected SELECT DISTINCT e.kind, e.scope_kind, e.scope_region FROM config_watermark_entries e JOIN config_watermark_touched t USING (kind, id);",
         )?;
         let affected = self
@@ -585,11 +592,13 @@ impl Storage {
             ConfigKind::Section => {
                 let s: Section = serde_json::from_str(doc)
                     .map_err(|e| anyhow::anyhow!("malformed section document for {id}: {e}"))?;
-                self.conn
-                    .execute("DELETE FROM sections WHERE name = ?", duckdb::params![id])?;
                 self.conn.execute(
                     "INSERT INTO sections (name, position, collapsed, display, updated_at, updated_by)
-                     VALUES (?, ?, ?, ?, ?, ?)",
+                     VALUES (?, ?, ?, ?, ?, ?)
+                     ON CONFLICT (name) DO UPDATE SET
+                         position = excluded.position, collapsed = excluded.collapsed,
+                         display = excluded.display, updated_at = excluded.updated_at,
+                         updated_by = excluded.updated_by",
                     duckdb::params![
                         s.name,
                         s.position,
@@ -603,11 +612,12 @@ impl Storage {
             ConfigKind::Setting => {
                 let value: String = serde_json::from_str(doc)
                     .map_err(|e| anyhow::anyhow!("malformed setting document for {id}: {e}"))?;
-                self.conn
-                    .execute("DELETE FROM settings WHERE key = ?", duckdb::params![id])?;
                 self.conn.execute(
                     "INSERT INTO settings (key, value, updated_at, updated_by)
-                     VALUES (?, ?, ?, ?)",
+                     VALUES (?, ?, ?, ?)
+                     ON CONFLICT (key) DO UPDATE SET
+                         value = excluded.value, updated_at = excluded.updated_at,
+                         updated_by = excluded.updated_by",
                     duckdb::params![id, value, hlc.millis, hlc.node_id],
                 )?;
             }
@@ -615,14 +625,15 @@ impl Storage {
                 let c: CredentialDoc = serde_json::from_str(doc)
                     .map_err(|e| anyhow::anyhow!("malformed credential document for {id}: {e}"))?;
                 self.conn.execute(
-                    "DELETE FROM agent_credentials WHERE id = ?",
-                    duckdb::params![id],
-                )?;
-                self.conn.execute(
                     "INSERT INTO agent_credentials
                          (id, zone, region, secret_hash, salt, created_at, revoked_at,
                           updated_at, updated_by)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT (id) DO UPDATE SET
+                         zone = excluded.zone, region = excluded.region,
+                         secret_hash = excluded.secret_hash, salt = excluded.salt,
+                         created_at = excluded.created_at, revoked_at = excluded.revoked_at,
+                         updated_at = excluded.updated_at, updated_by = excluded.updated_by",
                     duckdb::params![
                         c.id,
                         c.zone,
@@ -676,7 +687,9 @@ impl Storage {
                     .prepare("DELETE FROM config_tombstones WHERE kind = ? AND id = ?")?;
                 let mut tombstone_inserts = self.conn.prepare(
                     "INSERT INTO config_tombstones (kind, id, deleted_at, node_id)
-                 VALUES (?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT (kind, id) DO UPDATE SET
+                     deleted_at = excluded.deleted_at, node_id = excluded.node_id",
                 )?;
                 entries
                     .iter()
@@ -744,9 +757,6 @@ impl Storage {
                     "DELETE FROM check_placement_regions WHERE check_id = ?",
                     duckdb::params![check_id],
                 )?;
-            }
-            if tombstoned {
-                tombstone_delete.execute(duckdb::params![e.kind.as_str(), e.id])?;
             }
             tombstone_insert.execute(duckdb::params![
                 e.kind.as_str(),
@@ -917,14 +927,23 @@ impl Storage {
 
         let (table, pk) = kind.table_and_pk();
         // Select only a page of ids before projecting documents. The union
-        // keeps live rows and tombstones in the same cursor order.
+        // keeps live rows and tombstones in the same cursor order. A check's
+        // document is its stored `config` column verbatim, so that kind (the
+        // one that grows with the deployment) is projected in the same query
+        // rather than read back per id.
+        let live_doc = if kind == ConfigKind::Check {
+            "config, updated_at, updated_by"
+        } else {
+            "NULL::VARCHAR, NULL::BIGINT, NULL::VARCHAR"
+        };
         let sql = format!(
-            "SELECT id, deleted_at, node_id FROM (\
-                 SELECT {pk}::VARCHAR AS id, NULL::BIGINT AS deleted_at, NULL::VARCHAR AS node_id \
+            "SELECT id, deleted_at, node_id, doc, stamp_at, stamp_by FROM (\
+                 SELECT {pk}::VARCHAR AS id, NULL::BIGINT AS deleted_at, NULL::VARCHAR AS node_id, \
+                        {live_doc} \
                  FROM {table} \
                  UNION ALL \
-                 SELECT id, deleted_at, node_id FROM config_tombstones WHERE kind = ?\
-             ) entries \
+                 SELECT id, deleted_at, node_id, NULL, NULL, NULL FROM config_tombstones WHERE kind = ?\
+             ) entries (id, deleted_at, node_id, doc, stamp_at, stamp_by) \
              WHERE ? IS NULL OR id > ? \
              ORDER BY id \
              LIMIT ?"
@@ -939,19 +958,29 @@ impl Storage {
                         r.get::<_, String>(0)?,
                         r.get::<_, Option<i64>>(1)?,
                         r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
                     ))
                 },
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let mut entries = Vec::with_capacity(rows.len());
-        for (id, deleted_at, node_id) in rows {
+        for (id, deleted_at, node_id, doc, at, by) in rows {
             if let Some(deleted_at) = deleted_at {
                 entries.push(ConfigEntry {
                     kind,
                     id,
                     hlc: Hlc::new(deleted_at, node_id.unwrap_or_default()),
                     document: None,
+                });
+            } else if let Some(document) = doc {
+                entries.push(ConfigEntry {
+                    kind,
+                    id,
+                    hlc: Hlc::new(at.unwrap_or(0), by.unwrap_or_default()),
+                    document: Some(document),
                 });
             } else if let Some(entry) = self.config_entry(kind, &id)? {
                 entries.push(entry);
@@ -960,7 +989,29 @@ impl Storage {
         Ok(entries)
     }
 
-    /// Every entry of a kind, tombstones included, for an anti-entropy sweep.
+    /// The tombstone a delete left for `id`, if any — a point read, so
+    /// replicating one delete never scans a kind's whole history.
+    pub fn config_tombstone(&self, kind: ConfigKind, id: &str) -> Result<Option<ConfigEntry>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT deleted_at, node_id FROM config_tombstones WHERE kind = ? AND id = ?",
+                duckdb::params![kind.as_str(), id],
+                |r| {
+                    Ok(ConfigEntry {
+                        kind,
+                        id: id.to_owned(),
+                        hlc: Hlc::new(r.get(0)?, r.get::<_, String>(1)?),
+                        document: None,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Every entry of a kind, tombstones included. Tests only: production
+    /// reads page through `config_entries_page`.
+    #[cfg(test)]
     pub fn config_entries(&self, kind: ConfigKind) -> Result<Vec<ConfigEntry>> {
         let (table, pk) = kind.table_and_pk();
         let ids: Vec<String> = {

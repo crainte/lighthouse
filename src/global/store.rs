@@ -77,8 +77,12 @@ impl GlobalStore {
     /// identity: config-supplied, or generated once and persisted so a
     /// restart rejoins as itself — the same rule a coordinator's `node_id`
     /// follows, via the same `configplane::load_or_generate`.
-    pub async fn open(db_path: String, configured_node_id: Option<String>) -> Result<Self> {
-        let database = Database::open(db_path).await?;
+    pub async fn open(
+        db_path: String,
+        limits: crate::coordinator::db_limits::DatabaseLimits,
+        configured_node_id: Option<String>,
+    ) -> Result<Self> {
+        let database = Database::open(db_path, limits).await?;
         let node_id = database
             .call(move |storage| {
                 Ok(match configured_node_id {

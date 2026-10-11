@@ -146,6 +146,8 @@ pub struct CoordinatorConfig {
     pub listen: String,
     #[serde(default = "default_db_path")]
     pub db_path: String,
+    #[serde(default)]
+    pub database: DatabaseConfig,
     /// List of notification backends for alerts (webhook, ntfy, etc.).
     #[serde(default)]
     pub notifiers: Vec<Notifier>,
@@ -262,6 +264,11 @@ pub struct CoordinatorConfig {
 
 /// `[coordinator.global]` — a regional coordinator's link up to the global
 /// coordinator. Presence of this block is what turns the push loop on.
+///
+/// Give every coordinator of a region the same block: only the lowest-id
+/// live member publishes, and the others take over only when it dies, so a
+/// member without the block would leave its region unpublished while it is
+/// the lowest id.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GlobalPushConfig {
     /// Base URL of the global coordinator, e.g. `http://global:8080`.
@@ -354,6 +361,8 @@ pub struct GlobalConfig {
     /// `checks` and `sections` (see `global::store`) are ever touched.
     #[serde(default = "default_db_path")]
     pub db_path: String,
+    #[serde(default)]
+    pub database: DatabaseConfig,
     /// Other global nodes to *contact first*, as base URLs. Same contract as
     /// `coordinator.peers`: a seed list, not the membership, and peers
     /// authenticate with `peer_token`. Empty means a standalone global node,
@@ -409,6 +418,7 @@ impl Default for GlobalConfig {
             notifiers: Vec::new(),
             regions: Vec::new(),
             db_path: default_db_path(),
+            database: DatabaseConfig::default(),
             peers: Vec::new(),
             peer_token: None,
             node_id: None,
@@ -551,6 +561,44 @@ impl ProvisionedCredential {
                  for a fixture, or `token_env` naming the variable that holds it",
                 zone = self.zone
             ),
+        }
+    }
+}
+
+/// `[coordinator.database]` / `[global.database]` — DuckDB resource bounds.
+/// Unset values are derived from the container's cgroup limits (see
+/// `coordinator::db_limits`), so a pod's `resources.limits` is respected
+/// without configuration; set them to pin the values explicitly.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DatabaseConfig {
+    /// DuckDB `memory_limit`, e.g. `"2GiB"`. Env: `LIGHTHOUSE_DB_MEMORY_LIMIT`.
+    #[serde(default)]
+    pub memory_limit: Option<String>,
+    /// DuckDB worker threads. Env: `LIGHTHOUSE_DB_THREADS`.
+    #[serde(default)]
+    pub threads: Option<u32>,
+}
+
+impl DatabaseConfig {
+    pub fn resolved_memory_limit(&self) -> Option<String> {
+        self.memory_limit
+            .clone()
+            .or_else(|| std::env::var("LIGHTHOUSE_DB_MEMORY_LIMIT").ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn resolved_threads(&self) -> Result<Option<u32>> {
+        if let Some(threads) = self.threads {
+            return Ok(Some(threads));
+        }
+        match std::env::var("LIGHTHOUSE_DB_THREADS") {
+            Ok(value) if !value.trim().is_empty() => {
+                value.trim().parse().map(Some).map_err(|_| {
+                    anyhow::anyhow!("LIGHTHOUSE_DB_THREADS must be a positive integer")
+                })
+            }
+            _ => Ok(None),
         }
     }
 }
@@ -756,7 +804,7 @@ fn default_global_listen() -> String {
 /// Four push intervals of silence, mirroring the peer/agent "three misses plus
 /// slack" rule: one dropped push must not blank a healthy region.
 fn default_region_staleness_secs() -> u64 {
-    20
+    30
 }
 
 fn default_warn_below() -> f64 {
@@ -1846,6 +1894,7 @@ impl Default for CoordinatorConfig {
         Self {
             listen: default_listen(),
             db_path: default_db_path(),
+            database: DatabaseConfig::default(),
             notifiers: Vec::new(),
             admin_password: None,
             secure_cookies: false,

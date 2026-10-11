@@ -389,33 +389,52 @@ Estimated per-region ceilings (SCALING.md capacity model, extrapolated beyond th
 
 ### DuckDB operational safety
 
-- [ ] Exit on database invalidation. A DuckDB fatal error ("database has been invalidated") currently leaves the coordinator serving 500s indefinitely; detect it in `Database` and exit non-zero so the restart policy recovers and peers backfill the gap.
-- [ ] Bound DuckDB memory and threads, container-aware.
-  - [ ] Derive defaults from the cgroup limit (v2 `memory.max`/`cpu.max`, v1 `memory.limit_in_bytes`/`cpu.cfs_quota_us`), falling back to host totals; apply a fraction of memory to `memory_limit`, leaving headroom for the process itself.
-  - [ ] Allow an explicit override in config and env so Kubernetes manifests can pin it alongside `resources.limits`.
-  - [ ] Log the effective values at startup; test the cgroup parsing against fixture files.
-- [ ] Replace delete-then-reinsert upserts (`upsert_check`, `put_setting`, rollup policies, watermark tables) with `INSERT … ON CONFLICT DO UPDATE`, avoiding DuckDB's history of ART-index faults on same-key delete/insert within one transaction.
+- [x] Exit on database invalidation. A DuckDB fatal error ("database has been invalidated") currently leaves the coordinator serving 500s indefinitely; detect it in `Database` and exit non-zero so the restart policy recovers and peers backfill the gap.
+  `database::is_invalidated` matches `FATAL Error`/`database has been invalidated` on any job error; the worker logs and exits 1.
+- [x] Bound DuckDB memory and threads, container-aware.
+  - [x] Derive defaults from the cgroup limit (v2 `memory.max`/`cpu.max`, v1 `memory.limit_in_bytes`/`cpu.cfs_quota_us`), falling back to host totals; apply a fraction of memory to `memory_limit`, leaving headroom for the process itself.
+    Half of `min(cgroup, MemTotal)`; threads = quota rounded up, else `available_parallelism` (`coordinator::db_limits`).
+  - [x] Allow an explicit override in config and env so Kubernetes manifests can pin it alongside `resources.limits`.
+    `[coordinator.database]`/`[global.database]` `memory_limit`/`threads`, or `LIGHTHOUSE_DB_MEMORY_LIMIT`/`LIGHTHOUSE_DB_THREADS`.
+  - [x] Log the effective values at startup; test the cgroup parsing against fixture files.
+- [x] Replace delete-then-reinsert upserts (`upsert_check`, `put_setting`, rollup policies, watermark tables) with `INSERT … ON CONFLICT DO UPDATE`, avoiding DuckDB's history of ART-index faults on same-key delete/insert within one transaction.
+  Also config documents, tombstones, replicated incidents, placement regions and the watermark rebuilds; set-valued children delete only vanished keys.
 
 ### Read path
 
-- [ ] Page and filter status in SQL. The status handler builds every check's status before slicing the page (`routes/public.rs`), so cost is O(checks) per request regardless of page size.
-- [ ] Page the full config read (`config_entries`) for provisioning and repair so it never holds the database worker for seconds at 100k checks.
-- [ ] Add read-only connections alongside the single writer so reads stop queueing behind ingest.
-  - [ ] Prerequisite: config watermarks are connection-local TEMP tables (P2). Either keep digest reads on the writer connection or move watermarks to persistent derived tables first.
-  - [ ] Measure after the two items above; skip if SQL-side paging alone removes the ceiling.
+- [x] Page and filter status in SQL. The status handler builds every check's status before slicing the page (`routes/public.rs`), so cost is O(checks) per request regardless of page size.
+  Scope/order/paging in SQL; per-check work joins only the staged page (status, strips, latency points); section tiles are one `GROUP BY`. Regional status p95: 157 → 21 ms at 30k checks, 43 ms at 100k.
+- [x] Page the full config read (`config_entries`) for provisioning and repair so it never holds the database worker for seconds at 100k checks.
+  The pull was paged; check documents are now projected in the page query, a delete's tombstone is a point read, and the unpaged read is test-only.
+- [x] Add read-only connections alongside the single writer so reads stop queueing behind ingest.
+  - [x] Prerequisite: config watermarks are connection-local TEMP tables (P2). Either keep digest reads on the writer connection or move watermarks to persistent derived tables first.
+  - [x] Measure after the two items above; skip if SQL-side paging alone removes the ceiling.
+    Skipped by measurement: 43 ms p95 status and 101 ms full page at 100k checks (SCALING.md "Read path").
 
 ### Transport
 
-- [ ] Compress inter-node HTTP (replication, anti-entropy, global push, agent batches). `tower-http` and `flate2` are already in `Cargo.lock`; prefer zstd or gzip negotiated by `Content-Encoding`, and measure bytes and CPU at 10k checks.
-- [ ] Make the region-to-global push incremental: send changed check summaries since the last acknowledged push, with a periodic full snapshot as the repair path. Today every push resends ~2 MB per region at 10k checks.
-- [ ] Stop resending unchanged fleet-presence snapshots.
-- [ ] Re-evaluate protobuf/gRPC only after compression and deltas, and only if transport is still measured as material (SCALING.md "Scaling milestones").
+- [x] Compress inter-node HTTP (replication, anti-entropy, global push, agent batches). `tower-http` and `flate2` are already in `Cargo.lock`; prefer zstd or gzip negotiated by `Content-Encoding`, and measure bytes and CPU at 10k checks.
+  zstd both directions (`http::compressed`, `ZstdJson`). 10k-check snapshot 2.30 MB → 277 KB.
+- [x] Make the region-to-global push incremental: send changed check summaries since the last acknowledged push, with a periodic full snapshot as the repair path. Today every push resends ~2 MB per region at 10k checks.
+  Lowest-id live publisher per region; `epoch`/`seq`/`delta_base` chain with receiver `resync`; snapshot every 12th push. Steady-state delta: ~170 B.
+- [x] Stop resending unchanged fleet-presence snapshots.
+  Sent/persisted only on a material change or after a third of the agent's silence window.
+- [x] Re-evaluate protobuf/gRPC only after compression and deltas, and only if transport is still measured as material (SCALING.md "Scaling milestones").
+  Not material (~170 B per region per push in steady state); not adopted.
 
 ### Raw-result storage evolution
 
 - [ ] Move sealed days of raw results to per-day Parquet files read through DuckDB, so retention becomes deleting a file instead of a large `DELETE`, and current-day writes stay in the live table.
+  Measured, not required yet: ~76 ns per deleted row, and five-minute retention slices stay ≈230 ms at 100k checks × 3 domains. Volume (~390 GB per replica at that scale) is the binding cost, and Parquet would not change it materially (SCALING.md "Raw-result storage evolution").
 - [ ] Optional: ship sealed Parquet days to S3-compatible storage as the archive instead of backing up the live database.
-- [ ] Reframe backup around what is irreplaceable: the config catalogue (checks, sections, settings, credentials, policies). Raw metrics are not backed up; the existing `lighthouse backup` CLI remains for full-node recovery.
+  Skipped with the Parquet item it depends on.
+- [x] Reframe backup around what is irreplaceable: the config catalogue (checks, sections, settings, credentials, policies). Raw metrics are not backed up; the existing `lighthouse backup` CLI remains for full-node recovery.
+  `lighthouse backup --catalogue --output <json>` / `restore --catalogue --from <json>` over the paged config plane, online, HLC-applied.
+
+### P3 follow-ups
+
+- [ ] The global node aggregates every region's checks per `/api/v1/status` request: 241 ms p95 at 100k checks × 3 regions.
+- [ ] Building the global push summary is an O(checks) database job per push interval on the publisher: 396 ms every 5 s at 100k checks.
 
 ## Existing product issues
 

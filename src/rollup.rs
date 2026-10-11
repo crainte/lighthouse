@@ -167,26 +167,38 @@ impl RollupPolicy {
 /// `children` are per-agent states at the zone level, per-zone states at the
 /// region level, and per-region states at the check level.
 pub fn rollup(policy: &RollupPolicy, children: &[NodeState]) -> NodeState {
+    rollup_counts(policy, children.iter().map(|state| (*state, 1)))
+}
+
+/// `rollup` over `(state, how many children are in it)` pairs, so a caller
+/// holding aggregated counts never expands them into one entry per child.
+pub fn rollup_counts(
+    policy: &RollupPolicy,
+    children: impl IntoIterator<Item = (NodeState, usize)>,
+) -> NodeState {
     // Unknown children are excluded from the denominator entirely, not counted
     // as healthy and not counted as failing. This is the single most important
     // property in this file: a silent agent, a decommissioned one, or an
     // unreachable region must never manufacture a phantom outage — nor mask a
     // real one by inflating the healthy count.
-    let known: Vec<NodeState> = children
-        .iter()
-        .copied()
-        .filter(|s| *s != NodeState::Unknown)
-        .collect();
-
-    let n = known.len();
+    let (mut n, mut hard_down, mut failing) = (0, 0, 0);
+    for (state, count) in children {
+        if state == NodeState::Unknown {
+            continue;
+        }
+        n += count;
+        if state == NodeState::Down {
+            hard_down += count;
+        }
+        if state.is_failing() {
+            failing += count;
+        }
+    }
     if n == 0 {
         // Nobody has an opinion. The check reads as its `default_status`,
         // exactly as it does today before the first result arrives.
         return NodeState::Unknown;
     }
-
-    let hard_down = known.iter().filter(|s| **s == NodeState::Down).count();
-    let failing = known.iter().filter(|s| s.is_failing()).count();
 
     if policy.down_when.satisfied(hard_down, n) {
         NodeState::Down

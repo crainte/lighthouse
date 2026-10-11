@@ -25,6 +25,10 @@ pub struct RegionState {
     /// from each push's `advertise_url`.
     pub endpoints: Vec<String>,
     pub origin: String,
+    /// The origin's push chain position, so a delta applies only on top of
+    /// exactly the push it was computed against.
+    pub epoch: i64,
+    pub seq: u64,
     /// Wall-clock millis carried on the push that produced this entry.
     pub pushed_at: i64,
     /// Local receive time, used for staleness so a sender with a skewed clock
@@ -48,6 +52,16 @@ impl RegionState {
             self.health
         }
     }
+}
+
+/// What `apply_push` did with a push.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushOutcome {
+    Applied,
+    /// A snapshot older than what is cached; dropped.
+    Superseded,
+    /// A delta that does not extend the cached chain; send a snapshot.
+    Resync,
 }
 
 /// The cache proper: region name -> its cached state. Guarded by an `RwLock`
@@ -120,6 +134,8 @@ impl GlobalCache {
                         checks: HashMap::new(),
                         endpoints: r.endpoints.clone(),
                         origin: String::new(),
+                        epoch: 0,
+                        seq: 0,
                         pushed_at: 0,
                         // Seeded regions start dark: config declares they exist
                         // and where to reach them, not that they are healthy.
@@ -158,33 +174,57 @@ impl GlobalCache {
         (stale, never_received, oldest_received_at)
     }
 
-    /// Apply one push. Last-writer-wins by `pushed_at`, `origin` breaking a tie,
-    /// so three identical pushes from a region cluster collapse to one entry and
-    /// a delayed push never overwrites a newer one. This is the single mutation
-    /// entrypoint — a future global-to-global replicate handler calls it too.
-    pub fn apply_push(&self, push: RegionStatePush, now: i64) {
+    /// Apply one push. A snapshot is last-writer-wins by `pushed_at`, `origin`
+    /// breaking a tie, so a delayed push never overwrites a newer one. A delta
+    /// applies only on top of exactly the push it names (same origin, epoch
+    /// and `seq == delta_base`); anything else asks the sender to resync with
+    /// a snapshot. This is the single mutation entrypoint.
+    pub fn apply_push(&self, push: RegionStatePush, now: i64) -> PushOutcome {
         let mut guard = self.regions.write();
-        let entry = guard.entry(push.region.clone());
-        use std::collections::hash_map::Entry;
-        match entry {
-            Entry::Occupied(mut slot) => {
-                let cur = slot.get();
-                let stale_or_newer = push.pushed_at > cur.pushed_at
+        if let Some(base) = push.delta_base {
+            let Some(cur) = guard.get_mut(&push.region) else {
+                return PushOutcome::Resync;
+            };
+            if cur.received_at == 0
+                || cur.origin != push.origin
+                || cur.epoch != push.epoch
+                || cur.seq != base
+            {
+                return PushOutcome::Resync;
+            }
+            for id in &push.removed {
+                cur.checks.remove(id);
+            }
+            cur.checks
+                .extend(push.checks.into_iter().map(|c| (c.check_id, c)));
+            merge_endpoint(&mut cur.endpoints, push.advertise_url.as_deref());
+            cur.health = push.region_health;
+            cur.agents_healthy = push.agents_healthy;
+            cur.agents_total = push.agents_total;
+            cur.seq = push.seq;
+            cur.pushed_at = push.pushed_at;
+            cur.received_at = now;
+            return PushOutcome::Applied;
+        }
+        let endpoints = match guard.get(&push.region) {
+            Some(cur) => {
+                let newer = push.pushed_at > cur.pushed_at
                     || (push.pushed_at == cur.pushed_at && push.origin >= cur.origin)
                     || cur.received_at == 0;
-                if !stale_or_newer {
-                    return;
+                if !newer {
+                    return PushOutcome::Superseded;
                 }
-                let mut endpoints = cur.endpoints.clone();
-                merge_endpoint(&mut endpoints, push.advertise_url.as_deref());
-                slot.insert(Self::state_from_push(push, endpoints, now));
+                cur.endpoints.clone()
             }
-            Entry::Vacant(slot) => {
-                let mut endpoints = Vec::new();
-                merge_endpoint(&mut endpoints, push.advertise_url.as_deref());
-                slot.insert(Self::state_from_push(push, endpoints, now));
-            }
-        }
+            None => Vec::new(),
+        };
+        let mut endpoints = endpoints;
+        merge_endpoint(&mut endpoints, push.advertise_url.as_deref());
+        guard.insert(
+            push.region.clone(),
+            Self::state_from_push(push, endpoints, now),
+        );
+        PushOutcome::Applied
     }
 
     fn state_from_push(push: RegionStatePush, endpoints: Vec<String>, now: i64) -> RegionState {
@@ -196,6 +236,8 @@ impl GlobalCache {
             checks,
             endpoints,
             origin: push.origin,
+            epoch: push.epoch,
+            seq: push.seq,
             pushed_at: push.pushed_at,
             received_at: now,
         }
@@ -510,7 +552,59 @@ mod tests {
                     depends_on: Vec::new(),
                 })
                 .collect(),
+            epoch: 1,
+            seq: at as u64,
+            delta_base: None,
+            removed: Vec::new(),
         }
+    }
+
+    #[test]
+    fn deltas_apply_only_on_top_of_the_push_they_extend() {
+        let cache = GlobalCache::new(20, &[]);
+        let mut delta = push("us", "a", 6, NodeState::Down, &[("api", NodeState::Down)]);
+        delta.delta_base = Some(5);
+        delta.removed = vec![id("gone")];
+        assert_eq!(cache.apply_push(delta.clone(), 1_000), PushOutcome::Resync);
+
+        let snapshot = push(
+            "us",
+            "a",
+            5,
+            NodeState::Up,
+            &[
+                ("api", NodeState::Up),
+                ("gone", NodeState::Up),
+                ("kept", NodeState::Up),
+            ],
+        );
+        assert_eq!(cache.apply_push(snapshot, 1_000), PushOutcome::Applied);
+        assert_eq!(cache.apply_push(delta.clone(), 1_001), PushOutcome::Applied);
+        let mut states: Vec<(String, NodeState)> = cache
+            .aggregate(1_001)
+            .into_iter()
+            .map(|c| (c.name, c.state))
+            .collect();
+        states.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            states,
+            vec![
+                ("api".into(), NodeState::Down),
+                ("kept".into(), NodeState::Up)
+            ]
+        );
+
+        // Replaying the same delta, one from another origin, or one from a
+        // restarted sender (new epoch) cannot extend the chain.
+        assert_eq!(cache.apply_push(delta.clone(), 1_002), PushOutcome::Resync);
+        let mut other = delta.clone();
+        other.origin = "b".into();
+        other.delta_base = Some(6);
+        assert_eq!(cache.apply_push(other, 1_002), PushOutcome::Resync);
+        let mut restarted = delta;
+        restarted.epoch = 2;
+        restarted.delta_base = Some(6);
+        assert_eq!(cache.apply_push(restarted, 1_002), PushOutcome::Resync);
     }
 
     #[test]

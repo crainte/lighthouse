@@ -40,14 +40,29 @@ pub struct RegionStatePush {
     pub agents_healthy: u32,
     #[serde(default)]
     pub agents_total: u32,
-    /// One entry per configured, visible check.
+    /// One entry per configured, visible check — or, when `delta_base` is
+    /// set, only the checks whose summary changed since push `delta_base`.
     pub checks: Vec<CheckSummary>,
+    /// The sender's push chain: `epoch` identifies one sender process (its
+    /// cluster generation), `seq` numbers its pushes within it. A delta
+    /// applies only on top of exactly the push it names.
+    #[serde(default)]
+    pub epoch: i64,
+    #[serde(default)]
+    pub seq: u64,
+    /// `Some(base)`: incremental against push `base` of this origin/epoch;
+    /// `None`: a complete snapshot that replaces the region's checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_base: Option<u64>,
+    /// Checks gone since `delta_base`. Empty on a snapshot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed: Vec<CheckId>,
 }
 
 /// A single check's current state within a region. Fields mirror the public
 /// `CheckStatusDto` the dashboard already renders, so the global node can serve
 /// an aggregated `/api/v1/status` without inventing a new frontend contract.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CheckSummary {
     /// Immutable identity. Stable across regions: a check folded into a
     /// global check keeps its id everywhere, which is what lets the global
@@ -88,10 +103,33 @@ pub struct CheckSummary {
     pub depends_on: Vec<CheckId>,
 }
 
+impl CheckSummary {
+    /// Whether `self` differs from `previous` in a way a delta must carry.
+    /// `latency_ms` and `last_check` move on every probe, so they ride the
+    /// periodic snapshot instead; uptime is compared at display precision
+    /// (0.01%) so a slowly-recovering 24h figure does not resend every check
+    /// with a recent outage on every push.
+    pub fn materially_differs(&self, previous: &Self) -> bool {
+        fn material(s: &CheckSummary) -> CheckSummary {
+            CheckSummary {
+                latency_ms: 0,
+                last_check: 0,
+                uptime_24h: s.uptime_24h.map(|u| (u * 10_000.0).round()),
+                ..s.clone()
+            }
+        }
+        material(self) != material(previous)
+    }
+}
+
 /// The global node's acknowledgement of a push. Trivial today; a struct so the
 /// wire format can carry back "and here is who else I know" for global HA later
 /// without changing the sender's expectation of a JSON body.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PushAck {
     pub accepted: bool,
+    /// The receiver could not apply a delta (unknown chain, gap, or a newer
+    /// origin took over); the sender must send a full snapshot next.
+    #[serde(default)]
+    pub resync: bool,
 }

@@ -384,7 +384,7 @@ impl Cluster {
                 let body = &body;
                 async move {
                     let url = Self::endpoint(&peer, "internal/cluster/ping");
-                    let mut req = self.client.post(&url).json(body);
+                    let mut req = crate::http::ZstdJson::zstd_json(self.client.post(&url), body);
                     if let Some(t) = &self.token {
                         req = req.bearer_auth(t);
                     }
@@ -482,6 +482,18 @@ impl Cluster {
             .filter(|m| m.state == MemberState::Alive)
             .map(|m| m.url.clone())
             .collect()
+    }
+
+    /// Whether this node has the lowest id among live members: the one
+    /// deterministic owner of duties that want a single sender per cluster.
+    /// Failover is membership's own: once the owner is swept dead, the next
+    /// lowest takes over without any election.
+    pub fn is_lowest_live(&self) -> bool {
+        self.members
+            .read()
+            .values()
+            .filter(|m| m.state == MemberState::Alive && m.node_id != self.self_id)
+            .all(|m| m.node_id > self.self_id)
     }
 
     /// The full member view, for persistence or the admin API.
@@ -669,6 +681,7 @@ mod tests {
                             ),
                         )
                         .with_state(node.clone());
+                let app = crate::http::compressed(app);
                 tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
                 nodes.push(node);
             }

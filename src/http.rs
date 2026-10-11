@@ -31,6 +31,43 @@ pub fn internal_error(e: anyhow::Error) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
 }
 
+// ---- Inter-node compression ----
+
+/// zstd level for request bodies: the library default, which is the speed
+/// end of the curve and already shrinks repetitive JSON batches ~10x.
+const ZSTD_LEVEL: i32 = 3;
+
+/// Send a JSON body zstd-compressed. Every server in this binary decodes
+/// `Content-Encoding: zstd` (see `compressed`), and responses come back
+/// compressed through reqwest's own Accept-Encoding negotiation.
+pub trait ZstdJson {
+    fn zstd_json<T: Serialize + ?Sized>(self, body: &T) -> Self;
+}
+
+impl ZstdJson for reqwest::RequestBuilder {
+    fn zstd_json<T: Serialize + ?Sized>(self, body: &T) -> Self {
+        let encoded = serde_json::to_vec(body)
+            .map_err(std::io::Error::other)
+            .and_then(|json| zstd::encode_all(json.as_slice(), ZSTD_LEVEL));
+        match encoded {
+            Ok(bytes) => self
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_ENCODING, "zstd")
+                .body(bytes),
+            Err(_) => self.json(body),
+        }
+    }
+}
+
+/// Decode zstd request bodies and zstd-encode responses for clients that
+/// accept it. Body limits still apply to the decoded size, because axum's
+/// limit is enforced where the handler reads the (decompressed) body.
+pub fn compressed<S: Clone + Send + Sync + 'static>(router: axum::Router<S>) -> axum::Router<S> {
+    router
+        .layer(tower_http::compression::CompressionLayer::new())
+        .layer(tower_http::decompression::RequestDecompressionLayer::new())
+}
+
 #[derive(Serialize)]
 pub struct DeletedResponse {
     pub deleted: String,

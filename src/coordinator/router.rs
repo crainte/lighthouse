@@ -149,7 +149,7 @@ pub(in crate::coordinator) use crate::http::{error_response, internal_error, Del
 
 impl Coordinator {
     pub fn router(self) -> Router {
-        Router::new()
+        let router = Router::new()
             .route(
                 "/api/v1/results",
                 post(ingest_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
@@ -395,7 +395,8 @@ impl Coordinator {
             // Admin JSON is deliberately bounded even when unauthenticated: the
             // limit is enforced before handlers parse or authenticate a body.
             .layer(DefaultBodyLimit::max(1024 * 1024))
-            .layer(axum::middleware::from_fn(crate::security::security_headers))
+            .layer(axum::middleware::from_fn(crate::security::security_headers));
+        crate::http::compressed(router)
             .with_state(self)
             .fallback(static_handler)
     }
@@ -404,6 +405,7 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::ZstdJson;
     use crate::{
         config::{CheckConfig, CoordinatorConfig, GlobalConfig},
         global::GlobalNode,
@@ -465,16 +467,24 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let stored = checks.clone();
-        coord
-            .db(move |storage| {
-                for check in &stored {
-                    storage.upsert_check(check, 1)?;
-                }
-                Ok(())
-            })
-            .await
-            .unwrap();
+        // Provisioned the way a config-plane batch lands, a page per
+        // transaction, so a 100k-check setup measures the routes rather than
+        // 100k single-check admin edits.
+        for page in checks.chunks(crate::configplane::CONFIG_BACKFILL_PAGE) {
+            let entries: Vec<_> = page
+                .iter()
+                .map(|check| storage::ConfigEntry {
+                    kind: storage::ConfigKind::Check,
+                    id: check.id.to_string(),
+                    hlc: crate::coordinator::hlc::Hlc::new(1, "benchmark"),
+                    document: Some(serde_json::to_string(check).unwrap()),
+                })
+                .collect();
+            coord
+                .db(move |storage| storage.apply_config_entries(&entries))
+                .await
+                .unwrap();
+        }
         coord.reload_checks().await.unwrap();
         let now = chrono::Utc::now();
         coord
@@ -667,10 +677,12 @@ mod tests {
                 push.origin = format!("node-{region}-{sample}");
                 push.pushed_at += sample as i64 + 1;
                 push_bytes = serde_json::to_vec(&push).unwrap().len();
+                push.epoch = 1;
+                push.seq = sample as u64 + 1;
                 let response = client
                     .post(&push_url)
                     .bearer_auth(token)
-                    .json(&push)
+                    .zstd_json(&push)
                     .send()
                     .await
                     .unwrap();
@@ -678,6 +690,31 @@ mod tests {
                 push_ms.push(started.elapsed().as_millis());
             }
         }
+
+        // What actually crosses the wire per push interval now: the snapshot
+        // zstd-compressed, and a steady-state delta against an acknowledged
+        // snapshot (no state changed, so only the envelope remains).
+        let zstd_len = |push: &crate::global::wire::RegionStatePush| {
+            zstd::encode_all(serde_json::to_vec(push).unwrap().as_slice(), 3)
+                .unwrap()
+                .len()
+        };
+        let mut chain = super::super::global_push::PushChain::new(1);
+        let (snapshot, full) = chain.next(coord.build_state_push().await);
+        let push_zstd_bytes = zstd_len(&snapshot);
+        chain.settle(
+            snapshot.seq,
+            full,
+            Some(crate::global::wire::PushAck {
+                accepted: true,
+                resync: false,
+            }),
+        );
+        let started = Instant::now();
+        let (delta, _) = chain.next(coord.build_state_push().await);
+        let delta_build_ms = started.elapsed().as_millis();
+        assert_eq!(delta.delta_base, Some(snapshot.seq));
+        let push_delta_zstd_bytes = zstd_len(&delta);
 
         let warm = client.get(&global_url).send().await.unwrap();
         assert_eq!(warm.status(), reqwest::StatusCode::OK);
@@ -716,7 +753,7 @@ mod tests {
         assert_ceiling("LIGHTHOUSE_BENCH_MAX_GLOBAL_STATUS_P95_MS", global_p95);
         assert_ceiling("LIGHTHOUSE_BENCH_MAX_PUSH_BYTES", push_bytes as u128);
         println!(
-            "checks={check_count} regions={region_count} samples={sample_count} page_size={page_len} regional_status_p95_ms={regional_p95} regional_status_bytes={regional_bytes} status_page_p95_ms={page_p95} status_page_bytes={page_bytes} status_page_requests=3 status_page_max_p95_ms={page_max_p95} status_page_max_bytes={page_max_bytes} status_page_max_size={max_page_len} global_push_p95_ms={push_p95} push_bytes={push_bytes} global_status_p95_ms={global_p95} global_status_bytes={global_bytes}"
+            "checks={check_count} regions={region_count} samples={sample_count} page_size={page_len} regional_status_p95_ms={regional_p95} regional_status_bytes={regional_bytes} status_page_p95_ms={page_p95} status_page_bytes={page_bytes} status_page_requests=3 status_page_max_p95_ms={page_max_p95} status_page_max_bytes={page_max_bytes} status_page_max_size={max_page_len} global_push_p95_ms={push_p95} push_bytes={push_bytes} push_zstd_bytes={push_zstd_bytes} push_delta_zstd_bytes={push_delta_zstd_bytes} delta_build_ms={delta_build_ms} global_status_p95_ms={global_p95} global_status_bytes={global_bytes}"
         );
     }
 }

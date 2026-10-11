@@ -118,7 +118,12 @@ impl GlobalNode {
         if !auth.admin_enabled() {
             warn!("no admin password set (LIGHTHOUSE_ADMIN_PASSWORD); the admin UI is disabled");
         }
-        let store = store::GlobalStore::open(cfg.db_path.clone(), cfg.resolved_node_id()).await?;
+        let store = store::GlobalStore::open(
+            cfg.db_path.clone(),
+            crate::coordinator::db_limits::DatabaseLimits::resolve(&cfg.database)?,
+            cfg.resolved_node_id(),
+        )
+        .await?;
         let node_id = store.node_id().to_string();
         let cluster = match (cfg.resolved_peer_token(), cfg.resolved_advertise_url()) {
             (Some(token), Some(url)) => {
@@ -410,6 +415,10 @@ mod tests {
             agents_healthy: 1,
             agents_total: 1,
             checks: Vec::new(),
+            epoch: 1,
+            seq: 1,
+            delta_base: None,
+            removed: Vec::new(),
         };
         client
             .post(format!("http://{global_addr}/internal/global/state"))

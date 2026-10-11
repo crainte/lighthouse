@@ -234,6 +234,7 @@ mod incidents;
 mod results;
 mod rollups;
 mod schema;
+mod status;
 #[cfg(test)]
 mod test_support;
 
@@ -245,6 +246,7 @@ pub use incidents::*;
 pub use results::*;
 pub use rollups::*;
 use schema::{verify_schema, SCHEMA_DDL};
+pub use status::*;
 
 impl Storage {
     /// Open (or create) the database at `path` and ensure the schema exists.
@@ -296,22 +298,48 @@ impl Storage {
         // interleaved with DML there is a needless thing to depend on.
         store.prepare_ingest()?;
         store.prepare_config_watermarks()?;
+        store.prepare_status()?;
         Ok(store)
+    }
+
+    /// Apply DuckDB resource bounds and return what DuckDB reports back, so
+    /// the startup log shows the effective values rather than the request.
+    pub fn apply_limits(
+        &self,
+        limits: &crate::coordinator::db_limits::DatabaseLimits,
+    ) -> Result<crate::coordinator::db_limits::DatabaseLimits> {
+        self.conn.execute_batch(&format!(
+            "SET memory_limit = '{}'; SET threads = {};",
+            limits.memory_limit.replace('\'', ""),
+            limits.threads
+        ))?;
+        Ok(self.conn.query_row(
+            "SELECT current_setting('memory_limit'), current_setting('threads')::UINTEGER",
+            [],
+            |row| {
+                Ok(crate::coordinator::db_limits::DatabaseLimits {
+                    memory_limit: row.get(0)?,
+                    threads: row.get(1)?,
+                })
+            },
+        )?)
     }
 
     fn rebuild_stream_watermarks(&self) -> Result<()> {
         self.conn.execute_batch(
-            "DELETE FROM replication_stream_watermarks;
-             INSERT INTO replication_stream_watermarks
-             SELECT 'alerts', COALESCE(MAX(ts_millis), 0), COALESCE(MAX_BY(id, (ts_millis, id)), ''), COUNT(*) FROM alerts;
-             INSERT INTO replication_stream_watermarks
+            "INSERT INTO replication_stream_watermarks
+             SELECT 'alerts', COALESCE(MAX(ts_millis), 0), COALESCE(MAX_BY(id, (ts_millis, id)), ''), COUNT(*) FROM alerts
+             UNION ALL
              SELECT 'incidents', COALESCE(MAX(version_millis), 0),
                     COALESCE(MAX_BY(version_node || chr(0) || id, (version_millis, version_node, id)), ''),
-                    COUNT(*) FROM incidents;
-             INSERT INTO replication_stream_watermarks
-                           SELECT 'incident_tombstones', COALESCE(MAX(deleted_at), 0),
-                     COALESCE(MAX_BY(node_id || chr(0) || id, (deleted_at, node_id, id)), ''),
-                     COUNT(*) FROM incident_tombstones;",
+                    COUNT(*) FROM incidents
+             UNION ALL
+             SELECT 'incident_tombstones', COALESCE(MAX(deleted_at), 0),
+                    COALESCE(MAX_BY(node_id || chr(0) || id, (deleted_at, node_id, id)), ''),
+                    COUNT(*) FROM incident_tombstones
+             ON CONFLICT (stream) DO UPDATE SET
+                 max_millis = excluded.max_millis, max_id = excluded.max_id,
+                 item_count = excluded.item_count;",
         )?;
         Ok(())
     }

@@ -361,15 +361,17 @@ impl Storage {
         if current == desired {
             return Ok(());
         }
-        self.conn.execute(
-            "DELETE FROM incident_checks WHERE incident_id = ? AND source = 'manual'",
-            duckdb::params![incident_id],
+        let mut delete = self.conn.prepare(
+            "DELETE FROM incident_checks WHERE incident_id = ? AND check_id = ? AND source = 'manual'",
         )?;
-        let mut stmt = self.conn.prepare(
+        for check_id in current.difference(&desired) {
+            delete.execute(duckdb::params![incident_id, check_id])?;
+        }
+        let mut insert = self.conn.prepare(
             "INSERT INTO incident_checks (incident_id, check_id, source) VALUES (?, ?, 'manual')",
         )?;
-        for check_id in desired {
-            stmt.execute(duckdb::params![incident_id, check_id])?;
+        for check_id in desired.difference(&current) {
+            insert.execute(duckdb::params![incident_id, check_id])?;
         }
         self.touch_incident(incident_id, chrono::Utc::now().timestamp_millis())
     }
@@ -719,26 +721,53 @@ impl Storage {
                     i.version.node_id,
                 ],
             )?;
-            self.conn.execute(
-                "DELETE FROM incident_checks WHERE incident_id = ?",
-                duckdb::params![i.id],
-            )?;
+            let wanted_checks: std::collections::HashSet<CheckId> =
+                i.checks.iter().map(|(check_id, _)| *check_id).collect();
+            for stale in self
+                .conn
+                .prepare("SELECT check_id FROM incident_checks WHERE incident_id = ?")?
+                .query_map(duckdb::params![i.id], |row| row.get::<_, CheckId>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|check_id| !wanted_checks.contains(check_id))
+            {
+                self.conn.execute(
+                    "DELETE FROM incident_checks WHERE incident_id = ? AND check_id = ?",
+                    duckdb::params![i.id, stale],
+                )?;
+            }
             for (check_id, source) in &i.checks {
                 self.conn.execute(
                     "INSERT INTO incident_checks (incident_id, check_id, source)
-                     VALUES (?, ?, ?)",
+                     VALUES (?, ?, ?)
+                     ON CONFLICT (incident_id, check_id) DO UPDATE SET source = excluded.source",
                     duckdb::params![i.id, check_id, source.as_str()],
                 )?;
             }
-            self.conn.execute(
-                "DELETE FROM incident_updates WHERE incident_id = ?",
-                duckdb::params![i.id],
-            )?;
+            let wanted_updates: std::collections::HashSet<&str> =
+                i.updates.iter().map(|u| u.id.as_str()).collect();
+            for stale in self
+                .conn
+                .prepare("SELECT id FROM incident_updates WHERE incident_id = ?")?
+                .query_map(duckdb::params![i.id], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|id| !wanted_updates.contains(id.as_str()))
+            {
+                self.conn.execute(
+                    "DELETE FROM incident_updates WHERE id = ?",
+                    duckdb::params![stale],
+                )?;
+            }
             for u in &i.updates {
                 self.conn.execute(
                     "INSERT INTO incident_updates
                          (id, incident_id, state, body, author, created_at)
-                      VALUES (?, ?, ?, ?, ?, ?)",
+                      VALUES (?, ?, ?, ?, ?, ?)
+                      ON CONFLICT (id) DO UPDATE SET
+                          incident_id = excluded.incident_id, state = excluded.state,
+                          body = excluded.body, author = excluded.author,
+                          created_at = excluded.created_at",
                     duckdb::params![u.id, i.id, u.state.as_str(), u.body, u.author, u.created_at],
                 )?;
             }

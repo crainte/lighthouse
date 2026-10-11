@@ -2,8 +2,10 @@ pub mod alert;
 pub mod backup;
 pub mod cluster;
 pub mod database;
+pub mod db_limits;
 mod dispatch;
 mod fleet;
+mod global_push;
 pub mod gossip;
 pub mod hlc;
 mod ingest;
@@ -405,7 +407,11 @@ impl Coordinator {
     /// Check definitions are persisted and authoritative. Runtime edits survive
     /// restarts; process configuration never seeds application resources.
     pub async fn new(cfg: &CoordinatorConfig) -> Result<Self> {
-        let database = Database::open(cfg.db_path.clone()).await?;
+        let database = Database::open(
+            cfg.db_path.clone(),
+            db_limits::DatabaseLimits::resolve(&cfg.database)?,
+        )
+        .await?;
         let now = chrono::Utc::now().timestamp_millis();
         let status_agents_seed = cfg.status_page.agents.clone();
         let notifiers_seed = cfg.notifiers.clone();
@@ -750,197 +756,6 @@ impl Coordinator {
         });
     }
 
-    /// Push this coordinator's state summary to the global coordinator on a
-    /// timer. A no-op when no `[coordinator.global]` block is configured, so
-    /// this runs harmlessly in every mode that serves — like `spawn_cluster`.
-    ///
-    /// Best-effort like gossip: a failed push is logged and the next tick tries
-    /// again. The global node keeps last-writer-wins, so a missed push costs at
-    /// most one interval of staleness, never correctness.
-    pub fn spawn_global_push(&self) {
-        let Some((url, token, push_secs)) = self.inner.global_push.clone() else {
-            return;
-        };
-        let coord = self.clone();
-        // A global node that accepts the connection and never answers — or one
-        // whose address resolves somewhere that silently drops packets, which
-        // is what a half-created container looks like — would otherwise hold
-        // this loop on its first iteration forever. Nothing would notice: the
-        // region stops appearing on the global dashboard and logs nothing at
-        // all, which reads exactly like "no region has pushed yet". Bound the
-        // attempt to under the push interval so a dark global costs one
-        // warning per tick and recovers on its own when it returns.
-        let attempt_timeout = std::time::Duration::from_secs(push_secs).mul_f32(0.8);
-        let client = match reqwest::Client::builder().timeout(attempt_timeout).build() {
-            Ok(client) => client,
-            Err(error) => {
-                warn!(%error, "global push: failed to build HTTP client");
-                return;
-            }
-        };
-        let endpoint = format!("{}/internal/global/state", url.trim_end_matches('/'));
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(push_secs));
-            // A slow push must delay the next tick, not queue a burst of
-            // catch-up pushes carrying the same snapshot.
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tick.tick().await;
-                let push = coord.build_state_push().await;
-                match client
-                    .post(&endpoint)
-                    .bearer_auth(&token)
-                    .json(&push)
-                    .send()
-                    .await
-                {
-                    Ok(r) if r.status().is_success() => {}
-                    Ok(r) => warn!(status = %r.status(), "global push rejected"),
-                    Err(e) => warn!(error = %e, "global push failed"),
-                }
-            }
-        });
-    }
-
-    /// Build the summary of every configured, visible check for a global push.
-    /// Reuses the same status source the public `/api/v1/status` reads, so the
-    /// global dashboard shows exactly what a regional dashboard would.
-    async fn build_state_push(&self) -> crate::global::wire::RegionStatePush {
-        use crate::global::cache::worst;
-        use crate::global::wire::{CheckSummary, RegionStatePush};
-
-        let now = chrono::Utc::now().timestamp_millis();
-        let (rows, confirmed, polls) = self
-            .db(move |storage| {
-                Ok((
-                    storage.list_status(now),
-                    storage.list_current_state(),
-                    storage.list_agent_polls().unwrap_or_default(),
-                ))
-            })
-            .await
-            .unwrap_or_else(|error| {
-                warn!(%error, "global push database read failed");
-                (Ok(Vec::new()), Ok(Vec::new()), Vec::new())
-            });
-        let confirmed: std::collections::HashMap<crate::models::CheckId, NodeState> = confirmed
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| (r.check_id, r.state))
-            .collect();
-        let by_id = self.inner.checks.read();
-        let mut summaries: Vec<CheckSummary> = Vec::new();
-        let mut reported: std::collections::HashSet<crate::models::CheckId> =
-            std::collections::HashSet::new();
-        for r in rows.unwrap_or_default() {
-            let Some(meta) = by_id.get(&r.check_id) else {
-                continue;
-            };
-            if !meta.visible {
-                continue;
-            }
-            reported.insert(r.check_id);
-            summaries.push(CheckSummary {
-                check_id: r.check_id,
-                name: meta.name.clone(),
-                state: r.state,
-                latency_ms: r.latency_ms,
-                last_check: r.last_check,
-                uptime_24h: Some(r.uptime_24h),
-                status_code: r.status_code,
-                // The raw error is redacted from the public page; the global
-                // push carries only the safe category the failure implies.
-                error: r.failure.map(|f| f.summary()),
-                kind: Some(meta.kind),
-                group: meta.group.clone(),
-                latency_graph: meta.latency_graph,
-                position: meta.position,
-                depends_on: meta.depends_on.clone(),
-            });
-        }
-        // Configured-but-unreported checks still belong on the global page,
-        // carrying whatever confirmed state gossip supplied, else their default.
-        for (id, meta) in by_id.iter() {
-            if !meta.visible || reported.contains(id) {
-                continue;
-            }
-            summaries.push(CheckSummary {
-                check_id: *id,
-                name: meta.name.clone(),
-                state: confirmed
-                    .get(id)
-                    .copied()
-                    .unwrap_or_else(|| meta.default_status.into()),
-                latency_ms: 0,
-                last_check: 0,
-                uptime_24h: None,
-                status_code: None,
-                error: None,
-                kind: Some(meta.kind),
-                group: meta.group.clone(),
-                latency_graph: meta.latency_graph,
-                position: meta.position,
-                depends_on: meta.depends_on.clone(),
-            });
-        }
-        let region_health = summaries
-            .iter()
-            .fold(NodeState::Unknown, |acc, c| worst(acc, c.state));
-        // Truthful agent counts for this region: an agent is healthy when its
-        // last contact is inside its own silence window. The global status page
-        // shows these instead of pretending a region is one agent.
-        //
-        // Local `seen` alone undercounts in a cluster — an agent polling a peer
-        // coordinator is invisible here until fleet gossip lands it in the
-        // persisted `agent_polls` twin. Union both sources (an agent healthy in
-        // either is healthy), matching how `fleet_health` builds the same view,
-        // so every US coordinator reports the whole region's 3 agents, not just
-        // the ones it personally serves.
-        let (agents_healthy, agents_total) = {
-            let region = self.inner.region.as_str();
-            let mut merged: std::collections::HashMap<String, bool> =
-                std::collections::HashMap::new();
-            {
-                let seen = self.inner.seen.read();
-                for (id, a) in seen.iter() {
-                    if a.region != region {
-                        continue;
-                    }
-                    let healthy = now.saturating_sub(a.at) <= a.window_ms;
-                    merged
-                        .entry(id.clone())
-                        .and_modify(|h| *h = *h || healthy)
-                        .or_insert(healthy);
-                }
-            }
-            {
-                for p in polls {
-                    if p.region != region {
-                        continue;
-                    }
-                    let healthy = now.saturating_sub(p.at) <= p.window_ms;
-                    merged
-                        .entry(p.agent_id)
-                        .and_modify(|h| *h = *h || healthy)
-                        .or_insert(healthy);
-                }
-            }
-            let total = merged.len() as u32;
-            let healthy = merged.values().filter(|h| **h).count() as u32;
-            (healthy, total)
-        };
-        RegionStatePush {
-            region: self.inner.region.clone(),
-            origin: self.inner.node_id.clone(),
-            advertise_url: self.inner.advertise_url.clone(),
-            pushed_at: now,
-            region_health,
-            agents_healthy,
-            agents_total,
-            checks: summaries,
-        }
-    }
-
     /// Persist who is polling this node, and tell the peers.
     ///
     /// `Inner::seen` is a node-local map written only by `agent_checks_handler`,
@@ -962,9 +777,10 @@ impl Coordinator {
         let interval = self.inner.gossip_interval_secs;
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval));
+            let mut sent = std::collections::HashMap::<String, storage::AgentPollRow>::new();
             loop {
                 tick.tick().await;
-                let snapshot: Vec<storage::AgentPollRow> = coord
+                let current: Vec<storage::AgentPollRow> = coord
                     .inner
                     .seen
                     .read()
@@ -986,9 +802,24 @@ impl Coordinator {
                             .map(|ks| ks.iter().map(|k| k.as_db()).collect::<Vec<_>>().join(",")),
                     })
                     .collect();
+                let present: std::collections::HashSet<&str> =
+                    current.iter().map(|row| row.agent_id.as_str()).collect();
+                sent.retain(|agent_id, _| present.contains(agent_id.as_str()));
+                let snapshot: Vec<storage::AgentPollRow> = current
+                    .into_iter()
+                    .filter(|row| {
+                        sent.get(&row.agent_id)
+                            .is_none_or(|prev| row.supersedes(prev))
+                    })
+                    .collect();
                 if snapshot.is_empty() {
                     continue;
                 }
+                sent.extend(
+                    snapshot
+                        .iter()
+                        .map(|row| (row.agent_id.clone(), row.clone())),
+                );
                 let persisted = snapshot.clone();
                 if let Err(error) = coord
                     .db(move |storage| {
@@ -1020,12 +851,14 @@ impl Coordinator {
     /// Start the retention job: prune once at startup, then once a day. Runs
     /// beside ingest on its own task; a failed prune is logged and the
     /// schedule continues rather than taking the server down.
-    /// How many jobs a day's raw-result delete is cut into. The database worker
-    /// runs one job at a time, so the whole deletion in one job is the whole
-    /// deletion in one stall: every probe result and every dashboard read waits
-    /// behind it. Slicing does not make retention cheaper, it makes it
-    /// interruptible — the other work in the queue runs between slices.
-    const RETENTION_SLICES: i64 = 24;
+    /// The time range one raw-result delete job covers. The database worker
+    /// runs one job at a time, so a whole day's deletion in one job is one
+    /// stall every probe result and dashboard read waits behind. Slicing does
+    /// not make retention cheaper, it makes it interruptible. Five minutes
+    /// keeps a slice near DuckDB's measured ~76 ns per deleted row × 3M rows
+    /// ≈ 230 ms even at 100k checks × 3 domains × 30 s cadence (SCALING.md
+    /// "Raw-result storage evolution"), and costs only 288 small jobs a day.
+    const RETENTION_SLICE_MS: i64 = 5 * 60_000;
 
     /// Raw results first, in slices, then everything else in one job. Each
     /// slice is a complete, committed deletion of a time range, so an
@@ -1042,11 +875,21 @@ impl Coordinator {
         let mut removed = 0u64;
         if let Some(oldest) = self.db(|storage| storage.oldest_result_ts()).await? {
             if oldest < cutoff {
-                let step = ((cutoff - oldest) / Self::RETENTION_SLICES).max(3_600_000);
+                let step = Self::RETENTION_SLICE_MS;
                 let mut edge = oldest.saturating_add(step);
                 while edge < cutoff {
-                    removed += self.db(move |storage| storage.prune_results(edge)).await?;
-                    edge = edge.saturating_add(step);
+                    let sliced = self.db(move |storage| storage.prune_results(edge)).await?;
+                    removed += sliced;
+                    // An empty slice means a gap in history: jump to the next
+                    // retained row rather than walking empty five-minute steps.
+                    let next = if sliced == 0 {
+                        self.db(|storage| storage.oldest_result_ts())
+                            .await?
+                            .map_or(cutoff, |oldest| oldest.max(edge))
+                    } else {
+                        edge
+                    };
+                    edge = next.saturating_add(step);
                 }
                 removed += self
                     .db(move |storage| storage.prune_results(cutoff))

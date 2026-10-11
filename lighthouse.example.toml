@@ -26,6 +26,15 @@ max_in_flight_probes = 128
 listen = "0.0.0.0:8080"
 db_path = "lighthouse.duckdb"
 
+# DuckDB resource bounds. Unset values derive from the container's cgroup
+# limits (half the memory limit, CPU quota rounded up), falling back to host
+# totals; the effective values are logged at startup. Pin them to match a
+# Kubernetes `resources.limits`, here or via LIGHTHOUSE_DB_MEMORY_LIMIT /
+# LIGHTHOUSE_DB_THREADS. The same block is accepted as [global.database].
+# [coordinator.database]
+# memory_limit = "2GiB"
+# threads = 2
+
 # Fleet-wide defaults for region-tree alert handling. A check can override any
 # of these optional fields below. `min_incident_secs` holds a non-UP rollup
 # before opening an incident; `min_recovery_secs` holds an UP rollup before
@@ -165,7 +174,7 @@ degraded_is_downtime = false
 # [global]
 # listen = "0.0.0.0:8080"
 # token_env = "LIGHTHOUSE_GLOBAL_TOKEN"    # required: the shared push secret
-# region_staleness_secs = 20           # a region silent this long reads as dark
+# region_staleness_secs = 30           # a region silent this long reads as dark
 #
 # Cross-region alerting. Empty (the default) means the global node never pages:
 # the regions already alert, and double-paging is the failure mode to avoid.

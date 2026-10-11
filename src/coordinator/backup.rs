@@ -240,6 +240,110 @@ pub fn restore(backup_path: &Path, destination: &Path) -> Result<RestoreReport> 
     })
 }
 
+/// The irreplaceable part of a deployment: every config entry (checks,
+/// sections, settings, credentials, rollup policies, and their tombstones)
+/// in the same HLC-stamped form the config plane replicates. Raw metrics are
+/// deliberately absent; peers and rollups rebuild history, an operator cannot
+/// rebuild a catalogue. Credential entries carry only salted hashes, but the
+/// file still grants agent access to whoever holds it: store it like a secret.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Catalogue {
+    pub lighthouse_version: String,
+    pub git_sha: String,
+    pub created_at_millis: i64,
+    pub source_url: String,
+    pub entries: Vec<super::storage::ConfigEntry>,
+}
+
+/// Node identity is per process, never part of the shared catalogue.
+fn is_catalogue_entry(entry: &super::storage::ConfigEntry) -> bool {
+    !(entry.kind == super::storage::ConfigKind::Setting && entry.id == super::NODE_ID_KEY)
+}
+
+/// Read the catalogue from a running node through its paged config pull
+/// (`GET /internal/config`), so taking one needs no downtime and never holds
+/// the node's database worker for longer than one page.
+pub async fn export_catalogue(base_url: &str, peer_token: Option<&str>) -> Result<Catalogue> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/internal/config", base_url.trim_end_matches('/'));
+    let mut entries = Vec::new();
+    for kind in super::storage::ConfigKind::ALL {
+        crate::configplane::backfill_config_kind(&client, &url, peer_token, kind, |page| {
+            entries.extend(page.into_iter().filter(is_catalogue_entry));
+            std::future::ready(Ok(()))
+        })
+        .await
+        .with_context(|| format!("reading {} entries from {url}", kind.as_str()))?;
+    }
+    let build = crate::version::current();
+    Ok(Catalogue {
+        lighthouse_version: build.version.clone(),
+        git_sha: build.git_sha.clone(),
+        created_at_millis: chrono::Utc::now().timestamp_millis(),
+        source_url: base_url.to_string(),
+        entries,
+    })
+}
+
+/// Push a catalogue into a running node through the config plane's own
+/// `POST /internal/config`. Entries apply by HLC like any replicated edit, so
+/// importing into a populated node never overwrites a newer edit, a replay is
+/// harmless, and the node's peers converge on it through anti-entropy.
+pub async fn import_catalogue(
+    base_url: &str,
+    peer_token: Option<&str>,
+    catalogue: &Catalogue,
+) -> Result<usize> {
+    use crate::http::ZstdJson;
+    let client = reqwest::Client::new();
+    let url = format!("{}/internal/config", base_url.trim_end_matches('/'));
+    let entries: Vec<_> = catalogue
+        .entries
+        .iter()
+        .filter(|entry| is_catalogue_entry(entry))
+        .cloned()
+        .collect();
+    for chunk in entries.chunks(crate::configplane::CONFIG_BACKFILL_PAGE) {
+        let batch = crate::configplane::ConfigBatch {
+            origin: "catalogue-restore".into(),
+            entries: chunk.to_vec(),
+        };
+        let mut req = client.post(&url).zstd_json(&batch);
+        if let Some(token) = peer_token {
+            req = req.bearer_auth(token);
+        }
+        req.send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .with_context(|| format!("applying catalogue page to {url}"))?;
+    }
+    Ok(entries.len())
+}
+
+/// Write a catalogue to a new file; like a database backup, a generation is
+/// immutable once written.
+pub fn write_catalogue(catalogue: &Catalogue, destination: &Path) -> Result<()> {
+    if destination.exists() {
+        bail!(
+            "catalogue destination {} already exists; choose a new path per generation",
+            destination.display()
+        );
+    }
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating backup directory {}", parent.display()))?;
+    }
+    std::fs::write(destination, serde_json::to_vec_pretty(catalogue)?)
+        .with_context(|| format!("writing {}", destination.display()))
+}
+
+pub fn read_catalogue(source: &Path) -> Result<Catalogue> {
+    serde_json::from_slice(
+        &std::fs::read(source).with_context(|| format!("reading {}", source.display()))?,
+    )
+    .with_context(|| format!("parsing catalogue {}", source.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

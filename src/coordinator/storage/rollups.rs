@@ -314,7 +314,8 @@ impl Storage {
     ) -> Result<BTreeMap<CheckId, Vec<LatencyPoint>>> {
         let buckets = buckets.max(1);
         let bucket_ms = ((to - from) / buckets as i64).max(1);
-        let wanted: std::collections::HashSet<CheckId> = checks.iter().copied().collect();
+        let staged: Vec<(CheckId, bool)> = checks.iter().map(|id| (*id, false)).collect();
+        self.stage_check_ids(&staged)?;
 
         let mut folded: BTreeMap<CheckId, SegmentCounts> = BTreeMap::new();
         let source = Self::latency_source_sql(from, to);
@@ -322,6 +323,7 @@ impl Storage {
             "SELECT check_id, ((ts_millis - ? - 1) // ?)::BIGINT AS idx,
                     SUM(attempts), SUM(up), COALESCE(SUM(latency_sum), 0)
              FROM ({source}) observations
+             WHERE check_id IN (SELECT check_id FROM status_check_ids)
              GROUP BY 1, 2"
         ))?;
         let rows = stmt.query_map(duckdb::params![from, bucket_ms], |row| {
@@ -335,9 +337,6 @@ impl Storage {
         })?;
         for row in rows {
             let (check_id, index, attempts, up, sum_ms) = row?;
-            if !wanted.contains(&check_id) {
-                continue;
-            }
             let entry = folded
                 .entry(check_id)
                 .or_insert_with(|| SegmentCounts::new(buckets));

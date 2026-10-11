@@ -1,3 +1,4 @@
+use super::db_limits::DatabaseLimits;
 use super::storage::Storage;
 use anyhow::{anyhow, Result};
 use std::future::Future;
@@ -18,6 +19,15 @@ const TIMING_REPORT_EVERY: u64 = 128;
 const SLOW_CALL: std::time::Duration = std::time::Duration::from_millis(250);
 
 type Job = Box<dyn FnOnce(&Storage) + Send + 'static>;
+
+/// DuckDB invalidates the whole database instance after a fatal error and
+/// fails every later statement, so continuing only serves errors forever.
+/// Exiting lets the restart policy reopen it from the WAL and peers backfill
+/// whatever the restart window missed.
+fn is_invalidated(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    message.contains("database has been invalidated") || message.contains("FATAL Error")
+}
 
 #[derive(Default)]
 struct TimingCounter {
@@ -98,7 +108,7 @@ pub struct Database {
 }
 
 impl Database {
-    pub async fn open(path: String) -> Result<Self> {
+    pub async fn open(path: String, limits: DatabaseLimits) -> Result<Self> {
         let (tx, mut rx) = mpsc::channel::<Job>(QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = oneshot::channel();
         let timings = Arc::new(Timings {
@@ -111,7 +121,16 @@ impl Database {
         std::thread::Builder::new()
             .name("lighthouse-database".to_string())
             .spawn(move || {
-                let storage = match Storage::open(&path) {
+                let opened = Storage::open(&path).and_then(|storage| {
+                    let effective = storage.apply_limits(&limits)?;
+                    tracing::info!(
+                        memory_limit = %effective.memory_limit,
+                        threads = effective.threads,
+                        "DuckDB resource limits"
+                    );
+                    Ok(storage)
+                });
+                let storage = match opened {
                     Ok(storage) => {
                         let _ = ready_tx.send(Ok(()));
                         storage
@@ -239,8 +258,12 @@ impl Database {
                     elapsed.as_micros().min(u64::MAX as u128) as u64,
                     Ordering::Relaxed,
                 );
-                if result.is_err() {
+                if let Err(error) = &result {
                     metrics.query_errors_total.fetch_add(1, Ordering::Relaxed);
+                    if is_invalidated(error) {
+                        tracing::error!(caller = %caller, "DuckDB database invalidated, exiting for restart: {error:#}");
+                        std::process::exit(1);
+                    }
                 }
                 if timings.enabled {
                     timings.operation.observe("call", elapsed);
@@ -272,7 +295,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn slow_database_work_does_not_block_tokio() {
-        let database = Database::open(":memory:".to_string()).await.unwrap();
+        let database = Database::open(
+            ":memory:".to_string(),
+            DatabaseLimits::resolve(&Default::default()).unwrap(),
+        )
+        .await
+        .unwrap();
         let (started_tx, started_rx) = oneshot::channel();
         let slow = tokio::spawn({
             let database = database.clone();
@@ -300,9 +328,25 @@ mod tests {
         slow.await.unwrap();
     }
 
+    #[test]
+    fn fatal_duckdb_errors_are_recognised_as_invalidation() {
+        assert!(is_invalidated(&anyhow!(
+            "FATAL Error: Failed to create checkpoint because of error: disk full"
+        )));
+        assert!(is_invalidated(&anyhow!("Invalid Input Error: database has been invalidated because of a previous fatal error").context("recording results")));
+        assert!(!is_invalidated(&anyhow!(
+            "Constraint Error: Duplicate key \"id: 1\" violates primary key constraint"
+        )));
+    }
+
     #[tokio::test]
     async fn query_metrics_include_duration_errors_and_file_sizes() {
-        let database = Database::open(":memory:".to_string()).await.unwrap();
+        let database = Database::open(
+            ":memory:".to_string(),
+            DatabaseLimits::resolve(&Default::default()).unwrap(),
+        )
+        .await
+        .unwrap();
         database.call(|_| Ok(())).await.unwrap();
         assert!(database
             .call::<(), _>(|_| Err(anyhow!("expected")))
@@ -328,7 +372,12 @@ mod tests {
     /// moves.
     #[tokio::test(flavor = "current_thread")]
     async fn queue_depth_reflects_backlog_behind_a_slow_job() {
-        let database = Database::open(":memory:".to_string()).await.unwrap();
+        let database = Database::open(
+            ":memory:".to_string(),
+            DatabaseLimits::resolve(&Default::default()).unwrap(),
+        )
+        .await
+        .unwrap();
         let (started_tx, started_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel::<()>();
         let slow = tokio::spawn({

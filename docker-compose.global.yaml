@@ -332,7 +332,7 @@ configs:
       listen = "0.0.0.0:8080"
       db_path = "/data/lighthouse.duckdb"
       token_env = "LIGHTHOUSE_GLOBAL_TOKEN"
-      region_staleness_secs = 20
+      region_staleness_secs = 30
       node_id = "global-a"
       advertise_url = "http://global-a:8080"
       peers = ["http://global-b:8080"]
@@ -358,7 +358,7 @@ configs:
       listen = "0.0.0.0:8080"
       db_path = "/data/lighthouse.duckdb"
       token_env = "LIGHTHOUSE_GLOBAL_TOKEN"
-      region_staleness_secs = 20
+      region_staleness_secs = 30
       node_id = "global-b"
       advertise_url = "http://global-b:8080"
       peers = ["http://global-c:8080"]
@@ -384,7 +384,7 @@ configs:
       listen = "0.0.0.0:8080"
       db_path = "/data/lighthouse.duckdb"
       token_env = "LIGHTHOUSE_GLOBAL_TOKEN"
-      region_staleness_secs = 20
+      region_staleness_secs = 30
       node_id = "global-c"
       advertise_url = "http://global-c:8080"
       peers = ["http://global-a:8080"]

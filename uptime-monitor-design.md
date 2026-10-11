@@ -1905,10 +1905,13 @@ Deferred from Phase 3, tracked here so it isn't lost:
 - [x] Add at least a second regional cluster. `docker-compose.global.yaml` runs
       a 3-node `us` cluster (`:9001`–`:9003`) alongside a single-node `tw`
       region (`:9004`), leaving the Stage A Compose files untouched.
-- [x] State push from regional coordinators to a global coordinator. Any
-      coordinator with a `[coordinator.global]` block POSTs a summary (no raw
-      data) to `/internal/global/state` every `push_secs`; see
-      `Coordinator::spawn_global_push` and `global::wire::RegionStatePush`.
+- [x] State push from regional coordinators to a global coordinator. The
+      lowest-id live coordinator of a region with a `[coordinator.global]`
+      block POSTs a zstd-compressed summary (no raw data) to
+      `/internal/global/state` every `push_secs`: a delta of materially changed
+      checks against the last acknowledged push, with a full snapshot every
+      twelfth push and whenever the global node answers `resync`; see
+      `coordinator::global_push` and `global::wire::RegionStatePush`.
 - [x] Global state cache and cross-region tree consumption. `global::cache`
       keeps the latest push per region (last-writer-wins), aggregates checks
       cross-region (worst live region wins), and drops regions past the
