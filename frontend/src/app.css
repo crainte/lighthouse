@@ -1375,6 +1375,30 @@ button.link:hover {
 /* Full-bleed console: the sidebar runs the height of the viewport rather than
    sitting inside the status page's reading column. */
 .app.admin-app {
+  --ad-bg: #080f19;
+  --ad-panel: #101b29;
+  --ad-panel-2: #152334;
+  --ad-line: #223247;
+  --ad-line-soft: #1b2b3d;
+  --ad-text: #e8eff5;
+  --ad-dim: #a0afc0;
+  --ad-faint: #8a9aad;
+  --ad-cyan: #83b8ce;
+  --ad-green: #56c9a1;
+  --ad-amber: #e7b66b;
+  --ad-red: #ee8389;
+  --bg: var(--ad-bg);
+  --bg-elev: var(--ad-panel);
+  --bg-hover: var(--ad-panel-2);
+  --border: var(--ad-line);
+  --text: var(--ad-text);
+  --text-dim: var(--ad-dim);
+  --accent: var(--ad-cyan);
+  --up: var(--ad-green);
+  --down: var(--ad-red);
+  --unknown: var(--ad-faint);
+  --amber: var(--ad-amber);
+  font-variant-numeric: tabular-nums;
   max-width: none;
   margin: 0;
   padding: 0;
@@ -1385,7 +1409,7 @@ button.link:hover {
   /* minmax(0, 1fr) is load-bearing: a grid track defaults to min-content, and
      one long probe target would otherwise push the whole console sideways
      instead of ellipsing inside its cell. */
-  grid-template-columns: 240px minmax(0, 1fr);
+  grid-template-columns: 216px minmax(0, 1fr);
   gap: 0;
   align-items: stretch;
   min-height: 100vh;
@@ -1398,8 +1422,8 @@ button.link:hover {
   display: flex;
   flex-direction: column;
   gap: 0.35rem;
-  padding: 1rem 0.75rem 1rem;
-  background: var(--ad-bg);
+  padding: 1.5rem 1rem 1rem;
+  background: #0a121e;
   border-right: 1px solid var(--ad-line);
   position: sticky;
   top: 0;
@@ -1414,6 +1438,7 @@ button.link:hover {
   gap: 0.5rem;
   padding: 0.25rem 0.5rem 0.9rem;
 }
+.admin-app :focus-visible { outline: 2px solid var(--ad-cyan); outline-offset: 3px; }
 .nav-brand .brand-dot {
   width: 8px;
   height: 8px;
@@ -1481,8 +1506,8 @@ button.link:hover {
 /* Active = filled, brighter, and a left accent bar. The bar is what makes the
    current area findable at a glance in a nine-item list. */
 .admin-nav-item.active {
-  background: #16303a;
-  color: #a9e9f2;
+  background: #142c32;
+  color: #b5e7db;
   font-weight: 500;
 }
 .admin-nav-item.active::before {
@@ -1538,7 +1563,7 @@ button.link:hover {
 }
 .nav-status.open .dot {
   background: var(--ad-green);
-  box-shadow: 0 0 7px rgba(63, 185, 80, 0.7);
+  box-shadow: none;
 }
 .nav-status.connecting .dot {
   background: var(--ad-amber);
@@ -1819,13 +1844,14 @@ button.ot-id:hover {
   border-color: #2a343a;
 }
 .admin-app .btn.primary {
-  background: rgba(86, 212, 228, 0.12);
-  border-color: rgba(86, 212, 228, 0.4);
-  color: #8ae4ef;
+  background: #c5e3de;
+  border-color: #c5e3de;
+  color: #122b2c;
   font-weight: 500;
 }
 .admin-app .btn.primary:hover:not(:disabled) {
-  background: rgba(86, 212, 228, 0.2);
+  background: #e1f1ed;
+  color: #122b2c;
 }
 .admin-app .btn.danger {
   color: #ff8078;
@@ -1845,17 +1871,17 @@ button.ot-id:hover {
   margin-bottom: 1rem;
 }
 .admin-app .panel-title {
-  font-size: 0.63rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--ad-dim);
+  font-size: 14px;
+  font-weight: 550;
+  text-transform: none;
+  letter-spacing: -0.01em;
+  color: var(--ad-text);
   margin-bottom: 0.8rem;
 }
 .admin-app .admin-panel input,
 .admin-app .admin-panel select,
 .admin-app .admin-panel textarea {
-  background: #0c1013;
+  background: #0b1520;
   border: 1px solid var(--ad-line);
   border-radius: 6px;
   font-size: 0.84rem;
@@ -1867,8 +1893,9 @@ button.ot-id:hover {
   border-color: rgba(86, 212, 228, 0.55);
 }
 .admin-app .field-label {
-  font-size: 0.63rem;
-  letter-spacing: 0.08em;
+  font-size: 12px;
+  letter-spacing: 0;
+  text-transform: none;
   color: var(--ad-dim);
 }
 
@@ -1893,3 +1920,30 @@ button.ot-id:hover {
     padding: 1.1rem 1rem 3rem;
   }
 }
+.console-page-title { display: flex; align-items: center; gap: 12px; }
+.console-page-icon { color: var(--ad-cyan); background: var(--ad-panel); border: 1px solid var(--ad-line); border-radius: 8px; padding: 9px; }
+.admin-app .page-head { margin: 8px 0 24px; }
+.admin-app .page-head h2 { font-weight: 550; font-size: 26px; }
+.admin-app .page-meta { margin: 10px 0 0; line-height: 1.6; max-width: 75ch; }
+.admin-app strong { font-weight: 550; }
+.admin-app .btn { min-height: 34px; }
+.admin-app .stat-grid { gap: 0; border: 1px solid var(--ad-line); border-radius: 9px; overflow: hidden; }
+.admin-app .stat-card { border: 0; border-radius: 0; padding: 16px 20px; }
+.admin-app .stat-card + .stat-card { border-left: 1px solid var(--ad-line); }
+.admin-app .stat-label { font-size: 11px; font-weight: 400; text-transform: none; letter-spacing: 0; }
+.admin-app .stat-value { font-size: 26px; font-weight: 500; }
+.admin-app .ot-head { text-transform: none; letter-spacing: 0; font-size: 11px; font-weight: 500; background: #0d1723; }
+.admin-app .ot-row { min-height: 48px; font-size: 13px; }
+.admin-app .opill { text-transform: none; font-weight: 500; letter-spacing: 0; }
+.admin-app .opill.green { color: var(--ad-green); background: #142b28; border-color: #285145; }
+.admin-app .opill.amber { color: var(--ad-amber); background: #30291f; border-color: #51422c; }
+.admin-app .opill.red { color: var(--ad-red); background: #32212b; border-color: #56323e; }
+.admin-app .opill.cyan { color: var(--ad-cyan); background: #182a38; border-color: #2b475b; }
+.admin-app .admin-muted { line-height: 1.65; }
+.admin-app .lead { max-width: 85ch; }
+.admin-app .admin-rows { overflow-x: auto; }
+.admin-app .form-actions { padding-top: 16px; border-top: 1px solid var(--ad-line); }
+.admin-app input:not([type=checkbox]):not([type=radio]), .admin-app select, .admin-app textarea { color: var(--ad-text); }
+.admin-app button { transition: background-color 140ms, border-color 140ms, color 140ms; }
+@media (prefers-reduced-motion: reduce) { .admin-app button { transition: none; } }
+@media (max-width: 600px) { .admin-app .btn { min-height: 44px; } .admin-app .stat-grid { grid-template-columns: 1fr 1fr; } .admin-app .stat-card { padding: 12px; border-bottom: 1px solid var(--ad-line); } .admin-app .stat-value { font-size: 22px; } }

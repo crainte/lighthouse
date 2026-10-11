@@ -150,9 +150,8 @@
      that class in app.css), so the controls match every other admin page. -->
 <div class="admin-panel">
   <p class="admin-muted lead">
-    The raw results agents reported, newest first — verbatim, including the error
-    text the public status page deliberately summarises away. This is where you
-    answer "what did the agents actually see?".
+    Inspect individual probe attempts, newest first. Filter by monitor, location, or outcome to
+    investigate failures, including full error details omitted from the public status page.
   </p>
 
   <div class="controls">

@@ -153,15 +153,13 @@
   <div class="admin-panel">
     <div class="panel-title">Maintenance</div>
     <p class="admin-muted lead">
-      A window stops the checks it covers from paging anyone while it runs. Probing carries on, so
-      the grid, the latency chart and the uptime figure still show what really happened — and the
-      outage is still recorded as an alert and an incident. Announce one to say so on the public
-      page; leave it silent to suppress the pages and tell nobody.
+      Suppress notifications during planned work without stopping probes or changing uptime history.
+      Alerts and incidents are still recorded. Enable “Announce” to display the window on your public status page.
     </p>
 
     {#if rows.length === 0}
       <p class="admin-muted">
-        Nothing scheduled. Every check pages according to its own routing.
+        No maintenance scheduled. Notifications follow each check’s routing rules.
       </p>
     {:else}
       <div class="wlist">
@@ -169,7 +167,7 @@
           {@const s = phase(row)}
           <div class="wrow">
             <span class="pill {s.tone}">{s.label}</span>
-            <input class="wtitle" placeholder="what the work is" bind:value={row.title} />
+            <input class="wtitle" placeholder="Maintenance title" aria-label="Maintenance title" bind:value={row.title} />
             <label class="when">
               <span>from</span>
               <input type="datetime-local" bind:value={row.starts} />
@@ -218,7 +216,7 @@
     margin-bottom: 0.7rem;
     line-height: 1.5;
   }
-  .wlist {
+  .wlist { margin: 20px 0;
     display: flex;
     flex-direction: column;
     gap: 0.5rem;
@@ -227,8 +225,8 @@
     display: flex;
     flex-wrap: wrap;
     align-items: flex-end;
-    gap: 0.4rem;
-    padding: 0.5rem;
+    gap: 12px;
+    padding: 16px;
     border: 1px solid var(--border);
     border-radius: 8px;
   }
@@ -236,6 +234,7 @@
     flex: 1 1 12rem;
     min-width: 8rem;
   }
+  .when { flex-direction: column; align-items: flex-start !important; }
   .when,
   .scope,
   .ann {

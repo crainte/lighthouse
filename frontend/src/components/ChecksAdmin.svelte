@@ -47,7 +47,7 @@
       {#if !loading}<span class="kind-pill">{checks.length}</span>{/if}
     </div>
     <div class="range-switch">
-      <button class="range-btn" onclick={() => onopen(null)}>New check</button>
+      <button class="btn primary" onclick={() => onopen(null)}>＋ New check</button>
     </div>
   </div>
 
@@ -60,7 +60,7 @@
         <button class="range-btn" onclick={refresh}>Retry</button>
       </div>
     {:else if checks.length === 0}
-      <p class="admin-muted">No checks configured yet. “New check” adds the first one.</p>
+      <div class="checks-empty"><h3>Start monitoring your infrastructure</h3><p class="admin-muted">Create a check to track availability, response time, or certificate health.</p><button class="btn primary" onclick={() => onopen(null)}>Create your first check</button></div>
     {:else}
       <div class="admin-rows">
         <div class="row head">
@@ -93,6 +93,9 @@
 {/if}
 
 <style>
+  .checks-empty { padding: 32px 16px; text-align: center; }
+  .checks-empty h3 { font-size: 16px; font-weight: 550; margin: 0 0 8px; }
+  .checks-empty .btn { margin-top: 12px; }
   .area-bar {
     display: flex;
     align-items: center;
@@ -120,16 +123,18 @@
     gap: 0.6rem;
     align-items: center;
     font-size: 0.8rem;
-    padding: 0.34rem 0;
-    border-bottom: 1px solid rgba(48, 54, 61, 0.5);
+    padding: 12px 4px;
+    min-width: 760px;
+    border-bottom: 1px solid var(--ad-line-soft);
   }
+  .row:not(.head):hover { background: var(--ad-panel-2); }
   .row:last-child {
     border-bottom: none;
   }
   .row.head {
     font-size: 0.68rem;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
+    text-transform: none;
+    letter-spacing: 0;
     color: var(--text-dim);
     border-bottom: 1px solid var(--border);
     position: sticky;

@@ -94,7 +94,7 @@
 
 <div class="admin-panel">
   <div class="panel-title">Data cleanup</div>
-  <p class="admin-muted">Cleanup actions cannot be undone.</p>
+  <p class="cleanup-warning">Permanent actions. Review the scope before confirming; deleted records cannot be recovered.</p>
 
   <section class="results-cleanup">
     <div class="field-label">Raw probe results</div>
@@ -120,6 +120,7 @@
   </section>
 
   <div class="cleanup-form">
+    <div class="panel-title">Short-lived incidents</div>
     <label class="field">
       <span class="field-label">Maximum incident duration (seconds)</span>
       <NumberField min={1} max={3600} step={1} bind:value={maxSecs} disabled={purging} />
@@ -144,6 +145,7 @@
 </div>
 
 <style>
+  .cleanup-warning { padding: 12px 16px; border: 1px solid #56323e; border-left: 2px solid var(--ad-red); border-radius: 6px; color: var(--ad-red); font-size: 13px; background: #221a25; }
   .results-cleanup {
     display: grid;
     gap: 0.3rem;
@@ -153,8 +155,10 @@
   .cleanup-form {
     display: grid;
     gap: 0.3rem;
-    margin-top: 1.25rem;
-    max-width: 20rem;
+    margin-top: 28px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+    max-width: 32rem;
   }
 
   .field {

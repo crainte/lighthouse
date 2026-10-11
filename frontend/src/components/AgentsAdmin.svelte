@@ -395,8 +395,8 @@
 
   <div class="admin-panel">
     <p class="admin-muted lead">
-      Agents self-register by reporting results — there is no registration step, so an agent exists
-      because it sent something, and it goes away only by falling silent or by being purged here.
+      Agents appear automatically when they report results. Review connectivity and assignments,
+      or retire agents that are no longer in service.
     </p>
 
     {#if loading}

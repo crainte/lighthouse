@@ -173,7 +173,7 @@
       <div class="stat-sub">generation {cluster.self.generation}</div>
     </div>
     <div class="stat-card">
-      <div class="stat-label">Peers</div>
+      <div class="stat-label">{cluster.mode === 'global' ? 'Regions' : 'Peers'}</div>
       <div class="stat-value">{cluster.members.length}</div>
       <div class="stat-sub">
         {cluster.members.filter((m) => m.state === 'alive').length} alive

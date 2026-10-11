@@ -420,8 +420,8 @@
     <div>
       <div class="panel-title">Rollup policy</div>
       <p class="admin-muted lede">
-        Each node decides its own state from its children. Pick a node to change the thresholds
-        that decision uses. Policy is set per node and applies to every check.
+        Explore health from regions to individual agents. Select a node to adjust its degraded
+        and down thresholds. Each node’s policy applies to all of its checks.
       </p>
     </div>
     <button class="btn" onclick={refresh}>Refresh</button>

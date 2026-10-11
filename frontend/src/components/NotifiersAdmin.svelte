@@ -162,10 +162,9 @@
   <div class="admin-panel">
     <div class="panel-title">Notifications</div>
     <p class="admin-muted lead">
-      Where a confirmed state change is sent. A check picks its notifiers by <strong>name</strong>
-      in the check editor; one that picks none goes to every notifier marked
-      <strong>default</strong>, and one with <strong>Notify</strong> off goes nowhere at all.
-      Test before you save: a wrong ntfy topic is otherwise completely silent.
+      Choose where confirmed state changes are delivered. Checks use their selected channels,
+      or the default channels when none are selected. Checks with notifications disabled do not send alerts.
+      Test a channel before saving to verify delivery.
     </p>
 
     {#if unrouted.length}
@@ -216,14 +215,15 @@
     {/if}
 
     {#if rows.length === 0}
-      <p class="admin-muted">No notifiers. Alerts are recorded and shown, and go nowhere else.</p>
+      <p class="admin-muted">No delivery channels yet. Alerts remain available in the console; add a channel to receive notifications.</p>
     {:else}
       <div class="nlist">
         {#each rows as row (row.key)}
           <div class="nrow">
             <input
               class="nname"
-              placeholder="name"
+               placeholder="Channel name"
+               aria-label="Channel name"
               bind:value={row.notifier.name}
               oninput={() => touched(row.key)}
             />

@@ -136,7 +136,7 @@
 {/snippet}
 
 {#if incidents.length === 0}
-  <div class="otable"><div class="ot-empty">No incidents.</div></div>
+  <div class="otable"><div class="ot-empty">No incidents to display. Create an incident to track an issue and keep your team informed.</div></div>
 {:else}
   <div class="stat-grid">
       <div class="stat-card">

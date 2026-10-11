@@ -121,16 +121,14 @@
   <div class="admin-panel">
     <div class="panel-title">Agent credentials</div>
     <p class="admin-muted lead">
-      One credential per zone, shared by every agent in that zone: each of them carries the same
-      value in <code class="mono">[agent] token</code>. The credential decides the zone and region
-      its agents report from, so an agent cannot place itself somewhere it was not issued for.
-      Revoking is immediate and permanent, and takes down every agent in the zone at once — mint
-      the replacement and roll it out first.
+      Credentials authorize agents for a specific zone and region. Agents in a zone share the same
+      <code class="mono">[agent] token</code>. Tokens are shown only once when generated.
+      Revoking a credential immediately disconnects every agent using it. Deploy a replacement before revoking.
     </p>
 
     <form class="create" onsubmit={(e) => (e.preventDefault(), create())}>
-      <input bind:value={zone} placeholder="Zone (e.g. eu-west-1a)" />
-      <input bind:value={region} placeholder="Region (e.g. eu-west)" />
+      <input bind:value={zone} placeholder="Zone (e.g. eu-west-1a)" aria-label="Zone" />
+      <input bind:value={region} placeholder="Region (e.g. eu-west)" aria-label="Region" />
       <button class="btn primary" type="submit" disabled={creating}>
         {creating ? 'Generating…' : 'Generate'}
       </button>

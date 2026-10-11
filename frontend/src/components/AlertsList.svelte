@@ -52,7 +52,7 @@
 </script>
 
 {#if alerts.length === 0}
-  <div class="otable"><div class="ot-empty">No recent alerts.</div></div>
+  <div class="otable"><div class="ot-empty">No recent state changes. New alerts will appear here as monitors change state.</div></div>
 {:else}
   <div class="stat-grid">
     <div class="stat-card">

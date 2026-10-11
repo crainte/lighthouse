@@ -47,6 +47,9 @@
     openIncidentForCheck,
     stateTone,
   } from './lib/incident';
+  import NightwatchOverview from './components/NightwatchOverview.svelte';
+  import ConsoleIcon from './components/ConsoleIcon.svelte';
+  import ConsoleShell from './components/ConsoleShell.svelte';
   import OverallBanner from './components/OverallBanner.svelte';
   import ComponentRow from './components/ComponentRow.svelte';
   import AlertsList from './components/AlertsList.svelte';
@@ -79,12 +82,13 @@
   // section headings; `title`/`blurb` are the page head, so a panel never has to
   // render its own.
   const ADMIN_PANELS = [
+    { id: 'overview', label: 'Overview', group: '', title: 'Overview', blurb: 'Every signal, in sight.' },
     {
       id: 'checks',
       label: 'Checks',
       group: 'Monitor',
       title: 'Checks',
-      blurb: 'What gets probed, how often, and from where.',
+      blurb: 'Configure your monitors, evaluation rules, and probe locations.',
     },
     {
       id: 'alerts',
@@ -105,7 +109,7 @@
       label: 'Agents',
       group: 'Fleet',
       title: 'Agents',
-      blurb: 'The probe fleet and what each machine is running.',
+      blurb: 'Agent connectivity, capabilities, and check assignments.',
     },
     {
       id: 'credentials',
@@ -147,7 +151,7 @@
       label: 'Notifications',
       group: 'Platform',
       title: 'Notifications',
-      blurb: 'Where alerts go, and which checks route to whom.',
+      blurb: 'Delivery channels, alert routing, and failed notifications.',
     },
     {
       id: 'maintenance',
@@ -158,16 +162,13 @@
     },
     {
       id: 'data',
-      label: 'Data',
+      label: 'Data cleanup',
       group: 'Platform',
       title: 'Data cleanup',
       blurb: 'Remove short-lived incident records left by transient probe failures.',
     },
   ] as const;
   type AdminPanel = (typeof ADMIN_PANELS)[number]['id'];
-
-  /** Sidebar groups, in declaration order, so adding a panel needs no second list. */
-  const NAV_GROUPS = [...new Set(ADMIN_PANELS.map((p) => p.group))];
 
   type DayModal = { checkId: string; bucket: UptimeBucket } | null;
 
@@ -242,7 +243,6 @@
       ? ADMIN_PANELS.filter((p) => !GLOBAL_HIDDEN_PANELS.includes(p.id))
       : ADMIN_PANELS,
   );
-  const visibleGroups = $derived([...new Set(visiblePanels.map((p) => p.group))]);
   // Until the session probe answers, "logged out" is a guess — and on #/admin
   // acting on that guess flashes a sign-in prompt at someone already signed in.
   let sessionChecked = $state(false);
@@ -821,48 +821,20 @@
     {@const meta = ADMIN_PANELS.find((p) => p.id === panel)}
     {@const openCount = adminIncidents.filter((i) => i.state !== 'resolved').length}
     {@const unacked = adminIncidents.filter((i) => i.state === 'detected').length}
-    <div class="admin-shell">
-      <nav class="admin-nav" aria-label="admin sections">
-        <div class="nav-brand">
-          <span class="brand-dot"></span>
-          <span class="brand-name">Lightkeeper</span>
-          <span class="brand-tag">admin</span>
-        </div>
-        {#if sessionChecked && authenticated}
-          {#each visibleGroups as g (g)}
-            <div class="nav-group">{g}</div>
-            <div class="admin-nav-items">
-              {#each visiblePanels.filter((p) => p.group === g) as p (p.id)}
-                <button
-                  class="admin-nav-item"
-                  class:active={panel === p.id}
-                  aria-current={panel === p.id ? 'page' : undefined}
-                  onclick={() => selectPanel(p.id)}
-                >
-                  {p.label}
-                  <!-- Only counts worth acting on get a badge: unacknowledged
-                       outages, not every row the panel can list. -->
-                  {#if p.id === 'incidents' && openCount > 0}
-                    <span class="nav-badge" class:quiet={unacked === 0}>{openCount}</span>
-                  {/if}
-                </button>
-              {/each}
-            </div>
-          {/each}
-        {/if}
-        <div class="nav-foot">
-          <span class="nav-status {wsStatus}" title="live updates: {wsStatus}">
-            <span class="dot"></span>{wsStatus === 'open' ? 'live' : wsStatus}
-          </span>
-          <!-- Deep-linking straight to #/admin leaves nothing to pop, so this
-               sets the view outright instead of walking history. -->
-          <button class="admin-nav-item" onclick={goHome}>← Status page</button>
-          {#if authenticated}
-            <button class="admin-nav-item" onclick={signOut}>Log out</button>
-          {/if}
-        </div>
-      </nav>
-      <div class="admin-content">
+    <ConsoleShell
+      panels={visiblePanels}
+      active={panel}
+      title={meta?.title ?? 'Admin'}
+      incidentCount={openCount}
+      incidentsUnacknowledged={unacked}
+      {wsStatus}
+      {nodeMode}
+      authenticated={sessionChecked && authenticated}
+      overview={panel === 'overview' && sessionChecked && authenticated}
+      onSelect={(id) => selectPanel(id as AdminPanel)}
+      onHome={goHome}
+      onSignOut={signOut}
+    >
         {#if !sessionChecked}
           <div class="notice">Checking session…</div>
         {:else if !authenticated}
@@ -874,6 +846,8 @@
               <button class="btn primary" onclick={() => (adminView = 'login')}>Sign in</button>
             </div>
           </div>
+        {:else if panel === 'overview'}
+          <NightwatchOverview {checks} totalChecks={statusTotal} hasMore={statusHasMore || statusPage > 0} incidents={adminIncidents} groups={adminIncidentGroups} {alerts} {fleet} {maintenance} {loading} {error} {wsStatus} {nodeMode} onOpenCheck={openDetail} onOpenIncident={openIncidentEditor} onPanel={(id) => { const target = visiblePanels.find((p) => p.id === id); if (target) openAdmin(target.id); }} onAddCheck={() => openCheckEditor(null)} onRetry={load} onExpired={onExpired} />
         {:else if panel === 'checks' && editing}
           <!-- Keyed so back/forward between two checks rebuilds the editor
                instead of leaving one check's draft under another's id. -->
@@ -892,8 +866,8 @@
         {:else}
           <div class="page-head page-head-row">
             <div>
-              <h2>{meta?.title ?? 'Admin'}</h2>
-              <p class="page-meta">{meta?.blurb ?? ''}</p>
+              <div class="console-page-title"><span class="console-page-icon"><ConsoleIcon name={panel} size={20} /></span><h2>{meta?.title ?? 'Admin'}</h2></div>
+              <p class="page-meta">{panel === 'cluster' && nodeMode === 'global' ? 'Regional reporting and connectivity to this global node.' : meta?.blurb ?? ''}</p>
             </div>
             {#if panel === 'incidents'}
               <button class="btn primary" onclick={() => openIncidentEditor(null)}>
@@ -940,8 +914,7 @@
             <DataAdmin onexpired={onExpired} />
           {/if}
         {/if}
-      </div>
-    </div>
+    </ConsoleShell>
   {:else if loading}
     <div class="notice">Loading…</div>
   {:else if error}
