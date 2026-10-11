@@ -22,16 +22,16 @@ COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
 # rust-embed reads frontend/dist at compile time
 COPY --from=frontend /app/frontend/dist ./frontend/dist
-RUN cargo build --release --bin warden
+RUN cargo build --release --bin lighthouse
 
 # --- Stage 3: minimal runtime ---
 # distroless/cc provides glibc + libstdc++ + libgcc for the bundled DuckDB;
 # rustls means no OpenSSL is needed.
 FROM gcr.io/distroless/cc-debian12
 WORKDIR /data
-COPY --from=builder /app/target/release/warden /usr/local/bin/warden
+COPY --from=builder /app/target/release/lighthouse /usr/local/bin/lighthouse
 EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/warden"]
+ENTRYPOINT ["/usr/local/bin/lighthouse"]
 # Default: coordinator serving the dashboard on 0.0.0.0:8080.
 # With no [[checks]] configured the coordinator seeds demo data for the dashboard.
 #

@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 /// arrived at the destination are the bytes that were written here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupManifest {
-    pub warden_version: String,
+    pub lighthouse_version: String,
     pub git_sha: String,
     pub created_at_millis: i64,
     pub source_node: String,
@@ -130,7 +130,7 @@ pub fn create(source_path: &str, destination: &Path) -> Result<BackupManifest> {
     let sha256 = sha256_file(destination)?;
     let build = crate::version::current();
     let manifest = BackupManifest {
-        warden_version: build.version.clone(),
+        lighthouse_version: build.version.clone(),
         git_sha: build.git_sha.clone(),
         created_at_millis: chrono::Utc::now().timestamp_millis(),
         source_node,
@@ -249,7 +249,7 @@ mod tests {
 
     fn temp_db_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "warden-backup-{name}-{}.duckdb",
+            "lighthouse-backup-{name}-{}.duckdb",
             uuid::Uuid::now_v7()
         ))
     }

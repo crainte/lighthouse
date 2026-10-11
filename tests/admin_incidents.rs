@@ -13,8 +13,8 @@ mod common;
 use serde_json::{json, Value};
 
 use common::*;
-use warden::coordinator::Coordinator;
-use warden::models::{CheckId, NodeState};
+use lighthouse::coordinator::Coordinator;
+use lighthouse::models::{CheckId, NodeState};
 
 /// The incident lifecycle is driven by observations, not transitions: the open
 /// incident is the source of truth. A check whose first-ever observation is
@@ -27,19 +27,19 @@ use warden::models::{CheckId, NodeState};
 /// `Investigating`, because no human has looked at it yet.
 #[tokio::test]
 async fn incidents_open_on_down_and_resolve_on_up() {
-    use warden::coordinator::storage::IncidentState;
+    use lighthouse::coordinator::storage::IncidentState;
     let coord = coordinator_with(vec![http_check("api")]).await;
     let now = chrono::Utc::now().timestamp_millis();
 
     // `status_code: None` makes the default eval read the probe as Unknown;
     // `Some(code)` drives Up (2xx-3xx) or Down otherwise.
-    let result =
-        |ts: i64, status_code: Option<u16>, error: Option<String>| warden::models::CheckResult {
+    let result = |ts: i64, status_code: Option<u16>, error: Option<String>| {
+        lighthouse::models::CheckResult {
             check_id: cid("api"),
             agent_id: "agent-1".into(),
             zone: "test-zone".into(),
             region: "test-region".into(),
-            kind: warden::models::CheckKind::Http,
+            kind: lighthouse::models::CheckKind::Http,
             timestamp: chrono::DateTime::from_timestamp_millis(ts).unwrap(),
             latency_ms: 1,
             status_code,
@@ -50,11 +50,12 @@ async fn incidents_open_on_down_and_resolve_on_up() {
             headers: None,
             metric: None,
             metrics: None,
-        };
+        }
+    };
 
     // The demo seed opens its own incidents, so every assertion below counts
     // only this check's — a global count would be measuring the fixture.
-    async fn mine(c: &Coordinator) -> Vec<warden::coordinator::storage::IncidentRow> {
+    async fn mine(c: &Coordinator) -> Vec<lighthouse::coordinator::storage::IncidentRow> {
         c.incidents_for_test(100)
             .await
             .into_iter()
@@ -91,7 +92,7 @@ async fn incidents_open_on_down_and_resolve_on_up() {
             .collect::<Vec<_>>(),
         vec![(
             cid("api"),
-            warden::coordinator::storage::AffectSource::Origin
+            lighthouse::coordinator::storage::AffectSource::Origin
         )],
         "the origin is attached as an affected check"
     );
@@ -183,7 +184,7 @@ async fn incidents_open_on_down_and_resolve_on_up() {
 /// put it there.
 #[tokio::test]
 async fn a_dependent_check_joins_its_upstreams_incident() {
-    use warden::coordinator::storage::AffectSource;
+    use lighthouse::coordinator::storage::AffectSource;
     let mut api = http_check("api");
     api.depends_on = vec![cid("db")];
     let coord = coordinator_with(vec![http_check("db"), api]).await;
@@ -279,12 +280,12 @@ async fn unrelated_checks_falling_together_stay_separate_incidents() {
 /// closing a new one on every edge.
 #[tokio::test]
 async fn a_flapping_check_stays_inside_one_incident() {
-    use warden::coordinator::storage::IncidentState;
+    use lighthouse::coordinator::storage::IncidentState;
     let mut flappy = http_check("flappy");
     flappy.failures_before_down = 3;
     let coord = coordinator_with(vec![flappy]).await;
     let now = chrono::Utc::now().timestamp_millis();
-    async fn mine(c: &Coordinator) -> Vec<warden::coordinator::storage::IncidentRow> {
+    async fn mine(c: &Coordinator) -> Vec<lighthouse::coordinator::storage::IncidentRow> {
         c.incidents_for_test(100)
             .await
             .into_iter()
@@ -343,7 +344,7 @@ async fn a_flapping_check_stays_inside_one_incident() {
 /// checks came back.
 #[tokio::test]
 async fn auto_resolve_fires_even_after_a_human_has_acknowledged() {
-    use warden::coordinator::storage::IncidentState;
+    use lighthouse::coordinator::storage::IncidentState;
     let coord = coordinator_with(vec![http_check("svc")]).await;
     let now = chrono::Utc::now().timestamp_millis();
     let addr = spawn_server(coord.clone());
@@ -486,7 +487,7 @@ async fn incident_writes_are_admin_only_while_reads_are_public() {
 ///      vacuously — the loop had nothing to refuse.
 #[tokio::test]
 async fn a_manual_incident_is_never_auto_resolved() {
-    use warden::coordinator::storage::IncidentState;
+    use lighthouse::coordinator::storage::IncidentState;
     let coord = coordinator_with(vec![http_check("db")]).await;
     let now = chrono::Utc::now().timestamp_millis();
     let addr = spawn_server(coord.clone());

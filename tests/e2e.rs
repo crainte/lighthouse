@@ -1,4 +1,4 @@
-//! End-to-end smoke test for the Warden pipeline.
+//! End-to-end smoke test for the Lighthouse pipeline.
 //!
 //! Exercises the real code paths against live localhost servers:
 //!   agent::execute_check (real HTTP GET)
@@ -18,12 +18,12 @@ use axum::{extract::State, Json, Router};
 use parking_lot::Mutex;
 use serde_json::Value;
 
+use lighthouse::agent::{execute_check, Probes};
+use lighthouse::config::{CheckConfig, CoordinatorConfig};
+use lighthouse::coordinator::Coordinator;
+use lighthouse::models::{CheckId, CheckKind, Status};
+use lighthouse::notify::{Notifier, NotifierKind};
 use uuid::Uuid;
-use warden::agent::{execute_check, Probes};
-use warden::config::{CheckConfig, CoordinatorConfig};
-use warden::coordinator::Coordinator;
-use warden::models::{CheckId, CheckKind, Status};
-use warden::notify::{Notifier, NotifierKind};
 
 /// Bind an ephemeral 127.0.0.1 port and serve `app`. Returns the bound addr.
 /// The listener is bound before we hand it to `serve`, so the OS accepts
@@ -81,8 +81,8 @@ fn check(target: String) -> CheckConfig {
 }
 
 /// A single-agent test fleet: identity plus the location every result carries.
-fn origin() -> warden::agent::Origin<'static> {
-    warden::agent::Origin {
+fn origin() -> lighthouse::agent::Origin<'static> {
+    lighthouse::agent::Origin {
         agent_id: "agent-01",
         zone: "test-zone",
         region: "test-region",

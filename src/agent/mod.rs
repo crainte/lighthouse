@@ -235,7 +235,7 @@ impl Probes {
 
 /// A bounded, opt-in aggregate for the release benchmark. No samples, check
 /// labels, or metric registry are retained; production avoids every atomic
-/// update unless `WARDEN_BENCH_AGENT_METRICS=1` was set before first use.
+/// update unless `LIGHTHOUSE_BENCH_AGENT_METRICS=1` was set before first use.
 #[derive(Debug, Default)]
 pub struct AgentBenchmarkMetrics {
     pub scheduled: AtomicU64,
@@ -281,13 +281,16 @@ impl AgentBenchmarkMetrics {
 static BENCHMARK_METRICS: OnceLock<Option<Arc<AgentBenchmarkMetrics>>> = OnceLock::new();
 
 /// Return aggregate agent benchmark counters when explicitly enabled by
-/// `WARDEN_BENCH_AGENT_METRICS=1`. The returned counters are process-wide and
+/// `LIGHTHOUSE_BENCH_AGENT_METRICS=1`. The returned counters are process-wide and
 /// bounded; benchmark callers may clear them with [`reset_benchmark_metrics`].
 pub fn benchmark_metrics() -> Option<Arc<AgentBenchmarkMetrics>> {
     BENCHMARK_METRICS
         .get_or_init(|| {
-            (std::env::var("WARDEN_BENCH_AGENT_METRICS").ok().as_deref() == Some("1"))
-                .then(|| Arc::new(AgentBenchmarkMetrics::default()))
+            (std::env::var("LIGHTHOUSE_BENCH_AGENT_METRICS")
+                .ok()
+                .as_deref()
+                == Some("1"))
+            .then(|| Arc::new(AgentBenchmarkMetrics::default()))
         })
         .clone()
 }

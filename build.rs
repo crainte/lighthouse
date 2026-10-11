@@ -17,9 +17,9 @@ fn main() {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    println!("cargo:rustc-env=WARDEN_BUILT_AT={built_at}");
+    println!("cargo:rustc-env=LIGHTHOUSE_BUILT_AT={built_at}");
 
-    println!("cargo:rustc-env=WARDEN_GIT_SHA={}", git_sha());
+    println!("cargo:rustc-env=LIGHTHOUSE_GIT_SHA={}", git_sha());
     println!("cargo:rerun-if-env-changed=GIT_SHA");
 }
 

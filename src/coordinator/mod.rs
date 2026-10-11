@@ -70,7 +70,7 @@ impl TimingCounter {
         let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
         if count.is_multiple_of(TIMING_REPORT_EVERY) {
             tracing::info!(
-                target: "warden_bench",
+                target: "lighthouse_bench",
                 component,
                 operation,
                 samples = count,
@@ -99,9 +99,10 @@ struct Timings {
 impl Timings {
     fn new() -> Self {
         Self {
-            enabled: std::env::var_os("WARDEN_BENCH_TIMINGS").as_deref()
+            enabled: std::env::var_os("LIGHTHOUSE_BENCH_TIMINGS").as_deref()
                 == Some(std::ffi::OsStr::new("1"))
-                || std::env::var("RUST_LOG").is_ok_and(|filter| filter.contains("warden_bench")),
+                || std::env::var("RUST_LOG")
+                    .is_ok_and(|filter| filter.contains("lighthouse_bench")),
             prune_duration_us: AtomicU64::new(0),
             local_state_wait: TimingCounter::default(),
             local_state_hold: TimingCounter::default(),
@@ -463,7 +464,9 @@ impl Coordinator {
             &startup.session_key,
         );
         if !auth.admin_enabled() {
-            warn!("no admin password set (WARDEN_ADMIN_PASSWORD); the check editor is disabled");
+            warn!(
+                "no admin password set (LIGHTHOUSE_ADMIN_PASSWORD); the check editor is disabled"
+            );
         }
         // `Some` whenever this node is cluster-capable — a peer token and an
         // advertise URL are both present — regardless of whether it currently
@@ -1325,17 +1328,17 @@ impl Coordinator {
         let database = self.inner.database.metrics_snapshot();
         let mut samples = vec![
             crate::openmetrics::MetricSample::new(
-                "warden_database_queries_total",
+                "lighthouse_database_queries_total",
                 vec![],
                 database.queries_total as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_database_query_errors_total",
+                "lighthouse_database_query_errors_total",
                 vec![],
                 database.query_errors_total as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_database_query_duration_seconds_total",
+                "lighthouse_database_query_duration_seconds_total",
                 vec![],
                 database.query_duration_us as f64 / 1_000_000.0,
             ),
@@ -1344,52 +1347,52 @@ impl Coordinator {
             // slow scrape's cost is jobs waiting behind a busy worker or the
             // queries themselves getting slower.
             crate::openmetrics::MetricSample::new(
-                "warden_database_queue_wait_seconds_total",
+                "lighthouse_database_queue_wait_seconds_total",
                 vec![],
                 database.queue_wait_us as f64 / 1_000_000.0,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_database_queue_depth",
+                "lighthouse_database_queue_depth",
                 vec![],
                 database.queue_depth as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_database_logical_rows",
+                "lighthouse_database_logical_rows",
                 vec![],
                 database.logical_rows as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_database_file_bytes",
+                "lighthouse_database_file_bytes",
                 vec![],
                 database.database_bytes as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_database_wal_bytes",
+                "lighthouse_database_wal_bytes",
                 vec![],
                 database.wal_bytes as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_retention_prune_duration_seconds_total",
+                "lighthouse_retention_prune_duration_seconds_total",
                 vec![],
                 self.inner.timings.prune_duration_us.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_retention_rows_removed_total",
+                "lighthouse_retention_rows_removed_total",
                 vec![],
                 self.inner.retention_rows_removed.load(Ordering::Relaxed) as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_replication_alert_identity_conflicts_total",
+                "lighthouse_replication_alert_identity_conflicts_total",
                 vec![],
                 self.inner.alert_identity_conflicts.load(Ordering::Relaxed) as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_replication_raw_data_gaps_total",
+                "lighthouse_replication_raw_data_gaps_total",
                 vec![],
                 self.inner.replication_raw_data_gaps.load(Ordering::Relaxed) as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_replication_anti_entropy_failures_total",
+                "lighthouse_replication_anti_entropy_failures_total",
                 vec![],
                 self.inner
                     .replication_anti_entropy_failures
@@ -1401,7 +1404,7 @@ impl Coordinator {
             // first sweep succeeds, which reads as "always overdue" rather
             // than a false "just happened".
             crate::openmetrics::MetricSample::new(
-                "warden_replication_anti_entropy_last_success_timestamp_seconds",
+                "lighthouse_replication_anti_entropy_last_success_timestamp_seconds",
                 vec![],
                 self.inner
                     .replication_anti_entropy_last_success_ms
@@ -1409,22 +1412,22 @@ impl Coordinator {
                     / 1_000.0,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_notification_retries_total",
+                "lighthouse_notification_retries_total",
                 vec![],
                 self.inner.notification_retries.load(Ordering::Relaxed) as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_notification_giveups_total",
+                "lighthouse_notification_giveups_total",
                 vec![],
                 self.inner.notification_giveups.load(Ordering::Relaxed) as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_ingest_inflight",
+                "lighthouse_ingest_inflight",
                 vec![],
                 self.inner.ingest_inflight.load(Ordering::Relaxed) as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_ingest_rejected_total",
+                "lighthouse_ingest_rejected_total",
                 vec![],
                 self.inner.ingest_rejected.load(Ordering::Relaxed) as f64,
             ),
@@ -1503,7 +1506,7 @@ mod tests {
         assert_eq!(coord.prune_in_slices(7, 90, now).await.unwrap(), 0);
         let metrics = coord.metrics();
         assert_eq!(
-            crate::openmetrics::select(&metrics, "warden_database_logical_rows", &[])
+            crate::openmetrics::select(&metrics, "lighthouse_database_logical_rows", &[])
                 .unwrap()
                 .value,
             0.0
@@ -1511,7 +1514,7 @@ mod tests {
         assert!(
             crate::openmetrics::select(
                 &metrics,
-                "warden_retention_prune_duration_seconds_total",
+                "lighthouse_retention_prune_duration_seconds_total",
                 &[]
             )
             .unwrap()
@@ -1519,7 +1522,7 @@ mod tests {
                 > 0.0
         );
         assert_eq!(
-            crate::openmetrics::select(&metrics, "warden_retention_rows_removed_total", &[])
+            crate::openmetrics::select(&metrics, "lighthouse_retention_rows_removed_total", &[])
                 .unwrap()
                 .value,
             23.0,
@@ -1539,10 +1542,10 @@ mod tests {
         let rendered = crate::openmetrics::render(&before);
         let after = crate::openmetrics::parse(&rendered).unwrap();
         assert_eq!(
-            crate::openmetrics::select(&before, "warden_database_queries_total", &[])
+            crate::openmetrics::select(&before, "lighthouse_database_queries_total", &[])
                 .unwrap()
                 .value,
-            crate::openmetrics::select(&after, "warden_database_queries_total", &[])
+            crate::openmetrics::select(&after, "lighthouse_database_queries_total", &[])
                 .unwrap()
                 .value,
         );

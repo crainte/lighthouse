@@ -14,10 +14,12 @@ use std::net::SocketAddr;
 
 use serde_json::{json, Value};
 
+use lighthouse::config::{
+    AgentsDisplay, AgentsMode, CheckConfig, CoordinatorConfig, StatusPageConfig,
+};
+use lighthouse::coordinator::Coordinator;
+use lighthouse::models::{CheckId, CheckKind};
 use uuid::Uuid;
-use warden::config::{AgentsDisplay, AgentsMode, CheckConfig, CoordinatorConfig, StatusPageConfig};
-use warden::coordinator::Coordinator;
-use warden::models::{CheckId, CheckKind};
 
 const PASSWORD: &str = "correct horse battery staple";
 
@@ -481,7 +483,7 @@ async fn thresholds_that_cannot_be_satisfied_are_refused() {
 /// reverts because the config file is still treated as the authority.
 #[tokio::test]
 async fn a_saved_setting_outlives_a_restart_and_the_config_file_does_not_revert_it() {
-    let dir = std::env::temp_dir().join(format!("warden-display-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("lighthouse-display-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("display.duckdb");
     let _ = std::fs::remove_file(&path);

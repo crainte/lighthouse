@@ -10,9 +10,9 @@ mod common;
 use serde_json::{json, Value};
 
 use common::*;
+use lighthouse::config::CheckConfig;
+use lighthouse::models::CheckId;
 use uuid::Uuid;
-use warden::config::CheckConfig;
-use warden::models::CheckId;
 
 /// `limit` arrives from the network and the database is a single worker, so a
 /// caller must not be able to opt out of the page bound. The console still
@@ -978,7 +978,7 @@ async fn hosts_combine_by_any_or_all() {
     // A pool where one live member is enough, versus a set where each must be
     // up. Getting this backwards either hides an outage or invents one, so both
     // directions are pinned.
-    use warden::config::{CheckConfig, MatchMode};
+    use lighthouse::config::{CheckConfig, MatchMode};
 
     let pool = CheckConfig {
         host_match: MatchMode::Any,
@@ -1460,12 +1460,12 @@ async fn public_pages_never_republish_what_a_probe_observed() {
 
     let secret = "198.51.100.77";
     coord
-        .ingest(vec![warden::models::CheckResult {
+        .ingest(vec![lighthouse::models::CheckResult {
             check_id: ddns_id,
             agent_id: "agent-a".into(),
             zone: "us-east-a".into(),
             region: "us-east".into(),
-            kind: warden::models::CheckKind::Dns,
+            kind: lighthouse::models::CheckKind::Dns,
             timestamp: chrono::Utc::now(),
             latency_ms: 12,
             status_code: None,
@@ -1473,7 +1473,7 @@ async fn public_pages_never_republish_what_a_probe_observed() {
             error: Some(format!(
                 "resolved to {secret}, expected one of [\"203.0.113.9\"]"
             )),
-            failure: Some(warden::models::FailureKind::UnexpectedDnsAnswer),
+            failure: Some(lighthouse::models::FailureKind::UnexpectedDnsAnswer),
             body: None,
             headers: None,
             metric: None,
@@ -1527,29 +1527,29 @@ async fn certificate_expiry_days_survive_into_the_public_summary() {
     // visitor, so publishing the count reveals nothing — and it is the single
     // most useful thing a status page can say about a TLS failure. The names on
     // the certificate are what must not travel.
-    let expired = warden::models::FailureKind::CertificateExpired { days: 4129 };
+    let expired = lighthouse::models::FailureKind::CertificateExpired { days: 4129 };
     assert_eq!(expired.summary(), "Certificate expired 4129 days ago");
 
-    let soon = warden::models::FailureKind::CertificateExpiring { days: 6 };
+    let soon = lighthouse::models::FailureKind::CertificateExpiring { days: 6 };
     assert_eq!(soon.summary(), "Certificate expires in 6 days");
 
     // Singular and same-day read as English, not as "1 days".
     assert_eq!(
-        warden::models::FailureKind::CertificateExpiring { days: 1 }.summary(),
+        lighthouse::models::FailureKind::CertificateExpiring { days: 1 }.summary(),
         "Certificate expires in 1 day"
     );
     assert_eq!(
-        warden::models::FailureKind::CertificateExpired { days: 0 }.summary(),
+        lighthouse::models::FailureKind::CertificateExpired { days: 0 }.summary(),
         "Certificate expired today"
     );
 
     // No summary may quote an observed value.
     for kind in [
-        warden::models::FailureKind::UnexpectedDnsAnswer,
-        warden::models::FailureKind::UnexpectedContent,
-        warden::models::FailureKind::NameResolution,
-        warden::models::FailureKind::TlsError,
-        warden::models::FailureKind::Other,
+        lighthouse::models::FailureKind::UnexpectedDnsAnswer,
+        lighthouse::models::FailureKind::UnexpectedContent,
+        lighthouse::models::FailureKind::NameResolution,
+        lighthouse::models::FailureKind::TlsError,
+        lighthouse::models::FailureKind::Other,
     ] {
         let s = kind.summary();
         assert!(
@@ -1747,9 +1747,9 @@ async fn scoping_a_check_to_a_region_keeps_it_out_of_the_others() {
 /// observe them is through the verdict they produce.
 #[tokio::test]
 async fn openmetrics_metric_and_metrics_drive_the_verdict() {
-    use warden::config::{CheckConfig, MetricLabel, MetricOptions};
-    use warden::models::{CheckKind, CheckResult};
-    use warden::openmetrics::MetricSample;
+    use lighthouse::config::{CheckConfig, MetricLabel, MetricOptions};
+    use lighthouse::models::{CheckKind, CheckResult};
+    use lighthouse::openmetrics::MetricSample;
 
     // A metric check whose script compares two same-scrape series (used/size)
     // and treats an absent selection as DOWN.
@@ -1877,7 +1877,7 @@ async fn the_results_explorer_is_admin_only_and_returns_raw_errors() {
         .create_check_for_test(CheckConfig {
             id: cid("ddns-wa"),
             name: "ddns-wa".into(),
-            kind: warden::models::CheckKind::Dns,
+            kind: lighthouse::models::CheckKind::Dns,
             ..Default::default()
         })
         .await;
@@ -1888,12 +1888,12 @@ async fn the_results_explorer_is_admin_only_and_returns_raw_errors() {
     let now = chrono::Utc::now().timestamp_millis();
     let result =
         |check: &str, agent: &str, ts: i64, region: &str, zone: &str, error: Option<String>| {
-            warden::models::CheckResult {
+            lighthouse::models::CheckResult {
                 check_id: cid(check),
                 agent_id: agent.into(),
                 zone: zone.into(),
                 region: region.into(),
-                kind: warden::models::CheckKind::Dns,
+                kind: lighthouse::models::CheckKind::Dns,
                 timestamp: chrono::DateTime::from_timestamp_millis(ts).unwrap(),
                 latency_ms: 3,
                 status_code: None,

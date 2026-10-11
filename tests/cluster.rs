@@ -43,11 +43,11 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 
+use lighthouse::config::{CheckConfig, CoordinatorConfig};
+use lighthouse::coordinator::Coordinator;
+use lighthouse::models::{CheckId, CheckKind, CheckResult};
+use lighthouse::notify::{Notifier, NotifierKind};
 use uuid::Uuid;
-use warden::config::{CheckConfig, CoordinatorConfig};
-use warden::coordinator::Coordinator;
-use warden::models::{CheckId, CheckKind, CheckResult};
-use warden::notify::{Notifier, NotifierKind};
 
 /// Peers authenticate with their own secret, never an agent's — see
 /// `require_peer` in src/coordinator/mod.rs.
@@ -840,9 +840,9 @@ async fn anti_entropy_signals_peer_behind_raw_retention() {
 
     assert_eq!(history(b.addr, &cid_str(CHECK)).await.len(), 1);
     assert_eq!(
-        warden::openmetrics::select(
+        lighthouse::openmetrics::select(
             &b.coord.metrics(),
-            "warden_replication_raw_data_gaps_total",
+            "lighthouse_replication_raw_data_gaps_total",
             &[]
         )
         .unwrap()
@@ -851,9 +851,9 @@ async fn anti_entropy_signals_peer_behind_raw_retention() {
         "the signal must state that receiving the retained page did not complete backfill"
     );
     assert!(
-        warden::openmetrics::select(
+        lighthouse::openmetrics::select(
             &b.coord.metrics(),
-            "warden_replication_anti_entropy_last_success_timestamp_seconds",
+            "lighthouse_replication_anti_entropy_last_success_timestamp_seconds",
             &[]
         )
         .unwrap()
@@ -879,9 +879,9 @@ async fn anti_entropy_failure_is_counted_when_no_peer_answers() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     assert_eq!(
-        warden::openmetrics::select(
+        lighthouse::openmetrics::select(
             &b.coord.metrics(),
-            "warden_replication_anti_entropy_failures_total",
+            "lighthouse_replication_anti_entropy_failures_total",
             &[]
         )
         .unwrap()
@@ -891,9 +891,9 @@ async fn anti_entropy_failure_is_counted_when_no_peer_answers() {
     );
     b.coord.anti_entropy_sweep().await;
     assert_eq!(
-        warden::openmetrics::select(
+        lighthouse::openmetrics::select(
             &b.coord.metrics(),
-            "warden_replication_anti_entropy_failures_total",
+            "lighthouse_replication_anti_entropy_failures_total",
             &[]
         )
         .unwrap()
@@ -902,9 +902,9 @@ async fn anti_entropy_failure_is_counted_when_no_peer_answers() {
         "a sweep against an unreachable peer must count as a failure"
     );
     assert_eq!(
-        warden::openmetrics::select(
+        lighthouse::openmetrics::select(
             &b.coord.metrics(),
-            "warden_replication_anti_entropy_last_success_timestamp_seconds",
+            "lighthouse_replication_anti_entropy_last_success_timestamp_seconds",
             &[]
         )
         .unwrap()
@@ -1056,9 +1056,9 @@ async fn anti_entropy_stops_replaying_a_stream_that_cannot_converge() {
     let session_a = login(a.addr).await;
     gossip_step(a.addr, &session_a, b.addr).await;
     let conflicts = |node: &Node| {
-        warden::openmetrics::select(
+        lighthouse::openmetrics::select(
             &node.coord.metrics(),
-            "warden_replication_alert_identity_conflicts_total",
+            "lighthouse_replication_alert_identity_conflicts_total",
             &[],
         )
         .unwrap()

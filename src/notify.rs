@@ -567,7 +567,7 @@ mod tests {
     fn email_reads_flat_and_defaults_to_starttls() {
         let n: Notifier = serde_json::from_str(
             r#"{"name":"ops","type":"email","host":"smtp.example.com",
-                "from":"warden@example.com","to":"ops@example.com"}"#,
+                "from":"lighthouse@example.com","to":"ops@example.com"}"#,
         )
         .unwrap();
         let NotifierKind::Email(m) = &n.kind else {
@@ -593,7 +593,7 @@ mod tests {
             port: None,
             username: None,
             password: None,
-            from: "warden@example.com".into(),
+            from: "lighthouse@example.com".into(),
             to: "ops@example.com".into(),
             tls: MailTls::Starttls,
         };
@@ -618,7 +618,7 @@ mod tests {
                 // only place that is cheap to say so.
                 "username with no password",
                 MailConfig {
-                    username: Some("warden".into()),
+                    username: Some("lighthouse".into()),
                     ..good.clone()
                 },
             ),
@@ -638,7 +638,7 @@ mod tests {
                 port: Some(2525),
                 username: Some("  ".into()),
                 password: Some(String::new()),
-                from: " warden@example.com ".into(),
+                from: " lighthouse@example.com ".into(),
                 to: " ops@example.com ".into(),
                 tls: MailTls::None,
             }),
@@ -652,7 +652,7 @@ mod tests {
         assert_eq!(m.host, "smtp.example.com");
         assert_eq!(m.username, None);
         assert_eq!(m.password, None);
-        assert_eq!(m.from, "warden@example.com");
+        assert_eq!(m.from, "lighthouse@example.com");
         n.validate().unwrap();
     }
 
@@ -719,9 +719,9 @@ mod tests {
             kind: NotifierKind::Email(MailConfig {
                 host: "smtp.example.com".into(),
                 port: None,
-                username: Some("warden".into()),
+                username: Some("lighthouse".into()),
                 password: Some("smtp secret".into()),
-                from: "warden@example.com".into(),
+                from: "lighthouse@example.com".into(),
                 to: "ops@example.com".into(),
                 tls: MailTls::Starttls,
             }),

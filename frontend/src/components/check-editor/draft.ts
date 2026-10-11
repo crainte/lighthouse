@@ -218,7 +218,7 @@ export function fromCheck(c: AdminCheck): Draft {
 
 /** These map to unsigned integers server-side. A negative or fractional value
  *  can be typed past the `min` attribute and would fail JSON deserialization,
- *  surfacing a framework message instead of Warden's own. */
+ *  surfacing a framework message instead of Lighthouse's own. */
 export function whole(v: number | null, min: number): boolean {
   return v !== null && Number.isInteger(v) && v >= min;
 }

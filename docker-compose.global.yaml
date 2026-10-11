@@ -19,7 +19,7 @@
 # and sections), which global-a distributes to every region
 # (`global::store`/`global::reconcile`) and replicates to global-b and
 # global-c over their own peer cluster (`global::cluster`) — durably, in
-# `/data/warden.duckdb` on each, so any one of the three can restart, or the
+# `/data/lighthouse.duckdb` on each, so any one of the three can restart, or the
 # operator's browser can point at any one of the three, without losing or
 # disagreeing about the catalogue. A production deployment would put a load
 # balancer in front of all three and every region's `[coordinator.global]`
@@ -28,102 +28,102 @@
 # catalogue converging across the three without one.
 #
 # Required env (no committed defaults):
-#   WARDEN_PEER_TOKEN        shared by the us coordinator cluster
-#   WARDEN_GLOBAL_TOKEN      shared by every coordinator and every global node
-#   WARDEN_GLOBAL_PEER_TOKEN shared by the three global nodes' own cluster
-#   WARDEN_AGENT_TOKEN_W     the two us-west agents
-#   WARDEN_AGENT_TOKEN_E     the one us-east agent
-#   WARDEN_AGENT_TOKEN_TW    the tw agent
-#   WARDEN_ADMIN_PASSWORD    optional; the admin UI is read-only without it
+#   LIGHTHOUSE_PEER_TOKEN        shared by the us coordinator cluster
+#   LIGHTHOUSE_GLOBAL_TOKEN      shared by every coordinator and every global node
+#   LIGHTHOUSE_GLOBAL_PEER_TOKEN shared by the three global nodes' own cluster
+#   LIGHTHOUSE_AGENT_TOKEN_W     the two us-west agents
+#   LIGHTHOUSE_AGENT_TOKEN_E     the one us-east agent
+#   LIGHTHOUSE_AGENT_TOKEN_TW    the tw agent
+#   LIGHTHOUSE_ADMIN_PASSWORD    optional; the admin UI is read-only without it
 #
 # Preview: open http://localhost:9005 for the global dashboard once the stack
 # is up (cold start ~55s); :9006 and :9007 serve the same catalogue. The
 # regional dashboards remain on :9001-:9004.
 
-name: warden-global
+name: lighthouse-global
 
 x-coordinator: &coordinator
   build:
     context: .
     args:
       GIT_SHA: ${GIT_SHA:-}
-  image: warden:latest
+  image: lighthouse:latest
   command: ["coordinator"]
   environment:
-    WARDEN_ADMIN_PASSWORD: ${WARDEN_ADMIN_PASSWORD:-}
-    WARDEN_PEER_TOKEN: ${WARDEN_PEER_TOKEN:?WARDEN_PEER_TOKEN is required}
-    WARDEN_GLOBAL_TOKEN: ${WARDEN_GLOBAL_TOKEN:?WARDEN_GLOBAL_TOKEN is required}
-    WARDEN_AGENT_TOKEN_W: ${WARDEN_AGENT_TOKEN_W:?WARDEN_AGENT_TOKEN_W is required}
-    WARDEN_AGENT_TOKEN_E: ${WARDEN_AGENT_TOKEN_E:?WARDEN_AGENT_TOKEN_E is required}
-    WARDEN_AGENT_TOKEN_TW: ${WARDEN_AGENT_TOKEN_TW:?WARDEN_AGENT_TOKEN_TW is required}
+    LIGHTHOUSE_ADMIN_PASSWORD: ${LIGHTHOUSE_ADMIN_PASSWORD:-}
+    LIGHTHOUSE_PEER_TOKEN: ${LIGHTHOUSE_PEER_TOKEN:?LIGHTHOUSE_PEER_TOKEN is required}
+    LIGHTHOUSE_GLOBAL_TOKEN: ${LIGHTHOUSE_GLOBAL_TOKEN:?LIGHTHOUSE_GLOBAL_TOKEN is required}
+    LIGHTHOUSE_AGENT_TOKEN_W: ${LIGHTHOUSE_AGENT_TOKEN_W:?LIGHTHOUSE_AGENT_TOKEN_W is required}
+    LIGHTHOUSE_AGENT_TOKEN_E: ${LIGHTHOUSE_AGENT_TOKEN_E:?LIGHTHOUSE_AGENT_TOKEN_E is required}
+    LIGHTHOUSE_AGENT_TOKEN_TW: ${LIGHTHOUSE_AGENT_TOKEN_TW:?LIGHTHOUSE_AGENT_TOKEN_TW is required}
   restart: unless-stopped
   networks:
-    - warden
+    - lighthouse
 
 x-global: &global
   build:
     context: .
     args:
       GIT_SHA: ${GIT_SHA:-}
-  image: warden:latest
+  image: lighthouse:latest
   command: ["global"]
   environment:
-    WARDEN_ADMIN_PASSWORD: ${WARDEN_ADMIN_PASSWORD:-}
-    WARDEN_GLOBAL_TOKEN: ${WARDEN_GLOBAL_TOKEN:?WARDEN_GLOBAL_TOKEN is required}
+    LIGHTHOUSE_ADMIN_PASSWORD: ${LIGHTHOUSE_ADMIN_PASSWORD:-}
+    LIGHTHOUSE_GLOBAL_TOKEN: ${LIGHTHOUSE_GLOBAL_TOKEN:?LIGHTHOUSE_GLOBAL_TOKEN is required}
     # This global node's own cluster secret (Phase 4) — distinct from the
     # cross-region trust token above, which regions present. Named
-    # WARDEN_PEER_TOKEN inside the container because `GlobalConfig` resolves
+    # LIGHTHOUSE_PEER_TOKEN inside the container because `GlobalConfig` resolves
     # its peer token from that variable, the same one a coordinator's own
     # cluster uses; the compose-level name is kept separate
-    # (WARDEN_GLOBAL_PEER_TOKEN) so the two secrets are never accidentally
+    # (LIGHTHOUSE_GLOBAL_PEER_TOKEN) so the two secrets are never accidentally
     # set to the same value.
-    WARDEN_PEER_TOKEN: ${WARDEN_GLOBAL_PEER_TOKEN:?WARDEN_GLOBAL_PEER_TOKEN is required}
+    LIGHTHOUSE_PEER_TOKEN: ${LIGHTHOUSE_GLOBAL_PEER_TOKEN:?LIGHTHOUSE_GLOBAL_PEER_TOKEN is required}
   restart: unless-stopped
   networks:
-    - warden
+    - lighthouse
 
 x-agent: &agent
   build:
     context: .
     args:
       GIT_SHA: ${GIT_SHA:-}
-  image: warden:latest
+  image: lighthouse:latest
   command: ["agent"]
   cap_add:
     - NET_RAW
   restart: unless-stopped
   networks:
-    - warden
+    - lighthouse
 
 services:
   # ---- US region: 3-node cluster ----
   coordinator-us-a:
     <<: *coordinator
     ports:
-      - "${WARDEN_PORT_US_A:-9001}:8080"
+      - "${LIGHTHOUSE_PORT_US_A:-9001}:8080"
     configs:
       - source: coordinator-us-a-toml
-        target: /data/warden.toml
+        target: /data/lighthouse.toml
     volumes:
       - coordinator-us-a-data:/data
 
   coordinator-us-b:
     <<: *coordinator
     ports:
-      - "${WARDEN_PORT_US_B:-9002}:8080"
+      - "${LIGHTHOUSE_PORT_US_B:-9002}:8080"
     configs:
       - source: coordinator-us-b-toml
-        target: /data/warden.toml
+        target: /data/lighthouse.toml
     volumes:
       - coordinator-us-b-data:/data
 
   coordinator-us-c:
     <<: *coordinator
     ports:
-      - "${WARDEN_PORT_US_C:-9003}:8080"
+      - "${LIGHTHOUSE_PORT_US_C:-9003}:8080"
     configs:
       - source: coordinator-us-c-toml
-        target: /data/warden.toml
+        target: /data/lighthouse.toml
     volumes:
       - coordinator-us-c-data:/data
 
@@ -131,10 +131,10 @@ services:
   coordinator-tw:
     <<: *coordinator
     ports:
-      - "${WARDEN_PORT_TW:-9004}:8080"
+      - "${LIGHTHOUSE_PORT_TW:-9004}:8080"
     configs:
       - source: coordinator-tw-toml
-        target: /data/warden.toml
+        target: /data/lighthouse.toml
     volumes:
       - coordinator-tw-data:/data
 
@@ -143,30 +143,30 @@ services:
   global-a:
     <<: *global
     ports:
-      - "${WARDEN_PORT_GLOBAL:-9005}:8080"
+      - "${LIGHTHOUSE_PORT_GLOBAL:-9005}:8080"
     configs:
       - source: global-a-toml
-        target: /data/warden.toml
+        target: /data/lighthouse.toml
     volumes:
       - global-a-data:/data
 
   global-b:
     <<: *global
     ports:
-      - "${WARDEN_PORT_GLOBAL_B:-9006}:8080"
+      - "${LIGHTHOUSE_PORT_GLOBAL_B:-9006}:8080"
     configs:
       - source: global-b-toml
-        target: /data/warden.toml
+        target: /data/lighthouse.toml
     volumes:
       - global-b-data:/data
 
   global-c:
     <<: *global
     ports:
-      - "${WARDEN_PORT_GLOBAL_C:-9007}:8080"
+      - "${LIGHTHOUSE_PORT_GLOBAL_C:-9007}:8080"
     configs:
       - source: global-c-toml
-        target: /data/warden.toml
+        target: /data/lighthouse.toml
     volumes:
       - global-c-data:/data
 
@@ -174,35 +174,35 @@ services:
   agent-us-1:
     <<: *agent
     environment:
-      WARDEN_AGENT_TOKEN: ${WARDEN_AGENT_TOKEN_W:?WARDEN_AGENT_TOKEN_W is required}
+      LIGHTHOUSE_AGENT_TOKEN: ${LIGHTHOUSE_AGENT_TOKEN_W:?LIGHTHOUSE_AGENT_TOKEN_W is required}
     configs:
       - source: agent-us-1-toml
-        target: /data/warden.toml
+        target: /data/lighthouse.toml
 
   agent-us-2:
     <<: *agent
     environment:
-      WARDEN_AGENT_TOKEN: ${WARDEN_AGENT_TOKEN_W:?WARDEN_AGENT_TOKEN_W is required}
+      LIGHTHOUSE_AGENT_TOKEN: ${LIGHTHOUSE_AGENT_TOKEN_W:?LIGHTHOUSE_AGENT_TOKEN_W is required}
     configs:
       - source: agent-us-2-toml
-        target: /data/warden.toml
+        target: /data/lighthouse.toml
 
   agent-us-3:
     <<: *agent
     environment:
-      WARDEN_AGENT_TOKEN: ${WARDEN_AGENT_TOKEN_E:?WARDEN_AGENT_TOKEN_E is required}
+      LIGHTHOUSE_AGENT_TOKEN: ${LIGHTHOUSE_AGENT_TOKEN_E:?LIGHTHOUSE_AGENT_TOKEN_E is required}
     configs:
       - source: agent-us-3-toml
-        target: /data/warden.toml
+        target: /data/lighthouse.toml
 
   # ---- Taiwan agent ----
   agent-tw:
     <<: *agent
     environment:
-      WARDEN_AGENT_TOKEN: ${WARDEN_AGENT_TOKEN_TW:?WARDEN_AGENT_TOKEN_TW is required}
+      LIGHTHOUSE_AGENT_TOKEN: ${LIGHTHOUSE_AGENT_TOKEN_TW:?LIGHTHOUSE_AGENT_TOKEN_TW is required}
     configs:
       - source: agent-tw-toml
-        target: /data/warden.toml
+        target: /data/lighthouse.toml
 
 configs:
   # ---- US coordinators. All three share region "us", push to the global node,
@@ -213,7 +213,7 @@ configs:
     content: |
       [coordinator]
       listen = "0.0.0.0:8080"
-      db_path = "/data/warden.duckdb"
+      db_path = "/data/lighthouse.duckdb"
       node_id = "coordinator-us-a"
       region = "us"
       advertise_url = "http://coordinator-us-a:8080"
@@ -224,18 +224,18 @@ configs:
 
       [coordinator.global]
       url = "http://global-a:8080"
-      token_env = "WARDEN_GLOBAL_TOKEN"
+      token_env = "LIGHTHOUSE_GLOBAL_TOKEN"
       push_secs = 5
 
       [[coordinator.provision]]
       zone = "us-west-1a"
       region = "us"
-      token_env = "WARDEN_AGENT_TOKEN_W"
+      token_env = "LIGHTHOUSE_AGENT_TOKEN_W"
 
       [[coordinator.provision]]
       zone = "us-east-1a"
       region = "us"
-      token_env = "WARDEN_AGENT_TOKEN_E"
+      token_env = "LIGHTHOUSE_AGENT_TOKEN_E"
 
       # Checks are created through the Admin UI or API and persisted in the
       # database; none are seeded from this file.
@@ -244,7 +244,7 @@ configs:
     content: |
       [coordinator]
       listen = "0.0.0.0:8080"
-      db_path = "/data/warden.duckdb"
+      db_path = "/data/lighthouse.duckdb"
       node_id = "coordinator-us-b"
       region = "us"
       advertise_url = "http://coordinator-us-b:8080"
@@ -255,24 +255,24 @@ configs:
 
       [coordinator.global]
       url = "http://global-a:8080"
-      token_env = "WARDEN_GLOBAL_TOKEN"
+      token_env = "LIGHTHOUSE_GLOBAL_TOKEN"
       push_secs = 5
 
       [[coordinator.provision]]
       zone = "us-west-1a"
       region = "us"
-      token_env = "WARDEN_AGENT_TOKEN_W"
+      token_env = "LIGHTHOUSE_AGENT_TOKEN_W"
 
       [[coordinator.provision]]
       zone = "us-east-1a"
       region = "us"
-      token_env = "WARDEN_AGENT_TOKEN_E"
+      token_env = "LIGHTHOUSE_AGENT_TOKEN_E"
 
   coordinator-us-c-toml:
     content: |
       [coordinator]
       listen = "0.0.0.0:8080"
-      db_path = "/data/warden.duckdb"
+      db_path = "/data/lighthouse.duckdb"
       node_id = "coordinator-us-c"
       region = "us"
       advertise_url = "http://coordinator-us-c:8080"
@@ -283,25 +283,25 @@ configs:
 
       [coordinator.global]
       url = "http://global-a:8080"
-      token_env = "WARDEN_GLOBAL_TOKEN"
+      token_env = "LIGHTHOUSE_GLOBAL_TOKEN"
       push_secs = 5
 
       [[coordinator.provision]]
       zone = "us-west-1a"
       region = "us"
-      token_env = "WARDEN_AGENT_TOKEN_W"
+      token_env = "LIGHTHOUSE_AGENT_TOKEN_W"
 
       [[coordinator.provision]]
       zone = "us-east-1a"
       region = "us"
-      token_env = "WARDEN_AGENT_TOKEN_E"
+      token_env = "LIGHTHOUSE_AGENT_TOKEN_E"
 
   # ---- Taiwan coordinator: single node in region "tw". ----
   coordinator-tw-toml:
     content: |
       [coordinator]
       listen = "0.0.0.0:8080"
-      db_path = "/data/warden.duckdb"
+      db_path = "/data/lighthouse.duckdb"
       node_id = "coordinator-tw"
       region = "tw"
 
@@ -310,13 +310,13 @@ configs:
 
       [coordinator.global]
       url = "http://global-a:8080"
-      token_env = "WARDEN_GLOBAL_TOKEN"
+      token_env = "LIGHTHOUSE_GLOBAL_TOKEN"
       push_secs = 5
 
       [[coordinator.provision]]
       zone = "tw-north-1a"
       region = "tw"
-      token_env = "WARDEN_AGENT_TOKEN_TW"
+      token_env = "LIGHTHOUSE_AGENT_TOKEN_TW"
 
       # Checks are created through the Admin UI or API and persisted in the
       # database; none are seeded from this file.
@@ -330,8 +330,8 @@ configs:
     content: |
       [global]
       listen = "0.0.0.0:8080"
-      db_path = "/data/warden.duckdb"
-      token_env = "WARDEN_GLOBAL_TOKEN"
+      db_path = "/data/lighthouse.duckdb"
+      token_env = "LIGHTHOUSE_GLOBAL_TOKEN"
       region_staleness_secs = 20
       node_id = "global-a"
       advertise_url = "http://global-a:8080"
@@ -356,8 +356,8 @@ configs:
     content: |
       [global]
       listen = "0.0.0.0:8080"
-      db_path = "/data/warden.duckdb"
-      token_env = "WARDEN_GLOBAL_TOKEN"
+      db_path = "/data/lighthouse.duckdb"
+      token_env = "LIGHTHOUSE_GLOBAL_TOKEN"
       region_staleness_secs = 20
       node_id = "global-b"
       advertise_url = "http://global-b:8080"
@@ -382,8 +382,8 @@ configs:
     content: |
       [global]
       listen = "0.0.0.0:8080"
-      db_path = "/data/warden.duckdb"
-      token_env = "WARDEN_GLOBAL_TOKEN"
+      db_path = "/data/lighthouse.duckdb"
+      token_env = "LIGHTHOUSE_GLOBAL_TOKEN"
       region_staleness_secs = 20
       node_id = "global-c"
       advertise_url = "http://global-c:8080"
@@ -444,4 +444,4 @@ volumes:
   global-c-data:
 
 networks:
-  warden:
+  lighthouse:

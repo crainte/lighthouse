@@ -1600,7 +1600,7 @@ mod tests {
     /// pessimistic upper bound: every check flapping roughly daily for the
     /// full 90-day default retention.
     #[test]
-    #[ignore = "index tradeoff benchmark; configure WARDEN_BENCH_* for the intended scale"]
+    #[ignore = "index tradeoff benchmark; configure LIGHTHOUSE_BENCH_* for the intended scale"]
     fn benchmark_alert_incident_lookup_index_tradeoff() {
         fn env_u64(name: &str, default: u64) -> u64 {
             std::env::var(name)
@@ -1616,10 +1616,10 @@ mod tests {
             std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
         }
 
-        let alert_count = env_u64("WARDEN_BENCH_ALERTS", 900_000);
-        let incident_count = env_u64("WARDEN_BENCH_INCIDENTS", 45_000);
-        let check_pool = env_u64("WARDEN_BENCH_CHECK_POOL", 10_000);
-        let write_rounds = env_u64("WARDEN_BENCH_ALERT_WRITE_ROUNDS", 2_000);
+        let alert_count = env_u64("LIGHTHOUSE_BENCH_ALERTS", 900_000);
+        let incident_count = env_u64("LIGHTHOUSE_BENCH_INCIDENTS", 45_000);
+        let check_pool = env_u64("LIGHTHOUSE_BENCH_CHECK_POOL", 10_000);
+        let write_rounds = env_u64("LIGHTHOUSE_BENCH_ALERT_WRITE_ROUNDS", 2_000);
 
         struct Report {
             label: &'static str,
@@ -1636,7 +1636,7 @@ mod tests {
 
         for (label, with_index) in [("no_index", false), ("with_index", true)] {
             let path = std::env::temp_dir().join(format!(
-                "warden-alert-incident-index-bench-{label}-{}-{}.duckdb",
+                "lighthouse-alert-incident-index-bench-{label}-{}-{}.duckdb",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

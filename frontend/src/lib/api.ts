@@ -1,4 +1,4 @@
-// Types + fetch wrappers for the Warden coordinator HTTP API.
+// Types + fetch wrappers for the Lighthouse coordinator HTTP API.
 // Same-origin in production; /api is proxied to the backend during `vite dev`.
 
 /** A single probe attempt remains three-state; degradation is derived only

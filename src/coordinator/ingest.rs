@@ -1004,7 +1004,7 @@ mod tests {
 
     /// Admission control sheds a batch instead of piling every caller behind
     /// the same serialized write path once `MAX_INGEST_INFLIGHT` is already
-    /// reached, and says so on both new series: `warden_ingest_rejected_total`
+    /// reached, and says so on both new series: `lighthouse_ingest_rejected_total`
     /// moves, and the batch's result never reaches storage.
     #[tokio::test]
     async fn ingest_sheds_a_batch_once_inflight_is_saturated() {
@@ -1054,13 +1054,13 @@ mod tests {
             "a shed batch must never reach storage"
         );
         assert_eq!(
-            crate::openmetrics::select(&coord.metrics(), "warden_ingest_rejected_total", &[])
+            crate::openmetrics::select(&coord.metrics(), "lighthouse_ingest_rejected_total", &[])
                 .unwrap()
                 .value,
             1.0
         );
         assert_eq!(
-            crate::openmetrics::select(&coord.metrics(), "warden_ingest_inflight", &[])
+            crate::openmetrics::select(&coord.metrics(), "lighthouse_ingest_inflight", &[])
                 .unwrap()
                 .value,
             MAX_INGEST_INFLIGHT as f64,
@@ -1068,7 +1068,7 @@ mod tests {
         );
     }
 
-    /// The common case: an admitted batch's `warden_ingest_inflight` returns
+    /// The common case: an admitted batch's `lighthouse_ingest_inflight` returns
     /// to zero once `ingest` finishes, via the guard's `Drop`, not a manual
     /// decrement that a future early return could bypass.
     #[tokio::test]
@@ -1106,13 +1106,13 @@ mod tests {
             }])
             .await;
         assert_eq!(
-            crate::openmetrics::select(&coord.metrics(), "warden_ingest_inflight", &[])
+            crate::openmetrics::select(&coord.metrics(), "lighthouse_ingest_inflight", &[])
                 .unwrap()
                 .value,
             0.0
         );
         assert_eq!(
-            crate::openmetrics::select(&coord.metrics(), "warden_ingest_rejected_total", &[])
+            crate::openmetrics::select(&coord.metrics(), "lighthouse_ingest_rejected_total", &[])
                 .unwrap()
                 .value,
             0.0
@@ -1199,11 +1199,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "sustained-ingest benchmark; configure WARDEN_BENCH_* for the intended scale"]
+    #[ignore = "sustained-ingest benchmark; configure LIGHTHOUSE_BENCH_* for the intended scale"]
     async fn benchmark_sustained_coordinator_ingest() {
-        let check_count = env_usize("WARDEN_BENCH_CHECKS", 10_000);
-        let domain_count = env_usize("WARDEN_BENCH_DOMAINS", 1);
-        let batch_count = env_usize("WARDEN_BENCH_BATCHES", 20).max(1);
+        let check_count = env_usize("LIGHTHOUSE_BENCH_CHECKS", 10_000);
+        let domain_count = env_usize("LIGHTHOUSE_BENCH_DOMAINS", 1);
+        let batch_count = env_usize("LIGHTHOUSE_BENCH_BATCHES", 20).max(1);
         assert!(check_count > 0 && domain_count > 0);
 
         let coord = Coordinator::new(&CoordinatorConfig {
@@ -1276,14 +1276,14 @@ mod tests {
         let batch_p95 = percentile(&mut batch_ms, 95);
         let batch_p99 = percentile(&mut batch_ms, 99);
         let batch_max = *batch_ms.last().unwrap();
-        assert_ceiling("WARDEN_BENCH_MAX_INGEST_BATCH_P95_MS", batch_p95);
-        if let Ok(value) = std::env::var("WARDEN_BENCH_MIN_INGEST_ROWS_PER_SECOND") {
+        assert_ceiling("LIGHTHOUSE_BENCH_MAX_INGEST_BATCH_P95_MS", batch_p95);
+        if let Ok(value) = std::env::var("LIGHTHOUSE_BENCH_MIN_INGEST_ROWS_PER_SECOND") {
             let minimum = value
                 .parse::<f64>()
                 .expect("benchmark floor must be a number");
             assert!(
                 rows_per_second >= minimum,
-                "WARDEN_BENCH_MIN_INGEST_ROWS_PER_SECOND: {rows_per_second:.2} below {minimum:.2}"
+                "LIGHTHOUSE_BENCH_MIN_INGEST_ROWS_PER_SECOND: {rows_per_second:.2} below {minimum:.2}"
             );
         }
         println!(

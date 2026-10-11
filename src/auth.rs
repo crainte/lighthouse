@@ -50,16 +50,16 @@ const ATTEMPT_WINDOW_MS: i64 = 60_000;
 /// Separates the signing key derived for sessions from any other use of the
 /// same key material (e.g. `peer_token` also gates the cluster HTTP API), so
 /// a session token can never be replayed as proof of anything else.
-const KEY_DOMAIN: &[u8] = b"warden-session-v1";
+const KEY_DOMAIN: &[u8] = b"lighthouse-session-v1";
 
-pub const SESSION_COOKIE: &str = "warden_session";
+pub const SESSION_COOKIE: &str = "lighthouse_session";
 
 /// The global node names its session cookie distinctly so an operator can be
 /// signed into both a regional coordinator and the global dashboard at once.
 /// Cookies are not port-scoped, so on a shared host (localhost demo, or a
-/// reverse proxy fronting both) a single `warden_session` name would let each
+/// reverse proxy fronting both) a single `lighthouse_session` name would let each
 /// login clobber the other's cookie.
-pub const GLOBAL_SESSION_COOKIE: &str = "warden_global_session";
+pub const GLOBAL_SESSION_COOKIE: &str = "lighthouse_global_session";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum LoginError {
@@ -465,16 +465,22 @@ mod tests {
     #[test]
     fn cookie_value_finds_the_named_cookie_among_others() {
         assert_eq!(
-            cookie_value("theme=dark; warden_session=abc123; other=1", SESSION_COOKIE),
+            cookie_value(
+                "theme=dark; lighthouse_session=abc123; other=1",
+                SESSION_COOKIE
+            ),
             Some("abc123")
         );
         assert_eq!(
-            cookie_value("warden_session=solo", SESSION_COOKIE),
+            cookie_value("lighthouse_session=solo", SESSION_COOKIE),
             Some("solo")
         );
         assert_eq!(cookie_value("theme=dark", SESSION_COOKIE), None);
         // A cookie whose name merely ends with ours must not match.
-        assert_eq!(cookie_value("not_warden_session=abc", SESSION_COOKIE), None);
+        assert_eq!(
+            cookie_value("not_lighthouse_session=abc", SESSION_COOKIE),
+            None
+        );
     }
 
     #[test]

@@ -20,10 +20,10 @@ use axum::{extract::State, Json, Router};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 
+use lighthouse::config::{CheckConfig, CoordinatorConfig};
+use lighthouse::coordinator::Coordinator;
+use lighthouse::models::{CheckId, CheckKind, CheckResult};
 use uuid::Uuid;
-use warden::config::{CheckConfig, CoordinatorConfig};
-use warden::coordinator::Coordinator;
-use warden::models::{CheckId, CheckKind, CheckResult};
 
 const PASSWORD: &str = "correct horse battery staple";
 const LOUD: &str = "payments-api";
@@ -370,7 +370,7 @@ async fn a_test_send_reports_a_refusal_instead_of_claiming_success() {
     assert_eq!(sink.lock().len(), 1, "the test actually sent something");
     assert_eq!(
         sink.lock()[0]["name"],
-        "Warden test",
+        "Lighthouse test",
         "and it is recognisable as a test"
     );
 
@@ -672,7 +672,7 @@ async fn an_email_notifier_delivers_over_smtp() {
             "host": smtp.ip().to_string(),
             "port": smtp.port(),
             "tls": "none",
-            "from": "warden@example.com",
+            "from": "lighthouse@example.com",
             "to": "ops@example.com",
             "default": true,
         }]),
@@ -787,16 +787,24 @@ async fn a_notification_that_fails_is_queued_and_retried_until_it_lands() {
         "delivered means gone: there is no 'sent' row to accumulate"
     );
     assert_eq!(
-        warden::openmetrics::select(&coord.metrics(), "warden_notification_retries_total", &[])
-            .unwrap()
-            .value,
+        lighthouse::openmetrics::select(
+            &coord.metrics(),
+            "lighthouse_notification_retries_total",
+            &[]
+        )
+        .unwrap()
+        .value,
         1.0,
         "the first failed attempt was rescheduled, which is a retry, not a give-up"
     );
     assert_eq!(
-        warden::openmetrics::select(&coord.metrics(), "warden_notification_giveups_total", &[])
-            .unwrap()
-            .value,
+        lighthouse::openmetrics::select(
+            &coord.metrics(),
+            "lighthouse_notification_giveups_total",
+            &[]
+        )
+        .unwrap()
+        .value,
         0.0,
         "it landed on the retry, nobody was ever given up on"
     );
@@ -910,7 +918,7 @@ async fn a_slow_notifier_does_not_block_a_fast_notifier_in_the_same_retry_scan()
 /// restarted mid-outage still owes those pages.
 #[tokio::test]
 async fn a_queued_notification_outlives_a_restart_and_follows_the_edited_notifier() {
-    let dir = std::env::temp_dir().join(format!("warden-retry-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("lighthouse-retry-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("retry.duckdb");
     let _ = std::fs::remove_file(&path);
@@ -997,16 +1005,24 @@ async fn attempts_run_out_and_the_queue_records_that_nobody_was_paged() {
         queued[0]
     );
     assert_eq!(
-        warden::openmetrics::select(&coord.metrics(), "warden_notification_giveups_total", &[])
-            .unwrap()
-            .value,
+        lighthouse::openmetrics::select(
+            &coord.metrics(),
+            "lighthouse_notification_giveups_total",
+            &[]
+        )
+        .unwrap()
+        .value,
         1.0,
         "the panel's 'given_up' row must be visible as a metric too"
     );
     assert_eq!(
-        warden::openmetrics::select(&coord.metrics(), "warden_notification_retries_total", &[])
-            .unwrap()
-            .value,
+        lighthouse::openmetrics::select(
+            &coord.metrics(),
+            "lighthouse_notification_retries_total",
+            &[]
+        )
+        .unwrap()
+        .value,
         5.0,
         "five of the six attempts were rescheduled before the sixth gave up"
     );

@@ -1,18 +1,18 @@
 use anyhow::Result;
 use clap::Parser;
+use lighthouse::agent;
+use lighthouse::config::Config;
+use lighthouse::coordinator::Coordinator;
+use lighthouse::global::GlobalNode;
+use lighthouse::version;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
-use warden::agent;
-use warden::config::Config;
-use warden::coordinator::Coordinator;
-use warden::global::GlobalNode;
-use warden::version;
 
-/// Warden — self-hosted uptime monitor.
+/// Lighthouse — self-hosted uptime monitor.
 #[derive(Parser)]
 // `--version` carries the sha and build time too, because the version alone
 // cannot distinguish two deployments of an unreleased crate.
-#[command(name = "warden", version, long_version = build_banner())]
+#[command(name = "lighthouse", version, long_version = build_banner())]
 struct Cli {
     /// Run mode.
     #[arg(value_enum)]
@@ -20,7 +20,7 @@ struct Cli {
     /// Path to config file (TOML). Read for every mode but `restore`, which
     /// takes its paths explicitly because the whole point is never to touch
     /// a configured, possibly-live database.
-    #[arg(short, long, default_value = "warden.toml")]
+    #[arg(short, long, default_value = "lighthouse.toml")]
     config: PathBuf,
     /// `backup` only: where to write the checkpointed snapshot. Must not
     /// already exist — a backup generation is immutable once written.
@@ -88,7 +88,7 @@ async fn main() -> Result<()> {
         git_sha = %build.git_sha,
         built_at = %build.built_at.to_rfc3339(),
         mode = cli.mode.as_str(),
-        "warden starting"
+        "lighthouse starting"
     );
     let cfg = Config::load(&cli.config)?;
 
@@ -102,12 +102,12 @@ async fn main() -> Result<()> {
     }
 }
 
-/// `warden backup --output <path>`: checkpoint `coordinator.db_path` and
+/// `lighthouse backup --output <path>`: checkpoint `coordinator.db_path` and
 /// copy it there. Synchronous — there is no server to run alongside it, and
 /// the whole operation is expected to complete and exit.
 fn run_backup(cfg: &Config, output: Option<PathBuf>) -> Result<()> {
     let output = output.ok_or_else(|| anyhow::anyhow!("backup mode requires --output <path>"))?;
-    let manifest = warden::coordinator::backup::create(&cfg.coordinator.db_path, &output)?;
+    let manifest = lighthouse::coordinator::backup::create(&cfg.coordinator.db_path, &output)?;
     tracing::info!(
         source = %manifest.source_path,
         source_node = %manifest.source_node,
@@ -125,14 +125,14 @@ fn run_backup(cfg: &Config, output: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// `warden restore --from <backup> --into <fresh path>`: copy and verify,
+/// `lighthouse restore --from <backup> --into <fresh path>`: copy and verify,
 /// never opening or touching a live database. Reports what it found so an
 /// operator can compare it against SCALING.md's restore checklist before
 /// putting the result into service.
 fn run_restore(from: Option<PathBuf>, into: Option<PathBuf>) -> Result<()> {
     let from = from.ok_or_else(|| anyhow::anyhow!("restore mode requires --from <backup path>"))?;
     let into = into.ok_or_else(|| anyhow::anyhow!("restore mode requires --into <fresh path>"))?;
-    let report = warden::coordinator::backup::restore(&from, &into)?;
+    let report = lighthouse::coordinator::backup::restore(&from, &into)?;
     tracing::info!(
         destination = %into.display(),
         checksum_verified = report.checksum_verified,

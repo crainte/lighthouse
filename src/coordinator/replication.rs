@@ -1728,7 +1728,7 @@ mod tests {
         assert_eq!(
             crate::openmetrics::select(
                 &coord.metrics(),
-                "warden_replication_alert_identity_conflicts_total",
+                "lighthouse_replication_alert_identity_conflicts_total",
                 &[]
             )
             .unwrap()
@@ -1899,9 +1899,13 @@ mod tests {
             );
         }
         assert_eq!(
-            crate::openmetrics::select(&b.metrics(), "warden_replication_raw_data_gaps_total", &[])
-                .unwrap()
-                .value,
+            crate::openmetrics::select(
+                &b.metrics(),
+                "lighthouse_replication_raw_data_gaps_total",
+                &[]
+            )
+            .unwrap()
+            .value,
             check_ids.len() as f64,
             "the counter must still increment once per check, not once per sweep"
         );

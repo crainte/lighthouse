@@ -3,7 +3,7 @@ import { defineConfig } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { svelteTesting } from '@testing-library/svelte/vite';
 
-const BACKEND = process.env.WARDEN_BACKEND ?? 'http://127.0.0.1:8080';
+const BACKEND = process.env.LIGHTHOUSE_BACKEND ?? 'http://127.0.0.1:8080';
 
 export default defineConfig({
   plugins: [svelte(), svelteTesting()],

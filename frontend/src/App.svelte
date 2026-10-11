@@ -380,7 +380,7 @@
     { label: '90d', days: 90 },
   ] as const;
   const STRIP_SEGMENTS = 90;
-  const RANGE_STORAGE_KEY = 'warden.status.days';
+  const RANGE_STORAGE_KEY = 'lighthouse.status.days';
 
   function storedDays(): number {
     try {
@@ -795,7 +795,7 @@
   {#if view.name !== 'admin'}
     <header class="bar">
       <div class="brand">
-        <h1>Warden</h1>
+        <h1>Lightkeeper</h1>
         <p class="subtitle">Service Status</p>
       </div>
       <div class="bar-right">
@@ -825,7 +825,7 @@
       <nav class="admin-nav" aria-label="admin sections">
         <div class="nav-brand">
           <span class="brand-dot"></span>
-          <span class="brand-name">Warden</span>
+          <span class="brand-name">Lightkeeper</span>
           <span class="brand-tag">admin</span>
         </div>
         {#if sessionChecked && authenticated}

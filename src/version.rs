@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
-/// The identity of a running warden.
+/// The identity of a running lighthouse.
 ///
 /// Deserialisable as well as serialisable: this crosses the wire in both
 /// directions. An agent reports its build so the coordinator can explain why
@@ -40,11 +40,11 @@ pub fn current() -> &'static Build {
     static BUILD: OnceLock<Build> = OnceLock::new();
     BUILD.get_or_init(|| Build {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        git_sha: env!("WARDEN_GIT_SHA").to_string(),
+        git_sha: env!("LIGHTHOUSE_GIT_SHA").to_string(),
         // A build stamp that cannot be read is worse than one that is
         // obviously wrong, so an unparseable value becomes the epoch: visibly
         // absurd in the UI rather than absent from it.
-        built_at: env!("WARDEN_BUILT_AT")
+        built_at: env!("LIGHTHOUSE_BUILT_AT")
             .parse::<i64>()
             .ok()
             .and_then(|secs| DateTime::from_timestamp(secs, 0))

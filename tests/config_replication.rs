@@ -34,10 +34,10 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 
-use warden::config::{CheckConfig, CoordinatorConfig};
-use warden::coordinator::Coordinator;
-use warden::models::CheckKind;
-use warden::notify::{Notifier, NotifierKind};
+use lighthouse::config::{CheckConfig, CoordinatorConfig};
+use lighthouse::coordinator::Coordinator;
+use lighthouse::models::CheckKind;
+use lighthouse::notify::{Notifier, NotifierKind};
 
 const PEER_TOKEN: &str = "cluster-peer-secret";
 const ADMIN_PASSWORD: &str = "correct horse battery staple";

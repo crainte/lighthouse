@@ -1,5 +1,5 @@
 # Stage A regional demo: three peer coordinators and three agents in us-east.
-# Required: WARDEN_PEER_TOKEN, WARDEN_AGENT_TOKEN_A, WARDEN_AGENT_TOKEN_B.
+# Required: LIGHTHOUSE_PEER_TOKEN, LIGHTHOUSE_AGENT_TOKEN_A, LIGHTHOUSE_AGENT_TOKEN_B.
 # Tokens have no committed defaults; A is shared by the two us-east-1a agents.
 #
 # Demo matrix:
@@ -10,98 +10,98 @@
 # Seeds form the discovery chain a -> b -> c -> a. This is regional Stage A
 # only: no trans-world or global coordinator is included.
 
-name: warden-cluster
+name: lighthouse-cluster
 
 x-coordinator: &coordinator
   build:
     context: .
     args:
       GIT_SHA: ${GIT_SHA:-}
-  image: warden:latest
+  image: lighthouse:latest
   command: ["coordinator"]
   environment:
-    WARDEN_ADMIN_PASSWORD: ${WARDEN_ADMIN_PASSWORD:-}
-    WARDEN_PEER_TOKEN: ${WARDEN_PEER_TOKEN:?WARDEN_PEER_TOKEN is required}
-    WARDEN_AGENT_TOKEN_A: ${WARDEN_AGENT_TOKEN_A:?WARDEN_AGENT_TOKEN_A is required}
-    WARDEN_AGENT_TOKEN_B: ${WARDEN_AGENT_TOKEN_B:?WARDEN_AGENT_TOKEN_B is required}
+    LIGHTHOUSE_ADMIN_PASSWORD: ${LIGHTHOUSE_ADMIN_PASSWORD:-}
+    LIGHTHOUSE_PEER_TOKEN: ${LIGHTHOUSE_PEER_TOKEN:?LIGHTHOUSE_PEER_TOKEN is required}
+    LIGHTHOUSE_AGENT_TOKEN_A: ${LIGHTHOUSE_AGENT_TOKEN_A:?LIGHTHOUSE_AGENT_TOKEN_A is required}
+    LIGHTHOUSE_AGENT_TOKEN_B: ${LIGHTHOUSE_AGENT_TOKEN_B:?LIGHTHOUSE_AGENT_TOKEN_B is required}
   restart: unless-stopped
   networks:
-    - warden
+    - lighthouse
 
 x-agent: &agent
   build:
     context: .
     args:
       GIT_SHA: ${GIT_SHA:-}
-  image: warden:latest
+  image: lighthouse:latest
   command: ["agent"]
   cap_add:
     - NET_RAW
   restart: unless-stopped
   networks:
-    - warden
+    - lighthouse
 
 services:
   coordinator-a:
     <<: *coordinator
     ports:
-      - "${WARDEN_PORT_USE_A:-9001}:8080"
+      - "${LIGHTHOUSE_PORT_USE_A:-9001}:8080"
     configs:
       - source: coordinator-a-toml
-        target: /data/warden.toml
+        target: /data/lighthouse.toml
     volumes:
       - coordinator-a-data:/data
 
   coordinator-b:
     <<: *coordinator
     ports:
-      - "${WARDEN_PORT_USE_B:-9002}:8080"
+      - "${LIGHTHOUSE_PORT_USE_B:-9002}:8080"
     configs:
       - source: coordinator-b-toml
-        target: /data/warden.toml
+        target: /data/lighthouse.toml
     volumes:
       - coordinator-b-data:/data
 
   coordinator-c:
     <<: *coordinator
     ports:
-      - "${WARDEN_PORT_USE_C:-9003}:8080"
+      - "${LIGHTHOUSE_PORT_USE_C:-9003}:8080"
     configs:
       - source: coordinator-c-toml
-        target: /data/warden.toml
+        target: /data/lighthouse.toml
     volumes:
       - coordinator-c-data:/data
 
   agent-a1:
     <<: *agent
     environment:
-      WARDEN_AGENT_TOKEN: ${WARDEN_AGENT_TOKEN_A:?WARDEN_AGENT_TOKEN_A is required}
+      LIGHTHOUSE_AGENT_TOKEN: ${LIGHTHOUSE_AGENT_TOKEN_A:?LIGHTHOUSE_AGENT_TOKEN_A is required}
     configs:
       - source: agent-a1-toml
-        target: /data/warden.toml
+        target: /data/lighthouse.toml
 
   agent-a2:
     <<: *agent
     environment:
-      WARDEN_AGENT_TOKEN: ${WARDEN_AGENT_TOKEN_A:?WARDEN_AGENT_TOKEN_A is required}
+      LIGHTHOUSE_AGENT_TOKEN: ${LIGHTHOUSE_AGENT_TOKEN_A:?LIGHTHOUSE_AGENT_TOKEN_A is required}
     configs:
       - source: agent-a2-toml
-        target: /data/warden.toml
+        target: /data/lighthouse.toml
 
   agent-b1:
     <<: *agent
     environment:
-      WARDEN_AGENT_TOKEN: ${WARDEN_AGENT_TOKEN_B:?WARDEN_AGENT_TOKEN_B is required}
+      LIGHTHOUSE_AGENT_TOKEN: ${LIGHTHOUSE_AGENT_TOKEN_B:?LIGHTHOUSE_AGENT_TOKEN_B is required}
     configs:
       - source: agent-b1-toml
-        target: /data/warden.toml
+        target: /data/lighthouse.toml
 
 configs:
   coordinator-a-toml:
     content: |
       [coordinator]
       listen = "0.0.0.0:8080"
-      db_path = "/data/warden.duckdb"
+      db_path = "/data/lighthouse.duckdb"
       node_id = "coordinator-a"
       advertise_url = "http://coordinator-a:8080"
       peers = ["http://coordinator-b:8080"]
@@ -112,12 +112,12 @@ configs:
       [[coordinator.provision]]
       zone = "us-east-1a"
       region = "us-east"
-      token_env = "WARDEN_AGENT_TOKEN_A"
+      token_env = "LIGHTHOUSE_AGENT_TOKEN_A"
 
       [[coordinator.provision]]
       zone = "us-east-1b"
       region = "us-east"
-      token_env = "WARDEN_AGENT_TOKEN_B"
+      token_env = "LIGHTHOUSE_AGENT_TOKEN_B"
 
       # Checks are created through the Admin UI or API and persisted in the
       # database; none are seeded from this file. Coordinator-b and -c receive
@@ -127,7 +127,7 @@ configs:
     content: |
       [coordinator]
       listen = "0.0.0.0:8080"
-      db_path = "/data/warden.duckdb"
+      db_path = "/data/lighthouse.duckdb"
       node_id = "coordinator-b"
       advertise_url = "http://coordinator-b:8080"
       peers = ["http://coordinator-c:8080"]
@@ -138,18 +138,18 @@ configs:
       [[coordinator.provision]]
       zone = "us-east-1a"
       region = "us-east"
-      token_env = "WARDEN_AGENT_TOKEN_A"
+      token_env = "LIGHTHOUSE_AGENT_TOKEN_A"
 
       [[coordinator.provision]]
       zone = "us-east-1b"
       region = "us-east"
-      token_env = "WARDEN_AGENT_TOKEN_B"
+      token_env = "LIGHTHOUSE_AGENT_TOKEN_B"
 
   coordinator-c-toml:
     content: |
       [coordinator]
       listen = "0.0.0.0:8080"
-      db_path = "/data/warden.duckdb"
+      db_path = "/data/lighthouse.duckdb"
       node_id = "coordinator-c"
       advertise_url = "http://coordinator-c:8080"
       peers = ["http://coordinator-a:8080"]
@@ -160,12 +160,12 @@ configs:
       [[coordinator.provision]]
       zone = "us-east-1a"
       region = "us-east"
-      token_env = "WARDEN_AGENT_TOKEN_A"
+      token_env = "LIGHTHOUSE_AGENT_TOKEN_A"
 
       [[coordinator.provision]]
       zone = "us-east-1b"
       region = "us-east"
-      token_env = "WARDEN_AGENT_TOKEN_B"
+      token_env = "LIGHTHOUSE_AGENT_TOKEN_B"
 
   agent-a1-toml:
     content: |
@@ -203,4 +203,4 @@ volumes:
   coordinator-c-data:
 
 networks:
-  warden:
+  lighthouse:

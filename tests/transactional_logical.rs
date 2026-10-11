@@ -3,12 +3,12 @@
 use std::{net::SocketAddr, time::Duration};
 
 use duckdb::Connection;
-use uuid::Uuid;
-use warden::{
+use lighthouse::{
     config::{CheckConfig, CoordinatorConfig},
     coordinator::Coordinator,
     models::{CheckId, CheckKind, CheckResult, NodeState},
 };
+use uuid::Uuid;
 
 const PEER_TOKEN: &str = "transactional-peer-secret";
 
@@ -79,7 +79,10 @@ async fn close(handle: tokio::task::JoinHandle<()>, coord: Coordinator) {
 
 fn database_path() -> String {
     std::env::temp_dir()
-        .join(format!("warden-transactional-{}.duckdb", Uuid::now_v7()))
+        .join(format!(
+            "lighthouse-transactional-{}.duckdb",
+            Uuid::now_v7()
+        ))
         .to_string_lossy()
         .into_owned()
 }

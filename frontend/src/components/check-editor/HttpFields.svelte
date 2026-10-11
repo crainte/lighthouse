@@ -41,7 +41,7 @@
     addLabel="+ Add header"
     namePlaceholder="Authorization"
     valuePlaceholder="Bearer …"
-    emptyNote="None. The probe sends only Warden's defaults."
+    emptyNote="None. The probe sends only Lighthouse's defaults."
   />
 </div>
 

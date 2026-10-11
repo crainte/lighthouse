@@ -285,7 +285,7 @@
       if (h) return every(h, 'hour');
       if (at(hr)) return `every day, at ${hr.padStart(2, '0')}:${min.padStart(2, '0')}`;
     }
-    return 'Warden reads this schedule; this hint cannot put it in words.';
+    return 'Lighthouse reads this schedule; this hint cannot put it in words.';
   }
 
   function describeInterval(seconds: number | null): string {

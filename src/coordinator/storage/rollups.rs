@@ -1023,7 +1023,7 @@ mod tests {
     /// beside the full rebuilds it replaced — the rebuilds are timed here only
     /// to keep the comparison honest, they are no longer on the path.
     ///
-    /// `WARDEN_BENCH_PRUNE_ROWS` (default 20,000,000) sets the retained rows.
+    /// `LIGHTHOUSE_BENCH_PRUNE_ROWS` (default 20,000,000) sets the retained rows.
     #[test]
     fn latency_rollups_preserve_domains_dedup_and_raw_handoff() {
         let s = Storage::open(":memory:").unwrap();
@@ -1066,8 +1066,10 @@ mod tests {
 
     #[test]
     fn latency_rollup_retention_and_restart_keep_long_range_queries() {
-        let path =
-            std::env::temp_dir().join(format!("warden-rollups-{}.duckdb", uuid::Uuid::now_v7()));
+        let path = std::env::temp_dir().join(format!(
+            "lighthouse-rollups-{}.duckdb",
+            uuid::Uuid::now_v7()
+        ));
         let now = 500 * 24 * MILLIS_PER_HOUR;
         // Must be more than 90 days old (minute tier) but still inside the
         // 13-month hour tier selected relative to this query's end.
@@ -1230,7 +1232,7 @@ mod tests {
     #[test]
     fn a_raw_data_gap_survives_reopen() {
         let path = std::env::temp_dir().join(format!(
-            "warden-raw-data-gap-{}.duckdb",
+            "lighthouse-raw-data-gap-{}.duckdb",
             uuid::Uuid::now_v7()
         ));
         let path = path.to_string_lossy().into_owned();

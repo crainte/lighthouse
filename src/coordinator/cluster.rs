@@ -517,27 +517,27 @@ impl Cluster {
         }
         vec![
             crate::openmetrics::MetricSample::new(
-                "warden_cluster_membership_transitions_total",
+                "lighthouse_cluster_membership_transitions_total",
                 vec![("state".into(), "suspect".into())],
                 self.transitions_to_suspect.load(Ordering::Relaxed) as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_cluster_membership_transitions_total",
+                "lighthouse_cluster_membership_transitions_total",
                 vec![("state".into(), "dead".into())],
                 self.transitions_to_dead.load(Ordering::Relaxed) as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_cluster_members",
+                "lighthouse_cluster_members",
                 vec![("state".into(), "alive".into())],
                 alive as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_cluster_members",
+                "lighthouse_cluster_members",
                 vec![("state".into(), "suspect".into())],
                 suspect as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_cluster_members",
+                "lighthouse_cluster_members",
                 vec![("state".into(), "dead".into())],
                 dead as f64,
             ),
@@ -813,7 +813,7 @@ mod tests {
         let transitions = |c: &Cluster, state: &str| {
             crate::openmetrics::select(
                 &c.metrics(),
-                "warden_cluster_membership_transitions_total",
+                "lighthouse_cluster_membership_transitions_total",
                 &[("state".into(), state.into())],
             )
             .unwrap()
@@ -822,7 +822,7 @@ mod tests {
         let members = |c: &Cluster, state: &str| {
             crate::openmetrics::select(
                 &c.metrics(),
-                "warden_cluster_members",
+                "lighthouse_cluster_members",
                 &[("state".into(), state.into())],
             )
             .unwrap()

@@ -10,18 +10,18 @@ use duckdb::Connection;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{routing::get, Router};
+use lighthouse::agent;
+use lighthouse::config::{
+    AgentConfig, CheckConfig, CoordinatorConfig, GlobalConfig, GlobalPushConfig, RetentionConfig,
+};
+use lighthouse::coordinator::Coordinator;
+use lighthouse::credential;
+use lighthouse::global::GlobalNode;
+use lighthouse::models::{CheckId, CheckKind, CheckResult};
+use lighthouse::placement::Placement;
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
-use warden::agent;
-use warden::config::{
-    AgentConfig, CheckConfig, CoordinatorConfig, GlobalConfig, GlobalPushConfig, RetentionConfig,
-};
-use warden::coordinator::Coordinator;
-use warden::credential;
-use warden::global::GlobalNode;
-use warden::models::{CheckId, CheckKind, CheckResult};
-use warden::placement::Placement;
 
 const DEFAULT_CHECKS: usize = 10_000;
 const DEFAULT_SECS: u64 = 45;
@@ -42,7 +42,7 @@ impl TempDb {
             .unwrap()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "warden-release-bench-{}-{nonce}",
+            "lighthouse-release-bench-{}-{nonce}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -464,9 +464,9 @@ fn convergence_diagnostics(
 }
 
 /// A realistic but bounded release-mode load test. Environment knobs:
-/// `WARDEN_BENCH_CHECKS` (default 10000), `WARDEN_BENCH_SECS` (45, maximum
-/// 300), `WARDEN_BENCH_CRON` (default every 30 seconds),
-/// `WARDEN_BENCH_MAX_DISK_MB` (512), and `WARDEN_BENCH_ANTI_ENTROPY` (default
+/// `LIGHTHOUSE_BENCH_CHECKS` (default 10000), `LIGHTHOUSE_BENCH_SECS` (45, maximum
+/// 300), `LIGHTHOUSE_BENCH_CRON` (default every 30 seconds),
+/// `LIGHTHOUSE_BENCH_MAX_DISK_MB` (512), and `LIGHTHOUSE_BENCH_ANTI_ENTROPY` (default
 /// `on`; set to `off` to skip `spawn_cluster`). The latter also disables that
 /// method's heartbeat and discovery loops, so it is an isolation mode rather
 /// than an equivalent clustered run. It is ignored so ordinary test runs never
@@ -478,16 +478,17 @@ async fn release_benchmark_three_peers_one_region_global_live_agents_and_retenti
         .with_max_level(tracing::Level::INFO)
         .with_test_writer()
         .try_init();
-    let checks = env_usize("WARDEN_BENCH_CHECKS", DEFAULT_CHECKS).clamp(100, 100_000);
-    let seconds = env_secs("WARDEN_BENCH_SECS", DEFAULT_SECS).clamp(1, 300);
-    let cron = std::env::var("WARDEN_BENCH_CRON").unwrap_or_else(|_| DEFAULT_CRON.into());
-    let probe_limit = env_usize("WARDEN_BENCH_MAX_IN_FLIGHT_PROBES", 128);
+    let checks = env_usize("LIGHTHOUSE_BENCH_CHECKS", DEFAULT_CHECKS).clamp(100, 100_000);
+    let seconds = env_secs("LIGHTHOUSE_BENCH_SECS", DEFAULT_SECS).clamp(1, 300);
+    let cron = std::env::var("LIGHTHOUSE_BENCH_CRON").unwrap_or_else(|_| DEFAULT_CRON.into());
+    let probe_limit = env_usize("LIGHTHOUSE_BENCH_MAX_IN_FLIGHT_PROBES", 128);
     assert!(probe_limit > 0, "probe concurrency must be positive");
-    let anti_entropy = std::env::var("WARDEN_BENCH_ANTI_ENTROPY")
+    let anti_entropy = std::env::var("LIGHTHOUSE_BENCH_ANTI_ENTROPY")
         .map(|value| value != "off")
         .unwrap_or(true);
-    let max_disk =
-        env_secs("WARDEN_BENCH_MAX_DISK_MB", DEFAULT_MAX_DISK_MB).clamp(32, 4_096) * 1024 * 1024;
+    let max_disk = env_secs("LIGHTHOUSE_BENCH_MAX_DISK_MB", DEFAULT_MAX_DISK_MB).clamp(32, 4_096)
+        * 1024
+        * 1024;
     assert!(
         checks as u64 * PEERS as u64 * PEERS as u64 * 2_048 <= max_disk,
         "check count exceeds disk safety budget for three live agents and three replicas"
@@ -895,7 +896,7 @@ async fn release_benchmark_three_peers_one_region_global_live_agents_and_retenti
 //     persistent, on-disk database sized like the fixture above.
 //
 // Every threshold is a hard default (see `assert_ceiling`/`assert_floor`
-// below), not merely checked when a `WARDEN_BENCH_*` variable happens to be
+// below), not merely checked when a `LIGHTHOUSE_BENCH_*` variable happens to be
 // set — a silent regression must not pass just because nobody configured a
 // ceiling. Defaults are set at roughly 2x the number measured against this
 // workstation (see SCALING.md's "10,000-check production gate" section for
@@ -994,32 +995,34 @@ async fn status_pagination_covers_over_100_checks_regionally_and_globally() {
     assert_eq!(regional_ids, ids.iter().copied().collect());
 
     let now = chrono::Utc::now().timestamp_millis();
-    let push = warden::global::wire::RegionStatePush {
+    let push = lighthouse::global::wire::RegionStatePush {
         region: "status-pagination-region".into(),
         origin: "status-pagination-node".into(),
         advertise_url: Some(regional_base),
         pushed_at: now,
-        region_health: warden::models::NodeState::Unknown,
+        region_health: lighthouse::models::NodeState::Unknown,
         agents_healthy: 0,
         agents_total: 0,
         checks: ids
             .iter()
             .enumerate()
-            .map(|(number, check_id)| warden::global::wire::CheckSummary {
-                check_id: *check_id,
-                name: format!("bench-check-{number}"),
-                state: warden::models::NodeState::Unknown,
-                latency_ms: 0,
-                last_check: 0,
-                uptime_24h: None,
-                status_code: None,
-                error: None,
-                kind: Some(CheckKind::Http),
-                group: None,
-                latency_graph: true,
-                position: number as i32,
-                depends_on: Vec::new(),
-            })
+            .map(
+                |(number, check_id)| lighthouse::global::wire::CheckSummary {
+                    check_id: *check_id,
+                    name: format!("bench-check-{number}"),
+                    state: lighthouse::models::NodeState::Unknown,
+                    latency_ms: 0,
+                    last_check: 0,
+                    uptime_24h: None,
+                    status_code: None,
+                    error: None,
+                    kind: Some(CheckKind::Http),
+                    group: None,
+                    latency_graph: true,
+                    position: number as i32,
+                    depends_on: Vec::new(),
+                },
+            )
             .collect(),
     };
     let response = client
@@ -1091,14 +1094,14 @@ async fn seed_checks(coord: &Coordinator, checks: usize) -> Vec<CheckId> {
 /// the coordinator's own ingest cost without also paying for `reqwest`
 /// round trips on both sides.
 ///
-/// `WARDEN_BENCH_CHECKS` (default 10,000), `WARDEN_BENCH_INGEST_SECS`
+/// `LIGHTHOUSE_BENCH_CHECKS` (default 10,000), `LIGHTHOUSE_BENCH_INGEST_SECS`
 /// (default 10, so this stays fast enough to run alongside the others),
-/// `WARDEN_BENCH_MIN_INGEST_RESULTS_PER_SEC` (hard floor).
+/// `LIGHTHOUSE_BENCH_MIN_INGEST_RESULTS_PER_SEC` (hard floor).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "production-scale benchmark; run explicitly with cargo test --release --test release_benchmark -- --ignored --nocapture"]
 async fn benchmark_sustained_ingest_throughput_threshold() {
-    let checks = env_usize("WARDEN_BENCH_CHECKS", DEFAULT_CHECKS).clamp(100, 100_000);
-    let seconds = env_secs("WARDEN_BENCH_INGEST_SECS", 10).clamp(1, 120);
+    let checks = env_usize("LIGHTHOUSE_BENCH_CHECKS", DEFAULT_CHECKS).clamp(100, 100_000);
+    let seconds = env_secs("LIGHTHOUSE_BENCH_INGEST_SECS", 10).clamp(1, 120);
     let coord = Coordinator::new(&CoordinatorConfig {
         db_path: ":memory:".into(),
         region: "bench-region".into(),
@@ -1125,7 +1128,7 @@ async fn benchmark_sustained_ingest_throughput_threshold() {
     // ~2x below the ~29,800 results/s measured at 10,000 checks in
     // SCALING.md's "10,000-check production gate" section.
     assert_floor(
-        "WARDEN_BENCH_MIN_INGEST_RESULTS_PER_SEC",
+        "LIGHTHOUSE_BENCH_MIN_INGEST_RESULTS_PER_SEC",
         14_000,
         rate.floor() as u128,
     );
@@ -1138,16 +1141,16 @@ async fn benchmark_sustained_ingest_throughput_threshold() {
 /// latency, all over real HTTP against one shared 10,000-check fixture with
 /// 24h of history per check.
 ///
-/// `WARDEN_BENCH_CHECKS` (default 10,000), `WARDEN_BENCH_HISTORY_PER_CHECK`
-/// (default 12, i.e. one observation every two hours), `WARDEN_BENCH_QUERY_SAMPLES`
-/// (default 50), and one `WARDEN_BENCH_MAX_*_P50_MS` / `_P99_MS` pair per
+/// `LIGHTHOUSE_BENCH_CHECKS` (default 10,000), `LIGHTHOUSE_BENCH_HISTORY_PER_CHECK`
+/// (default 12, i.e. one observation every two hours), `LIGHTHOUSE_BENCH_QUERY_SAMPLES`
+/// (default 50), and one `LIGHTHOUSE_BENCH_MAX_*_P50_MS` / `_P99_MS` pair per
 /// endpoint (hard ceilings, all overridable).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "production-scale benchmark; run explicitly with cargo test --release --test release_benchmark -- --ignored --nocapture"]
 async fn benchmark_status_uptime_history_latency_query_thresholds() {
-    let checks = env_usize("WARDEN_BENCH_CHECKS", DEFAULT_CHECKS).clamp(100, 100_000);
-    let history_per_check = env_usize("WARDEN_BENCH_HISTORY_PER_CHECK", 12).clamp(1, 1_000);
-    let samples = env_usize("WARDEN_BENCH_QUERY_SAMPLES", 50).clamp(1, 1_000);
+    let checks = env_usize("LIGHTHOUSE_BENCH_CHECKS", DEFAULT_CHECKS).clamp(100, 100_000);
+    let history_per_check = env_usize("LIGHTHOUSE_BENCH_HISTORY_PER_CHECK", 12).clamp(1, 1_000);
+    let samples = env_usize("LIGHTHOUSE_BENCH_QUERY_SAMPLES", 50).clamp(1, 1_000);
     let coord = Coordinator::new(&CoordinatorConfig {
         db_path: ":memory:".into(),
         region: "bench-region".into(),
@@ -1214,14 +1217,22 @@ async fn benchmark_status_uptime_history_latency_query_thresholds() {
     // Defaults are ~2x what this benchmark measured at 10,000 checks / 24h
     // history on the machine SCALING.md's numbers were taken on; see its
     // "10,000-check production gate" section for the measured values.
-    assert_ceiling("WARDEN_BENCH_MAX_STATUS_P50_MS", 120, status_p50);
-    assert_ceiling("WARDEN_BENCH_MAX_STATUS_P99_MS", 150, status_p99);
-    assert_ceiling("WARDEN_BENCH_MAX_UPTIME_P50_MS", 80, uptime_p50);
-    assert_ceiling("WARDEN_BENCH_MAX_UPTIME_P99_MS", 120, uptime_p99);
-    assert_ceiling("WARDEN_BENCH_MAX_HISTORY_P50_MS", 20, history_p50);
-    assert_ceiling("WARDEN_BENCH_MAX_HISTORY_P99_MS", 30, history_p99);
-    assert_ceiling("WARDEN_BENCH_MAX_LATENCY_POINTS_P50_MS", 100, latency_p50);
-    assert_ceiling("WARDEN_BENCH_MAX_LATENCY_POINTS_P99_MS", 150, latency_p99);
+    assert_ceiling("LIGHTHOUSE_BENCH_MAX_STATUS_P50_MS", 120, status_p50);
+    assert_ceiling("LIGHTHOUSE_BENCH_MAX_STATUS_P99_MS", 150, status_p99);
+    assert_ceiling("LIGHTHOUSE_BENCH_MAX_UPTIME_P50_MS", 80, uptime_p50);
+    assert_ceiling("LIGHTHOUSE_BENCH_MAX_UPTIME_P99_MS", 120, uptime_p99);
+    assert_ceiling("LIGHTHOUSE_BENCH_MAX_HISTORY_P50_MS", 20, history_p50);
+    assert_ceiling("LIGHTHOUSE_BENCH_MAX_HISTORY_P99_MS", 30, history_p99);
+    assert_ceiling(
+        "LIGHTHOUSE_BENCH_MAX_LATENCY_POINTS_P50_MS",
+        100,
+        latency_p50,
+    );
+    assert_ceiling(
+        "LIGHTHOUSE_BENCH_MAX_LATENCY_POINTS_P99_MS",
+        150,
+        latency_p99,
+    );
 
     println!(
         "benchmark_query_latency checks={checks} history_per_check={history_per_check} samples={samples} status_p50_ms={status_p50} status_p99_ms={status_p99} uptime_p50_ms={uptime_p50} uptime_p99_ms={uptime_p99} history_p50_ms={history_p50} history_p99_ms={history_p99} latency_points_p50_ms={latency_p50} latency_points_p99_ms={latency_p99}"
@@ -1235,12 +1246,12 @@ async fn benchmark_status_uptime_history_latency_query_thresholds() {
 /// and `chaos.rs`'s peer-unavailable scenarios exercise for correctness;
 /// this measures its cost at production cardinality instead.
 ///
-/// `WARDEN_BENCH_CHECKS` (default 10,000), `WARDEN_BENCH_ANTI_ENTROPY_MAX_SECS`
+/// `LIGHTHOUSE_BENCH_CHECKS` (default 10,000), `LIGHTHOUSE_BENCH_ANTI_ENTROPY_MAX_SECS`
 /// (hard ceiling on total sweep time to full convergence).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "production-scale benchmark; run explicitly with cargo test --release --test release_benchmark -- --ignored --nocapture"]
 async fn benchmark_anti_entropy_reconciliation_threshold() {
-    let checks = env_usize("WARDEN_BENCH_CHECKS", DEFAULT_CHECKS).clamp(100, 100_000);
+    let checks = env_usize("LIGHTHOUSE_BENCH_CHECKS", DEFAULT_CHECKS).clamp(100, 100_000);
     let peer_token = "bench-anti-entropy-peer-token";
 
     async fn node(peer_token: &str, peers: Vec<String>) -> (Coordinator, SocketAddr) {
@@ -1336,7 +1347,7 @@ async fn benchmark_anti_entropy_reconciliation_threshold() {
     // ~2x the measured 61s full catalogue-plus-results convergence for a
     // 10,000-check late joiner (SCALING.md's "10,000-check production gate").
     assert_ceiling(
-        "WARDEN_BENCH_ANTI_ENTROPY_MAX_SECS",
+        "LIGHTHOUSE_BENCH_ANTI_ENTROPY_MAX_SECS",
         130,
         elapsed.as_secs() as u128,
     );
@@ -1349,16 +1360,16 @@ async fn benchmark_anti_entropy_reconciliation_threshold() {
 
 /// `Storage::prune_results` duration (via the `prune_results_for_test` hook
 /// every restart/recovery test already uses) over a realistic multi-day raw
-/// backlog: `WARDEN_BENCH_CHECKS` (default 10,000) checks, each with
-/// `WARDEN_BENCH_RETENTION_DAYS` (default 3) days of hourly results, pruning
+/// backlog: `LIGHTHOUSE_BENCH_CHECKS` (default 10,000) checks, each with
+/// `LIGHTHOUSE_BENCH_RETENTION_DAYS` (default 3) days of hourly results, pruning
 /// everything older than one day.
 ///
-/// `WARDEN_BENCH_RETENTION_MAX_MS` is the hard ceiling.
+/// `LIGHTHOUSE_BENCH_RETENTION_MAX_MS` is the hard ceiling.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "production-scale benchmark; run explicitly with cargo test --release --test release_benchmark -- --ignored --nocapture"]
 async fn benchmark_retention_cleanup_threshold() {
-    let checks = env_usize("WARDEN_BENCH_CHECKS", DEFAULT_CHECKS).clamp(100, 100_000);
-    let days = env_usize("WARDEN_BENCH_RETENTION_DAYS", 3).clamp(1, 30);
+    let checks = env_usize("LIGHTHOUSE_BENCH_CHECKS", DEFAULT_CHECKS).clamp(100, 100_000);
+    let days = env_usize("LIGHTHOUSE_BENCH_RETENTION_DAYS", 3).clamp(1, 30);
     let coord = Coordinator::new(&CoordinatorConfig {
         db_path: ":memory:".into(),
         region: "bench-region".into(),
@@ -1384,7 +1395,11 @@ async fn benchmark_retention_cleanup_threshold() {
     let elapsed = started.elapsed();
     // ~5x (not 2x) the measured 80ms: a raw-result delete's cost is I/O-bound
     // and the least alike-hardware-portable of these numbers.
-    assert_ceiling("WARDEN_BENCH_RETENTION_MAX_MS", 400, elapsed.as_millis());
+    assert_ceiling(
+        "LIGHTHOUSE_BENCH_RETENTION_MAX_MS",
+        400,
+        elapsed.as_millis(),
+    );
     assert!(
         removed > 0 && removed < seeded_rows,
         "the prune should have removed the seeded backlog but kept the most recent hour: \
@@ -1403,13 +1418,13 @@ async fn benchmark_retention_cleanup_threshold() {
 /// which measures the same WAL-replay boundary directly against `Storage`
 /// without a `Coordinator` or router around it.
 ///
-/// `WARDEN_BENCH_CHECKS` (default 10,000), `WARDEN_BENCH_HISTORY_PER_CHECK`
-/// (default 12), `WARDEN_BENCH_STARTUP_MAX_MS` (hard ceiling).
+/// `LIGHTHOUSE_BENCH_CHECKS` (default 10,000), `LIGHTHOUSE_BENCH_HISTORY_PER_CHECK`
+/// (default 12), `LIGHTHOUSE_BENCH_STARTUP_MAX_MS` (hard ceiling).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "production-scale benchmark; run explicitly with cargo test --release --test release_benchmark -- --ignored --nocapture"]
 async fn benchmark_startup_recovery_threshold() {
-    let checks = env_usize("WARDEN_BENCH_CHECKS", DEFAULT_CHECKS).clamp(100, 100_000);
-    let history_per_check = env_usize("WARDEN_BENCH_HISTORY_PER_CHECK", 12).clamp(1, 1_000);
+    let checks = env_usize("LIGHTHOUSE_BENCH_CHECKS", DEFAULT_CHECKS).clamp(100, 100_000);
+    let history_per_check = env_usize("LIGHTHOUSE_BENCH_HISTORY_PER_CHECK", 12).clamp(1, 1_000);
     let temp = TempDb::new();
     let path = temp.path("startup-recovery");
 
@@ -1452,7 +1467,11 @@ async fn benchmark_startup_recovery_threshold() {
         "the reopened catalogue must match what was seeded before the restart"
     );
     // ~2x the measured 9.6s WAL-replay reopen at 10,000 checks / 24h history.
-    assert_ceiling("WARDEN_BENCH_STARTUP_MAX_MS", 20_000, elapsed.as_millis());
+    assert_ceiling(
+        "LIGHTHOUSE_BENCH_STARTUP_MAX_MS",
+        20_000,
+        elapsed.as_millis(),
+    );
     println!(
         "benchmark_startup_recovery checks={checks} history_per_check={history_per_check} seeded_rows={seeded_rows} reopen_ms={}",
         elapsed.as_millis()

@@ -441,11 +441,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "production-cardinality benchmark; configure WARDEN_BENCH_* for the intended scale"]
+    #[ignore = "production-cardinality benchmark; configure LIGHTHOUSE_BENCH_* for the intended scale"]
     async fn benchmark_status_and_global_push_production_cardinality() {
-        let check_count = env_usize("WARDEN_BENCH_CHECKS", 10_000);
-        let region_count = env_usize("WARDEN_BENCH_REGIONS", 3);
-        let sample_count = env_usize("WARDEN_BENCH_SAMPLES", 20).max(1);
+        let check_count = env_usize("LIGHTHOUSE_BENCH_CHECKS", 10_000);
+        let region_count = env_usize("LIGHTHOUSE_BENCH_REGIONS", 3);
+        let sample_count = env_usize("LIGHTHOUSE_BENCH_SAMPLES", 20).max(1);
         let token = "benchmark-global-token";
         let coord = Coordinator::new(&CoordinatorConfig {
             db_path: ":memory:".into(),
@@ -704,17 +704,17 @@ mod tests {
         let page_max_p95 = percentile(&mut page_max_ms, 95);
         let push_p95 = percentile(&mut push_ms, 95);
         let global_p95 = percentile(&mut global_ms, 95);
-        assert_ceiling("WARDEN_BENCH_MAX_REGIONAL_STATUS_P95_MS", regional_p95);
-        assert_ceiling("WARDEN_BENCH_MAX_STATUS_PAGE_P95_MS", page_p95);
-        assert_ceiling("WARDEN_BENCH_MAX_STATUS_PAGE_BYTES", page_bytes as u128);
-        assert_ceiling("WARDEN_BENCH_MAX_STATUS_PAGE_MAX_P95_MS", page_max_p95);
+        assert_ceiling("LIGHTHOUSE_BENCH_MAX_REGIONAL_STATUS_P95_MS", regional_p95);
+        assert_ceiling("LIGHTHOUSE_BENCH_MAX_STATUS_PAGE_P95_MS", page_p95);
+        assert_ceiling("LIGHTHOUSE_BENCH_MAX_STATUS_PAGE_BYTES", page_bytes as u128);
+        assert_ceiling("LIGHTHOUSE_BENCH_MAX_STATUS_PAGE_MAX_P95_MS", page_max_p95);
         assert_ceiling(
-            "WARDEN_BENCH_MAX_STATUS_PAGE_MAX_BYTES",
+            "LIGHTHOUSE_BENCH_MAX_STATUS_PAGE_MAX_BYTES",
             page_max_bytes as u128,
         );
-        assert_ceiling("WARDEN_BENCH_MAX_GLOBAL_PUSH_P95_MS", push_p95);
-        assert_ceiling("WARDEN_BENCH_MAX_GLOBAL_STATUS_P95_MS", global_p95);
-        assert_ceiling("WARDEN_BENCH_MAX_PUSH_BYTES", push_bytes as u128);
+        assert_ceiling("LIGHTHOUSE_BENCH_MAX_GLOBAL_PUSH_P95_MS", push_p95);
+        assert_ceiling("LIGHTHOUSE_BENCH_MAX_GLOBAL_STATUS_P95_MS", global_p95);
+        assert_ceiling("LIGHTHOUSE_BENCH_MAX_PUSH_BYTES", push_bytes as u128);
         println!(
             "checks={check_count} regions={region_count} samples={sample_count} page_size={page_len} regional_status_p95_ms={regional_p95} regional_status_bytes={regional_bytes} status_page_p95_ms={page_p95} status_page_bytes={page_bytes} status_page_requests=3 status_page_max_p95_ms={page_max_p95} status_page_max_bytes={page_max_bytes} status_page_max_size={max_page_len} global_push_p95_ms={push_p95} push_bytes={push_bytes} global_status_p95_ms={global_p95} global_status_bytes={global_bytes}"
         );

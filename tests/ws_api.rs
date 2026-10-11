@@ -15,13 +15,13 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio_tungstenite::connect_async;
 
+use lighthouse::config::{CheckConfig, CoordinatorConfig};
+use lighthouse::models::CheckId;
 use uuid::Uuid;
-use warden::config::{CheckConfig, CoordinatorConfig};
-use warden::models::CheckId;
 
 /// Ingest accepts only minted agent credentials, so the test provisions one.
 const AGENT_TOKEN: &str = "wac_ws.ws-test-agent-secret";
-use warden::coordinator::Coordinator;
+use lighthouse::coordinator::Coordinator;
 
 /// Bind an ephemeral 127.0.0.1 port, read the port BEFORE serving, then serve
 /// the router in a spawned task. The listener is bound before `serve`, so the
@@ -63,7 +63,7 @@ async fn transition_broadcasts_over_ws_and_surfaces_in_read_api() {
     // currently exist, and this test is about transitions surfacing, not about
     // how orphaned history is treated.
     // Ingest refuses anything but a minted credential, so provision one rather
-    // than relying on an ambient `WARDEN_AGENT_TOKEN`. This test is therefore
+    // than relying on an ambient `LIGHTHOUSE_AGENT_TOKEN`. This test is therefore
     // independent of whatever the machine exports.
     let coord = Coordinator::new(&CoordinatorConfig {
         listen: "127.0.0.1:0".into(),

@@ -424,7 +424,7 @@ mod tests {
     #[test]
     fn render_round_trips_labels_and_special_values() {
         let samples = vec![MetricSample::new(
-            "warden_database_queries_total",
+            "lighthouse_database_queries_total",
             pairs(&[("result", "error\n\\\"")]),
             f64::INFINITY,
         )];

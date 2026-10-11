@@ -10,11 +10,11 @@
 
 use std::net::SocketAddr;
 
+use lighthouse::config::{CheckConfig, CoordinatorConfig};
+use lighthouse::coordinator::Coordinator;
+use lighthouse::models::{CheckId, CheckKind};
 use serde_json::{json, Value};
 use uuid::Uuid;
-use warden::config::{CheckConfig, CoordinatorConfig};
-use warden::coordinator::Coordinator;
-use warden::models::{CheckId, CheckKind};
 
 const PASSWORD: &str = "correct horse battery staple";
 const PEER_TOKEN: &str = "peer-only-secret";

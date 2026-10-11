@@ -386,7 +386,7 @@ mod tests {
         for src in [
             r#"return io.open("/etc/passwd") and "UP" or "DOWN""#,
             r#"return os.execute("id") and "UP" or "DOWN""#,
-            r#"return os.getenv("WARDEN_ADMIN_PASSWORD") and "UP" or "DOWN""#,
+            r#"return os.getenv("LIGHTHOUSE_ADMIN_PASSWORD") and "UP" or "DOWN""#,
             r#"return require("os") and "UP" or "DOWN""#,
             r#"return load("return 1") and "UP" or "DOWN""#,
             r#"return dofile("/etc/passwd") and "UP" or "DOWN""#,

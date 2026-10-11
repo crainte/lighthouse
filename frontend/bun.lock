@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "warden-frontend",
+      "name": "lightkeeper",
       "devDependencies": {
         "@sveltejs/vite-plugin-svelte": "^7.3.0",
         "@testing-library/jest-dom": "^7.0.1",

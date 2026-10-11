@@ -1,8 +1,8 @@
-# Scaling Warden to 10,000 Checks
+# Scaling Lighthouse to 10,000 Checks
 
 ## Goal
 
-Warden should reliably monitor at least 10,000 checks across a geographically distributed deployment without trying to reproduce Prometheus's feature set. The target is dependable wide-area probing, clear regional and global state, bounded failure behavior, and predictable operation during outages and coordinator recovery.
+Lighthouse should reliably monitor at least 10,000 checks across a geographically distributed deployment without trying to reproduce Prometheus's feature set. The target is dependable wide-area probing, clear regional and global state, bounded failure behavior, and predictable operation during outages and coordinator recovery.
 
 The expected topology is:
 
@@ -18,7 +18,7 @@ Global coordinator cluster (3 nodes)
         └── Agents in multiple failure domains
 ```
 
-A typical Kubernetes cluster may run three agent replicas for capacity, rolling upgrades, and failover. Those colocated replicas normally belong to the same Warden zone and use placement `count = 1`: one agent probes a given check while rendezvous hashing spreads checks across all three. Distinct zones or regions provide independent observations and multiply result volume.
+A typical Kubernetes cluster may run three agent replicas for capacity, rolling upgrades, and failover. Those colocated replicas normally belong to the same Lighthouse zone and use placement `count = 1`: one agent probes a given check while rendezvous hashing spreads checks across all three. Distinct zones or regions provide independent observations and multiply result volume.
 
 ## Confirmed identity decisions
 
@@ -107,7 +107,7 @@ New result/state/config data is generally sent incrementally, and anti-entropy c
 
 ### Alert identity conflict health and safe repair
 
-`warden_replication_alert_identity_conflicts_total` is a per-process counter of
+`lighthouse_replication_alert_identity_conflicts_total` is a per-process counter of
 replicated alert IDs whose immutable payload differs from an existing local row.
 It is intentionally a health alarm, not a reconciliation mechanism: the
 coordinator retains the local row and continues applying the rest of the batch.
@@ -246,7 +246,7 @@ The target policy for a large deployment is:
 Raw retention supports detailed diagnosis. State transitions support exact time-weighted
 uptime without retaining every successful probe. Rollups support bounded long-range
 latency queries. The backup schedule is an operational starting point, not a built-in
-Warden guarantee.
+Lighthouse guarantee.
 
 Minute/hour rollups replicate through their own digest and cursored backfill
 (`/internal/backfill/latency-minute`, `-hour`), the same shape as the alert/incident/
@@ -357,8 +357,8 @@ columns — a rollback onto a database a newer binary already touched — are
 tolerated.
 
 Rebuild procedure for a node that fails to open on a real deployment: stop
-the node, move its database file aside (e.g. `/data/warden.duckdb` to
-`/data/warden.duckdb.bak`), and restart it. It re-replicates current
+the node, move its database file aside (e.g. `/data/lighthouse.duckdb` to
+`/data/lighthouse.duckdb.bak`), and restart it. It re-replicates current
 configuration from its peers and re-accumulates history from the retention
 window forward; global-tier config re-replicates the same way regional
 peers do. Do not delete the moved-aside file until the rebuilt node has
@@ -553,8 +553,8 @@ Run the benchmark from a release build with a file-descriptor limit of at least 
 ```
 docker run --rm --ulimit nofile=65536:65536 \
   -v "$PWD/target/release/deps/release_benchmark-<hash>:/bench:ro" \
-  -e WARDEN_BENCH_CHECKS=10000 -e WARDEN_BENCH_SECS=120 \
-  -e WARDEN_BENCH_MAX_IN_FLIGHT_PROBES=2048 -e WARDEN_BENCH_MAX_DISK_MB=4096 \
+  -e LIGHTHOUSE_BENCH_CHECKS=10000 -e LIGHTHOUSE_BENCH_SECS=120 \
+  -e LIGHTHOUSE_BENCH_MAX_IN_FLIGHT_PROBES=2048 -e LIGHTHOUSE_BENCH_MAX_DISK_MB=4096 \
   ubuntu:25.10 /bench --ignored --nocapture --test-threads 1
 ```
 
@@ -584,19 +584,19 @@ Measured on 2026-09-20 with a release build on the same workstation as the numbe
 above (single coordinator per benchmark, in-memory database except the restart
 benchmark, which is on-disk). Thresholds are set at roughly 2x each measured number
 (5x for retention, which is the most disk-dependent of the five); see the
-`WARDEN_BENCH_*` names in `tests/release_benchmark.rs` to override any of them for
+`LIGHTHOUSE_BENCH_*` names in `tests/release_benchmark.rs` to override any of them for
 different hardware or a stricter release gate:
 
 | Benchmark | Measurement | Threshold (env var) |
 |---|---:|---|
-| Sustained ingest (`Coordinator::ingest`, 10,000 checks) | 29,847 results/s | ≥ 14,000 (`WARDEN_BENCH_MIN_INGEST_RESULTS_PER_SEC`) |
-| Public status page, p50 / p99 | 53 / 65 ms | ≤ 120 / 150 ms (`WARDEN_BENCH_MAX_STATUS_P50_MS` / `_P99_MS`) |
-| 24h uptime strips, p50 / p99 | 36 / 52 ms | ≤ 80 / 120 ms (`WARDEN_BENCH_MAX_UPTIME_P50_MS` / `_P99_MS`) |
-| Single-check history (100 rows), p50 / p99 | 3 / 7 ms | ≤ 20 / 30 ms (`WARDEN_BENCH_MAX_HISTORY_P50_MS` / `_P99_MS`) |
-| Latency-points strips, p50 / p99 | 45 / 67 ms | ≤ 100 / 150 ms (`WARDEN_BENCH_MAX_LATENCY_POINTS_P50_MS` / `_P99_MS`) |
-| Anti-entropy: late joiner converges catalogue + results, 10,000 checks | 61 s | ≤ 130 s (`WARDEN_BENCH_ANTI_ENTROPY_MAX_SECS`) |
-| Retention: `prune_results` over a 3-day/720K-row backlog | 80 ms | ≤ 400 ms (`WARDEN_BENCH_RETENTION_MAX_MS`) |
-| Startup recovery: reopen a 10,000-check/24h-history database | 9.6 s | ≤ 20 s (`WARDEN_BENCH_STARTUP_MAX_MS`) |
+| Sustained ingest (`Coordinator::ingest`, 10,000 checks) | 29,847 results/s | ≥ 14,000 (`LIGHTHOUSE_BENCH_MIN_INGEST_RESULTS_PER_SEC`) |
+| Public status page, p50 / p99 | 53 / 65 ms | ≤ 120 / 150 ms (`LIGHTHOUSE_BENCH_MAX_STATUS_P50_MS` / `_P99_MS`) |
+| 24h uptime strips, p50 / p99 | 36 / 52 ms | ≤ 80 / 120 ms (`LIGHTHOUSE_BENCH_MAX_UPTIME_P50_MS` / `_P99_MS`) |
+| Single-check history (100 rows), p50 / p99 | 3 / 7 ms | ≤ 20 / 30 ms (`LIGHTHOUSE_BENCH_MAX_HISTORY_P50_MS` / `_P99_MS`) |
+| Latency-points strips, p50 / p99 | 45 / 67 ms | ≤ 100 / 150 ms (`LIGHTHOUSE_BENCH_MAX_LATENCY_POINTS_P50_MS` / `_P99_MS`) |
+| Anti-entropy: late joiner converges catalogue + results, 10,000 checks | 61 s | ≤ 130 s (`LIGHTHOUSE_BENCH_ANTI_ENTROPY_MAX_SECS`) |
+| Retention: `prune_results` over a 3-day/720K-row backlog | 80 ms | ≤ 400 ms (`LIGHTHOUSE_BENCH_RETENTION_MAX_MS`) |
+| Startup recovery: reopen a 10,000-check/24h-history database | 9.6 s | ≤ 20 s (`LIGHTHOUSE_BENCH_STARTUP_MAX_MS`) |
 
 The query-latency benchmark seeds one shared 10,000-check/24h-history fixture rather
 than a separate one per endpoint, so status, uptime, history, and latency-points cost
@@ -774,8 +774,8 @@ forecast from repeated constants.
 Run a local baseline with:
 
 ```bash
-WARDEN_BENCH_CHECKS=10000 WARDEN_BENCH_DAYS=30 WARDEN_BENCH_OBSERVATION_SECS=30 \
-WARDEN_BENCH_DOMAINS=1 \
+LIGHTHOUSE_BENCH_CHECKS=10000 LIGHTHOUSE_BENCH_DAYS=30 LIGHTHOUSE_BENCH_OBSERVATION_SECS=30 \
+LIGHTHOUSE_BENCH_DOMAINS=1 \
 rtk cargo test benchmark_representative_storage_capacity_baseline -- --ignored --nocapture
 ```
 
@@ -783,9 +783,9 @@ Repeat for one, three, and five independent domains. The test reports logical ro
 DuckDB, WAL, and backup bytes; p95 history and latency-query time; and seed, prune,
 checkpoint, backup, and restore duration. Backup is measured from a checkpointed,
 closed database, matching the required offline file-copy procedure. Optional
-`WARDEN_BENCH_MAX_*` variables turn these measurements into explicit acceptance
-ceilings, including `WARDEN_BENCH_MAX_BACKUP_MS` and
-`WARDEN_BENCH_MAX_RESTORE_MS`.
+`LIGHTHOUSE_BENCH_MAX_*` variables turn these measurements into explicit acceptance
+ceilings, including `LIGHTHOUSE_BENCH_MAX_BACKUP_MS` and
+`LIGHTHOUSE_BENCH_MAX_RESTORE_MS`.
 
 This is baseline characterization only. It does not validate live probe traffic,
 network replication, online backups, rollup resolution switching, or partition expiry;
@@ -879,10 +879,10 @@ already exists. `list_status` and `uptime_strips` scan the table unfiltered by
 `check_id` because they want every check in one pass; a `check_id`-leading index cannot
 help a query that does not filter on it, so there is nothing to add there either.
 
-Run either tradeoff benchmark with `WARDEN_BENCH_CHECKS`/`WARDEN_BENCH_DAYS`/
-`WARDEN_BENCH_OBSERVATION_SECS`/`WARDEN_BENCH_INGEST_ROUNDS` or
-`WARDEN_BENCH_ALERTS`/`WARDEN_BENCH_INCIDENTS`/`WARDEN_BENCH_CHECK_POOL`/
-`WARDEN_BENCH_ALERT_WRITE_ROUNDS` respectively:
+Run either tradeoff benchmark with `LIGHTHOUSE_BENCH_CHECKS`/`LIGHTHOUSE_BENCH_DAYS`/
+`LIGHTHOUSE_BENCH_OBSERVATION_SECS`/`LIGHTHOUSE_BENCH_INGEST_ROUNDS` or
+`LIGHTHOUSE_BENCH_ALERTS`/`LIGHTHOUSE_BENCH_INCIDENTS`/`LIGHTHOUSE_BENCH_CHECK_POOL`/
+`LIGHTHOUSE_BENCH_ALERT_WRITE_ROUNDS` respectively:
 
 ```bash
 rtk cargo test benchmark_check_results_check_id_ts_index_tradeoff -- --ignored --nocapture
@@ -897,13 +897,13 @@ through the real coordinator evaluation, rollup, and persistence path. It defaul
 five domains:
 
 ```bash
-WARDEN_BENCH_CHECKS=10000 WARDEN_BENCH_DOMAINS=1 WARDEN_BENCH_BATCHES=20 \
+LIGHTHOUSE_BENCH_CHECKS=10000 LIGHTHOUSE_BENCH_DOMAINS=1 LIGHTHOUSE_BENCH_BATCHES=20 \
 rtk cargo test benchmark_sustained_coordinator_ingest -- --ignored --nocapture
 ```
 
 It reports total rows, sustained rows/s, and batch p50/p95/p99/max. Optional
-`WARDEN_BENCH_MIN_INGEST_ROWS_PER_SECOND` and
-`WARDEN_BENCH_MAX_INGEST_BATCH_P95_MS` variables enforce acceptance thresholds.
+`LIGHTHOUSE_BENCH_MIN_INGEST_ROWS_PER_SECOND` and
+`LIGHTHOUSE_BENCH_MAX_INGEST_BATCH_P95_MS` variables enforce acceptance thresholds.
 This isolates coordinator ingest capacity; agent scheduling, network transfer, and
 concurrent query/retention load still require production-scale measurement.
 
@@ -914,17 +914,17 @@ real regional and global HTTP status routes plus authenticated full-state pushes
 uses 10,000 checks, three regions, and 20 samples by default. Run it with:
 
 ```bash
-WARDEN_BENCH_CHECKS=10000 WARDEN_BENCH_REGIONS=3 WARDEN_BENCH_SAMPLES=20 \
+LIGHTHOUSE_BENCH_CHECKS=10000 LIGHTHOUSE_BENCH_REGIONS=3 LIGHTHOUSE_BENCH_SAMPLES=20 \
 rtk cargo test benchmark_status_and_global_push_production_cardinality -- --ignored --nocapture
 ```
 
 It reports regional/global status p95 and response bytes, full status-page p95 and bytes
 at both the dashboard's default page size and the route's `MAX_PAGE_SIZE` ceiling, plus
-global-push p95 and payload bytes. Optional `WARDEN_BENCH_MAX_REGIONAL_STATUS_P95_MS`,
-`WARDEN_BENCH_MAX_STATUS_PAGE_P95_MS`, `WARDEN_BENCH_MAX_STATUS_PAGE_BYTES`,
-`WARDEN_BENCH_MAX_STATUS_PAGE_MAX_P95_MS`, `WARDEN_BENCH_MAX_STATUS_PAGE_MAX_BYTES`,
-`WARDEN_BENCH_MAX_GLOBAL_PUSH_P95_MS`, `WARDEN_BENCH_MAX_GLOBAL_STATUS_P95_MS`, and
-`WARDEN_BENCH_MAX_PUSH_BYTES` variables enforce local acceptance ceilings. The global
+global-push p95 and payload bytes. Optional `LIGHTHOUSE_BENCH_MAX_REGIONAL_STATUS_P95_MS`,
+`LIGHTHOUSE_BENCH_MAX_STATUS_PAGE_P95_MS`, `LIGHTHOUSE_BENCH_MAX_STATUS_PAGE_BYTES`,
+`LIGHTHOUSE_BENCH_MAX_STATUS_PAGE_MAX_P95_MS`, `LIGHTHOUSE_BENCH_MAX_STATUS_PAGE_MAX_BYTES`,
+`LIGHTHOUSE_BENCH_MAX_GLOBAL_PUSH_P95_MS`, `LIGHTHOUSE_BENCH_MAX_GLOBAL_STATUS_P95_MS`, and
+`LIGHTHOUSE_BENCH_MAX_PUSH_BYTES` variables enforce local acceptance ceilings. The global
 push route has an explicit 16 MiB limit so supported 10,000-check snapshots are not
 rejected by Axum's 2 MiB default. This validates cardinality, not sustained concurrent
 load or the full production capacity envelope.
@@ -1257,8 +1257,8 @@ file copy. The target schedule is 7 daily, 4 weekly, and 12 monthly snapshots;
 apply immutable/off-site storage and access controls appropriate to the loss
 scenario. This schedule is operator-managed, not a built-in scheduler.
 
-`warden backup --config warden.toml --output <path>` and
-`warden restore --from <backup> --into <path>` are the built-in procedure for
+`lighthouse backup --config lighthouse.toml --output <path>` and
+`lighthouse restore --from <backup> --into <path>` are the built-in procedure for
 the two paragraphs above, run as a separate CLI invocation rather than an
 admin HTTP route: streaming a multi-gigabyte database through an admin session
 is the wrong shape for an operator action this size, and a backup command that
@@ -1303,41 +1303,41 @@ Every series below is low-cardinality by construction: no check id, agent id,
 or peer id ever appears as a label, only bounded, admin-known sets (a
 membership `state`, for example).
 
-- **Database latency and lock wait**: `warden_database_queries_total`,
-  `warden_database_query_duration_seconds_total` (execution),
-  `warden_database_queue_wait_seconds_total` (time queued behind the single
+- **Database latency and lock wait**: `lighthouse_database_queries_total`,
+  `lighthouse_database_query_duration_seconds_total` (execution),
+  `lighthouse_database_queue_wait_seconds_total` (time queued behind the single
   worker before execution — the "lock wait" half), and
-  `warden_database_queue_depth` (current backlog, gauge). Alert on
+  `lighthouse_database_queue_depth` (current backlog, gauge). Alert on
   `queue_depth` sustained near 256 (`QUEUE_CAPACITY`) — SCALING.md's own
   "Read path" section documents that overrunning this queue turns into
   backpressure on result ingest — or on `queue_wait_seconds_total` growing
   faster than `queries_total` (jobs increasingly wait rather than run).
-- **Ingest backpressure**: `warden_ingest_inflight` (gauge, concurrent
-  `ingest` calls admitted) and `warden_ingest_rejected_total` (batches shed
+- **Ingest backpressure**: `lighthouse_ingest_inflight` (gauge, concurrent
+  `ingest` calls admitted) and `lighthouse_ingest_rejected_total` (batches shed
   once `MAX_INGEST_INFLIGHT` — 256, matching the database queue's own budget
   — is already reached). Any nonzero rate on the rejected counter means the
   coordinator is shedding agent data under overload; alert on it directly
   rather than waiting for the queue-depth signal above.
-- **Replication health**: existing `warden_replication_raw_data_gaps_total`
-  and `warden_replication_alert_identity_conflicts_total`, plus
-  `warden_replication_anti_entropy_failures_total` (a sweep that never
+- **Replication health**: existing `lighthouse_replication_raw_data_gaps_total`
+  and `lighthouse_replication_alert_identity_conflicts_total`, plus
+  `lighthouse_replication_anti_entropy_failures_total` (a sweep that never
   reached reconciliation: no reachable peer, a malformed response, or a
   failed local digest read) and
-  `warden_replication_anti_entropy_last_success_timestamp_seconds` (unix
+  `lighthouse_replication_anti_entropy_last_success_timestamp_seconds` (unix
   seconds, gauge). Alert on `time() -
-  warden_replication_anti_entropy_last_success_timestamp_seconds` exceeding
+  lighthouse_replication_anti_entropy_last_success_timestamp_seconds` exceeding
   a few multiples of `anti_entropy_secs` — reconciliation lag stated
   directly, not inferred from the failure counter's absence.
-- **Notification retry/give-up**: `warden_notification_retries_total` and
-  `warden_notification_giveups_total`. A give-up means the admin panel's
+- **Notification retry/give-up**: `lighthouse_notification_retries_total` and
+  `lighthouse_notification_giveups_total`. A give-up means the admin panel's
   "nobody was paged" case actually happened; alert on any increase.
-- **Cluster membership**: `warden_cluster_membership_transitions_total{state="suspect"|"dead"}`
+- **Cluster membership**: `lighthouse_cluster_membership_transitions_total{state="suspect"|"dead"}`
   (counter, demotions only — a resurrection through gossip shows up in the
-  gauge below on its own) and `warden_cluster_members{state="alive"|"suspect"|"dead"}`
+  gauge below on its own) and `lighthouse_cluster_members{state="alive"|"suspect"|"dead"}`
   (gauge). Alert on `dead` staying above zero, or on a transition rate that
   outpaces expected restarts.
-- **Retention**: existing `warden_retention_prune_duration_seconds_total`,
-  plus `warden_retention_rows_removed_total`. Alert if a day passes with no
+- **Retention**: existing `lighthouse_retention_prune_duration_seconds_total`,
+  plus `lighthouse_retention_rows_removed_total`. Alert if a day passes with no
   movement on either — the daily job did not run — or if prune duration grows
   without bound relative to rows removed.
 
@@ -1347,15 +1347,15 @@ same database series (it shares `coordinator::database::Database` verbatim
 via `GlobalStore`) and, when `global.peers` is configured, the same cluster
 membership series (it shares `coordinator::cluster::Cluster` verbatim too).
 Global reconciliation is labelled by a fixed `scope="peer"|"region"`:
-`warden_global_reconciliation_failures_total` (local digest read, digest
+`lighthouse_global_reconciliation_failures_total` (local digest read, digest
 transport/status, or malformed response; a region counts once after every
-endpoint fails), `warden_global_reconciliation_repair_failures_total` (a
+endpoint fails), `lighthouse_global_reconciliation_repair_failures_total` (a
 repair after a valid comparison failed), and
-`warden_global_reconciliation_last_success_timestamp_seconds` (last valid
+`lighthouse_global_reconciliation_last_success_timestamp_seconds` (last valid
 digest comparison, recorded before repair). Region push staleness is derived
 at scrape time from the cache's receiver-side timestamps, with no extra
-state: `warden_global_regions_stale`, `warden_global_regions_never_received`,
-and `warden_global_max_received_push_age_seconds` (0 when no region has
+state: `lighthouse_global_regions_stale`, `lighthouse_global_regions_never_received`,
+and `lighthouse_global_max_received_push_age_seconds` (0 when no region has
 pushed). Only global-a receives pushes in the Compose fixture, so the
 staleness gauges are meaningful there only.
 

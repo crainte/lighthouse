@@ -23,11 +23,11 @@ use axum::{extract::State, Json, Router};
 use parking_lot::Mutex;
 use serde_json::Value;
 
+use lighthouse::config::{CheckConfig, CoordinatorConfig};
+use lighthouse::coordinator::Coordinator;
+use lighthouse::models::{CheckId, CheckKind, CheckResult};
+use lighthouse::notify::{Notifier, NotifierKind};
 use uuid::Uuid;
-use warden::config::{CheckConfig, CoordinatorConfig};
-use warden::coordinator::Coordinator;
-use warden::models::{CheckId, CheckKind, CheckResult};
-use warden::notify::{Notifier, NotifierKind};
 
 /// Peers authenticate with their own secret, never an agent's.
 const PEER_TOKEN: &str = "cluster-peer-secret";

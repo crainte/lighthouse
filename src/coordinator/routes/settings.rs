@@ -376,8 +376,13 @@ pub(in crate::coordinator) async fn test_notifier_handler(
         from: NodeState::Unknown,
         to: NodeState::Up,
     };
-    let result =
-        crate::notify::send(&reqwest::Client::new(), &notifier, &sample, "Warden test").await;
+    let result = crate::notify::send(
+        &reqwest::Client::new(),
+        &notifier,
+        &sample,
+        "Lighthouse test",
+    )
+    .await;
     Json(NotifierTestResponse {
         delivered: result.is_ok(),
         error: result.err(),

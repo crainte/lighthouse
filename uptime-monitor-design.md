@@ -22,10 +22,10 @@
 Single binary currently has three modes:
 
 ```
-warden agent        # Runs checks, posts to regional coordinators
-warden coordinator  # Regional coordinator, clusterable
-warden standalone   # All-in-one for small deployments
-warden global       # Cross-region aggregator (Stage B / Phase 6)
+lighthouse agent        # Runs checks, posts to regional coordinators
+lighthouse coordinator  # Regional coordinator, clusterable
+lighthouse standalone   # All-in-one for small deployments
+lighthouse global       # Cross-region aggregator (Stage B / Phase 6)
 ```
 
 The `global` mode is implemented (Phase 6). See `docker-compose.global.yaml`.
@@ -1642,9 +1642,9 @@ WebSocket /api/v1/ws/events
 ```toml
 [coordinator]
 listen = "0.0.0.0:8080"
-db_path = "/var/lib/warden/warden.duckdb"
-# admin_password = "..."  # Prefer WARDEN_ADMIN_PASSWORD.
-# peer_token = "..."      # Prefer WARDEN_PEER_TOKEN.
+db_path = "/var/lib/lighthouse/lighthouse.duckdb"
+# admin_password = "..."  # Prefer LIGHTHOUSE_ADMIN_PASSWORD.
+# peer_token = "..."      # Prefer LIGHTHOUSE_PEER_TOKEN.
 # peers = ["http://coordinator-b:8080", "http://coordinator-c:8080"]
 
 [coordinator.rollup_defaults]
@@ -1658,7 +1658,7 @@ Runtime resources are not sourced from this file. Checks are created only via
 the authenticated Admin UI/API and persisted in DuckDB. Agent credentials are
 minted or provisioned through the credential control plane, and notifications,
 maintenance windows, sections, and display settings become store-authoritative
-after their supported initialization path. See `warden.example.toml` for the
+after their supported initialization path. See `lighthouse.example.toml` for the
 complete deployment configuration.
 ---
 
@@ -1896,7 +1896,7 @@ Deferred from Phase 3, tracked here so it isn't lost:
       `docker-compose.yaml` starts one `standalone` process on `:9000` with one
       command; `docker-compose.cluster.yaml` starts three coordinators on
       `:9001`–`:9003` and three agents in one `us-east` region. The old
-      `deploy/*.toml`, `docker-compose.agents.yaml`, and root `warden.toml` were
+      `deploy/*.toml`, `docker-compose.agents.yaml`, and root `lighthouse.toml` were
       removed; configuration now lives in Compose configs. Ports `:9004` and
       `:9005` are reserved for the Stage B multi-region/global topology and are
       intentionally unused in Stage A.
@@ -1921,7 +1921,7 @@ Deferred from Phase 3, tracked here so it isn't lost:
 - [x] Global request-time merged reads. Logs, uptime, latency/sparklines,
       alerts, and incidents fan out to their regional owners and merge only in
       the response; the global cache retains state summaries, never raw data.
-- [x] CLI: `global` mode (`warden global`), no raw storage, no probing.
+- [x] CLI: `global` mode (`lighthouse global`), no raw storage, no probing.
 - [x] Stage B Compose topology on reserved ports `:9004` (tw) / `:9005`
       (global), without changing either completed Stage A topology.
 - [x] Cross-region alerting, off by default: the global node pages only when a

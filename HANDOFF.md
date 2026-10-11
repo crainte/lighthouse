@@ -1,4 +1,4 @@
-# Warden — session handoff
+# Lighthouse — session handoff
 
 Repo: `~/code/uptime`. The working tree contains the completed Stage A region
 tree and deployment cleanup, uncommitted.
@@ -8,7 +8,7 @@ one all-in-one `standalone` process on `:9000`; `docker-compose.cluster.yaml`
 runs three regional coordinators on `:9001`–`:9003` plus three agents, all in
 one `us-east` region. `:9004` and `:9005` are unused and reserved for the Stage
 B multi-region/global deployment. The old `deploy/*.toml`,
-`docker-compose.agents.yaml`, and root `warden.toml` have been removed; both
+`docker-compose.agents.yaml`, and root `lighthouse.toml` have been removed; both
 stacks now carry their config as Compose configs.
 
 **Security-relevant behaviour change, read this before an incident makes you
@@ -292,7 +292,7 @@ The Stage A regional cluster requires explicit secrets—there are no committed
 token defaults—and serves `:9001`, `:9002`, and `:9003`:
 
 ```bash
-WARDEN_PEER_TOKEN=... WARDEN_AGENT_TOKEN_A=... WARDEN_AGENT_TOKEN_B=... \
+LIGHTHOUSE_PEER_TOKEN=... LIGHTHOUSE_AGENT_TOKEN_A=... LIGHTHOUSE_AGENT_TOKEN_B=... \
   docker compose -f docker-compose.cluster.yaml up -d --build
 ```
 
@@ -375,7 +375,7 @@ nodes do not yet sync.
   because UNKNOWN is also the default.
 - Verify against **live JSON**, not the TS types; `api.ts` and the Rust DTOs drift.
 - Re-check the served bundle hash against `frontend/dist` after a rebuild;
-  `rust-embed` does not reliably re-embed. If stale: `cargo clean -p warden`.
+  `rust-embed` does not reliably re-embed. If stale: `cargo clean -p lighthouse`.
 - Svelte `{#each}` keys must be unique — duplicates silently hang the page.
 - `innerText` reflects CSS `text-transform`. Asserting `'Sign in required'`
   against a panel that renders uppercase gives a false negative.
@@ -451,7 +451,7 @@ and suppressing a dependent's notification.
 
 **Deploying a no-migration schema change onto an existing volume.** "No
 migrations" is fine for the code and a trap for deployment: the Compose config
-sets `db_path = /data/warden.duckdb` on its named volume, so old
+sets `db_path = /data/lighthouse.duckdb` on its named volume, so old
 `alerts`/`incidents` tables survive a rebuild and
 `CREATE TABLE IF NOT EXISTS` silently no-ops on them. The new binary then boots
 cleanly and 500s on every incident and alert read:
@@ -468,10 +468,10 @@ re-minting and rewriting `.env` before the fleet reports again. Drop only the
 tables whose shape changed and everything else survives:
 
 1. Prove the incompatibility against a **copy** first (`docker cp` the active
-   service's `/data/warden.duckdb` to `/tmp/...`, then point a local coordinator
+   service's `/data/lighthouse.duckdb` to `/tmp/...`, then point a local coordinator
    at it). Never diagnose on the live file.
-2. Stop the active service, then copy **both** `warden.duckdb` *and*
-   `warden.duckdb.wal` out. **Stopping the container does not checkpoint the
+2. Stop the active service, then copy **both** `lighthouse.duckdb` *and*
+   `lighthouse.duckdb.wal` out. **Stopping the container does not checkpoint the
    WAL** — there were 2.3 MB of committed rows in it, and taking only the main
    file loses them *and* leaves a mismatched WAL behind. Opening the pair with
    DuckDB replays and folds the WAL in (results went 342,013 → 350,155, which is
@@ -626,14 +626,14 @@ listed under item 2 above.
   `:9001`–`:9003` with three agents in one `us-east` region. Boot order does
   not matter—seeds are retried—and each coordinator has its own volume. Do not
   reintroduce `deploy/*.toml`, `docker-compose.agents.yaml`, or root
-  `warden.toml`; reserve `:9004` / `:9005` for Stage B.
+  `lighthouse.toml`; reserve `:9004` / `:9005` for Stage B.
 - `git stash` holds an earlier AgentsAdmin experiment of yours
   ("superseded by scale rebuild") — `git stash pop` if you want it back,
   `git stash drop` to bin it.
 
 ## Verification gates
 
-Run with `WARDEN_AGENT_TOKEN` **exported** — the point is that tests are not
+Run with `LIGHTHOUSE_AGENT_TOKEN` **exported** — the point is that tests are not
 sensitive to it.
 
 | Gate | Expected |

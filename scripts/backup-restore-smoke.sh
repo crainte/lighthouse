@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Backup/restore smoke test against the real `warden` binary.
+# Backup/restore smoke test against the real `lighthouse` binary.
 #
 # Starts a standalone node with a fresh file-backed DuckDB, creates one check
 # through the authenticated admin API (checks are never file-seeded — see
@@ -7,7 +7,7 @@
 # and restarts so the embedded agent can authenticate (standalone still
 # polls its own coordinator over HTTP for the check list; only result
 # ingest is in-process), lets it probe itself over TCP a couple of times,
-# stops the node, runs `warden backup`, then `warden restore` into a fresh
+# stops the node, runs `lighthouse backup`, then `lighthouse restore` into a fresh
 # path, and asserts the restore report says data actually came back.
 # Exercises the same `run_backup`/`run_restore` code paths in src/main.rs
 # that an operator runs by hand.
@@ -19,11 +19,11 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-WARDEN_BIN="${WARDEN_BIN:-}"
-if [[ -z "$WARDEN_BIN" ]]; then
-  echo "==> building warden (debug; the smoke test only needs a runnable binary)"
-  cargo build --locked --bin warden >/dev/null
-  WARDEN_BIN="$repo_root/target/debug/warden"
+LIGHTHOUSE_BIN="${LIGHTHOUSE_BIN:-}"
+if [[ -z "$LIGHTHOUSE_BIN" ]]; then
+  echo "==> building lighthouse (debug; the smoke test only needs a runnable binary)"
+  cargo build --locked --bin lighthouse >/dev/null
+  LIGHTHOUSE_BIN="$repo_root/target/debug/lighthouse"
 fi
 
 work_dir="$(mktemp -d)"
@@ -40,7 +40,7 @@ trap cleanup EXIT
 port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
 admin_password="gate-smoke-$$"
 db_path="$work_dir/coordinator.duckdb"
-config_path="$work_dir/warden.toml"
+config_path="$work_dir/lighthouse.toml"
 cookie_jar="$work_dir/cookies.txt"
 base_url="http://127.0.0.1:$port"
 
@@ -61,7 +61,7 @@ EOF
 }
 
 start_node() {
-  "$WARDEN_BIN" standalone --config "$config_path" >"$work_dir/warden.log" 2>&1 &
+  "$LIGHTHOUSE_BIN" standalone --config "$config_path" >"$work_dir/lighthouse.log" 2>&1 &
   pid=$!
   local ready=0
   for _ in $(seq 1 50); do
@@ -70,15 +70,15 @@ start_node() {
       break
     fi
     if ! kill -0 "$pid" 2>/dev/null; then
-      echo "warden exited before becoming ready; log:" >&2
-      cat "$work_dir/warden.log" >&2
+      echo "lighthouse exited before becoming ready; log:" >&2
+      cat "$work_dir/lighthouse.log" >&2
       exit 1
     fi
     sleep 0.2
   done
   if [[ "$ready" -ne 1 ]]; then
-    echo "warden never became ready on $base_url" >&2
-    cat "$work_dir/warden.log" >&2
+    echo "lighthouse never became ready on $base_url" >&2
+    cat "$work_dir/lighthouse.log" >&2
     exit 1
   fi
 }
@@ -147,8 +147,8 @@ for _ in $(seq 1 40); do
   sleep 1
 done
 if [[ "$have_results" -ne 1 ]]; then
-  echo "no results recorded after waiting; warden log:" >&2
-  cat "$work_dir/warden.log" >&2
+  echo "no results recorded after waiting; lighthouse log:" >&2
+  cat "$work_dir/lighthouse.log" >&2
   exit 1
 fi
 
@@ -158,11 +158,11 @@ stop_node
 backup_path="$work_dir/backup.duckdb"
 restore_path="$work_dir/restored.duckdb"
 
-echo "==> warden backup --output $backup_path"
-"$WARDEN_BIN" backup --config "$config_path" --output "$backup_path"
+echo "==> lighthouse backup --output $backup_path"
+"$LIGHTHOUSE_BIN" backup --config "$config_path" --output "$backup_path"
 
-echo "==> warden restore --from $backup_path --into $restore_path"
-restore_output="$("$WARDEN_BIN" restore --from "$backup_path" --into "$restore_path")"
+echo "==> lighthouse restore --from $backup_path --into $restore_path"
+restore_output="$("$LIGHTHOUSE_BIN" restore --from "$backup_path" --into "$restore_path")"
 echo "$restore_output"
 
 if [[ ! -f "$restore_path" ]]; then

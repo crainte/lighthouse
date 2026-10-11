@@ -712,8 +712,10 @@ mod tests {
 
     #[test]
     fn fresh_schema_marker_never_rewrites_new_random_check_ids() {
-        let path =
-            std::env::temp_dir().join(format!("warden-storage-{}.duckdb", uuid::Uuid::now_v7()));
+        let path = std::env::temp_dir().join(format!(
+            "lighthouse-storage-{}.duckdb",
+            uuid::Uuid::now_v7()
+        ));
         let path = path.to_string_lossy().into_owned();
         let id = CheckId::now_v7();
         let check = CheckConfig {

@@ -19,7 +19,7 @@
 #
 # Usage: scripts/release-gate.sh [--skip-docker]
 #
-# `cargo test` runs with `WARDEN_AGENT_TOKEN` unset: several tests assert
+# `cargo test` runs with `LIGHTHOUSE_AGENT_TOKEN` unset: several tests assert
 # behavior for an agent with no ambient credential, and a machine that
 # happens to export that variable for its own agent config would otherwise
 # make those tests flaky depending on where they run (see tests/ws_api.rs).
@@ -75,7 +75,7 @@ run_step() {
 
 cargo_check() { cargo check --all-targets --locked; }
 cargo_clippy() { cargo clippy --all-targets --locked -- -D warnings; }
-cargo_test() { env -u WARDEN_AGENT_TOKEN cargo test --locked; }
+cargo_test() { env -u LIGHTHOUSE_AGENT_TOKEN cargo test --locked; }
 cargo_audit_step() { cargo audit; }
 
 frontend_install() { (cd frontend && bun install --frozen-lockfile); }
@@ -87,9 +87,9 @@ frontend_build() { (cd frontend && bun run build); }
 docker_build_step() {
   local git_sha
   git_sha="$(git rev-parse --short=12 HEAD)"
-  # Tagged `warden:gate`, distinct from `warden:latest`, so a local gate run
+  # Tagged `lighthouse:gate`, distinct from `lighthouse:latest`, so a local gate run
   # never clobbers whatever image an operator already deployed from.
-  docker build --build-arg "GIT_SHA=$git_sha" -t warden:gate .
+  docker build --build-arg "GIT_SHA=$git_sha" -t lighthouse:gate .
 }
 
 backup_restore_smoke() { "$repo_root/scripts/backup-restore-smoke.sh"; }
@@ -117,7 +117,7 @@ if [[ "$skip_docker" -eq 1 ]]; then
   echo
   echo "SKIP  container build (--skip-docker)"
 else
-  run_step "container build (docker build -t warden:gate)" docker_build_step
+  run_step "container build (docker build -t lighthouse:gate)" docker_build_step
 fi
 
 run_step "backup/restore smoke test" backup_restore_smoke

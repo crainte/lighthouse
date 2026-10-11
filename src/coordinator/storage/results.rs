@@ -1774,7 +1774,7 @@ mod tests {
     #[test]
     fn uncommitted_ingest_is_not_visible_after_reopen() {
         let path =
-            std::env::temp_dir().join(format!("warden-ingest-{}.duckdb", uuid::Uuid::now_v7()));
+            std::env::temp_dir().join(format!("lighthouse-ingest-{}.duckdb", uuid::Uuid::now_v7()));
         {
             let s = Storage::open(path.to_str().unwrap()).unwrap();
             s.prepare_ingest().unwrap();
@@ -2227,7 +2227,7 @@ mod tests {
     #[test]
     fn opening_repairs_an_incomplete_latest_results_projection() {
         let path = std::env::temp_dir().join(format!(
-            "warden-latest-results-repair-{}.duckdb",
+            "lighthouse-latest-results-repair-{}.duckdb",
             uuid::Uuid::now_v7()
         ));
         let path_string = path.to_string_lossy().into_owned();
@@ -2658,7 +2658,7 @@ mod tests {
     #[test]
     fn prune_metadata_is_idempotent_after_restart() {
         let path = std::env::temp_dir().join(format!(
-            "warden-prune-metadata-{}.duckdb",
+            "lighthouse-prune-metadata-{}.duckdb",
             uuid::Uuid::now_v7()
         ));
         let path_string = path.to_string_lossy().into_owned();
@@ -2706,7 +2706,7 @@ mod tests {
     #[test]
     fn restart_recovers_committed_rows_and_backup_restore_preserves_them() {
         let path = std::env::temp_dir().join(format!(
-            "warden-restart-recovery-{}.duckdb",
+            "lighthouse-restart-recovery-{}.duckdb",
             uuid::Uuid::now_v7()
         ));
         let path_string = path.to_string_lossy().into_owned();
@@ -2766,11 +2766,11 @@ mod tests {
         assert!(hour_rollups.count > 0);
 
         let backup_path = std::env::temp_dir().join(format!(
-            "warden-restart-recovery-backup-{}.duckdb",
+            "lighthouse-restart-recovery-backup-{}.duckdb",
             uuid::Uuid::now_v7()
         ));
         let restore_path = std::env::temp_dir().join(format!(
-            "warden-restart-recovery-restored-{}.duckdb",
+            "lighthouse-restart-recovery-restored-{}.duckdb",
             uuid::Uuid::now_v7()
         ));
         crate::coordinator::backup::create(&path_string, &backup_path).unwrap();
@@ -2974,11 +2974,11 @@ mod tests {
                    WHERE latest.check_id = state_history.check_id
                      AND latest.newest = state_history.since)";
 
-        let checks: i64 = std::env::var("WARDEN_BENCH_CHECKS")
+        let checks: i64 = std::env::var("LIGHTHOUSE_BENCH_CHECKS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10_000);
-        let spans: i64 = std::env::var("WARDEN_BENCH_SPANS_PER_CHECK")
+        let spans: i64 = std::env::var("LIGHTHOUSE_BENCH_SPANS_PER_CHECK")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(300);
@@ -3144,14 +3144,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "capacity baseline; configure WARDEN_BENCH_DEDUP_ROWS for the intended scale"]
+    #[ignore = "capacity baseline; configure LIGHTHOUSE_BENCH_DEDUP_ROWS for the intended scale"]
     fn benchmark_replicated_dedup_against_retained_history() {
-        let retained: u64 = std::env::var("WARDEN_BENCH_DEDUP_ROWS")
+        let retained: u64 = std::env::var("LIGHTHOUSE_BENCH_DEDUP_ROWS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(20_000_000);
         let path =
-            std::env::temp_dir().join(format!("warden-dedup-{}.duckdb", uuid::Uuid::now_v7()));
+            std::env::temp_dir().join(format!("lighthouse-dedup-{}.duckdb", uuid::Uuid::now_v7()));
         let store = Storage::open(path.to_str().unwrap()).unwrap();
         let check_key = "dedup-scaling-check";
         let check = cid(check_key);
@@ -3225,7 +3225,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "capacity baseline; configure WARDEN_BENCH_* for the intended scale"]
+    #[ignore = "capacity baseline; configure LIGHTHOUSE_BENCH_* for the intended scale"]
     fn benchmark_representative_storage_capacity_baseline() {
         fn env_u64(name: &str, default: u64) -> u64 {
             std::env::var(name)
@@ -3248,15 +3248,15 @@ mod tests {
                 .unwrap_or(0)
         }
 
-        let check_count = env_u64("WARDEN_BENCH_CHECKS", 100);
-        let days = env_u64("WARDEN_BENCH_DAYS", 2);
-        let observation_secs = env_u64("WARDEN_BENCH_OBSERVATION_SECS", 30);
-        let domains = env_u64("WARDEN_BENCH_DOMAINS", 1);
+        let check_count = env_u64("LIGHTHOUSE_BENCH_CHECKS", 100);
+        let days = env_u64("LIGHTHOUSE_BENCH_DAYS", 2);
+        let observation_secs = env_u64("LIGHTHOUSE_BENCH_OBSERVATION_SECS", 30);
+        let domains = env_u64("LIGHTHOUSE_BENCH_DOMAINS", 1);
         assert!(check_count > 0 && days > 0 && observation_secs > 0 && domains > 0);
         let observations_per_check = days * 86_400 / observation_secs;
         let rows = check_count * observations_per_check * domains;
         let path = std::env::temp_dir().join(format!(
-            "warden-capacity-bench-{}-{}.duckdb",
+            "lighthouse-capacity-bench-{}-{}.duckdb",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3354,14 +3354,14 @@ mod tests {
         );
 
         for (name, value) in [
-            ("WARDEN_BENCH_MAX_HISTORY_P95_MS", history_p95_ms),
-            ("WARDEN_BENCH_MAX_LATENCY_P95_MS", latency_p95_ms),
-            ("WARDEN_BENCH_MAX_PRUNE_MS", prune_ms),
-            ("WARDEN_BENCH_MAX_CHECKPOINT_MS", checkpoint_ms),
-            ("WARDEN_BENCH_MAX_BACKUP_MS", backup_ms),
-            ("WARDEN_BENCH_MAX_RESTORE_MS", restore_ms),
+            ("LIGHTHOUSE_BENCH_MAX_HISTORY_P95_MS", history_p95_ms),
+            ("LIGHTHOUSE_BENCH_MAX_LATENCY_P95_MS", latency_p95_ms),
+            ("LIGHTHOUSE_BENCH_MAX_PRUNE_MS", prune_ms),
+            ("LIGHTHOUSE_BENCH_MAX_CHECKPOINT_MS", checkpoint_ms),
+            ("LIGHTHOUSE_BENCH_MAX_BACKUP_MS", backup_ms),
+            ("LIGHTHOUSE_BENCH_MAX_RESTORE_MS", restore_ms),
             (
-                "WARDEN_BENCH_MAX_DATABASE_BYTES",
+                "LIGHTHOUSE_BENCH_MAX_DATABASE_BYTES",
                 database_before_prune as u128,
             ),
         ] {
@@ -3389,11 +3389,11 @@ mod tests {
     /// with the pragma left at its default, a prune this size crosses
     /// DuckDB's own threshold before `prune_results` even returns, and a
     /// caller-issued CHECKPOINT afterward finds nothing left to flush. Run
-    /// with `WARDEN_BENCH_CHECKS`/`WARDEN_BENCH_DAYS`/
-    /// `WARDEN_BENCH_OBSERVATION_SECS` for other scales; the numbers recorded
+    /// with `LIGHTHOUSE_BENCH_CHECKS`/`LIGHTHOUSE_BENCH_DAYS`/
+    /// `LIGHTHOUSE_BENCH_OBSERVATION_SECS` for other scales; the numbers recorded
     /// in TODO.md/SCALING.md are the defaults below.
     #[test]
-    #[ignore = "capacity baseline; configure WARDEN_BENCH_* for the intended scale"]
+    #[ignore = "capacity baseline; configure LIGHTHOUSE_BENCH_* for the intended scale"]
     fn benchmark_checkpoint_after_prune() {
         fn env_u64(name: &str, default: u64) -> u64 {
             std::env::var(name)
@@ -3405,13 +3405,13 @@ mod tests {
             std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
         }
 
-        let check_count = env_u64("WARDEN_BENCH_CHECKS", 1_000);
-        let days = env_u64("WARDEN_BENCH_DAYS", 30);
-        let observation_secs = env_u64("WARDEN_BENCH_OBSERVATION_SECS", 30);
+        let check_count = env_u64("LIGHTHOUSE_BENCH_CHECKS", 1_000);
+        let days = env_u64("LIGHTHOUSE_BENCH_DAYS", 30);
+        let observation_secs = env_u64("LIGHTHOUSE_BENCH_OBSERVATION_SECS", 30);
         let observations_per_check = days * 86_400 / observation_secs;
         let step_ms = observation_secs as i64 * 1_000;
         let path = std::env::temp_dir().join(format!(
-            "warden-checkpoint-bench-{}-{}.duckdb",
+            "lighthouse-checkpoint-bench-{}-{}.duckdb",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3501,12 +3501,12 @@ mod tests {
     /// three invariants — (a) recovery duration, (b) no data loss of
     /// committed rows, (c) a backup/restore round trip preserving row
     /// counts, watermarks, and rollups — at a scale CI cannot afford to run
-    /// on every commit. Configure `WARDEN_BENCH_CHECKS`/`WARDEN_BENCH_DAYS`/
-    /// `WARDEN_BENCH_OBSERVATION_SECS` for the intended scale; see that test's
+    /// on every commit. Configure `LIGHTHOUSE_BENCH_CHECKS`/`LIGHTHOUSE_BENCH_DAYS`/
+    /// `LIGHTHOUSE_BENCH_OBSERVATION_SECS` for the intended scale; see that test's
     /// doc comment for what "closed uncleanly" does and does not simulate
     /// here.
     #[test]
-    #[ignore = "capacity baseline; configure WARDEN_BENCH_* for the intended scale"]
+    #[ignore = "capacity baseline; configure LIGHTHOUSE_BENCH_* for the intended scale"]
     fn benchmark_restart_recovery_at_production_scale() {
         fn env_u64(name: &str, default: u64) -> u64 {
             std::env::var(name)
@@ -3520,14 +3520,14 @@ mod tests {
                 .and_then(|value| value.parse().ok())
         }
 
-        let check_count = env_u64("WARDEN_BENCH_CHECKS", 1_000);
-        let days = env_u64("WARDEN_BENCH_DAYS", 30);
-        let observation_secs = env_u64("WARDEN_BENCH_OBSERVATION_SECS", 30);
+        let check_count = env_u64("LIGHTHOUSE_BENCH_CHECKS", 1_000);
+        let days = env_u64("LIGHTHOUSE_BENCH_DAYS", 30);
+        let observation_secs = env_u64("LIGHTHOUSE_BENCH_OBSERVATION_SECS", 30);
         let observations_per_check = days * 86_400 / observation_secs;
         let step_ms = observation_secs as i64 * 1_000;
         let expected_rows = check_count * observations_per_check;
         let path = std::env::temp_dir().join(format!(
-            "warden-restart-bench-{}-{}.duckdb",
+            "lighthouse-restart-bench-{}-{}.duckdb",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3616,9 +3616,9 @@ mod tests {
             minute_rollups.count, hour_rollups.count
         );
         for (name, value) in [
-            ("WARDEN_BENCH_MAX_RECOVERY_MS", recovery_ms),
-            ("WARDEN_BENCH_MAX_BACKUP_MS", backup_ms),
-            ("WARDEN_BENCH_MAX_RESTORE_MS", restore_ms),
+            ("LIGHTHOUSE_BENCH_MAX_RECOVERY_MS", recovery_ms),
+            ("LIGHTHOUSE_BENCH_MAX_BACKUP_MS", backup_ms),
+            ("LIGHTHOUSE_BENCH_MAX_RESTORE_MS", restore_ms),
         ] {
             if let Some(limit) = env_u128(name) {
                 assert!(value <= limit, "{name}: measured {value}, limit {limit}");
@@ -3736,12 +3736,12 @@ mod tests {
     /// the candidate index created before any data lands (the worst case: every
     /// row ever written pays the maintenance cost, matching what putting it in
     /// `Storage::open`'s DDL would mean), once without — and reports the read
-    /// and write sides side by side. Run with `WARDEN_BENCH_CHECKS`/
-    /// `WARDEN_BENCH_DAYS`/`WARDEN_BENCH_OBSERVATION_SECS`/
-    /// `WARDEN_BENCH_INGEST_ROUNDS` for other scales; the numbers recorded in
+    /// and write sides side by side. Run with `LIGHTHOUSE_BENCH_CHECKS`/
+    /// `LIGHTHOUSE_BENCH_DAYS`/`LIGHTHOUSE_BENCH_OBSERVATION_SECS`/
+    /// `LIGHTHOUSE_BENCH_INGEST_ROUNDS` for other scales; the numbers recorded in
     /// SCALING.md are the defaults below.
     #[test]
-    #[ignore = "index tradeoff benchmark; configure WARDEN_BENCH_* for the intended scale"]
+    #[ignore = "index tradeoff benchmark; configure LIGHTHOUSE_BENCH_* for the intended scale"]
     fn benchmark_check_results_check_id_ts_index_tradeoff() {
         fn env_u64(name: &str, default: u64) -> u64 {
             std::env::var(name)
@@ -3757,10 +3757,10 @@ mod tests {
             std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
         }
 
-        let check_count = env_u64("WARDEN_BENCH_CHECKS", 1_000);
-        let days = env_u64("WARDEN_BENCH_DAYS", 7);
-        let observation_secs = env_u64("WARDEN_BENCH_OBSERVATION_SECS", 30);
-        let ingest_rounds = env_u64("WARDEN_BENCH_INGEST_ROUNDS", 20);
+        let check_count = env_u64("LIGHTHOUSE_BENCH_CHECKS", 1_000);
+        let days = env_u64("LIGHTHOUSE_BENCH_DAYS", 7);
+        let observation_secs = env_u64("LIGHTHOUSE_BENCH_OBSERVATION_SECS", 30);
+        let ingest_rounds = env_u64("LIGHTHOUSE_BENCH_INGEST_ROUNDS", 20);
         let observations_per_check = days * 86_400 / observation_secs;
         let rows = check_count * observations_per_check;
         let step_ms = observation_secs as i64 * 1_000;
@@ -3781,7 +3781,7 @@ mod tests {
 
         for (label, with_index) in [("no_index", false), ("with_index", true)] {
             let path = std::env::temp_dir().join(format!(
-                "warden-check-results-index-bench-{label}-{}-{}.duckdb",
+                "lighthouse-check-results-index-bench-{label}-{}-{}.duckdb",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

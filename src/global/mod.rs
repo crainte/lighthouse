@@ -1,4 +1,4 @@
-//! The global coordinator (`warden global`), Stage B of the design.
+//! The global coordinator (`lighthouse global`), Stage B of the design.
 //!
 //! It holds **no raw data**. Regional coordinators push a state summary every
 //! few seconds; the global node caches the latest per region ([`cache`]),
@@ -116,7 +116,7 @@ impl GlobalNode {
             None => crate::auth::Auth::new(cfg.resolved_admin_password()),
         };
         if !auth.admin_enabled() {
-            warn!("no admin password set (WARDEN_ADMIN_PASSWORD); the admin UI is disabled");
+            warn!("no admin password set (LIGHTHOUSE_ADMIN_PASSWORD); the admin UI is disabled");
         }
         let store = store::GlobalStore::open(cfg.db_path.clone(), cfg.resolved_node_id()).await?;
         let node_id = store.node_id().to_string();
@@ -187,42 +187,42 @@ impl GlobalNode {
         let database = self.inner.store.database_metrics();
         let mut samples = vec![
             crate::openmetrics::MetricSample::new(
-                "warden_database_queries_total",
+                "lighthouse_database_queries_total",
                 vec![],
                 database.queries_total as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_database_query_errors_total",
+                "lighthouse_database_query_errors_total",
                 vec![],
                 database.query_errors_total as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_database_query_duration_seconds_total",
+                "lighthouse_database_query_duration_seconds_total",
                 vec![],
                 database.query_duration_us as f64 / 1_000_000.0,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_database_queue_wait_seconds_total",
+                "lighthouse_database_queue_wait_seconds_total",
                 vec![],
                 database.queue_wait_us as f64 / 1_000_000.0,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_database_queue_depth",
+                "lighthouse_database_queue_depth",
                 vec![],
                 database.queue_depth as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_database_logical_rows",
+                "lighthouse_database_logical_rows",
                 vec![],
                 database.logical_rows as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_database_file_bytes",
+                "lighthouse_database_file_bytes",
                 vec![],
                 database.database_bytes as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_database_wal_bytes",
+                "lighthouse_database_wal_bytes",
                 vec![],
                 database.wal_bytes as f64,
             ),
@@ -231,12 +231,12 @@ impl GlobalNode {
         let (stale, never_received, oldest_received_at) = self.inner.cache.staleness_snapshot(now);
         samples.extend([
             crate::openmetrics::MetricSample::new(
-                "warden_global_reconciliation_failures_total",
+                "lighthouse_global_reconciliation_failures_total",
                 vec![("scope".into(), "peer".into())],
                 self.inner.peer_reconcile_failures.load(Ordering::Relaxed) as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_global_reconciliation_last_success_timestamp_seconds",
+                "lighthouse_global_reconciliation_last_success_timestamp_seconds",
                 vec![("scope".into(), "peer".into())],
                 self.inner
                     .peer_reconcile_last_success_ms
@@ -244,12 +244,12 @@ impl GlobalNode {
                     / 1_000.0,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_global_reconciliation_failures_total",
+                "lighthouse_global_reconciliation_failures_total",
                 vec![("scope".into(), "region".into())],
                 self.inner.region_reconcile_failures.load(Ordering::Relaxed) as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_global_reconciliation_last_success_timestamp_seconds",
+                "lighthouse_global_reconciliation_last_success_timestamp_seconds",
                 vec![("scope".into(), "region".into())],
                 self.inner
                     .region_reconcile_last_success_ms
@@ -257,31 +257,31 @@ impl GlobalNode {
                     / 1_000.0,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_global_reconciliation_repair_failures_total",
+                "lighthouse_global_reconciliation_repair_failures_total",
                 vec![("scope".into(), "peer".into())],
                 self.inner
                     .peer_reconcile_repair_failures
                     .load(Ordering::Relaxed) as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_global_reconciliation_repair_failures_total",
+                "lighthouse_global_reconciliation_repair_failures_total",
                 vec![("scope".into(), "region".into())],
                 self.inner
                     .region_reconcile_repair_failures
                     .load(Ordering::Relaxed) as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_global_regions_stale",
+                "lighthouse_global_regions_stale",
                 vec![],
                 stale as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_global_regions_never_received",
+                "lighthouse_global_regions_never_received",
                 vec![],
                 never_received as f64,
             ),
             crate::openmetrics::MetricSample::new(
-                "warden_global_max_received_push_age_seconds",
+                "lighthouse_global_max_received_push_age_seconds",
                 vec![],
                 if oldest_received_at == 0 {
                     0.0
@@ -500,7 +500,7 @@ mod tests {
     #[tokio::test]
     async fn global_node_restart_preserves_the_catalogue() {
         let dir = std::env::temp_dir().join(format!(
-            "warden-global-restart-test-{}-{}",
+            "lighthouse-global-restart-test-{}-{}",
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
@@ -1059,7 +1059,7 @@ mod tests {
         assert_eq!(
             reconciliation_metric(
                 &node,
-                "warden_global_reconciliation_failures_total",
+                "lighthouse_global_reconciliation_failures_total",
                 "region"
             ),
             0.0
@@ -1067,7 +1067,7 @@ mod tests {
         assert!(
             reconciliation_metric(
                 &node,
-                "warden_global_reconciliation_last_success_timestamp_seconds",
+                "lighthouse_global_reconciliation_last_success_timestamp_seconds",
                 "region"
             ) > 0.0
         );
@@ -1093,7 +1093,7 @@ mod tests {
         assert_eq!(
             reconciliation_metric(
                 &node,
-                "warden_global_reconciliation_failures_total",
+                "lighthouse_global_reconciliation_failures_total",
                 "region"
             ),
             0.0
@@ -1109,13 +1109,17 @@ mod tests {
         assert_eq!(
             reconciliation_metric(
                 &node,
-                "warden_global_reconciliation_failures_total",
+                "lighthouse_global_reconciliation_failures_total",
                 "region"
             ),
             2.0
         );
         assert_eq!(
-            reconciliation_metric(&node, "warden_global_reconciliation_failures_total", "peer"),
+            reconciliation_metric(
+                &node,
+                "lighthouse_global_reconciliation_failures_total",
+                "peer"
+            ),
             2.0
         );
     }
@@ -1157,7 +1161,7 @@ mod tests {
         assert_eq!(
             reconciliation_metric(
                 &node,
-                "warden_global_reconciliation_repair_failures_total",
+                "lighthouse_global_reconciliation_repair_failures_total",
                 "region"
             ),
             1.0
@@ -1165,7 +1169,7 @@ mod tests {
         assert_eq!(
             reconciliation_metric(
                 &node,
-                "warden_global_reconciliation_repair_failures_total",
+                "lighthouse_global_reconciliation_repair_failures_total",
                 "peer"
             ),
             0.0
@@ -1196,7 +1200,7 @@ mod tests {
         assert_eq!(
             reconciliation_metric(
                 &node,
-                "warden_global_reconciliation_repair_failures_total",
+                "lighthouse_global_reconciliation_repair_failures_total",
                 "region"
             ),
             1.0
@@ -1204,7 +1208,7 @@ mod tests {
         assert_eq!(
             reconciliation_metric(
                 &node,
-                "warden_global_reconciliation_repair_failures_total",
+                "lighthouse_global_reconciliation_repair_failures_total",
                 "peer"
             ),
             1.0
@@ -1212,26 +1216,30 @@ mod tests {
         assert_eq!(
             reconciliation_metric(
                 &node,
-                "warden_global_reconciliation_failures_total",
+                "lighthouse_global_reconciliation_failures_total",
                 "region"
             ),
             0.0
         );
         assert_eq!(
-            reconciliation_metric(&node, "warden_global_reconciliation_failures_total", "peer"),
+            reconciliation_metric(
+                &node,
+                "lighthouse_global_reconciliation_failures_total",
+                "peer"
+            ),
             0.0
         );
         assert!(
             reconciliation_metric(
                 &node,
-                "warden_global_reconciliation_last_success_timestamp_seconds",
+                "lighthouse_global_reconciliation_last_success_timestamp_seconds",
                 "region"
             ) > 0.0
         );
         assert!(
             reconciliation_metric(
                 &node,
-                "warden_global_reconciliation_last_success_timestamp_seconds",
+                "lighthouse_global_reconciliation_last_success_timestamp_seconds",
                 "peer"
             ) > 0.0
         );
@@ -1259,12 +1267,14 @@ mod tests {
 
         let metrics = node.metrics();
         assert!(
-            crate::openmetrics::select(&metrics, "warden_database_queries_total", &[])
+            crate::openmetrics::select(&metrics, "lighthouse_database_queries_total", &[])
                 .unwrap()
                 .value
                 > 0.0,
             "the read above must show up on the same counters a coordinator exposes"
         );
-        assert!(crate::openmetrics::select(&metrics, "warden_database_queue_depth", &[]).is_ok());
+        assert!(
+            crate::openmetrics::select(&metrics, "lighthouse_database_queue_depth", &[]).is_ok()
+        );
     }
 }

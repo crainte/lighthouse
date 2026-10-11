@@ -11,9 +11,9 @@ mod common;
 use serde_json::{json, Value};
 
 use common::*;
-use warden::config::{CheckConfig, CoordinatorConfig};
-use warden::coordinator::Coordinator;
-use warden::notify::{Notifier, NotifierKind};
+use lighthouse::config::{CheckConfig, CoordinatorConfig};
+use lighthouse::coordinator::Coordinator;
+use lighthouse::notify::{Notifier, NotifierKind};
 
 #[tokio::test]
 async fn http_security_headers_and_cookie_policy_are_applied() {
@@ -197,14 +197,14 @@ async fn notifier_admin_reads_redact_secrets_and_put_accepts_placeholders() {
             },
             Notifier {
                 name: "mail".into(),
-                kind: NotifierKind::Email(warden::notify::MailConfig {
+                kind: NotifierKind::Email(lighthouse::notify::MailConfig {
                     host: "smtp.example.test".into(),
                     port: None,
-                    username: Some("warden".into()),
+                    username: Some("lighthouse".into()),
                     password: Some("smtp-secret".into()),
-                    from: "warden@example.test".into(),
+                    from: "lighthouse@example.test".into(),
                     to: "ops@example.test".into(),
-                    tls: warden::notify::MailTls::Starttls,
+                    tls: lighthouse::notify::MailTls::Starttls,
                 }),
                 default: false,
             },
@@ -300,12 +300,12 @@ async fn a_hanging_notification_endpoint_cannot_stall_ingest() {
         })
         .await;
 
-    let result = |status: u16, ts: i64| warden::models::CheckResult {
+    let result = |status: u16, ts: i64| lighthouse::models::CheckResult {
         check_id: cid("svc"),
         agent_id: "agent-a".into(),
         zone: "test-zone".into(),
         region: "test-region".into(),
-        kind: warden::models::CheckKind::Http,
+        kind: lighthouse::models::CheckKind::Http,
         timestamp: chrono::DateTime::from_timestamp_millis(ts).unwrap(),
         latency_ms: 1,
         status_code: Some(status),

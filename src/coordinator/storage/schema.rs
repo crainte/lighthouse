@@ -501,7 +501,7 @@ mod tests {
     #[test]
     fn opening_a_database_missing_a_current_column_fails_clearly() {
         let path = std::env::temp_dir().join(format!(
-            "warden-missing-column-{}.duckdb",
+            "lighthouse-missing-column-{}.duckdb",
             uuid::Uuid::now_v7()
         ));
         let path = path.to_string_lossy().into_owned();
@@ -544,7 +544,7 @@ mod tests {
     #[test]
     fn a_fresh_file_database_reopens_and_keeps_its_data() {
         let path = std::env::temp_dir().join(format!(
-            "warden-fresh-reopen-{}.duckdb",
+            "lighthouse-fresh-reopen-{}.duckdb",
             uuid::Uuid::now_v7()
         ));
         let path = path.to_string_lossy().into_owned();

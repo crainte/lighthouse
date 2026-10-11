@@ -23,11 +23,11 @@
 
 use std::net::SocketAddr;
 
+use lighthouse::config::{CheckConfig, CoordinatorConfig, ProvisionedCredential};
+use lighthouse::coordinator::Coordinator;
+use lighthouse::models::{CheckId, CheckKind};
 use serde_json::{json, Value};
 use uuid::Uuid;
-use warden::config::{CheckConfig, CoordinatorConfig, ProvisionedCredential};
-use warden::coordinator::Coordinator;
-use warden::models::{CheckId, CheckKind};
 
 const PASSWORD: &str = "correct horse battery staple";
 const PEER_TOKEN: &str = "peer-only-secret";
@@ -200,7 +200,7 @@ async fn stop(handle: tokio::task::JoinHandle<()>) {
 /// A private directory per test, since two tests running in parallel must not
 /// share a database file.
 fn db_file(name: &str) -> String {
-    let dir = std::env::temp_dir().join(format!("warden-provision-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("lighthouse-provision-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("{name}.duckdb"));
     let _ = std::fs::remove_file(&path);
@@ -242,7 +242,7 @@ async fn a_configured_credential_works_and_pins_the_zone_it_declares() {
 /// the secret stays out of the committed file.
 #[tokio::test]
 async fn the_token_may_come_from_the_environment() {
-    const VAR: &str = "WARDEN_TEST_PROVISION_TOKEN_FROM_ENV";
+    const VAR: &str = "LIGHTHOUSE_TEST_PROVISION_TOKEN_FROM_ENV";
     std::env::set_var(VAR, format!("  {TOKEN}  "));
     let coord = boot(
         ":memory:",
@@ -421,7 +421,7 @@ async fn a_revoked_credential_is_not_resurrected_by_its_own_config_block() {
 
 #[tokio::test]
 async fn an_unresolvable_token_fails_startup_naming_the_zone_and_the_variable() {
-    const VAR: &str = "WARDEN_TEST_PROVISION_TOKEN_NEVER_SET";
+    const VAR: &str = "LIGHTHOUSE_TEST_PROVISION_TOKEN_NEVER_SET";
     let err = boot_error(
         vec![block("us-east-1a", "us-east", None, Some(VAR))],
         "a block whose token resolves to nothing must not boot silently",
@@ -437,7 +437,7 @@ async fn a_malformed_token_fails_startup() {
         vec![block(
             "us-east-1a",
             "us-east",
-            Some("not-a-warden-token"),
+            Some("not-a-lighthouse-token"),
             None,
         )],
         "a token that is not shaped like a credential must not boot",

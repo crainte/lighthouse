@@ -9,9 +9,9 @@ use std::net::SocketAddr;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use warden::config::CoordinatorConfig;
-use warden::coordinator::Coordinator;
-use warden::models::CheckId;
+use lighthouse::config::CoordinatorConfig;
+use lighthouse::coordinator::Coordinator;
+use lighthouse::models::CheckId;
 
 pub const PASSWORD: &str = "correct horse battery staple";
 /// A provisioned agent credential. Agents authenticate only with these now —
@@ -122,7 +122,7 @@ pub async fn login(base: &str) -> String {
 
 /// Build a coordinator whose checks carry `depends_on` / `failures_before_down`
 /// as configured, so the reconciler has a real graph to read.
-pub async fn coordinator_with(checks: Vec<warden::config::CheckConfig>) -> Coordinator {
+pub async fn coordinator_with(checks: Vec<lighthouse::config::CheckConfig>) -> Coordinator {
     let coord = Coordinator::new(&CoordinatorConfig {
         listen: "127.0.0.1:0".into(),
         db_path: ":memory:".into(),
@@ -141,8 +141,8 @@ pub async fn coordinator_with(checks: Vec<warden::config::CheckConfig>) -> Coord
     coord
 }
 
-pub fn http_check(name: &str) -> warden::config::CheckConfig {
-    warden::config::CheckConfig {
+pub fn http_check(name: &str) -> lighthouse::config::CheckConfig {
+    lighthouse::config::CheckConfig {
         id: cid(name),
         name: name.into(),
         target: format!("http://{name}.test/"),
@@ -150,13 +150,13 @@ pub fn http_check(name: &str) -> warden::config::CheckConfig {
     }
 }
 
-pub fn probe(check: &str, ts: i64, code: u16) -> warden::models::CheckResult {
-    warden::models::CheckResult {
+pub fn probe(check: &str, ts: i64, code: u16) -> lighthouse::models::CheckResult {
+    lighthouse::models::CheckResult {
         check_id: cid(check),
         agent_id: "agent-1".into(),
         zone: "test-zone".into(),
         region: "test-region".into(),
-        kind: warden::models::CheckKind::Http,
+        kind: lighthouse::models::CheckKind::Http,
         timestamp: chrono::DateTime::from_timestamp_millis(ts).unwrap(),
         latency_ms: 1,
         status_code: Some(code),

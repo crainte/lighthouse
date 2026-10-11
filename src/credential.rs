@@ -185,7 +185,7 @@ mod tests {
         assert!(verify(&rec, "chosen-in-advance"));
         assert!(!verify(&rec, "something-else"));
         assert!(
-            provision("not-a-warden-token", "z", "r", 5).is_none(),
+            provision("not-a-lighthouse-token", "z", "r", 5).is_none(),
             "a malformed token must be refused, not silently reshaped"
         );
     }

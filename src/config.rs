@@ -75,7 +75,7 @@ pub struct AgentConfig {
     #[serde(default = "default_max_in_flight_probes")]
     pub max_in_flight_probes: usize,
     /// Shared secret presented to the coordinator, falling back to
-    /// `WARDEN_AGENT_TOKEN`. Must match the coordinator's `agent_token`.
+    /// `LIGHTHOUSE_AGENT_TOKEN`. Must match the coordinator's `agent_token`.
     #[serde(default)]
     pub token: Option<String>,
     /// Which entry of `coordinator_url` is currently believed reachable.
@@ -125,7 +125,7 @@ impl AgentConfig {
     pub fn resolved_token(&self) -> Option<String> {
         self.token
             .clone()
-            .or_else(|| std::env::var("WARDEN_AGENT_TOKEN").ok())
+            .or_else(|| std::env::var("LIGHTHOUSE_AGENT_TOKEN").ok())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     }
@@ -149,7 +149,7 @@ pub struct CoordinatorConfig {
     /// List of notification backends for alerts (webhook, ntfy, etc.).
     #[serde(default)]
     pub notifiers: Vec<Notifier>,
-    /// Password for the admin UI. Read from `WARDEN_ADMIN_PASSWORD` when unset
+    /// Password for the admin UI. Read from `LIGHTHOUSE_ADMIN_PASSWORD` when unset
     /// here, which is how it should normally be supplied — a password in a
     /// config file tends to end up in version control.
     ///
@@ -291,20 +291,20 @@ impl GlobalPushConfig {
                     .as_deref()
                     .and_then(|key| std::env::var(key).ok())
             })
-            .or_else(|| std::env::var("WARDEN_GLOBAL_TOKEN").ok())
+            .or_else(|| std::env::var("LIGHTHOUSE_GLOBAL_TOKEN").ok())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     }
 }
 
-/// `[global]` — the global coordinator itself (`warden global`). Caches state
+/// `[global]` — the global coordinator itself (`lighthouse global`). Caches state
 /// summaries pushed by regional coordinators, serves an aggregated dashboard,
 /// and routes drill-down reads back to the owning region. Holds no raw data.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GlobalConfig {
     #[serde(default = "default_global_listen")]
     pub listen: String,
-    /// Admin password for the aggregated dashboard, `WARDEN_ADMIN_PASSWORD`
+    /// Admin password for the aggregated dashboard, `LIGHTHOUSE_ADMIN_PASSWORD`
     /// when unset — same contract as a coordinator.
     #[serde(default)]
     pub admin_password: Option<String>,
@@ -321,7 +321,7 @@ pub struct GlobalConfig {
     pub trusted_proxies: Vec<String>,
     /// Secret regional coordinators must present to push state. Required in
     /// `global` mode: an unauthenticated push endpoint would let anyone rewrite
-    /// what the global dashboard shows. Falls back to `WARDEN_GLOBAL_TOKEN`.
+    /// what the global dashboard shows. Falls back to `LIGHTHOUSE_GLOBAL_TOKEN`.
     #[serde(default)]
     pub token: Option<String>,
     /// Seconds without a push after which a region reads as dark (its health
@@ -424,7 +424,7 @@ impl GlobalConfig {
     pub fn resolved_admin_password(&self) -> Option<String> {
         self.admin_password
             .clone()
-            .or_else(|| std::env::var("WARDEN_ADMIN_PASSWORD").ok())
+            .or_else(|| std::env::var("LIGHTHOUSE_ADMIN_PASSWORD").ok())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     }
@@ -432,7 +432,7 @@ impl GlobalConfig {
     pub fn resolved_token(&self) -> Option<String> {
         self.token
             .clone()
-            .or_else(|| std::env::var("WARDEN_GLOBAL_TOKEN").ok())
+            .or_else(|| std::env::var("LIGHTHOUSE_GLOBAL_TOKEN").ok())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     }
@@ -443,7 +443,7 @@ impl GlobalConfig {
     pub fn resolved_peer_token(&self) -> Option<String> {
         self.peer_token
             .clone()
-            .or_else(|| std::env::var("WARDEN_PEER_TOKEN").ok())
+            .or_else(|| std::env::var("LIGHTHOUSE_PEER_TOKEN").ok())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     }
@@ -451,7 +451,7 @@ impl GlobalConfig {
     pub fn resolved_advertise_url(&self) -> Option<String> {
         self.advertise_url
             .clone()
-            .or_else(|| std::env::var("WARDEN_ADVERTISE_URL").ok())
+            .or_else(|| std::env::var("LIGHTHOUSE_ADVERTISE_URL").ok())
             .map(|s| s.trim().trim_end_matches('/').to_string())
             .filter(|s| !s.is_empty())
     }
@@ -459,7 +459,7 @@ impl GlobalConfig {
     pub fn resolved_node_id(&self) -> Option<String> {
         self.node_id
             .clone()
-            .or_else(|| std::env::var("WARDEN_NODE_ID").ok())
+            .or_else(|| std::env::var("LIGHTHOUSE_NODE_ID").ok())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     }
@@ -471,7 +471,7 @@ impl GlobalConfig {
         if self.resolved_token().is_none() {
             anyhow::bail!(
                 "global mode needs a token: set [global] token (or \
-                 WARDEN_GLOBAL_TOKEN) to the same value the regional \
+                 LIGHTHOUSE_GLOBAL_TOKEN) to the same value the regional \
                  coordinators present in [coordinator.global] token."
             );
         }
@@ -481,7 +481,7 @@ impl GlobalConfig {
             if self.resolved_peer_token().is_none() {
                 anyhow::bail!(
                     "global.peers is set but peer_token is not: peers would refuse \
-                     every message. Set peer_token (or WARDEN_PEER_TOKEN) to the \
+                     every message. Set peer_token (or LIGHTHOUSE_PEER_TOKEN) to the \
                      same value on every global node."
                 );
             }
@@ -489,7 +489,7 @@ impl GlobalConfig {
                 anyhow::bail!(
                     "global.peers is set but advertise_url is not: peers would have \
                      no address to reach this node on. Set advertise_url (or \
-                     WARDEN_ADVERTISE_URL) to this node's base URL, e.g. \
+                     LIGHTHOUSE_ADVERTISE_URL) to this node's base URL, e.g. \
                      http://global-a:8080"
                 );
             }
@@ -779,21 +779,21 @@ impl CoordinatorConfig {
     }
 
     pub fn resolved_admin_password(&self) -> Option<String> {
-        Self::secret(&self.admin_password, "WARDEN_ADMIN_PASSWORD")
+        Self::secret(&self.admin_password, "LIGHTHOUSE_ADMIN_PASSWORD")
     }
 
     /// Secret peers present to each other on `/internal/gossip`. Its own value,
     /// not shared with agents: an agent credential must never open an endpoint
     /// that rewrites published state.
     pub fn resolved_peer_token(&self) -> Option<String> {
-        Self::secret(&self.peer_token, "WARDEN_PEER_TOKEN")
+        Self::secret(&self.peer_token, "LIGHTHOUSE_PEER_TOKEN")
     }
 
     /// Where peers should dial this node, environment second like the secrets.
     pub fn resolved_advertise_url(&self) -> Option<String> {
         self.advertise_url
             .clone()
-            .or_else(|| std::env::var("WARDEN_ADVERTISE_URL").ok())
+            .or_else(|| std::env::var("LIGHTHOUSE_ADVERTISE_URL").ok())
             .map(|s| s.trim().trim_end_matches('/').to_string())
             .filter(|s| !s.is_empty())
     }
@@ -801,7 +801,7 @@ impl CoordinatorConfig {
     pub fn resolved_node_id(&self) -> Option<String> {
         self.node_id
             .clone()
-            .or_else(|| std::env::var("WARDEN_NODE_ID").ok())
+            .or_else(|| std::env::var("LIGHTHOUSE_NODE_ID").ok())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     }
@@ -823,7 +823,7 @@ impl CoordinatorConfig {
         let token = g.resolved_token().ok_or_else(|| {
             anyhow::anyhow!(
                 "coordinator.global is set but its token is not: set \
-                 [coordinator.global] token (or token_env, or WARDEN_GLOBAL_TOKEN) \
+                 [coordinator.global] token (or token_env, or LIGHTHOUSE_GLOBAL_TOKEN) \
                  to the value the global node's [global] token expects."
             )
         })?;
@@ -844,7 +844,7 @@ impl CoordinatorConfig {
         if self.resolved_peer_token().is_none() {
             anyhow::bail!(
                 "coordinator.peers is set but peer_token is not: peers would refuse \
-                 every message. Set peer_token (or WARDEN_PEER_TOKEN) to the same \
+                 every message. Set peer_token (or LIGHTHOUSE_PEER_TOKEN) to the same \
                  value on every coordinator."
             );
         }
@@ -852,7 +852,7 @@ impl CoordinatorConfig {
             anyhow::bail!(
                 "coordinator.peers is set but advertise_url is not: peers would have \
                  no address to reach this node on. Set advertise_url (or \
-                 WARDEN_ADVERTISE_URL) to this node's base URL, e.g. \
+                 LIGHTHOUSE_ADVERTISE_URL) to this node's base URL, e.g. \
                  http://coordinator-a:8080"
             );
         }
@@ -1816,7 +1816,7 @@ fn default_listen() -> String {
     "0.0.0.0:8080".into()
 }
 fn default_db_path() -> String {
-    "warden.duckdb".into()
+    "lighthouse.duckdb".into()
 }
 fn default_timeout_secs() -> u64 {
     10

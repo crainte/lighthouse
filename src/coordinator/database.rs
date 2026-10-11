@@ -34,7 +34,7 @@ impl TimingCounter {
         let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
         if count.is_multiple_of(TIMING_REPORT_EVERY) {
             tracing::info!(
-                target: "warden_bench",
+                target: "lighthouse_bench",
                 component = "database_worker",
                 operation,
                 samples = count,
@@ -84,8 +84,8 @@ pub struct MetricsSnapshot {
 
 impl Timings {
     fn enabled() -> bool {
-        std::env::var_os("WARDEN_BENCH_TIMINGS").as_deref() == Some(std::ffi::OsStr::new("1"))
-            || std::env::var("RUST_LOG").is_ok_and(|filter| filter.contains("warden_bench"))
+        std::env::var_os("LIGHTHOUSE_BENCH_TIMINGS").as_deref() == Some(std::ffi::OsStr::new("1"))
+            || std::env::var("RUST_LOG").is_ok_and(|filter| filter.contains("lighthouse_bench"))
     }
 }
 
@@ -109,7 +109,7 @@ impl Database {
         let metrics = Arc::new(Metrics::default());
         let database_path = Arc::new(std::path::PathBuf::from(&path));
         std::thread::Builder::new()
-            .name("warden-database".to_string())
+            .name("lighthouse-database".to_string())
             .spawn(move || {
                 let storage = match Storage::open(&path) {
                     Ok(storage) => {
@@ -246,7 +246,7 @@ impl Database {
                     timings.operation.observe("call", elapsed);
                     if elapsed >= SLOW_CALL {
                         tracing::info!(
-                            target: "warden_bench",
+                            target: "lighthouse_bench",
                             component = "database_worker",
                             operation = "slow_call",
                             caller = %caller,

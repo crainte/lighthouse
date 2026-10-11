@@ -52,11 +52,11 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 
+use lighthouse::config::{CheckConfig, CoordinatorConfig};
+use lighthouse::coordinator::Coordinator;
+use lighthouse::models::{CheckId, CheckKind, CheckResult};
+use lighthouse::notify::{Notifier, NotifierKind};
 use uuid::Uuid;
-use warden::config::{CheckConfig, CoordinatorConfig};
-use warden::coordinator::Coordinator;
-use warden::models::{CheckId, CheckKind, CheckResult};
-use warden::notify::{Notifier, NotifierKind};
 
 const PEER_TOKEN: &str = "chaos-peer-secret";
 const ADMIN_PASSWORD: &str = "correct horse battery staple";
@@ -761,7 +761,10 @@ async fn agent_failover_between_coordinators_converges_on_one_incident() {
 async fn coordinator_restart_mid_incident_lifecycle_preserves_exactly_one_incident() {
     const AGENT_TOKEN: &str = "wac_chaos.restart-secret";
     let path = std::env::temp_dir()
-        .join(format!("warden-chaos-restart-{}.duckdb", Uuid::now_v7()))
+        .join(format!(
+            "lighthouse-chaos-restart-{}.duckdb",
+            Uuid::now_v7()
+        ))
         .to_string_lossy()
         .into_owned();
 

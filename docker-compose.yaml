@@ -1,34 +1,34 @@
-# Standalone Warden: one process runs the coordinator and local agent.
-# Open http://localhost:${WARDEN_PORT:-9000}. Incidents must persist for 60s
+# Standalone Lighthouse: one process runs the coordinator and local agent.
+# Open http://localhost:${LIGHTHOUSE_PORT:-9000}. Incidents must persist for 60s
 # before publication, avoiding transient alerts in this single-observer setup.
 
-name: warden-standalone
+name: lighthouse-standalone
 
 services:
-  warden:
+  lighthouse:
     build:
       context: .
       args:
         GIT_SHA: ${GIT_SHA:-}
-    image: warden:latest
+    image: lighthouse:latest
     command: ["standalone"]
     ports:
-      - "${WARDEN_PORT:-9000}:8080"
+      - "${LIGHTHOUSE_PORT:-9000}:8080"
     environment:
-      WARDEN_ADMIN_PASSWORD: ${WARDEN_ADMIN_PASSWORD:-}
+      LIGHTHOUSE_ADMIN_PASSWORD: ${LIGHTHOUSE_ADMIN_PASSWORD:-}
     cap_add:
       - NET_RAW
     configs:
-      - source: warden-toml
-        target: /data/warden.toml
+      - source: lighthouse-toml
+        target: /data/lighthouse.toml
     volumes:
-      - warden-data:/data
+      - lighthouse-data:/data
     restart: unless-stopped
     networks:
-      - warden
+      - lighthouse
 
 configs:
-  warden-toml:
+  lighthouse-toml:
     content: |
       [agent]
       zone = "local"
@@ -37,7 +37,7 @@ configs:
 
       [coordinator]
       listen = "0.0.0.0:8080"
-      db_path = "/data/warden.duckdb"
+      db_path = "/data/lighthouse.duckdb"
 
       [coordinator.rollup_defaults]
       min_incident_secs = 60
@@ -46,7 +46,7 @@ configs:
       # database; none are seeded from this file.
 
 volumes:
-  warden-data:
+  lighthouse-data:
 
 networks:
-  warden:
+  lighthouse:

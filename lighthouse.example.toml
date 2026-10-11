@@ -1,7 +1,7 @@
-# Warden bare-metal standalone config example.
-# Run directly on the host: warden standalone --config warden.example.toml
+# Lighthouse bare-metal standalone config example.
+# Run directly on the host: lighthouse standalone --config lighthouse.example.toml
 # The coordinator listens on the host address below; arrange any firewall, TLS
-# termination, and public port mapping outside Warden.
+# termination, and public port mapping outside Lighthouse.
 #
 # This is the only standalone TOML example. The only two Compose examples
 # (`docker-compose.yaml` and `docker-compose.cluster.yaml`) inline their own
@@ -24,7 +24,7 @@ max_in_flight_probes = 128
 
 [coordinator]
 listen = "0.0.0.0:8080"
-db_path = "warden.duckdb"
+db_path = "lighthouse.duckdb"
 
 # Fleet-wide defaults for region-tree alert handling. A check can override any
 # of these optional fields below. `min_incident_secs` holds a non-UP rollup
@@ -56,7 +56,7 @@ degraded_is_downtime = false
 # webhook_url = "https://hooks.slack.com/services/..."   # not the webhook kind
 #
 # type = "ntfy"
-# topic = "warden"
+# topic = "lighthouse"
 # base_url = "https://ntfy.sh"  # optional
 #
 # type = "pagerduty"          # Events API v2. The check id is the dedup key, so
@@ -66,21 +66,21 @@ degraded_is_downtime = false
 # host = "smtp.example.com"
 # port = 587                  # optional: 465 implicit, 587 starttls, 25 none
 # tls = "starttls"            # starttls (default) | implicit | none
-# username = "warden"         # both or neither
+# username = "lighthouse"         # both or neither
 # password = "..."            # better supplied in the admin UI than this file
-# from = "warden@example.com"
+# from = "lighthouse@example.com"
 # to = "ops@example.com"      # one address; use an alias for a list
 
 # Secrets are better supplied by the environment than written here — this file
 # tends to end up in version control. All three fall back to an env var:
 #
-#   WARDEN_ADMIN_PASSWORD  unlocks the check editor. With neither this nor the
+#   LIGHTHOUSE_ADMIN_PASSWORD  unlocks the check editor. With neither this nor the
 #                          env var set, the editor is disabled rather than open.
-#   WARDEN_PEER_TOKEN      coordinator-to-coordinator authentication for both
+#   LIGHTHOUSE_PEER_TOKEN      coordinator-to-coordinator authentication for both
 #                          membership and replication. Only needed when
 #                          `peers` is set. Unset means every peer message is
 #                          refused with 401.
-#   WARDEN_ADVERTISE_URL   see below.
+#   LIGHTHOUSE_ADVERTISE_URL   see below.
 #
 # Agents are not authenticated by anything in this file. Each zone gets a
 # credential minted in Admin > Credentials, and a coordinator with none refuses
@@ -89,7 +89,7 @@ degraded_is_downtime = false
 #
 # admin_password = "change-me"
 # Set only when clients reach this server through HTTPS (including a TLS
-# terminator you trust). Warden never trusts Forwarded/X-Forwarded-Proto from a
+# terminator you trust). Lighthouse never trusts Forwarded/X-Forwarded-Proto from a
 # request to decide this, because clients can forge those headers.
 # secure_cookies = true
 
@@ -110,12 +110,12 @@ degraded_is_downtime = false
 #
 # Stable identity of this node in the cluster. Unset means one is generated on
 # first boot and persisted, so a restart rejoins as itself rather than
-# appearing as a new member and leaving a ghost behind. Env: WARDEN_NODE_ID.
+# appearing as a new member and leaving a ghost behind. Env: LIGHTHOUSE_NODE_ID.
 # node_id = "coordinator-a"
 #
 # How peers reach *this* node. Required once `peers` is non-empty — startup
 # refuses to run without it, because a node no peer can dial back replicates
-# outward while receiving nothing. Env: WARDEN_ADVERTISE_URL.
+# outward while receiving nothing. Env: LIGHTHOUSE_ADVERTISE_URL.
 # advertise_url = "http://coordinator-a:8080"
 #
 # How often every known member is pinged. Also the granularity of failure
@@ -145,7 +145,7 @@ degraded_is_downtime = false
 #
 # [coordinator.global]
 # url = "http://global:8080"           # base URL of the global coordinator
-# token_env = "WARDEN_GLOBAL_TOKEN"    # or: token = "..."; the global node's secret
+# token_env = "LIGHTHOUSE_GLOBAL_TOKEN"    # or: token = "..."; the global node's secret
 # push_secs = 5                        # 5-10s; default 5
 
 # Placement chooses probes by failure domain with rendezvous hashing: if a
@@ -157,14 +157,14 @@ degraded_is_downtime = false
 # fleet-wide. Both `regions` and `zones` are optional allow-lists, set when
 # creating or editing a check through the Admin UI or API.
 
-# --- Global coordinator (`warden global`) -----------------------------------
+# --- Global coordinator (`lighthouse global`) -----------------------------------
 # Only read in `global` mode. The global node caches the state summaries the
 # regions push, serves an aggregated dashboard, and proxies drill-down reads
 # back to the owning region. It holds no raw data and probes nothing.
 #
 # [global]
 # listen = "0.0.0.0:8080"
-# token_env = "WARDEN_GLOBAL_TOKEN"    # required: the shared push secret
+# token_env = "LIGHTHOUSE_GLOBAL_TOKEN"    # required: the shared push secret
 # region_staleness_secs = 20           # a region silent this long reads as dark
 #
 # Cross-region alerting. Empty (the default) means the global node never pages:
@@ -211,7 +211,7 @@ degraded_is_downtime = false
 # [[coordinator.provision]]
 # zone = "us-east-1a"
 # region = "us-east"
-# token_env = "WARDEN_AGENT_TOKEN_A"    # or: token = "wac_....." (fixtures)
+# token_env = "LIGHTHOUSE_AGENT_TOKEN_A"    # or: token = "wac_....." (fixtures)
 
 # --- Checks -------------------------------------------------------------
 # Checks (HTTP, TCP, DNS, ICMP, ...) are created through the Admin UI or the

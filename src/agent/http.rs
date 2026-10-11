@@ -225,7 +225,7 @@ mod tests {
 
     fn self_signed_cert() -> rustls::pki_types::CertificateDer<'static> {
         let dir = std::env::temp_dir().join(format!(
-            "warden-tls-test-{}",
+            "lighthouse-tls-test-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()

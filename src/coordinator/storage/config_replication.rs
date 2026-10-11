@@ -1359,7 +1359,7 @@ mod tests {
         }
         samples.sort_unstable();
         let p95 = samples[19];
-        let max_digest_ms = std::env::var("WARDEN_BENCH_MAX_CONFIG_DIGEST_MS")
+        let max_digest_ms = std::env::var("LIGHTHOUSE_BENCH_MAX_CONFIG_DIGEST_MS")
             .ok()
             .and_then(|value| value.parse::<u128>().ok())
             .unwrap_or(100);
@@ -1532,7 +1532,7 @@ mod tests {
     fn config_watermarks_match_reference_scan_for_every_kind_after_direct_writes_reopen_and_rollback(
     ) {
         let path = std::env::temp_dir().join(format!(
-            "warden-config-watermarks-{}.duckdb",
+            "lighthouse-config-watermarks-{}.duckdb",
             uuid::Uuid::new_v4()
         ));
         let path = path.to_string_lossy().into_owned();
@@ -1854,21 +1854,21 @@ mod tests {
     #[test]
     #[ignore = "production-scale benchmark; requires substantial time and disk"]
     fn benchmark_full_digest_with_production_retained_history() {
-        let check_count = std::env::var("WARDEN_BENCH_CHECKS")
+        let check_count = std::env::var("LIGHTHOUSE_BENCH_CHECKS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(10_000);
-        let observations_per_check = std::env::var("WARDEN_BENCH_OBSERVATIONS_PER_CHECK")
+        let observations_per_check = std::env::var("LIGHTHOUSE_BENCH_OBSERVATIONS_PER_CHECK")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(30 * 24 * 60 * 2);
-        let max_digest_ms = std::env::var("WARDEN_BENCH_MAX_DIGEST_MS")
+        let max_digest_ms = std::env::var("LIGHTHOUSE_BENCH_MAX_DIGEST_MS")
             .ok()
             .and_then(|value| value.parse::<u128>().ok())
             .unwrap_or(2_000);
         let sample_count = 20usize;
         let path = std::env::temp_dir().join(format!(
-            "warden-anti-entropy-bench-{}-{}.duckdb",
+            "lighthouse-anti-entropy-bench-{}-{}.duckdb",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
