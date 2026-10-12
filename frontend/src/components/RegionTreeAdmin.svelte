@@ -42,7 +42,8 @@
     name: string;
     state: RegionTreeState;
     children: RegionTreeState[];
-    effective: RollupPolicy;
+    /** `null` when the owning region did not answer the global node. */
+    effective: RollupPolicy | null;
   };
   type AgentRow = { id: string; staleness_ms: number; perCheck: RegionTreeState[] };
   type PolicyNode = {
@@ -63,6 +64,13 @@
   let tree = $state<RegionTreeResponse | null>(null);
   let policies = $state<StoredRollupPolicy[]>([]);
   let selectedId = $state<string | null>(null);
+  let previewQuery = $state('');
+  let previewPage = $state(0);
+  const PREVIEW_PAGE_SIZE = 25;
+  const SIM_STATES: RegionTreeState[] = ['up', 'degraded', 'down', 'unknown'];
+  const TIER_ORDER: RollupNodeType[] = ['zone', 'region', 'global'];
+  let simTier = $state<RollupNodeType>('region');
+  let simChildren = $state<RegionTreeState[]>(['up', 'up', 'degraded', 'up', 'down']);
   let draft = $state<PolicyDraft>(toDraft(DEFAULTS.global));
   let collapsed = $state(new Set<string>());
   let loading = $state(true);
@@ -96,7 +104,7 @@
     for (const check of source.checks) {
       root.perCheck.push({
         check_id: check.check_id,
-        name: check.name,
+        name: check.name ?? check.check_id,
         state: check.state,
         children: check.regions.map((r) => r.state),
         effective: check.effective_policy,
@@ -110,7 +118,7 @@
         }
         rn.perCheck.push({
           check_id: check.check_id,
-          name: check.name,
+          name: check.name ?? check.check_id,
           state: region.state,
           children: region.zones.map((z) => z.state),
           effective: region.effective_policy,
@@ -125,7 +133,7 @@
           }
           zn.perCheck.push({
             check_id: check.check_id,
-            name: check.name,
+            name: check.name ?? check.check_id,
             state: zone.state,
             children: zone.agents.map((a) => a.state),
             effective: zone.effective_policy,
@@ -249,6 +257,8 @@
       return;
     }
     selectedId = node.node_id;
+    previewQuery = '';
+    previewPage = 0;
     draft = toDraft(nodePolicy(node));
     error = null;
     note = null;
@@ -273,7 +283,7 @@
     if (!node) return [] as { check_id: string; name: string }[];
     const own = nodePolicy(node);
     return node.perCheck
-      .filter((c) => !samePolicy(c.effective, own))
+      .filter((c) => c.effective !== null && !samePolicy(c.effective, own))
       .map((c) => ({ check_id: c.check_id, name: c.name }));
   });
   let shadowedIds = $derived(new Set(shadowed.map((c) => c.check_id)));
@@ -285,19 +295,58 @@
     return node.perCheck.map((c) => {
       const isShadowed = shadowedIds.has(c.check_id);
       const known = c.children.filter((s) => s !== 'unknown').length;
-      const next = isShadowed ? c.state : rollup(draftPolicy, c.children);
+      const unavailable = c.children.length === 0;
+      const next = isShadowed || unavailable ? c.state : rollup(draftPolicy, c.children);
       return {
         check_id: c.check_id,
         name: c.name,
         now: c.state,
         next,
         known,
+        unavailable,
         silent: c.children.length - known,
         shadowed: isShadowed,
-        changed: !isShadowed && next !== c.state,
+        changed: !isShadowed && !unavailable && next !== c.state,
       };
     });
   });
+
+  const previewMatches = $derived(preview.filter((p) =>
+    `${p.name} ${p.check_id}`.toLowerCase().includes(previewQuery.trim().toLowerCase()),
+  ));
+  const previewPages = $derived(Math.max(1, Math.ceil(previewMatches.length / PREVIEW_PAGE_SIZE)));
+  const currentPreviewPage = $derived(Math.min(previewPage, previewPages - 1));
+  const previewRows = $derived(previewMatches.slice(currentPreviewPage * PREVIEW_PAGE_SIZE, (currentPreviewPage + 1) * PREVIEW_PAGE_SIZE));
+  const changedCount = $derived(preview.filter((p) => p.changed).length);
+  const unavailableCount = $derived(preview.filter((p) => p.unavailable).length);
+
+  const tierNodes = $derived.by(() => {
+    const out: Record<RollupNodeType, PolicyNode[]> = { global: [], region: [], zone: [] };
+    for (const row of rows) if (row.kind === 'node') out[row.node.node_type].push(row.node);
+    return out;
+  });
+  const agentCount = $derived.by(() => {
+    const ids = new Set<string>();
+    const walk = (node: PolicyNode) => { node.agents.forEach((a) => ids.add(a.id)); node.children.forEach(walk); };
+    if (root) walk(root);
+    return ids.size;
+  });
+  const detailMissing = $derived(tierNodes.region.length > 0 && tierNodes.zone.length === 0);
+  const simPolicy = $derived(selected?.node_type === simTier ? draftPolicy : DEFAULTS[simTier]);
+  const simResult = $derived(rollup(simPolicy, simChildren));
+  const simKnown = $derived(simChildren.filter((s) => s !== 'unknown').length);
+
+  function cycleSimChild(index: number) {
+    simChildren = simChildren.map((state, i) => i === index ? SIM_STATES[(SIM_STATES.indexOf(state) + 1) % SIM_STATES.length] : state);
+  }
+
+  function resizeSim(delta: number) {
+    simChildren = delta > 0 ? [...simChildren, 'up' as RegionTreeState].slice(0, 12) : simChildren.slice(0, Math.max(1, simChildren.length - 1));
+  }
+
+  function tierTitle(tier: RollupNodeType): string {
+    return tier === 'global' ? 'Global check state' : tier === 'region' ? 'Region state' : 'Zone state';
+  }
 
   /** A quorum larger than the reporting fleet clamps, which is worth saying. */
   let clamping = $derived.by(() =>
@@ -416,20 +465,44 @@
     <button class="btn" onclick={refresh}>Retry</button>
   </div>
 {:else if root}
-  <div class="head">
-    <div>
-      <div class="panel-title">Rollup policy</div>
-      <p class="admin-muted lede">
-        Explore health from regions to individual agents. Select a node to adjust its degraded
-        and down thresholds. Each node’s policy applies to all of its checks.
-      </p>
+  {#if tree?.unavailable_regions?.length}<p class="admin-error">Region detail not read from {tree.unavailable_regions.join(', ')}: those regions did not answer, so their zones, agents and stored policies are missing.</p>{/if}
+  <section class="rollup-pipeline" aria-labelledby="rollup-pipeline-title">
+    <div class="section-heading"><div><h3 id="rollup-pipeline-title">Escalation path</h3><p>Every check moves through the same chain. Unknown children are excluded from each calculation; they neither create nor hide an outage.</p></div><button class="btn" onclick={refresh}>Refresh</button></div>
+    <div class="pipeline-track">
+      <div class="pipeline-stage source-stage"><span class="stage-index">01</span><strong>Agent observations</strong><p>Each assigned agent reports up, down, degraded, or unknown.</p><div class="stage-meter">{#if detailMissing}<span>—</span><small>agent detail not supplied</small>{:else}<span>{agentCount}</span><small>{agentCount === 1 ? 'agent' : 'agents'} in rollup data</small>{/if}</div></div>
+      {#each TIER_ORDER as tier, i (tier)}
+        <button class="pipeline-stage" class:active={simTier === tier} aria-pressed={simTier === tier} onclick={() => (simTier = tier)}>
+          <span class="stage-index">0{i + 2}</span><strong>{tierTitle(tier)}</strong>
+          <p>Down when {thresholdPhrase(DEFAULTS[tier].down_when, CHILD[tier])} is down.</p>
+          <div class="stage-meter">{#if tier === 'zone' && detailMissing}<span>—</span><small>zone detail not supplied</small>{:else}<span>{tierNodes[tier].length}</span><small>{tier === 'global' ? 'aggregate' : tierNodes[tier].length === 1 ? tier : `${tier}s`} · {policies.filter((p) => p.node_type === tier).length} {policies.filter((p) => p.node_type === tier).length === 1 ? 'override' : 'overrides'}</small>{/if}</div>
+        </button>
+      {/each}
     </div>
-    <button class="btn" onclick={refresh}>Refresh</button>
-  </div>
+  </section>
+
+  <section class="rollup-lab" aria-labelledby="rollup-lab-title">
+    <div class="lab-copy">
+      <span class="lab-kicker">Interactive simulation</span>
+      <h3 id="rollup-lab-title">{tierTitle(simTier)}</h3>
+      <p>Select child states to test the {selected?.node_type === simTier ? `${selected.label} draft` : 'built-in default'} policy before saving an override.</p>
+      <div class="lab-policy"><span>Degraded when</span><strong>{thresholdPhrase(simPolicy.degraded_when, CHILD[simTier])} is down or degraded</strong><span>Down when</span><strong>{thresholdPhrase(simPolicy.down_when, CHILD[simTier])} is down</strong></div>
+    </div>
+    <div class="lab-stage">
+      <div class="lab-children" aria-label={`Simulated ${CHILD[simTier]} states`}>
+        {#each simChildren as state, i (`${i}-${state}`)}
+          <button class="sim-child {tone(state)}" aria-label={`${CHILD[simTier]} ${i + 1}: ${state}. Change state`} onclick={() => cycleSimChild(i)}><span></span>{state}</button>
+        {/each}
+      </div>
+      <div class="lab-controls"><button class="btn" disabled={simChildren.length <= 1} onclick={() => resizeSim(-1)}>Remove child</button><span>{simKnown} known of {simChildren.length}</span><button class="btn" disabled={simChildren.length >= 12} onclick={() => resizeSim(1)}>Add child</button></div>
+      <div class="lab-result {tone(simResult)}" aria-live="polite"><span>Resulting state</span><strong>{simResult}</strong></div>
+    </div>
+  </section>
+
+  <div class="section-heading"><div><h3>Location policies</h3><p>Choose a location to adjust its thresholds. Overrides apply to every check rolled up through that location.</p></div></div>
 
   <div class="admin-panel tree">
     <div class="legend">
-      <span>Node</span>
+      <span aria-hidden="true"></span><span>Node</span>
       <span>Degraded / down</span>
       <span>State per check</span>
     </div>
@@ -542,21 +615,23 @@
 
               {#if clamping.length}
                 <p class="admin-muted feedback">
-                  Quorum exceeds the reporting fleet and will clamp — {clamping.join('; ')}.
+                  {clamping.length} quorum thresholds exceed the available child-state count and will clamp.
                 </p>
               {/if}
 
               {#if shadowed.length}
                 <p class="admin-muted feedback">
-                  Not applied to {shadowed.map((c) => c.name).join(', ')}: {shadowed.length === 1 ? 'this check sets' : 'these checks set'}
-                  its own {selected.node_type} policy in the check editor, which wins over this one.
+                  {shadowed.length} checks report an effective policy different from this node’s policy.
+                  Their current states are retained in this preview; the response does not identify the source of that difference.
                 </p>
               {/if}
 
               {#if preview.length}
                 <div class="preview">
-                  <div class="preview-head">Effect on each check</div>
-                  {#each preview as p (p.check_id)}
+                  <div class="preview-head">Policy impact · {preview.length} checks · {changedCount} projected changes</div>
+                  {#if unavailableCount}<p class="admin-muted preview-note">Child details unavailable for {unavailableCount} checks. Current states are shown, but policy effects cannot be calculated for them. Missing details do not mean probes stopped reporting.</p>{/if}
+                  <div class="preview-controls"><input type="search" aria-label="Search policy preview" placeholder="Find a check by name or ID" bind:value={previewQuery} oninput={() => (previewPage = 0)} /><span>{previewMatches.length} matches · up to {PREVIEW_PAGE_SIZE} per page</span></div>
+                  {#each previewRows as p (p.check_id)}
                     <div class="preview-row" class:changed={p.changed}>
                       <span class="pcheck">{p.name}</span>
                       <span class="opill {tone(p.now)}"><span class="pdot"></span>{p.now}</span>
@@ -564,13 +639,14 @@
                         <span class="arrow">→</span>
                         <span class="opill {tone(p.next)}"><span class="pdot"></span>{p.next}</span>
                       {:else}
-                        <span class="arrow muted">{p.shadowed ? 'overridden' : 'unchanged'}</span>
+                        <span class="arrow muted">{p.unavailable ? 'Preview unavailable' : p.shadowed ? 'Different effective policy' : 'unchanged'}</span>
                       {/if}
                       <span class="pcount">
-                        {p.known} {p.known === 1 ? CHILD[selected.node_type] : `${CHILD[selected.node_type]}s`} reporting{p.silent ? `, ${p.silent} silent` : ''}
+                        {#if p.unavailable}Child details not supplied{:else}{p.known} {p.known === 1 ? CHILD[selected.node_type] : `${CHILD[selected.node_type]}s`} with known state{p.silent ? `, ${p.silent} unknown` : ''}{/if}
                       </span>
                     </div>
                   {/each}
+                  <div class="preview-controls"><button class="btn" disabled={currentPreviewPage === 0} onclick={() => (previewPage = currentPreviewPage - 1)}>Previous</button><span>Page {currentPreviewPage + 1} of {previewPages}</span><button class="btn" disabled={currentPreviewPage + 1 >= previewPages} onclick={() => (previewPage = currentPreviewPage + 1)}>Next</button></div>
                 </div>
               {:else}
                 <p class="admin-muted feedback">
@@ -605,6 +681,39 @@
 {/if}
 
 <style>
+  .rollup-pipeline { margin-bottom: 20px; }
+  .pipeline-track { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0; overflow: hidden; border: 1px solid var(--ad-line); border-radius: 9px; background: var(--ad-line); }
+  .pipeline-stage { position: relative; display: grid; align-content: start; gap: 12px; min-width: 0; min-height: 210px; padding: 22px; color: var(--ad-text); text-align: left; background: var(--ad-panel); border: 0; border-left: 1px solid var(--ad-line); font: inherit; }
+  .pipeline-stage:first-child { border-left: 0; }
+  button.pipeline-stage { cursor: pointer; }
+  button.pipeline-stage:hover, .pipeline-stage.active { background: #142538; }
+  .pipeline-stage.active { box-shadow: inset 0 2px 0 var(--ad-cyan); }
+  .pipeline-stage:not(:last-child)::after { content: ''; position: absolute; z-index: 1; top: 50%; right: -8px; width: 14px; height: 14px; background: inherit; border-top: 1px solid var(--ad-line); border-right: 1px solid var(--ad-line); transform: translateY(-50%) rotate(45deg); }
+  .stage-index, .lab-kicker { color: var(--ad-cyan); font-size: 11px; font-weight: 500; }
+  .pipeline-stage strong { font-size: 15px; font-weight: 550; }
+  .pipeline-stage p { margin: 0; color: var(--ad-dim); font-size: 12px; line-height: 1.6; }
+  .stage-meter { display: flex; align-items: baseline; gap: 8px; margin-top: auto; }
+  .stage-meter span { font-size: 26px; }
+  .stage-meter small { color: var(--ad-dim); font-size: 11px; }
+  .rollup-lab { display: grid; grid-template-columns: minmax(240px, .75fr) minmax(0, 1.25fr); gap: 0; margin: 20px 0 32px; overflow: hidden; border: 1px solid var(--ad-line); border-radius: 9px; background: var(--ad-panel); }
+  .lab-copy { padding: 28px; border-right: 1px solid var(--ad-line); }
+  .lab-copy h3 { margin: 12px 0 10px; font-size: 22px; font-weight: 550; }
+  .lab-copy > p { color: var(--ad-dim); font-size: 13px; line-height: 1.65; }
+  .lab-policy { display: grid; gap: 8px; margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--ad-line); }
+  .lab-policy span { color: var(--ad-dim); font-size: 11px; }
+  .lab-policy strong { margin-bottom: 10px; font-size: 13px; font-weight: 500; line-height: 1.5; }
+  .lab-stage { display: grid; align-content: center; gap: 24px; padding: 32px; background: radial-gradient(circle at 70% 50%, rgba(86, 212, 228, .055), transparent 55%), #0b1520; }
+  .lab-children { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 12px; }
+  .sim-child { display: flex; align-items: center; gap: 10px; min-height: 48px; padding: 0 14px; color: var(--ad-text); text-transform: capitalize; background: var(--ad-panel); border: 1px solid var(--ad-line); border-radius: 7px; cursor: pointer; font: inherit; font-size: 13px; }
+  .sim-child span { width: 9px; height: 9px; border-radius: 50%; background: currentColor; }
+  .sim-child.green { color: var(--ad-green); } .sim-child.amber { color: var(--ad-amber); } .sim-child.red { color: var(--ad-red); } .sim-child.grey { color: var(--ad-dim); }
+  .lab-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; color: var(--ad-dim); font-size: 12px; }
+  .lab-result { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 22px 24px; border: 1px solid currentColor; border-radius: 8px; background: color-mix(in srgb, currentColor 8%, transparent); }
+  .lab-result span { color: var(--ad-dim); font-size: 12px; }
+  .lab-result strong { font-size: 30px; font-weight: 500; text-transform: capitalize; }
+  .lab-result.green { color: var(--ad-green); } .lab-result.amber { color: var(--ad-amber); } .lab-result.red { color: var(--ad-red); } .lab-result.grey { color: var(--ad-dim); }
+  @media (max-width: 1050px) { .pipeline-track { grid-template-columns: repeat(2, minmax(0, 1fr)); } .pipeline-stage:nth-child(3) { border-left: 0; } .pipeline-stage { border-bottom: 1px solid var(--ad-line); } .pipeline-stage::after { display: none; } .rollup-lab { grid-template-columns: 1fr; } .lab-copy { border-right: 0; border-bottom: 1px solid var(--ad-line); } }
+  @media (max-width: 600px) { .pipeline-track { grid-template-columns: 1fr; } .pipeline-stage { min-height: 0; border-left: 0; } .lab-copy, .lab-stage { padding: 20px; } .lab-children { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   .head { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin: 0 0 .6rem; }
   .lede { max-width: 62ch; margin: .3rem 0 0; }
   .tree { padding: 0; overflow: hidden; }
@@ -616,18 +725,15 @@
     gap: .65rem;
   }
   .legend {
-    grid-template-columns: minmax(9rem, 1fr) minmax(9rem, auto) minmax(10rem, auto);
-    padding: .5rem .8rem;
+    padding: 12px 16px;
     border-bottom: 1px solid var(--ad-line);
-    color: var(--ad-faint);
-    font-size: .63rem;
-    text-transform: uppercase;
-    letter-spacing: .08em;
+    color: var(--ad-dim);
+    font-size: 11px;
+    text-transform: none;
+    letter-spacing: 0;
   }
   .row { padding: 16px; min-height: 64px; border-bottom: 1px solid rgba(255, 255, 255, .035); }
-  /* Indent encodes depth; the tree is shallow enough that a rule per level is
-     unnecessary and a custom property keeps the markup flat. */
-  .row { padding-left: calc(.8rem + var(--depth) * 1.15rem); }
+  .row .label { padding-left: calc(var(--depth) * 12px); }
   .row.node.selected { background: var(--ad-panel-2); }
   .row.agent { grid-template-columns: 32px minmax(0, 1fr) minmax(130px, .65fr) minmax(160px, .8fr); }
   .row.agent .label { grid-column: 2; }
@@ -650,8 +756,8 @@
   }
   .pick:hover { color: var(--ad-cyan); }
   .node-kind {
-    color: var(--ad-faint); font-size: .63rem; text-transform: uppercase;
-    letter-spacing: .08em; margin-right: .4rem;
+    color: var(--ad-dim); font-size: 11px; text-transform: capitalize;
+    letter-spacing: 0; margin-right: 8px;
   }
   .tree-badge {
     margin-left: .45rem; padding: .05rem .3rem; border-radius: 4px;
@@ -665,7 +771,7 @@
 
   .editor {
     padding: 24px;
-    padding-left: calc(.8rem + var(--depth) * 1.15rem + 1.1rem);
+    padding-left: 24px;
     background: var(--ad-panel-2);
     border-bottom: 1px solid var(--ad-line);
     box-shadow: inset 3px 0 0 var(--ad-cyan);
@@ -687,6 +793,9 @@
     padding: .35rem .6rem; background: var(--ad-panel-2); color: var(--ad-faint);
     font-size: .63rem; text-transform: uppercase; letter-spacing: .08em;
   }
+  .preview-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 12px; font-size: 12px; color: var(--ad-dim); }
+  .preview-controls input { flex: 1 1 220px; }
+  .preview-note { padding: 0 12px; }
   .preview-row {
     display: flex; flex-wrap: wrap; align-items: center; gap: .5rem;
     padding: .35rem .6rem; border-top: 1px solid rgba(255, 255, 255, .035);
@@ -706,7 +815,7 @@
     .head { flex-direction: column; align-items: flex-start; }
     .legend { display: none; }
     .row, .row.agent { grid-template-columns: 32px minmax(0, 1fr); }
-    .row { padding-left: calc(8px + var(--depth) * 8px); }
+    .row .label { padding-left: calc(var(--depth) * 6px); }
     .editor { padding: 16px; }
     .actions { flex-wrap: wrap; }
     .row .policy { grid-column: 2; }

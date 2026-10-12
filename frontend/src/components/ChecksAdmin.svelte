@@ -37,19 +37,18 @@
     <p class="admin-error">{loadError ?? 'Session expired.'}</p>
     <p class="admin-muted">Your session expired. Sign in again to manage checks.</p>
     <div class="range-switch expired-action">
-      <button class="range-btn" onclick={onexpired}>Sign in again</button>
+      <button class="btn" onclick={onexpired}>Sign in again</button>
     </div>
   </div>
 {:else}
-  <div class="area-bar">
-    <div class="title-line">
-      <span class="panel-title no-gap">Checks</span>
-      {#if !loading}<span class="kind-pill">{checks.length}</span>{/if}
-    </div>
-    <div class="range-switch">
-      <button class="btn primary" onclick={() => onopen(null)}>＋ New check</button>
-    </div>
-  </div>
+  {#if !loading && !loadError && checks.length}
+    <section class="catalogue-summary" aria-label="Check catalogue summary">
+      <div><span>Total checks</span><strong>{checks.length}</strong></div>
+      <div><span>Enabled</span><strong class="summary-good">{checks.filter((c) => c.enabled).length}</strong></div>
+      <div><span>Public</span><strong>{checks.filter((c) => c.visible).length}</strong></div>
+      <div class="catalogue-types"><span>Probe types</span><p>{#each [...new Set(checks.map((c) => c.type))] as type (type)}<span class="kind-pill">{type} · {checks.filter((c) => c.type === type).length}</span>{/each}</p></div>
+    </section>
+  {/if}
 
   <div class="admin-panel">
     {#if loading}
@@ -57,7 +56,7 @@
     {:else if loadError}
       <p class="admin-error">{loadError}</p>
       <div class="range-switch expired-action">
-        <button class="range-btn" onclick={refresh}>Retry</button>
+        <button class="btn" onclick={refresh}>Retry</button>
       </div>
     {:else if checks.length === 0}
       <div class="checks-empty"><h3>Start monitoring your infrastructure</h3><p class="admin-muted">Create a check to track availability, response time, or certificate health.</p><button class="btn primary" onclick={() => onopen(null)}>Create your first check</button></div>
@@ -93,19 +92,16 @@
 {/if}
 
 <style>
+  .catalogue-summary { display: grid; grid-template-columns: repeat(3, minmax(120px, .55fr)) minmax(0, 2fr); gap: 1px; margin-bottom: 20px; overflow: hidden; background: var(--ad-line); border: 1px solid var(--ad-line); border-radius: 9px; }
+  .catalogue-summary > div { display: grid; align-content: start; gap: 10px; min-width: 0; padding: 18px 20px; background: var(--ad-panel); }
+  .catalogue-summary span { color: var(--ad-dim); font-size: 12px; }
+  .catalogue-summary strong { font-size: 24px; font-weight: 500; }
+  .catalogue-summary .summary-good { color: var(--ad-green); }
+  .catalogue-types p { display: flex; flex-wrap: wrap; gap: 8px; margin: 0; }
+  @media (max-width: 760px) { .catalogue-summary { grid-template-columns: repeat(3, minmax(0, 1fr)); } .catalogue-types { grid-column: 1 / -1; } }
   .checks-empty { padding: 32px 16px; text-align: center; }
   .checks-empty h3 { font-size: 16px; font-weight: 550; margin: 0 0 8px; }
   .checks-empty .btn { margin-top: 12px; }
-  .area-bar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 1rem;
-    margin-bottom: 0.6rem;
-  }
-  .no-gap {
-    margin-bottom: 0;
-  }
   .expired-action {
     margin-top: 0.7rem;
   }

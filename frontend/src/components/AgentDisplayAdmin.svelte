@@ -177,7 +177,7 @@
       Your session expired. Sign in again to change what the status page shows.
     </p>
     <div class="range-switch retry">
-      <button class="range-btn" onclick={onexpired}>Sign in again</button>
+      <button class="btn" onclick={onexpired}>Sign in again</button>
     </div>
   </div>
 {:else if loading}
@@ -186,7 +186,7 @@
   <div class="admin-panel">
     <p class="admin-error">{loadError}</p>
     <div class="range-switch retry">
-      <button class="range-btn" onclick={refresh}>Retry</button>
+      <button class="btn" onclick={refresh}>Retry</button>
     </div>
   </div>
 {:else}

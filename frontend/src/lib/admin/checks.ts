@@ -51,7 +51,8 @@ export interface RegionTreeZone {
 export interface RegionTreeRegion {
   region: string;
   state: RegionTreeState;
-  effective_policy: RollupPolicy;
+  /** `null` on the global node when this region did not answer. */
+  effective_policy: RollupPolicy | null;
   zones: RegionTreeZone[];
 }
 
@@ -66,6 +67,8 @@ export interface RegionTreeCheck {
 
 export interface RegionTreeResponse {
   checks: RegionTreeCheck[];
+  /** Global node only: regions whose subtree could not be read. */
+  unavailable_regions?: string[];
 }
 
 export interface CheckHeader {

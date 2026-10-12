@@ -3,9 +3,9 @@ import { buildIdentity } from './admin';
 import { reportedBuild } from './admin/cluster';
 
 describe('buildIdentity', () => {
-  it('does not interpret regional reporting origins as software builds', () => {
-    expect(reportedBuild('origin us-coordinator-1')).toBeNull();
+  it('treats a blank or missing build as unreported', () => {
     expect(reportedBuild(null)).toBeNull();
+    expect(reportedBuild('  ')).toBeNull();
     expect(reportedBuild('')).toBeNull();
     expect(reportedBuild('0.1.0 (abc123, built today)')).toBe('0.1.0 (abc123, built today)');
   });

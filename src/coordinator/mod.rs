@@ -818,6 +818,7 @@ impl Coordinator {
                             .kinds
                             .as_ref()
                             .map(|ks| ks.iter().map(|k| k.as_db()).collect::<Vec<_>>().join(",")),
+                        coordinator: Some(coord.inner.node_id.clone()),
                     })
                     .collect();
                 let present: std::collections::HashSet<&str> =

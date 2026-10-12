@@ -462,6 +462,70 @@ Estimated per-region ceilings (SCALING.md capacity model, extrapolated beyond th
   - [x] Add tests for `failures_before_down`, long schedules, retry cadence, recovery cadence, hold-down, and restart behavior.
   - [x] Remove the old `TODO` item if current retry/down cadence already solves the issue.
 
+## Admin console backend gaps
+
+Found while redesigning the Lightkeeper admin pages. The frontend currently labels each gap
+instead of guessing; remove the label when the backend closes it.
+
+### Identity: ids and names
+
+- [x] Return check names from the global region tree. `CheckTreeDto` in `src/global/routes.rs`
+      has no `name`, so Admin > Alert rollup shows check UUIDs on the global node (the coordinator's
+      `CheckTreeDto` in `src/coordinator/routes/policies.rs` already carries it).
+      Done with the merged global tree below.
+- [ ] Return check ids, not names, for orphaned and unrunnable checks in `/api/v1/agents`
+      (`checks_with_no_live_agent`, `checks_no_agent_can_run` in `src/coordinator/routes/agents.rs`).
+      `AgentsAdmin.svelte` maps names back to ids to open the editor, which breaks on duplicate or
+      just-renamed names. Return `{ id, name }` pairs.
+
+### Global tier: missing data
+
+- [x] Keep the `_total` fields when the global node merges `/api/v1/agents`
+      (`agents_handler` in `src/global/routes.rs`). They are dropped today, so the orphaned/unrunnable
+      warnings never showed on the global node. The frontend now falls back to the sample length,
+      which undercounts once a region caps its sample.
+      Totals are summed per region (a check orphaned in two regions counts twice), and the fan-out is now concurrent with `unavailable_regions` naming any region that did not answer. The frontend fallback is gone.
+- [x] Stop putting `origin <coordinator-id>` in the global cluster response's `build` field
+      (`cluster_handler`). Add a separate `origin` field and report the region's real build so version
+      skew across regions can be detected. The frontend currently treats `origin …` builds as unreported.
+      `origin` is its own field. `build` is the publishing coordinator's build, read from the region's roster (next item), and Topology compares every regional coordinator's build against the global node's.
+- [x] Expose each region's coordinator roster (members, state, build, gossip links) to the global
+      node. Admin > Topology on the global node can only show one node per region.
+      The global `/api/v1/cluster` gathers each region's own `/api/v1/cluster` on request (concurrent, 5 s deadline) into `regions[]`. Nothing is pushed or stored, and an unanswering region reads `available: false`.
+- [x] Record which coordinator each agent polls and expose it, so Topology can draw agent →
+      coordinator links instead of grouping agents only by declared region and zone.
+      `agent_polls.coordinator` (schema change, so databases are rebuilt) travels with the replicated poll row. `Agent.coordinator` names it, and Topology highlights the polled coordinator.
+- [x] Include zone and agent detail in the global region tree. `zones` is always empty, so the
+      Alert rollup preview cannot compute policy effects for regions on the global node.
+      The global tree gathers every region's tree and keeps each region's own node verbatim (zones, agents, stored policies). A region that did not answer keeps its cached state with `effective_policy: null` and is listed in `unavailable_regions`. Checks no push carries, such as hidden monitors, are included too.
+- [x] Return stored rollup overrides in the global region tree. It reports built-in defaults as each
+      node's `effective_policy`, while overrides are edited through the relay onto the regions, so the
+      global view can disagree with what the regions apply.
+      Region and zone nodes carry the policy each region applies. The check root reports `global::cache::ROLLUP` (degraded = any, down = any), which is what the global tier's worst-of fold actually applies; a test pins `worst` to it. A stored `global` override is applied only by regions, to their own roots.
+- [x] Report an agent's build regardless of which coordinator it polls. `Agent.version` is null
+      when the agent polls a peer coordinator, because build and capabilities arrive on a poll.
+      Already true through replicated poll rows; verified on the live stack. The stale doc comments are fixed, and `declarations` is extracted and tested.
+
+### Global tier: missing actions
+
+- [ ] Issue agent credentials from the global node, scoped to a registered region and zone, and
+      deliver them to that region. Admin > Topology on the global node shows this flow as a labelled
+      preview that generates an invalid placeholder token and never calls a write API; the
+      Credentials page is hidden on the global node.
+
+### Scale and query shape
+
+- [ ] Page and filter `/api/v1/admin/region-tree` server-side. Both handlers return every check's
+      full tree in one response; the UI now renders 25 preview rows at a time but still downloads and
+      folds all 10,000.
+- [ ] Say why a check's effective rollup policy differs from its location's policy (check
+      override, or something else). Alert rollup can only report that they differ.
+- [ ] Add facets and aggregate counts for probe results. Agent, region and zone filter options and
+      the up/failed summary on Admin > Probe results come from the current batch (at most 500 rows),
+      not from all stored results.
+- [ ] Give the admin overview the full catalogue, including hidden monitors. It reads the public
+      status endpoint today, so checks with `visible = false` are missing from its counts.
+
 ## Confirmed strengths to preserve
 
 These are not action items, but changes above should retain them:

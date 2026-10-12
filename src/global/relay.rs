@@ -289,35 +289,15 @@ pub(super) async fn relay_merge(
         );
     }
 
-    let mut requests = tokio::task::JoinSet::new();
-    for (region, endpoints) in regions {
-        let node = node.clone();
-        let method = method.clone();
-        let pq = pq.clone();
-        let body = body.clone();
-        let region = region.clone();
-        let endpoints = endpoints.clone();
-        requests.spawn(async move {
-            let result = fetch_region_json(&node, &method, &pq, &body, &endpoints, authed).await;
-            (region, result)
-        });
-    }
-
     let mut merged = Vec::with_capacity(regions.len());
-    while let Some(result) = requests.join_next().await {
+    for (region, result) in fetch_each(node, method, &pq, body, regions, authed, None).await {
         match result {
-            Ok((region, Ok(value))) => merged.push((region, value)),
-            Ok((region, Err(message))) => {
+            Ok(value) => merged.push((region, value)),
+            Err(message) => {
                 return error_response(
                     StatusCode::BAD_GATEWAY,
                     &format!("region '{region}' is unavailable: {message}"),
                 );
-            }
-            Err(error) => {
-                return error_response(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("region relay task failed: {error}"),
-                )
             }
         }
     }
@@ -334,6 +314,121 @@ pub(super) async fn relay_merge(
         Err(message) => error_response(StatusCode::BAD_GATEWAY, &message),
     }
 }
+/// One JSON answer per region, fetched concurrently and returned in the order
+/// `regions` lists them. A `deadline` bounds each region as a whole, so one
+/// region accepting connections and never answering cannot hold the view for
+/// the client timeout times its endpoint count.
+async fn fetch_each(
+    node: &GlobalNode,
+    method: &Method,
+    pq: &str,
+    body: &Bytes,
+    regions: &[(String, Vec<String>)],
+    authed: bool,
+    deadline: Option<std::time::Duration>,
+) -> Vec<(String, Result<serde_json::Value, String>)> {
+    let mut requests = tokio::task::JoinSet::new();
+    for (index, (_, endpoints)) in regions.iter().enumerate() {
+        let (node, method, pq, body, endpoints) = (
+            node.clone(),
+            method.clone(),
+            pq.to_string(),
+            body.clone(),
+            endpoints.clone(),
+        );
+        requests.spawn(async move {
+            let fetch = fetch_region_json(&node, &method, &pq, &body, &endpoints, authed);
+            let result = match deadline {
+                Some(limit) => tokio::time::timeout(limit, fetch)
+                    .await
+                    .unwrap_or_else(|_| Err(format!("no answer within {limit:?}"))),
+                None => fetch.await,
+            };
+            (index, result)
+        });
+    }
+    let mut results: Vec<Option<Result<serde_json::Value, String>>> =
+        regions.iter().map(|_| None).collect();
+    while let Some(joined) = requests.join_next().await {
+        if let Ok((index, result)) = joined {
+            results[index] = Some(result);
+        }
+    }
+    regions
+        .iter()
+        .zip(results)
+        .map(|((region, _), result)| {
+            let result = result.unwrap_or_else(|| Err("region relay task failed".into()));
+            (region.clone(), result)
+        })
+        .collect()
+}
+
+/// The admin views the global node assembles from its regions (fleet, rosters,
+/// rollup tree, credentials) are diagnostics an operator opens while something
+/// is wrong, so they answer from the regions that respond rather than failing
+/// outright, and name the rest.
+const ADMIN_GATHER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One region's answer to an admin read.
+pub(super) struct Gathered {
+    pub answers: Vec<(String, serde_json::Value)>,
+    /// Regions that did not answer, in name order.
+    pub unavailable: Vec<String>,
+}
+
+/// Ask one coordinator in every known region the same admin read, concurrently
+/// and within a bounded deadline.
+pub(super) async fn gather_regions(node: &GlobalNode, pq: &str) -> Gathered {
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut regions = node.inner.cache.region_endpoints(now);
+    regions.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut gathered = Gathered {
+        answers: Vec::with_capacity(regions.len()),
+        unavailable: Vec::new(),
+    };
+    let results = fetch_each(
+        node,
+        &Method::GET,
+        pq,
+        &Bytes::new(),
+        &regions,
+        true,
+        Some(ADMIN_GATHER_DEADLINE),
+    )
+    .await;
+    for (region, result) in results {
+        match result {
+            Ok(value) => gathered.answers.push((region, value)),
+            Err(error) => {
+                warn!(region = %region, path = pq, %error, "admin gather: region did not answer");
+                gathered.unavailable.push(region);
+            }
+        }
+    }
+    gathered
+}
+
+/// `gather_regions` for a view that has nothing to show without at least one
+/// region: 503 when none is known, 502 when none answered.
+pub(super) async fn gather_some(node: &GlobalNode, pq: &str) -> Result<Gathered, Response> {
+    let gathered = gather_regions(node, pq).await;
+    if gathered.answers.is_empty() {
+        return Err(if gathered.unavailable.is_empty() {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no region is available to serve this query yet",
+            )
+        } else {
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                "no region coordinator answered the query",
+            )
+        });
+    }
+    Ok(gathered)
+}
+
 async fn fetch_region_json(
     node: &GlobalNode,
     method: &Method,

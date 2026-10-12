@@ -114,12 +114,12 @@
     <p class="admin-error">{loadError ?? formError ?? 'Session expired.'}</p>
     <p class="admin-muted">Your session expired. Sign in again to manage agent credentials.</p>
     <div class="range-switch retry">
-      <button class="range-btn" onclick={onexpired}>Sign in again</button>
+      <button class="btn" onclick={onexpired}>Sign in again</button>
     </div>
   </div>
 {:else}
   <div class="admin-panel">
-    <div class="panel-title">Agent credentials</div>
+    <div class="panel-title">Zone credentials</div>
     <p class="admin-muted lead">
       Credentials authorize agents for a specific zone and region. Agents in a zone share the same
       <code class="mono">[agent] token</code>. Tokens are shown only once when generated.
@@ -162,7 +162,7 @@
     {:else if loadError}
       <p class="admin-error">{loadError}</p>
       <div class="range-switch retry">
-        <button class="range-btn" onclick={refresh}>Retry</button>
+        <button class="btn" onclick={refresh}>Retry</button>
       </div>
     {:else if ordered.length === 0}
       <p class="admin-muted">

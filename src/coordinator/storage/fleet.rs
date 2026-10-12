@@ -119,6 +119,11 @@ pub struct AgentPollRow {
     /// one node than on another for no reason but build order.
     #[serde(default)]
     pub kinds: Option<String>,
+    /// The node id of the coordinator the agent polled, so the fleet view can
+    /// draw which coordinator each agent actually talks to. `None` from a peer
+    /// predating it.
+    #[serde(default)]
+    pub coordinator: Option<String>,
 }
 
 impl AgentPollRow {
@@ -348,8 +353,9 @@ impl Storage {
         }
         self.conn.execute(
             "INSERT OR REPLACE INTO agent_polls
-                 (agent_id, zone, region, polled_at, window_ms, rtt_ms, build, declared_kinds)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 (agent_id, zone, region, polled_at, window_ms, rtt_ms, build, declared_kinds,
+                  coordinator)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             duckdb::params![
                 row.agent_id,
                 row.zone,
@@ -359,6 +365,7 @@ impl Storage {
                 row.rtt_ms,
                 row.build,
                 row.kinds,
+                row.coordinator,
             ],
         )?;
         Ok(())
@@ -379,7 +386,8 @@ impl Storage {
     /// replicating it to peers.
     pub fn list_agent_polls(&self) -> Result<Vec<AgentPollRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT agent_id, zone, region, polled_at, window_ms, rtt_ms, build, declared_kinds
+            "SELECT agent_id, zone, region, polled_at, window_ms, rtt_ms, build, declared_kinds,
+                    coordinator
              FROM agent_polls",
         )?;
         let rows = stmt
@@ -393,6 +401,7 @@ impl Storage {
                     rtt_ms: row.get(5)?,
                     build: row.get(6)?,
                     kinds: row.get(7)?,
+                    coordinator: row.get(8)?,
                 })
             })?
             .collect::<std::result::Result<_, _>>()?;
@@ -543,11 +552,13 @@ mod tests {
         s.record_agent_poll(&AgentPollRow {
             build: Some("0.3.0 (abc123, built 2026-08-31 00:00:00 UTC)".into()),
             kinds: Some("http,tcp,warp-drive".into()),
+            coordinator: Some("coord-a".into()),
             ..poll("agent-a", "z1", "r1", 1000, 90_000)
         })
         .unwrap();
 
         let polls = s.list_agent_polls().unwrap();
+        assert_eq!(polls[0].coordinator.as_deref(), Some("coord-a"));
         assert_eq!(polls[0].kinds.as_deref(), Some("http,tcp,warp-drive"));
         assert_eq!(
             polls[0].build.as_deref(),

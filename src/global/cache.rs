@@ -494,11 +494,17 @@ impl GlobalCache {
     }
 }
 
+/// The policy `worst` folds regions by, stated as one so the admin tree can
+/// report what the global tier actually applies at a check's root.
+pub const ROLLUP: crate::rollup::RollupPolicy =
+    crate::rollup::RollupPolicy::new(crate::rollup::Threshold::Any, crate::rollup::Threshold::Any);
+
 /// `NodeState` has no ordering that means "worse", so spell it out. The rule
 /// matches how a region rollup reads a mix: any Down makes the whole thing
 /// Down, else any Degraded degrades it, else Up if anything is Up, else nothing
 /// is known.
 pub fn worst(a: NodeState, b: NodeState) -> NodeState {
+    // Kept equal to `rollup(&ROLLUP, ..)` by `worst_is_the_global_rollup_policy`.
     use NodeState::{Degraded, Down, Unknown, Up};
     match (a, b) {
         (Down, _) | (_, Down) => Down,
@@ -530,6 +536,21 @@ mod tests {
     use super::*;
     use crate::global::wire::RegionStatePush;
     use crate::models::{CheckId, NodeState};
+
+    #[test]
+    fn worst_is_the_global_rollup_policy() {
+        use NodeState::{Degraded, Down, Unknown, Up};
+        let all = [Up, Degraded, Down, Unknown];
+        for a in all {
+            for b in all {
+                assert_eq!(
+                    worst(a, b),
+                    crate::rollup::rollup(&ROLLUP, &[a, b]),
+                    "{a:?} + {b:?}"
+                );
+            }
+        }
+    }
 
     fn id(name: &str) -> CheckId {
         CheckId::new_v5(&CheckId::NAMESPACE_OID, name.as_bytes())

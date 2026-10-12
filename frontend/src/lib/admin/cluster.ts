@@ -21,8 +21,7 @@ export function buildIdentity(build: string): string {
 }
 
 export function reportedBuild(build?: string | null): string | null {
-  const value = build?.trim();
-  return !value || value.startsWith("origin ") ? null : value;
+  return build?.trim() || null;
 }
 
 export interface ClusterMember {
@@ -43,6 +42,21 @@ export interface ClusterMember {
   /** The peer wire protocol that node speaks. Absent from a peer predating the
    *  field. Nothing is gated on it; a mismatch is a diagnosis, not a refusal. */
   protocol?: number | null;
+  /** Global node only: the regional coordinator whose push this region entry
+   *  was last built from. Its build is the region's `build`. */
+  origin?: string | null;
+}
+
+/** Global node only: one region's own coordinator cluster, as that region
+ *  reports it. `available` is false when the region did not answer. */
+export interface RegionRoster {
+  region: string;
+  /** The answering coordinator first. */
+  members: ClusterMember[];
+  links: ClusterLink[];
+  now: number | null;
+  link_stale_after_ms: number | null;
+  available: boolean;
 }
 
 /** A standalone coordinator answers with `members: []` rather than failing the
@@ -56,6 +70,7 @@ export interface ClusterResponse {
   mode?: ClusterMode;
   links?: ClusterLink[];
   link_stale_after_ms?: number;
+  regions?: RegionRoster[];
 }
 
 /** Lives outside `/admin/*`: cluster membership is coordinator state, not

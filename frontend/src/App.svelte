@@ -77,10 +77,9 @@
   import DataAdmin from './components/DataAdmin.svelte';
   import { fetchSession, logout, type NodeMode } from './lib/admin';
 
-  // One array drives the sidebar and the content switch, so a new admin area is
-  // a single line here plus its panel. `group` buckets them under the sidebar's
-  // section headings; `title`/`blurb` are the page head, so a panel never has to
-  // render its own.
+  // One array drives the sidebar and the content switch. Admin page standard:
+  // the shell owns location, App owns the page title/purpose/primary action, and
+  // panels begin with content or section headings that never repeat the title.
   const ADMIN_PANELS = [
     { id: 'overview', label: 'Overview', group: '', title: 'Overview', blurb: 'Every signal, in sight.' },
     {
@@ -88,7 +87,7 @@
       label: 'Checks',
       group: 'Monitor',
       title: 'Checks',
-      blurb: 'Configure your monitors, evaluation rules, and probe locations.',
+      blurb: 'Monitor definitions, probe schedules, placement, and public visibility.',
     },
     {
       id: 'alerts',
@@ -102,70 +101,70 @@
       label: 'Incidents',
       group: 'Monitor',
       title: 'Incidents',
-      blurb: 'Outages as the status page tells them.',
+      blurb: 'Active and historical outages, acknowledgements, and public updates.',
     },
     {
       id: 'agents',
       label: 'Agents',
       group: 'Fleet',
       title: 'Agents',
-      blurb: 'Agent connectivity, capabilities, and check assignments.',
+      blurb: 'Probe fleet connectivity, placement, capabilities, and assignment health.',
     },
     {
       id: 'credentials',
       label: 'Credentials',
       group: 'Fleet',
-      title: 'Agent credentials',
-      blurb: 'One per zone. The secret is shown once, at mint.',
+      title: 'Credentials',
+      blurb: 'Zone-scoped agent credentials for this regional coordinator.',
     },
     {
       id: 'results',
       label: 'Probe results',
       group: 'Fleet',
       title: 'Probe results',
-      blurb: 'Raw results agents reported — filter by check, agent, status, or location.',
+      blurb: 'Individual probe attempts with outcome, location, latency, and error details.',
     },
     {
       id: 'cluster',
-      label: 'Cluster',
+      label: 'Topology',
       group: 'Fleet',
-      title: 'Cluster',
-      blurb: 'The coordinators gossiping with each other, and what each one currently believes.',
+      title: 'Topology',
+      blurb: 'Deployment structure, connectivity, and onboarding for regions and agents.',
     },
     {
       id: 'region-tree',
-      label: 'Region tree',
+      label: 'Alert rollup',
       group: 'Fleet',
-      title: 'Region tree',
-      blurb: 'Effective check state and rollup policy from regions down to individual agents.',
+      title: 'Alert rollup',
+      blurb: 'How agent observations become zone, region, and global alert states.',
     },
     {
       id: 'status',
       label: 'Status page',
       group: 'Platform',
       title: 'Status page',
-      blurb: 'Sections, ordering, and how much of the fleet visitors see.',
+      blurb: 'Public sections, monitor order, and fleet visibility.',
     },
     {
       id: 'notifications',
       label: 'Notifications',
       group: 'Platform',
       title: 'Notifications',
-      blurb: 'Delivery channels, alert routing, and failed notifications.',
+      blurb: 'Delivery channels, default routing, and failed notification attempts.',
     },
     {
       id: 'maintenance',
       label: 'Maintenance',
       group: 'Platform',
       title: 'Maintenance',
-      blurb: 'Scheduled windows and alert suppression.',
+      blurb: 'Planned work windows that suppress notifications without pausing probes.',
     },
     {
       id: 'data',
       label: 'Data cleanup',
       group: 'Platform',
       title: 'Data cleanup',
-      blurb: 'Remove short-lived incident records left by transient probe failures.',
+      blurb: 'Permanent cleanup operations for stored probe and incident data.',
     },
   ] as const;
   type AdminPanel = (typeof ADMIN_PANELS)[number]['id'];
@@ -869,13 +868,15 @@
             <div class="page-head page-head-row">
             <div>
               <div class="console-page-title"><span class="console-page-icon"><ConsoleIcon name={panel} size={20} /></span><h2>{meta?.title ?? 'Admin'}</h2></div>
-              <p class="page-meta">{panel === 'cluster' && nodeMode === 'global' ? 'Regional reporting and connectivity to this global node.' : meta?.blurb ?? ''}</p>
+              <p class="page-meta">{meta?.blurb ?? ''}</p>
             </div>
-            {#if panel === 'incidents'}
-              <button class="btn primary" onclick={() => openIncidentEditor(null)}>
-                New incident
-              </button>
-            {/if}
+            <div class="page-actions">
+              {#if panel === 'checks'}
+                <button class="btn primary" onclick={() => openCheckEditor(null)}>New check</button>
+              {:else if panel === 'incidents'}
+                <button class="btn primary" onclick={() => openIncidentEditor(null)}>New incident</button>
+              {/if}
+            </div>
           </div>
           {#if panel === 'checks'}
             <ChecksAdmin onopen={openCheckEditor} onexpired={onExpired} />

@@ -412,6 +412,7 @@ mod fleet_tests {
             // probe never enters it.
             build: None,
             kinds: None,
+            coordinator: None,
         }
     }
 

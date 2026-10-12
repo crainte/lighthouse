@@ -90,9 +90,13 @@ struct AgentDto {
     /// Round-trip of its last poll, ms, as the agent measured it. `None` for an
     /// agent seen only through reported results, never a live poll.
     poll_rtt_ms: Option<i64>,
-    /// The build it reported on its last poll here. `None` for an agent that
-    /// predates build reporting, or one polling a peer rather than this node.
+    /// The build it reported on its last poll, to whichever coordinator it
+    /// polls: peers replicate poll rows. `None` for an agent that predates
+    /// build reporting, or one seen only through results.
     version: Option<String>,
+    /// Node id of the coordinator it last polled. `None` when that poll came
+    /// from a peer predating the field, or it was seen only through results.
+    coordinator: Option<String>,
     /// Check kinds it says it can probe. `None` means it never said, which is
     /// read as "anything" — not as "nothing".
     kinds: Option<Vec<String>>,
@@ -107,6 +111,60 @@ struct Declared {
     /// Wire names as sent, not parsed — a kind this node has never heard of
     /// must survive being displayed and compared.
     kinds: Option<Vec<String>>,
+    coordinator: Option<String>,
+}
+
+/// What each agent said about itself on its last poll, wherever it polled.
+///
+/// Choose the newest declaration per agent, with local `seen` winning only
+/// timestamp ties. Without replicated rows an operator would see builds and
+/// capabilities only for agents that poll the node they opened.
+///
+/// Kinds stay as the wire names the agent sent, unparsed. A peer may
+/// legitimately name a kind this node has never heard of, and narrowing to
+/// the kinds this binary knows would make an agent look less capable here
+/// than on the node it actually polls.
+fn declarations(
+    polls: Vec<storage::AgentPollRow>,
+    seen: &std::collections::HashMap<String, SeenAgent>,
+    me: &str,
+) -> std::collections::HashMap<String, Declared> {
+    let mut declared: std::collections::HashMap<String, Declared> = polls
+        .into_iter()
+        .map(|p| {
+            (
+                p.agent_id,
+                Declared {
+                    at: p.at,
+                    rtt_ms: p.rtt_ms,
+                    build: p.build,
+                    kinds: p.kinds.map(|k| split_kinds(&k)),
+                    coordinator: p.coordinator,
+                },
+            )
+        })
+        .collect();
+    for (id, s) in seen {
+        if declared
+            .get(id)
+            .is_none_or(|replicated| s.at >= replicated.at)
+        {
+            declared.insert(
+                id.clone(),
+                Declared {
+                    at: s.at,
+                    rtt_ms: s.rtt_ms,
+                    build: s.build.clone(),
+                    kinds: s
+                        .kinds
+                        .as_ref()
+                        .map(|ks| ks.iter().map(|k| k.as_db().to_string()).collect()),
+                    coordinator: Some(me.to_string()),
+                },
+            );
+        }
+    }
+    declared
 }
 
 /// Split a declared kind list into its wire names.
@@ -203,49 +261,7 @@ pub(in crate::coordinator) async fn agents_handler(
         .map(|(_, m)| m.name.clone())
         .collect();
 
-    // What each agent said about itself on its last poll, wherever it polled.
-    //
-    // Choose the newest declaration per agent, with local `seen` winning only
-    // timestamp ties. Without replicated rows an operator would see builds and
-    // capabilities only for agents that poll the node they opened.
-    //
-    // Kinds stay as the wire names the agent sent, unparsed. A peer may
-    // legitimately name a kind this node has never heard of, and narrowing to
-    // the kinds this binary knows would make an agent look less capable here
-    // than on the node it actually polls.
-    let mut declared: std::collections::HashMap<String, Declared> = polls
-        .into_iter()
-        .map(|p| {
-            (
-                p.agent_id,
-                Declared {
-                    at: p.at,
-                    rtt_ms: p.rtt_ms,
-                    build: p.build,
-                    kinds: p.kinds.map(|k| split_kinds(&k)),
-                },
-            )
-        })
-        .collect();
-    for (id, s) in coord.inner.seen.read().iter() {
-        if declared
-            .get(id)
-            .is_none_or(|replicated| s.at >= replicated.at)
-        {
-            declared.insert(
-                id.clone(),
-                Declared {
-                    at: s.at,
-                    rtt_ms: s.rtt_ms,
-                    build: s.build.clone(),
-                    kinds: s
-                        .kinds
-                        .as_ref()
-                        .map(|ks| ks.iter().map(|k| k.as_db().to_string()).collect()),
-                },
-            );
-        }
-    }
+    let declared = declarations(polls, &coord.inner.seen.read(), &coord.inner.node_id);
 
     let unrunnable: Vec<String> = coord
         .inner
@@ -306,6 +322,7 @@ pub(in crate::coordinator) async fn agents_handler(
                 poll_rtt_ms,
                 version: said.and_then(|d| d.build.clone()),
                 kinds: said.and_then(|d| d.kinds.clone()),
+                coordinator: said.and_then(|d| d.coordinator.clone()),
             }
         })
         .collect();
@@ -802,7 +819,10 @@ struct RevokedResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{declared_kinds, fleet_for, placement_fleet, resolve_checks_for_agent, SeenAgent};
+    use super::{
+        declarations, declared_kinds, fleet_for, placement_fleet, resolve_checks_for_agent,
+        SeenAgent,
+    };
     use crate::config::CheckConfig;
     use crate::coordinator::storage::AgentPollRow;
     use crate::models::CheckKind;
@@ -872,6 +892,7 @@ mod tests {
             rtt_ms: None,
             build: None,
             kinds: Some("tcp".into()),
+            coordinator: None,
         };
 
         let fleet = placement_fleet(101, &seen, std::slice::from_ref(&replicated));
@@ -890,6 +911,37 @@ mod tests {
         assert_eq!(fleet[0].zone, "local-zone");
         assert_eq!(fleet[0].region, "local-region");
         assert_eq!(fleet[0].kinds, Some(vec![CheckKind::Http]));
+    }
+
+    #[test]
+    fn an_agent_polling_a_peer_still_reports_its_build_and_coordinator() {
+        let local = SeenAgent {
+            zone: "z".into(),
+            region: "r".into(),
+            at: 100,
+            window_ms: 100,
+            rtt_ms: None,
+            kinds: None,
+            build: Some("local".into()),
+        };
+        let seen = HashMap::from([("here".to_string(), local)]);
+        let peer = |agent: &str, at: i64| AgentPollRow {
+            agent_id: agent.into(),
+            zone: "z".into(),
+            region: "r".into(),
+            at,
+            window_ms: 100,
+            rtt_ms: None,
+            build: Some("peer".into()),
+            kinds: None,
+            coordinator: Some("coord-b".into()),
+        };
+        let declared = declarations(vec![peer("there", 90), peer("here", 50)], &seen, "coord-a");
+        assert_eq!(declared["there"].build.as_deref(), Some("peer"));
+        assert_eq!(declared["there"].coordinator.as_deref(), Some("coord-b"));
+        // The newer local poll wins, and names this node.
+        assert_eq!(declared["here"].build.as_deref(), Some("local"));
+        assert_eq!(declared["here"].coordinator.as_deref(), Some("coord-a"));
     }
 
     #[test]

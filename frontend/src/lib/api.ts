@@ -66,11 +66,12 @@ export interface Agent {
   /** Round-trip of the agent's last poll, ms, as it measured it. `null` for an
    *  agent seen only via reported results, never a live poll. */
   poll_rtt_ms: number | null;
-  /** The build it reported on its last poll here. `null` for an agent that
-   *  predates build reporting, or one polling a peer coordinator rather than
-   *  this one — capability and build arrive on a poll, and a poll goes to a
-   *  single node. */
+  /** The build it reported on its last poll, to whichever coordinator it
+   *  polls. `null` for an agent that predates build reporting, or one seen
+   *  only via reported results. */
   version: string | null;
+  /** Node id of the coordinator it last polled. `null` when unknown. */
+  coordinator: string | null;
   /** Check kinds it says it can probe. `null` means it never said, which is
    *  read as "anything" rather than "nothing": every agent predating capability
    *  negotiation reports nothing, and treating that as incapable would empty
@@ -92,6 +93,9 @@ export interface AgentsResponse {
    *  naming all of them costs as much as the page being warned about. */
   checks_with_no_live_agent_total: number;
   checks_no_agent_can_run_total: number;
+  /** Global node only: regions whose fleet could not be read, so the lists
+   *  above are missing them. */
+  unavailable_regions?: string[];
 }
 
 /** Agent liveness on the public page. An agent answering is healthy even if

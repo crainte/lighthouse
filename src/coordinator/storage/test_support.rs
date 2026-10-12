@@ -140,6 +140,7 @@ pub(crate) fn poll(
         rtt_ms: None,
         build: None,
         kinds: None,
+        coordinator: None,
     }
 }
 // ---- Incident deletion ----

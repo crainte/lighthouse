@@ -16,7 +16,6 @@ use axum::{body::Bytes, Json, Router};
 use serde::Serialize;
 use std::collections::HashMap;
 use tokio::sync::broadcast;
-use tracing::warn;
 
 pub(super) fn router(node: GlobalNode) -> Router {
     let router = Router::new()
@@ -382,6 +381,9 @@ struct ClusterMemberDto {
     build: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     protocol: Option<u32>,
+    /// The regional coordinator whose push this entry was last built from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -393,6 +395,64 @@ struct ClusterResponse {
     mode: &'static str,
     links: Vec<ClusterLinkDto>,
     link_stale_after_ms: i64,
+    regions: Vec<RegionRosterDto>,
+}
+
+/// One region's own coordinator cluster, exactly as that region's
+/// `/api/v1/cluster` reports it. Gathered on request rather than pushed: it is
+/// a diagnostic read by an open Topology page, and costs nothing otherwise.
+#[derive(Serialize)]
+struct RegionRosterDto {
+    region: String,
+    /// Every coordinator in the region, its `self` first. Empty when the
+    /// region did not answer.
+    members: Vec<serde_json::Value>,
+    links: Vec<serde_json::Value>,
+    now: Option<i64>,
+    link_stale_after_ms: Option<i64>,
+    available: bool,
+}
+
+impl RegionRosterDto {
+    fn from_view(region: String, mut view: serde_json::Value) -> Self {
+        let mut members = vec![view["self"].take()];
+        members.extend(take_array(&mut view["members"]));
+        Self {
+            region,
+            members,
+            links: take_array(&mut view["links"]),
+            now: view["now"].as_i64(),
+            link_stale_after_ms: view["link_stale_after_ms"].as_i64(),
+            available: true,
+        }
+    }
+
+    fn unavailable(region: String) -> Self {
+        Self {
+            region,
+            members: Vec::new(),
+            links: Vec::new(),
+            now: None,
+            link_stale_after_ms: None,
+            available: false,
+        }
+    }
+
+    /// The build one of this region's coordinators reported.
+    fn build_of(&self, node_id: &str) -> Option<String> {
+        self.members
+            .iter()
+            .find(|m| m["node_id"] == node_id)
+            .and_then(|m| m["build"].as_str())
+            .map(str::to_string)
+    }
+}
+
+fn take_array(value: &mut serde_json::Value) -> Vec<serde_json::Value> {
+    match value.take() {
+        serde_json::Value::Array(items) => items,
+        _ => Vec::new(),
+    }
 }
 
 #[derive(Serialize)]
@@ -408,18 +468,40 @@ async fn cluster_handler(
     State(node): State<GlobalNode>,
     _admin: crate::http::AdminSession,
 ) -> Response {
+    let gathered = relay::gather_regions(&node, "/api/v1/cluster").await;
     let now = chrono::Utc::now().timestamp_millis();
     let roster = node.inner.cache.roster(now);
+    let mut regions: Vec<RegionRosterDto> = gathered
+        .answers
+        .into_iter()
+        .map(|(region, view)| RegionRosterDto::from_view(region, view))
+        .collect();
+    regions.extend(
+        gathered
+            .unavailable
+            .into_iter()
+            .map(RegionRosterDto::unavailable),
+    );
+    regions.sort_by(|a, b| a.region.cmp(&b.region));
     let members = roster
         .iter()
-        .map(|r| ClusterMemberDto {
-            node_id: r.region.clone(),
-            url: r.endpoints.first().cloned().unwrap_or_default(),
-            generation: 0,
-            last_seen: if r.age_ms < 0 { now } else { now - r.age_ms },
-            state: if r.stale { "dead" } else { "alive" },
-            build: (!r.origin.is_empty()).then(|| format!("origin {}", r.origin)),
-            protocol: None,
+        .map(|r| {
+            let origin = (!r.origin.is_empty()).then(|| r.origin.clone());
+            ClusterMemberDto {
+                node_id: r.region.clone(),
+                url: r.endpoints.first().cloned().unwrap_or_default(),
+                generation: 0,
+                last_seen: if r.age_ms < 0 { now } else { now - r.age_ms },
+                state: if r.stale { "dead" } else { "alive" },
+                build: origin.as_deref().and_then(|origin| {
+                    regions
+                        .iter()
+                        .find(|g| g.region == r.region)
+                        .and_then(|g| g.build_of(origin))
+                }),
+                protocol: None,
+                origin,
+            }
         })
         .collect();
     let links = roster
@@ -442,78 +524,120 @@ async fn cluster_handler(
             state: "alive",
             build: Some(crate::version::current().to_string()),
             protocol: None,
+            origin: None,
         },
         members,
         now,
         mode: "global",
         links,
         link_stale_after_ms: node.inner.cache.staleness_ms(),
+        regions,
     })
     .into_response()
 }
 
-// Aggregated region tree: check -> region -> state, matching the coordinator's
-// RegionTreeResponse closely enough that the admin region-tree panel renders.
-// The global node has no zones or agents, so those arrays are empty.
+/// The coordinator's region tree, assembled across regions: each region
+/// answers for its own subtree (zones, agents, and the policies it stores and
+/// applies), and this node supplies the check root it computes itself.
 #[derive(Serialize)]
 struct RegionTreeResponse {
     checks: Vec<CheckTreeDto>,
+    unavailable_regions: Vec<String>,
 }
 
 #[derive(Serialize)]
 struct CheckTreeDto {
     check_id: CheckId,
+    name: String,
     state: NodeState,
-    // The SPA reads `effective_policy.degraded_when`; without it the region-tree
-    // panel dereferences undefined and crashes. The global node has no stored
-    // per-node overrides, so it reports the built-in rollup defaults it actually
-    // aggregates by.
+    /// What this node rolls regions up by. A stored `global` override is
+    /// applied by each region to its own root, never here.
     effective_policy: crate::rollup::RollupPolicy,
-    regions: Vec<RegionNodeDto>,
-}
-
-#[derive(Serialize)]
-struct RegionNodeDto {
-    region: String,
-    state: NodeState,
-    effective_policy: crate::rollup::RollupPolicy,
-    zones: Vec<serde_json::Value>,
+    /// Region nodes as each region reported them. A region that did not
+    /// answer carries its cached state, no zones and a `null` policy.
+    regions: Vec<serde_json::Value>,
 }
 
 async fn region_tree_handler(
     State(node): State<GlobalNode>,
     _admin: crate::http::AdminSession,
 ) -> Response {
+    let gathered = match relay::gather_some(&node, "/api/v1/admin/region-tree").await {
+        Ok(gathered) => gathered,
+        Err(response) => return response,
+    };
     let now = chrono::Utc::now().timestamp_millis();
-    let checks = node
-        .inner
-        .cache
-        .aggregate(now)
+    Json(merge_region_tree(node.inner.cache.aggregate(now), gathered)).into_response()
+}
+
+fn merge_region_tree(
+    aggregate: Vec<super::cache::AggregatedCheck>,
+    gathered: relay::Gathered,
+) -> RegionTreeResponse {
+    use std::collections::BTreeMap;
+    // check -> (name, region -> that region's own node for the check)
+    let mut reported: HashMap<CheckId, (String, BTreeMap<String, serde_json::Value>)> =
+        HashMap::new();
+    for (_, mut body) in gathered.answers {
+        for mut check in take_array(&mut body["checks"]) {
+            let Some(id) = check["check_id"].as_str().and_then(|s| s.parse().ok()) else {
+                continue;
+            };
+            let entry = reported.entry(id).or_default();
+            if entry.0.is_empty() {
+                entry.0 = check["name"].as_str().unwrap_or_default().to_string();
+            }
+            for region in take_array(&mut check["regions"]) {
+                if let Some(name) = region["region"].as_str() {
+                    entry.1.entry(name.to_string()).or_insert(region);
+                }
+            }
+        }
+    }
+    let mut checks: Vec<CheckTreeDto> = aggregate
         .into_iter()
         .map(|c| {
-            let mut regions: Vec<RegionNodeDto> = c
-                .per_region
-                .into_iter()
-                .map(|(region, state)| RegionNodeDto {
-                    region,
-                    state,
-                    // Regions roll their zones up by the region default; the
-                    // global node has no zone visibility but reports the policy
-                    // edge so the panel renders and edits read sanely.
-                    effective_policy: crate::rollup::RollupPolicy::REGION_DEFAULT,
-                    zones: Vec::new(),
-                })
-                .collect();
-            regions.sort_by(|a, b| a.region.cmp(&b.region));
+            let (_, mut nodes) = reported.remove(&c.check_id).unwrap_or_default();
+            for (region, state) in c.per_region {
+                nodes.entry(region.clone()).or_insert_with(|| {
+                    serde_json::json!({
+                        "region": region,
+                        "state": state,
+                        "effective_policy": null,
+                        "zones": [],
+                    })
+                });
+            }
             CheckTreeDto {
                 check_id: c.check_id,
+                name: c.name,
                 state: c.state,
-                effective_policy: crate::rollup::RollupPolicy::CHECK_DEFAULT,
-                regions,
+                effective_policy: super::cache::ROLLUP,
+                regions: nodes.into_values().collect(),
             }
         })
         .collect();
-    Json(RegionTreeResponse { checks }).into_response()
+    // Checks no live push carries (hidden monitors, or a region whose push is
+    // stale) still have regional trees; roll them up the way the cache would.
+    let mut rest: Vec<_> = reported.into_iter().collect();
+    rest.sort_by_key(|(id, _)| *id);
+    checks.extend(rest.into_iter().map(|(check_id, (name, nodes))| {
+        let states: Vec<NodeState> = nodes
+            .values()
+            .filter_map(|n| serde_json::from_value(n["state"].clone()).ok())
+            .collect();
+        CheckTreeDto {
+            check_id,
+            name,
+            state: crate::rollup::rollup(&super::cache::ROLLUP, &states),
+            effective_policy: super::cache::ROLLUP,
+            regions: nodes.into_values().collect(),
+        }
+    }));
+    RegionTreeResponse {
+        checks,
+        unavailable_regions: gathered.unavailable,
+    }
 }
 
 /// The admin fleet view, gathered from every region and merged. Each region
@@ -524,104 +648,61 @@ async fn region_tree_handler(
 ///
 /// Agents are deduped by id (an id is unique across regions in practice; if two
 /// regions ever name the same id, first-region-wins is stable because
-/// `region_endpoints` orders regions deterministically). The two check-name
+/// `gather_regions` answers in region-name order). The two check-name
 /// lists are unioned, since a check unrunnable in one region is worth surfacing
 /// even if another region can run it.
 async fn agents_handler(
     State(node): State<GlobalNode>,
     _admin: crate::http::AdminSession,
 ) -> Response {
-    let now = chrono::Utc::now().timestamp_millis();
-    let regions = node.inner.cache.region_endpoints(now);
-    if regions.is_empty() {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no region is available to serve this query yet",
-        );
+    match relay::gather_some(&node, "/api/v1/agents").await {
+        Ok(gathered) => Json(merge_agents(gathered)).into_response(),
+        Err(response) => response,
     }
-
-    let mut agents: Vec<serde_json::Value> = Vec::new();
-    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut no_live_agent: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut no_agent_can_run: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
-    let mut answered = false;
-
-    for (region, endpoints) in &regions {
-        // One coordinator per region answers; the cluster replicates the fleet
-        // view internally, so trying the first live endpoint is enough.
-        let mut got = None;
-        for base in endpoints {
-            let req = relay::region_request(
-                &node,
-                &Method::GET,
-                base,
-                "/api/v1/agents",
-                &Bytes::new(),
-                true,
-            );
-            match req.send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    match resp.json::<serde_json::Value>().await {
-                        Ok(v) => {
-                            got = Some(v);
-                            break;
-                        }
-                        Err(e) => {
-                            warn!(region = %region, base = %base, error = %e, "agents relay: bad json")
-                        }
-                    }
-                }
-                Ok(resp) => {
-                    warn!(region = %region, base = %base, status = %resp.status(), "agents relay: non-2xx")
-                }
-                Err(e) => {
-                    warn!(region = %region, base = %base, error = %e, "agents relay failed, trying next")
-                }
-            }
-        }
-        let Some(body) = got else { continue };
-        answered = true;
-        if let Some(list) = body.get("agents").and_then(|a| a.as_array()) {
-            for a in list {
-                let id = a.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-                if id.is_empty() || seen_ids.insert(id.to_string()) {
-                    agents.push(a.clone());
-                }
-            }
-        }
-        collect_strings(&body, "checks_with_no_live_agent", &mut no_live_agent);
-        collect_strings(&body, "checks_no_agent_can_run", &mut no_agent_can_run);
-    }
-
-    if !answered {
-        return error_response(
-            StatusCode::BAD_GATEWAY,
-            "no region coordinator answered the fleet query",
-        );
-    }
-
-    Json(serde_json::json!({
-        "agents": agents,
-        "checks_with_no_live_agent": no_live_agent.into_iter().collect::<Vec<_>>(),
-        "checks_no_agent_can_run": no_agent_can_run.into_iter().collect::<Vec<_>>(),
-    }))
-    .into_response()
 }
 
-/// Fold one region's string array into an accumulating set.
-fn collect_strings(
-    body: &serde_json::Value,
-    key: &str,
-    out: &mut std::collections::BTreeSet<String>,
-) {
-    if let Some(list) = body.get(key).and_then(|v| v.as_array()) {
-        for s in list {
-            if let Some(s) = s.as_str() {
-                out.insert(s.to_string());
+/// The two fleet-health lists each region reports: a bounded sample of names
+/// and the count the sample was taken from.
+const FLEET_DIAGNOSTICS: [&str; 2] = ["checks_with_no_live_agent", "checks_no_agent_can_run"];
+
+/// Union the regions' fleets. Totals are summed, not recounted from the
+/// samples: a region caps its sample, so the union of samples undercounts
+/// exactly when the count matters. A check orphaned in two regions is two
+/// problems and counts twice.
+fn merge_agents(gathered: relay::Gathered) -> serde_json::Value {
+    let mut agents: Vec<serde_json::Value> = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut samples: [std::collections::BTreeSet<String>; 2] = Default::default();
+    let mut totals = [0u64; 2];
+    for (_, body) in gathered.answers {
+        for a in body["agents"].as_array().into_iter().flatten() {
+            let id = a["agent_id"].as_str().unwrap_or("");
+            if id.is_empty() || seen_ids.insert(id.to_string()) {
+                agents.push(a.clone());
             }
         }
+        for (i, key) in FLEET_DIAGNOSTICS.iter().enumerate() {
+            let sample = body[*key].as_array();
+            totals[i] += body[format!("{key}_total")]
+                .as_u64()
+                .unwrap_or_else(|| sample.map_or(0, |s| s.len() as u64));
+            samples[i].extend(
+                sample
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|s| s.as_str().map(str::to_string)),
+            );
+        }
     }
+    let mut out = serde_json::json!({
+        "agents": agents,
+        "unavailable_regions": gathered.unavailable,
+    });
+    for (i, key) in FLEET_DIAGNOSTICS.iter().enumerate() {
+        out[*key] = serde_json::json!(std::mem::take(&mut samples[i]));
+        out[format!("{key}_total")] = serde_json::json!(totals[i]);
+    }
+    out
 }
 
 /// Global has no incidents or alerts of its own — the regions own those. Return
@@ -761,3 +842,137 @@ pub(super) fn is_admin(node: &GlobalNode, headers: &HeaderMap) -> bool {
 }
 
 pub(crate) use crate::http::error_response;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::global::cache::AggregatedCheck;
+    use serde_json::json;
+
+    fn gathered(answers: Vec<(&str, serde_json::Value)>, unavailable: &[&str]) -> relay::Gathered {
+        relay::Gathered {
+            answers: answers
+                .into_iter()
+                .map(|(region, body)| (region.to_string(), body))
+                .collect(),
+            unavailable: unavailable.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn merged_fleet_keeps_each_regions_totals_not_its_sample_length() {
+        let merged = merge_agents(gathered(
+            vec![
+                (
+                    "tw",
+                    json!({
+                        "agents": [{"agent_id": "a"}],
+                        "checks_with_no_live_agent": ["x"],
+                        "checks_with_no_live_agent_total": 120,
+                        "checks_no_agent_can_run": [],
+                        "checks_no_agent_can_run_total": 0,
+                    }),
+                ),
+                (
+                    "us",
+                    // A region predating the totals counts its sample.
+                    json!({
+                        "agents": [{"agent_id": "a"}, {"agent_id": "b"}],
+                        "checks_with_no_live_agent": ["x", "y"],
+                        "checks_no_agent_can_run": ["z"],
+                    }),
+                ),
+            ],
+            &["eu"],
+        ));
+        assert_eq!(merged["agents"].as_array().unwrap().len(), 2);
+        assert_eq!(merged["checks_with_no_live_agent"], json!(["x", "y"]));
+        assert_eq!(merged["checks_with_no_live_agent_total"], 122);
+        assert_eq!(merged["checks_no_agent_can_run_total"], 1);
+        assert_eq!(merged["unavailable_regions"], json!(["eu"]));
+    }
+
+    #[test]
+    fn region_roster_reports_the_publishers_real_build() {
+        let roster = RegionRosterDto::from_view(
+            "us".into(),
+            json!({
+                "self": {"node_id": "us-a", "build": "0.1.0 (abc, built x)"},
+                "members": [{"node_id": "us-b", "build": "0.1.0 (def, built y)"}],
+                "links": [{"source": "us-a", "target": "us-b"}],
+                "now": 5,
+                "link_stale_after_ms": 9,
+            }),
+        );
+        assert_eq!(roster.members.len(), 2);
+        assert_eq!(roster.links.len(), 1);
+        assert_eq!(
+            roster.build_of("us-b").as_deref(),
+            Some("0.1.0 (def, built y)")
+        );
+        assert_eq!(roster.build_of("us-c"), None);
+    }
+
+    fn aggregated(id: CheckId, per_region: &[(&str, NodeState)]) -> AggregatedCheck {
+        AggregatedCheck {
+            check_id: id,
+            name: "api".into(),
+            state: NodeState::Down,
+            per_region: per_region
+                .iter()
+                .map(|(r, s)| (r.to_string(), *s))
+                .collect(),
+            latency_ms: 0,
+            last_check: 0,
+            uptime_24h: None,
+            status_code: None,
+            error: None,
+            kind: None,
+            group: None,
+            latency_graph: false,
+            position: 0,
+        }
+    }
+
+    #[test]
+    fn global_region_tree_carries_regional_subtrees_and_its_own_root_policy() {
+        let api = CheckId::from_u128(1);
+        let hidden = CheckId::from_u128(2);
+        let stored = json!({"degraded_when": "all", "down_when": "all"});
+        let us_tree = json!({"checks": [
+            {"check_id": api.to_string(), "name": "api", "regions": [{
+                "region": "us", "state": "down", "effective_policy": stored,
+                "zones": [{"zone": "a", "state": "down", "effective_policy": stored, "agents": [
+                    {"id": "agent-1", "state": "down", "staleness_ms": 10}
+                ]}],
+            }]},
+            {"check_id": hidden.to_string(), "name": "hidden", "regions": [{
+                "region": "us", "state": "degraded", "effective_policy": stored, "zones": [],
+            }]},
+        ]});
+        let tree = merge_region_tree(
+            vec![aggregated(
+                api,
+                &[("us", NodeState::Down), ("tw", NodeState::Up)],
+            )],
+            gathered(vec![("us", us_tree)], &["tw"]),
+        );
+        let json = serde_json::to_value(&tree).unwrap();
+        let api_node = &json["checks"][0];
+        assert_eq!(api_node["name"], "api");
+        assert_eq!(
+            api_node["effective_policy"],
+            json!({"degraded_when": "any", "down_when": "any"})
+        );
+        let regions = api_node["regions"].as_array().unwrap();
+        assert_eq!(regions[0]["region"], "tw");
+        assert_eq!(regions[0]["effective_policy"], serde_json::Value::Null);
+        assert_eq!(regions[0]["state"], "up");
+        assert_eq!(regions[1]["effective_policy"], stored);
+        assert_eq!(regions[1]["zones"][0]["agents"][0]["id"], "agent-1");
+        // A check no push carries still appears, rolled up by the same rule.
+        assert_eq!(json["checks"][1]["check_id"], hidden.to_string());
+        assert_eq!(json["checks"][1]["state"], "degraded");
+        assert_eq!(json["unavailable_regions"], json!(["tw"]));
+    }
+}

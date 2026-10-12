@@ -15,6 +15,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { render, cleanup, screen, fireEvent } from '@testing-library/svelte';
 import ClusterAdmin from './ClusterAdmin.svelte';
 import RegionsAdmin from './RegionsAdmin.svelte';
+import RegionTreeAdmin from './RegionTreeAdmin.svelte';
 import ProbeResultsAdmin from './ProbeResultsAdmin.svelte';
 import type { Incident, IncidentGroup } from '../lib/api';
 import CheckEditor from './CheckEditor.svelte';
@@ -57,18 +58,79 @@ afterEach(() => {
 describe('component render smoke', () => {
   const noop = () => {};
 
-  it('shows regional origins as unavailable builds and opens node details', async () => {
-    const now = Date.now();
-    const member = (node_id: string, build: string) => ({ node_id, build, url: '', state: 'alive', last_seen: now, generation: 1 });
+  it('bounds a 10k-check policy preview and does not treat omitted children as silent', async () => {
+    const policy = { degraded_when: 'any', down_when: 'all' };
     vi.stubGlobal('fetch', vi.fn(async (url: string) => new Response(JSON.stringify(
-      url.includes('/cluster') ? { self: member('global', '0.1.0 (abc123, built today)'), members: [member('us', 'origin us-c1')], mode: 'global', now, links: [] } : { agents: [], regions: [] },
+      url.includes('rollup-policies') ? { policies: [] } : { checks: Array.from({ length: 10000 }, (_, i) => ({ check_id: `check-${i}`, state: 'up', effective_policy: policy, regions: [{ region: 'us', state: 'up', effective_policy: policy, zones: [] }] })) },
+    ), { headers: { 'content-type': 'application/json' } })));
+    const { container } = render(RegionTreeAdmin, { props: { onexpired: noop } });
+    await fireEvent.click(await screen.findByRole('button', { name: /region\s*us\s*Edit policy/i }));
+    expect(screen.getByText(/Child details unavailable for 10000 checks/)).toBeInTheDocument();
+    expect(container.querySelectorAll('.preview-row')).toHaveLength(25);
+    expect(screen.queryByText(/0 zones reporting/)).not.toBeInTheDocument();
+    expect(screen.getByText(/0 projected changes/)).toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('check-25')).toBeInTheDocument();
+    await fireEvent.input(screen.getByRole('searchbox', { name: 'Search policy preview' }), { target: { value: 'check-9999' } });
+    expect(container.querySelectorAll('.preview-row')).toHaveLength(1);
+    expect(screen.getByText('check-9999')).toBeInTheDocument();
+  });
+
+  it('shows regional coordinator rosters, build skew, and which coordinator an agent polls', async () => {
+    const now = Date.now();
+    const member = (node_id: string, build: string | null) => ({ node_id, build, url: '', state: 'alive', last_seen: now, generation: 1 });
+    const agent = { agent_id: 'agent-1', region: 'us', zone: 'us-a', status: 'up', last_seen: now, checks_reporting: 1, results_24h: 1, retired: false, assigned_checks: 0, poll_rtt_ms: 3, version: null, kinds: null, coordinator: 'us-c2' };
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => new Response(JSON.stringify(
+      url.includes('/cluster')
+        ? {
+            self: member('global', '0.1.0 (abc123, built today)'),
+            members: [{ ...member('us', '0.1.0 (abc123, built today)'), origin: 'us-c1' }],
+            mode: 'global', now, links: [],
+            regions: [{ region: 'us', members: [member('us-c1', '0.1.0 (abc123, built today)'), member('us-c2', '0.0.9 (old, built then)')], links: [], now, link_stale_after_ms: 1000, available: true }],
+          }
+        : { agents: [agent], regions: [] },
     ), { headers: { 'content-type': 'application/json' } })));
     render(ClusterAdmin);
-    expect(await screen.findByText('1 regional builds not reported')).toBeInTheDocument();
-    expect(screen.queryByText(/reported builds differ/)).not.toBeInTheDocument();
+    expect(await screen.findByText('1 reported build differs')).toBeInTheDocument();
     await fireEvent.click(screen.getByRole('button', { name: /us\s*Region/ }));
     expect(screen.getByText('Reporting origin')).toBeInTheDocument();
-    expect(screen.getByText('us-c1')).toBeInTheDocument();
+    expect(screen.getAllByText('us-c1').length).toBeGreaterThan(0);
+    await fireEvent.click(screen.getByRole('button', { name: /agent-1/ }));
+    expect(screen.getByText('Polls coordinator').nextElementSibling).toHaveTextContent('us-c2');
+    expect(screen.getByRole('button', { name: /us-c2/ })).toHaveClass('polled');
+  });
+
+  it('labels global agent tokens as previews and never calls the credential API', async () => {
+    const now = Date.now();
+    const member = (node_id: string) => ({ node_id, build: null, url: '', state: 'alive', last_seen: now, generation: 1 });
+    const fetchMock = vi.fn(async (url: string) => new Response(JSON.stringify(
+      url.includes('/cluster') ? { self: member('global'), members: [member('us')], mode: 'global', now, links: [] } : url.includes('/regions') ? { regions: [] } : { agents: [] },
+    ), { headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    render(ClusterAdmin);
+    expect(await screen.findByText(/Preview · Not issued/)).toBeInTheDocument();
+    await fireEvent.change(screen.getByLabelText('Region', { selector: 'select' }), { target: { value: 'us' } });
+    await fireEvent.input(screen.getByPlaceholderText('e.g. us-east-1a'), { target: { value: 'us-east-1a' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Generate preview' }));
+    expect(screen.getByText(/this token is not valid/)).toBeInTheDocument();
+    expect(screen.getByText(/PREVIEW-NOT-A-REAL-AGENT-TOKEN/)).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalledWith(expect.stringContaining('agent-credentials'), expect.anything());
+  });
+
+  it('simulates rollup state transitions from child states', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => new Response(JSON.stringify(
+      url.includes('rollup-policies') ? { policies: [] } : { checks: [] },
+    ), { headers: { 'content-type': 'application/json' } })));
+    render(RegionTreeAdmin, { props: { onexpired: noop } });
+    await fireEvent.click(await screen.findByRole('button', { name: /Zone state/ }));
+    const result = () => screen.getByText('Resulting state').nextElementSibling;
+    expect(result()).toHaveTextContent('up');
+    for (const n of [1, 2, 4]) {
+      await fireEvent.click(screen.getByRole('button', { name: new RegExp(`agent ${n}: up`) }));
+      await fireEvent.click(screen.getByRole('button', { name: new RegExp(`agent ${n}: degraded`) }));
+    }
+    await fireEvent.click(screen.getByRole('button', { name: /agent 3: degraded/ }));
+    expect(result()).toHaveTextContent('down');
   });
 
   it('decommissions a peer coordinator only after confirmation', async () => {

@@ -11,8 +11,10 @@
     <path d="m12 3 10 18H2Z" /><path d="M12 9v5m0 3v.1" />
   {:else if name === 'agents' || name === 'data'}
     <rect x="4" y="3" width="16" height="7" rx="2" /><rect x="4" y="14" width="16" height="7" rx="2" /><path d="M8 6.5h.01M8 17.5h.01M12 6.5h5M12 17.5h5" />
-  {:else if name === 'cluster' || name === 'region-tree'}
+  {:else if name === 'cluster'}
     <circle cx="12" cy="5" r="3" /><circle cx="5" cy="19" r="3" /><circle cx="19" cy="19" r="3" /><path d="m10 8-4 8m8-8 4 8M8 19h8" />
+  {:else if name === 'region-tree'}
+    <path d="M4 5h16l-6 7v5l-4 2v-7Z" />
   {:else if name === 'results' || name === 'status'}
     <rect x="5" y="3" width="14" height="18" rx="2" /><path d="M9 8h6M9 12h6m-6 4h4" />
   {:else if name === 'credentials'}

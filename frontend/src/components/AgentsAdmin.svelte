@@ -32,6 +32,7 @@
   // not missing, they are too old to run the kind they were given.
   let unrunnable = $state<string[]>([]);
   let unrunnableTotal = $state(0);
+  let unavailableRegions = $state<string[]>([]);
   // `orphaned`/`unrunnable` are check names, not ids — the editor route needs
   // the id, so this resolves one from the other for the orphan links below.
   let idByName = $state<Map<string, string>>(new Map());
@@ -306,6 +307,7 @@
       orphanedTotal = r.checks_with_no_live_agent_total;
       unrunnable = r.checks_no_agent_can_run;
       unrunnableTotal = r.checks_no_agent_can_run_total;
+      unavailableRegions = r.unavailable_regions ?? [];
       idByName = new Map(checks.map((c) => [c.name, c.id]));
     } catch (e) {
       loadError = fail(e);
@@ -346,17 +348,13 @@
     <p class="admin-error">{purgeError ?? loadError ?? 'Session expired.'}</p>
     <p class="admin-muted">Your session expired. Sign in again to manage agents.</p>
     <div class="range-switch retry">
-      <button class="range-btn" onclick={onexpired}>Sign in again</button>
+      <button class="btn" onclick={onexpired}>Sign in again</button>
     </div>
   </div>
 {:else}
-  <div class="area-bar">
-    <div class="title-line">
-      <span class="panel-title no-gap">Agents</span>
-      {#if !loading}<span class="kind-pill">{agents.length}</span>{/if}
-    </div>
-  </div>
-
+  {#if unavailableRegions.length}
+    <p class="admin-error">Fleet not read from {unavailableRegions.join(', ')}: those regions did not answer, so their agents and warnings are missing below.</p>
+  {/if}
   {#if orphanedTotal > 0}
     <OrphanBanner
       title={`${orphanedTotal} ${orphanedTotal === 1 ? 'check has' : 'checks have'} no live agent`}
@@ -391,17 +389,12 @@
   {/if}
 
   <div class="admin-panel fleet-workspace">
-    <p class="admin-muted lead">
-      Agents appear automatically when they report results. Review connectivity and assignments,
-      or retire agents that are no longer in service.
-    </p>
-
     {#if loading}
       <p class="admin-muted">Loading…</p>
     {:else if loadError}
       <p class="admin-error">{loadError}</p>
       <div class="range-switch retry">
-        <button class="range-btn" onclick={refresh}>Retry</button>
+        <button class="btn" onclick={refresh}>Retry</button>
       </div>
     {:else if agents.length === 0}
       <p class="admin-muted">
@@ -474,20 +467,6 @@
 {/if}
 
 <style>
-  .area-bar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 1rem;
-    margin-bottom: 0.6rem;
-  }
-  .no-gap {
-    margin-bottom: 0;
-  }
-  .lead {
-    margin-bottom: 0.8rem;
-    line-height: 1.5;
-  }
   .retry {
     margin-top: 0.7rem;
   }

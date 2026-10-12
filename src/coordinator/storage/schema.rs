@@ -480,7 +480,10 @@ CREATE TABLE IF NOT EXISTS agent_polls (
     build     VARCHAR,
     -- Comma-separated wire names, stored unparsed so a kind this
     -- node has never heard of survives the round trip.
-    declared_kinds VARCHAR
+    declared_kinds VARCHAR,
+    -- Node id of the coordinator polled, for the agent -> coordinator
+    -- link in the fleet view. Nullable: a peer predating it omits it.
+    coordinator VARCHAR
 );
 -- An incident delete is replicated state for the same reason a
 -- config delete is: an absence alone cannot be told apart from

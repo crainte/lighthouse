@@ -146,7 +146,7 @@
     <p class="admin-error">{loadError ?? saveError ?? 'Session expired.'}</p>
     <p class="admin-muted">Your session expired. Sign in again to change where alerts go.</p>
     <div class="range-switch retry">
-      <button class="range-btn" onclick={onexpired}>Sign in again</button>
+      <button class="btn" onclick={onexpired}>Sign in again</button>
     </div>
   </div>
 {:else if loading}
@@ -155,12 +155,12 @@
   <div class="admin-panel">
     <p class="admin-error">{loadError}</p>
     <div class="range-switch retry">
-      <button class="range-btn" onclick={refresh}>Retry</button>
+      <button class="btn" onclick={refresh}>Retry</button>
     </div>
   </div>
 {:else}
   <div class="admin-panel">
-    <div class="panel-title">Notifications</div>
+    <div class="panel-title">Delivery channels</div>
     <p class="admin-muted lead">
       Choose where confirmed state changes are delivered. Checks use their selected channels,
       or the default channels when none are selected. Checks with notifications disabled do not send alerts.

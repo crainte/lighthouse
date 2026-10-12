@@ -93,7 +93,6 @@
 </script>
 
 <div class="admin-panel">
-  <div class="panel-title">Data cleanup</div>
   <p class="cleanup-warning">Permanent actions. Review the scope before confirming; deleted records cannot be recovered.</p>
 
   <section class="results-cleanup">

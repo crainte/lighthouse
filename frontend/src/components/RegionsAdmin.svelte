@@ -60,11 +60,9 @@
   refresh();
 </script>
 
-<section class="regions-panel" aria-label="Regions">
-  <h3>Regions</h3>
+<section class="regions-panel" aria-label="Region registration">
   <p class="admin-muted">
-    A region attaches itself with its registration key in <code class="mono">[coordinator.global] token</code>.
-    Keys are shown once. Rotating a key disconnects the region until it is updated.
+    Put the key in <code class="mono">[coordinator.global] token</code>. Rotating a key disconnects the region until it is updated.
   </p>
   <form class="regions-create" onsubmit={(e) => (e.preventDefault(), mint(name))}>
     <label class="field"><span class="field-label">Region</span><input bind:value={name} placeholder="Region (e.g. eu-west)" /></label>
@@ -107,8 +105,8 @@
 </section>
 
 <style>
-  .regions-panel { margin-top: 28px; background: var(--ad-panel); border: 1px solid var(--ad-line); border-radius: 9px; padding: 24px; }
-  h3 { margin: 0 0 8px; font-size: 16px; font-weight: 550; }
+  .regions-panel { min-width: 0; }
+  .regions-panel > p { margin: 0; font-size: 12px; }
   .regions-create { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-end; margin: 20px 0; }
   .regions-create .field { flex: 1 1 14rem; max-width: 24rem; }
   .regions-minted { border: 1px solid var(--ad-amber); border-radius: 7px; padding: 16px; margin-bottom: 16px; font-size: 13px; }
