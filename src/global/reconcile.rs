@@ -66,7 +66,7 @@ pub fn push_now(node: &GlobalNode, entries: Vec<ConfigEntry>) {
                 // round trip.
                 continue;
             }
-            if let Err(e) = push_batch(&node, &endpoints, scoped).await {
+            if let Err(e) = push_batch(&node, &region, &endpoints, scoped).await {
                 tracing::warn!(
                     %region, error = %e,
                     "global: optimistic config push failed, the reconciliation sweep will retry"
@@ -117,12 +117,14 @@ fn check_admits(entry: &ConfigEntry, region: &str) -> bool {
 /// try-in-order failover every other region call in this crate uses.
 async fn push_batch(
     node: &GlobalNode,
+    region: &str,
     endpoints: &[String],
     entries: Vec<ConfigEntry>,
 ) -> anyhow::Result<()> {
-    let Some(token) = node.inner.token.as_deref() else {
-        anyhow::bail!("no global token configured");
+    let Some(token) = node.inner.regions.relay_token(region) else {
+        anyhow::bail!("region has not attached yet");
     };
+    let token = token.as_str();
     let batch = ConfigBatch {
         origin: node.inner.store.node_id().to_string(),
         entries,
@@ -169,9 +171,10 @@ pub(super) async fn reconcile_region(node: &GlobalNode, region: &str, endpoints:
     if endpoints.is_empty() {
         return;
     }
-    let Some(token) = node.inner.token.as_deref() else {
+    let Some(token) = node.inner.regions.relay_token(region) else {
         return;
     };
+    let token = token.as_str();
     let our = match our_digest(node, region).await {
         Ok(d) => d,
         Err(e) => {
@@ -459,9 +462,10 @@ async fn push_kind(
     base: &str,
     kind: ConfigKind,
 ) -> anyhow::Result<()> {
-    let Some(token) = node.inner.token.as_deref() else {
-        anyhow::bail!("missing regional token");
+    let Some(token) = node.inner.regions.relay_token(region) else {
+        anyhow::bail!("region has not attached yet");
     };
+    let token = token.as_str();
     let url = format!("{}/internal/global/config", base.trim_end_matches('/'));
     let mut after: Option<String> = None;
     let mut total = 0usize;

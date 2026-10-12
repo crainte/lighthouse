@@ -103,6 +103,16 @@ impl GlobalStore {
         &self.node_id
     }
 
+    /// The worker itself, for jobs shared verbatim with a coordinator such as
+    /// `cluster::persist_membership`.
+    pub fn database(&self) -> &Database {
+        &self.database
+    }
+
+    pub async fn cluster_members(&self) -> Result<Vec<crate::coordinator::cluster::Member>> {
+        self.db(|storage| storage.list_cluster_members()).await
+    }
+
     /// Same counters a coordinator's own `Database` keeps: queries, errors,
     /// duration, queue wait/depth, file sizes. The global tier has no ingest,
     /// replication-to-regions, or retention of its own, but it shares this
@@ -332,6 +342,68 @@ impl GlobalStore {
             }
         }
         Ok((checks, entries))
+    }
+
+    // ---- Regions (see `global::regions`) ----
+
+    pub async fn regions(&self) -> Result<Vec<super::regions::RegionRecord>> {
+        let rows = self
+            .db(|storage| storage.settings_with_prefix(super::regions::KEY_PREFIX))
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(key, value)| match serde_json::from_str(&value) {
+                Ok(record) => Some(record),
+                Err(e) => {
+                    tracing::warn!(%key, error = %e, "global: skipping malformed region record");
+                    None
+                }
+            })
+            .collect())
+    }
+
+    pub async fn put_region(
+        &self,
+        key: &str,
+        record: &super::regions::RegionRecord,
+    ) -> Result<ConfigEntry> {
+        // A setting's document is its stored string value, JSON-encoded.
+        let document = serde_json::to_string(&serde_json::to_string(record)?)?;
+        self.write_config(ConfigKind::Setting, key, Some(document))
+            .await
+    }
+
+    pub async fn delete_region(&self, name: &str) -> Result<ConfigEntry> {
+        let key = format!("{}{name}", super::regions::KEY_PREFIX);
+        self.write_config(ConfigKind::Setting, &key, None).await
+    }
+
+    /// Whether an operator removed this region (its record is tombstoned).
+    pub async fn region_removed(&self, name: &str) -> Result<bool> {
+        let key = format!("{}{name}", super::regions::KEY_PREFIX);
+        self.db(move |storage| storage.config_tombstone(ConfigKind::Setting, &key))
+            .await
+            .map(|t| t.is_some())
+    }
+
+    /// Drop `region` from every check's placement, disabling a check it was
+    /// the only region for — an empty placement means "every region".
+    /// Returns the rewritten checks' entries to distribute.
+    pub async fn strip_region(&self, region: &str) -> Result<Vec<ConfigEntry>> {
+        let checks = self.db(|storage| storage.list_checks()).await?;
+        let mut entries = Vec::new();
+        for mut check in checks {
+            let before = check.placement.regions.len();
+            check.placement.regions.retain(|r| r != region);
+            if check.placement.regions.len() == before {
+                continue;
+            }
+            if check.placement.regions.is_empty() {
+                check.enabled = false;
+            }
+            entries.push(self.write_check(&check).await?);
+        }
+        Ok(entries)
     }
 
     // ---- Sections ----

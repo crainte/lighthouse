@@ -167,13 +167,13 @@
           {@const s = phase(row)}
           <div class="wrow">
             <span class="pill {s.tone}">{s.label}</span>
-            <input class="wtitle" placeholder="Maintenance title" aria-label="Maintenance title" bind:value={row.title} />
+            <label class="wtitle field"><span class="field-label">Maintenance title</span><input placeholder="Maintenance title" bind:value={row.title} /></label>
             <label class="when">
-              <span>from</span>
+              <span>Starts</span>
               <input type="datetime-local" bind:value={row.starts} />
             </label>
             <label class="when">
-              <span>to</span>
+              <span>Ends</span>
               <input type="datetime-local" bind:value={row.ends} />
             </label>
             <label class="scope" title="Nothing selected means every check">
@@ -190,7 +190,7 @@
             </label>
             <label class="ann" title="Shown to anonymous visitors while the window runs">
               <input type="checkbox" bind:checked={row.announce} />
-              <span>announce</span>
+              <span>Announce on status page</span>
             </label>
             <button class="btn danger" onclick={() => remove(row.key)}>Remove</button>
           </div>
@@ -219,21 +219,20 @@
   .wlist { margin: 20px 0;
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
+    gap: 16px;
   }
   .wrow {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: flex-end;
-    gap: 12px;
-    padding: 16px;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+    align-items: end;
+    gap: 20px;
+    padding: 20px;
     border: 1px solid var(--border);
     border-radius: 8px;
   }
-  .wtitle {
-    flex: 1 1 12rem;
-    min-width: 8rem;
-  }
+  .wtitle { grid-column: 1 / -1; }
+  .wrow > .pill { grid-column: 1 / -1; justify-self: start; }
+  .wrow > .btn { justify-self: end; }
   .when { flex-direction: column; align-items: flex-start !important; }
   .when,
   .scope,
@@ -271,8 +270,11 @@
   .actions {
     display: flex;
     align-items: center;
-    gap: 0.4rem;
-    margin-top: 0.7rem;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-top: 24px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
   }
   .spacer {
     flex: 1;

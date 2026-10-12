@@ -852,19 +852,21 @@
           <!-- Keyed so back/forward between two checks rebuilds the editor
                instead of leaving one check's draft under another's id. -->
           {#key editing.id}
-            <CheckEditor id={editing.id} onsaved={load} onclose={() => openAdmin('checks')} />
+            <div class="admin-workspace"><CheckEditor id={editing.id} onsaved={load} onclose={() => openAdmin('checks')} /></div>
           {/key}
         {:else if panel === 'incidents' && incEditing}
           {#key incEditing.id}
-            <IncidentEditor
+              <div class="admin-workspace"><IncidentEditor
+
               incidentId={incEditing.id}
               checks={checks.map((c) => ({ id: c.check_id, name: c.name }))}
               onClose={() => openAdmin('incidents')}
-              onSaved={onIncidentSaved}
-            />
+                onSaved={onIncidentSaved}
+              /></div>
           {/key}
-        {:else}
-          <div class="page-head page-head-row">
+          {:else}
+            <div class="admin-workspace">
+            <div class="page-head page-head-row">
             <div>
               <div class="console-page-title"><span class="console-page-icon"><ConsoleIcon name={panel} size={20} /></span><h2>{meta?.title ?? 'Admin'}</h2></div>
               <p class="page-meta">{panel === 'cluster' && nodeMode === 'global' ? 'Regional reporting and connectivity to this global node.' : meta?.blurb ?? ''}</p>
@@ -911,8 +913,9 @@
           {:else if panel === 'maintenance'}
             <MaintenanceAdmin onexpired={onExpired} />
           {:else}
-            <DataAdmin onexpired={onExpired} />
-          {/if}
+              <DataAdmin onexpired={onExpired} />
+            {/if}
+            </div>
         {/if}
     </ConsoleShell>
   {:else if loading}

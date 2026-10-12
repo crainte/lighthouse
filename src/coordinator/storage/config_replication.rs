@@ -147,6 +147,17 @@ impl Storage {
         Ok(rows.next().transpose()?)
     }
 
+    /// Every setting whose key starts with `prefix`, as `(key, value)`.
+    pub fn settings_with_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key, value FROM settings WHERE starts_with(key, ?) ORDER BY key")?;
+        let rows = stmt
+            .query_map(duckdb::params![prefix], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
     pub fn put_setting(&self, key: &str, value: &str) -> Result<()> {
         self.transaction(|store| {
             store.conn.execute(

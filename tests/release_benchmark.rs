@@ -501,12 +501,16 @@ async fn release_benchmark_three_peers_one_region_global_live_agents_and_retenti
     let (probe_addr, probe_server) =
         serve(Router::new().route("/health", get(|| async { "ok" }))).await;
     let probe_url = format!("http://{probe_addr}/health");
-    let global_token = format!("bench-global-{}", Uuid::now_v7());
+    let global_token = format!("wac_bench.{}", Uuid::now_v7().simple());
     let (global_addr, global_server) = serve(
         GlobalNode::new(&GlobalConfig {
             listen: "127.0.0.1:0".into(),
-            token: Some(global_token.clone()),
-            regions: Vec::new(),
+            provision: vec![lighthouse::config::ProvisionedCredential {
+                zone: String::new(),
+                region: "bench-region".into(),
+                token: Some(global_token.clone()),
+                token_env: None,
+            }],
             db_path: ":memory:".into(),
             ..Default::default()
         })
@@ -633,7 +637,7 @@ async fn release_benchmark_three_peers_one_region_global_live_agents_and_retenti
         ))
         .unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(16_384);
-        agents.push(tokio::spawn(agent::sync_loop(cfg.clone(), tx, Vec::new())));
+        agents.push(tokio::spawn(agent::sync_loop(cfg.clone(), tx)));
         agents.push(tokio::spawn(agent::poster_loop(cfg, rx)));
     }
 
@@ -966,7 +970,7 @@ fn bench_check(id: CheckId, number: usize) -> CheckConfig {
 #[tokio::test]
 async fn status_pagination_covers_over_100_checks_regionally_and_globally() {
     let checks = 101;
-    let token = "status-pagination-global-token";
+    let token = "wac_pagination.global-key";
     let coord = Coordinator::new(&CoordinatorConfig {
         db_path: ":memory:".into(),
         region: "status-pagination-region".into(),
@@ -978,7 +982,12 @@ async fn status_pagination_covers_over_100_checks_regionally_and_globally() {
     let (regional_addr, regional_server) = serve(coord.router()).await;
     let (global_addr, global_server) = serve(
         GlobalNode::new(&GlobalConfig {
-            token: Some(token.into()),
+            provision: vec![lighthouse::config::ProvisionedCredential {
+                zone: String::new(),
+                region: "status-pagination-region".into(),
+                token: Some(token.into()),
+                token_env: None,
+            }],
             db_path: ":memory:".into(),
             ..Default::default()
         })

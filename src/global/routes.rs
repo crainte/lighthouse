@@ -11,7 +11,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post, put};
+use axum::routing::{any, delete, get, post, put};
 use axum::{body::Bytes, Json, Router};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -70,6 +70,20 @@ pub(super) fn router(node: GlobalNode) -> Router {
             put(admin::rename_section_handler).delete(admin::delete_section_handler),
         )
         .route("/api/v1/sections", get(admin::public_sections_handler))
+        // Region registration and removal, and decommissioning a peer
+        // global node. See `regions`.
+        .route(
+            "/api/v1/admin/regions",
+            get(admin::list_regions_handler).post(admin::mint_region_handler),
+        )
+        .route(
+            "/api/v1/admin/regions/:name",
+            delete(admin::remove_region_handler),
+        )
+        .route(
+            "/api/v1/admin/cluster/members/:node_id",
+            delete(admin::decommission_member_handler),
+        )
         // Auth: same contract as the coordinator so the SPA's login flow
         // works unchanged. `session` also carries a `mode` marker.
         .route(
@@ -136,8 +150,24 @@ async fn push_handler(
     headers: HeaderMap,
     Json(push): Json<RegionStatePush>,
 ) -> Response {
-    if let Some(denied) = require_push_token(&node, &headers) {
-        return denied;
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match node.admit_push(bearer, &push.region, push.advertise_url.as_deref()) {
+        Ok(()) => {}
+        Err(super::regions::PushDenied::Unauthenticated) => {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "unknown or revoked region registration key",
+            )
+        }
+        Err(super::regions::PushDenied::WrongRegion(bound)) => {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                &format!("this key is registered to region {bound:?}"),
+            )
+        }
     }
     let now = chrono::Utc::now().timestamp_millis();
     // Diff the cross-region rollup around the push so a dashboard socket sees a
@@ -207,22 +237,6 @@ async fn handle_ws(mut socket: WebSocket, node: GlobalNode) {
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => break,
         }
-    }
-}
-
-fn require_push_token(node: &GlobalNode, headers: &HeaderMap) -> Option<Response> {
-    let expected = node.inner.token.as_deref()?;
-    let presented = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    if presented == Some(expected) {
-        None
-    } else {
-        Some(error_response(
-            StatusCode::UNAUTHORIZED,
-            "invalid push token",
-        ))
     }
 }
 

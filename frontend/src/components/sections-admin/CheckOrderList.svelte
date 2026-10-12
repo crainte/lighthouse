@@ -166,16 +166,16 @@
               >
               <div class="movers">
                 <button
-                  class="btn nudge"
+                  class="reorder-step"
                   onclick={() => moveCheck(gi, i, -1)}
                   disabled={i === 0 || busyOrder}
-                  aria-label="Move {c.name} up">▲</button
+                  aria-label="Move {c.name} up"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 14 6-6 6 6" /></svg></button
                 >
                 <button
-                  class="btn nudge"
+                  class="reorder-step"
                   onclick={() => moveCheck(gi, i, 1)}
                   disabled={i === g.rows.length - 1 || busyOrder}
-                  aria-label="Move {c.name} down">▼</button
+                  aria-label="Move {c.name} down"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 10 6 6 6-6" /></svg></button
                 >
               </div>
               <span class="mono oname" class:off={!c.enabled}>{c.name}</span>
@@ -258,7 +258,7 @@
     flex-direction: column;
     gap: 2px;
   }
-  .nudge {
+  .reorder-step {
     padding: 0 0.3rem;
     font-size: 0.55rem;
     line-height: 1.25;

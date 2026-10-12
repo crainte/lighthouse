@@ -288,6 +288,17 @@ impl Storage {
         })
     }
 
+    /// Drop per-peer state kept for decommissioned members' addresses.
+    pub fn forget_peer_state(&self, urls: &[String]) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare("DELETE FROM raw_data_gaps WHERE peer = ?")?;
+        for url in urls {
+            stmt.execute(duckdb::params![url])?;
+        }
+        Ok(())
+    }
+
     /// Every persisted member, for rejoining the cluster on restart.
     pub fn list_cluster_members(&self) -> Result<Vec<crate::coordinator::cluster::Member>> {
         let mut stmt = self

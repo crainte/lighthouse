@@ -52,6 +52,10 @@ pub enum MemberState {
     Alive,
     Suspect,
     Dead,
+    /// Decommissioned by an operator. Terminal: it gossips like any other
+    /// entry, beats every generation, and is never pinged, replicated to,
+    /// or retried as a seed again. Rejoining takes a new `node_id`.
+    Removed,
 }
 
 impl MemberState {
@@ -60,6 +64,7 @@ impl MemberState {
             MemberState::Alive => "alive",
             MemberState::Suspect => "suspect",
             MemberState::Dead => "dead",
+            MemberState::Removed => "removed",
         }
     }
 
@@ -67,9 +72,19 @@ impl MemberState {
         match s {
             "suspect" => MemberState::Suspect,
             "dead" => MemberState::Dead,
+            "removed" => MemberState::Removed,
             _ => MemberState::Alive,
         }
     }
+}
+
+/// Why `Cluster::remove` refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RemoveError {
+    /// A node cannot decommission itself: removal is an operator acting from
+    /// a surviving member.
+    IsSelf,
+    NotFound,
 }
 
 /// One node as this coordinator currently believes it, on the wire and on
@@ -164,6 +179,9 @@ pub struct Cluster {
     /// which the state-count gauge already reflects on the next scrape.
     transitions_to_suspect: AtomicU64,
     transitions_to_dead: AtomicU64,
+    /// Set once a peer answers 410: this node was decommissioned. It stops
+    /// pinging and replicating instead of retrying a cluster that refuses it.
+    fenced: std::sync::atomic::AtomicBool,
 }
 
 impl Cluster {
@@ -190,7 +208,64 @@ impl Cluster {
             peer_timeout_ms: peer_timeout_secs as i64 * 1000,
             transitions_to_suspect: AtomicU64::new(0),
             transitions_to_dead: AtomicU64::new(0),
+            fenced: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    fn is_fenced(&self) -> bool {
+        self.fenced.load(Ordering::Relaxed)
+    }
+
+    /// Decommission `node_id`: a terminal tombstone that spreads with the
+    /// next pings, so every member stops contacting it and none can be talked
+    /// back into it by stale gossip or by the node itself returning.
+    pub fn remove(&self, node_id: &str, now_millis: i64) -> Result<Member, RemoveError> {
+        if node_id == self.self_id {
+            return Err(RemoveError::IsSelf);
+        }
+        let mut guard = self.members.write();
+        let member = guard.get_mut(node_id).ok_or(RemoveError::NotFound)?;
+        if member.state != MemberState::Removed {
+            member.state = MemberState::Removed;
+            member.last_seen = now_millis;
+            warn!(node_id, url = %member.url, "cluster member decommissioned");
+        }
+        Ok(member.clone())
+    }
+
+    fn is_removed(&self, node_id: &str) -> bool {
+        self.members
+            .read()
+            .get(node_id)
+            .is_some_and(|m| m.state == MemberState::Removed)
+    }
+
+    /// Identity, address, process and state of every member — what persisting
+    /// membership must capture. `last_seen` moves on every ping and is left
+    /// out, so an unchanged cluster costs no write per heartbeat.
+    pub fn persist_key(&self) -> Vec<(String, String, i64, MemberState)> {
+        let mut key: Vec<_> = self
+            .members
+            .read()
+            .values()
+            .map(|m| (m.node_id.clone(), m.url.clone(), m.generation, m.state))
+            .collect();
+        key.sort_by(|a, b| a.0.cmp(&b.0));
+        key
+    }
+
+    /// Base URLs of decommissioned members, for purging per-peer state. An
+    /// address a live replacement has since taken over is not included.
+    pub fn removed_urls(&self) -> Vec<String> {
+        let guard = self.members.read();
+        let (removed, current): (Vec<&Member>, Vec<&Member>) = guard
+            .values()
+            .partition(|m| m.state == MemberState::Removed);
+        removed
+            .into_iter()
+            .filter(|r| !current.iter().any(|m| m.url == r.url))
+            .map(|m| m.url.clone())
+            .collect()
     }
 
     /// Seed the in-memory view from what was persisted, so a restarted node
@@ -287,6 +362,12 @@ impl Cluster {
             return;
         }
         match guard.get(&incoming.node_id) {
+            // A removal is terminal and outranks any generation: neither stale
+            // gossip nor the decommissioned process itself can undo it.
+            Some(known) if known.state == MemberState::Removed => {}
+            Some(_) if incoming.state == MemberState::Removed => {
+                guard.insert(incoming.node_id.clone(), incoming);
+            }
             None => {
                 guard.insert(incoming.node_id.clone(), incoming);
             }
@@ -307,10 +388,50 @@ impl Cluster {
 
     /// Handle an inbound ping: merge the sender's view, answer with ours. The
     /// HTTP layer is a thin wrapper over this, so the merge rule is testable
-    /// without standing up a server.
-    pub fn handle_ping(&self, incoming: &PingBody, now_millis: i64) -> PingBody {
+    /// without standing up a server. `None` when the sender was decommissioned:
+    /// the caller answers 410 and nothing it says is merged.
+    pub fn handle_ping(&self, incoming: &PingBody, now_millis: i64) -> Option<PingBody> {
+        if self.is_removed(&incoming.node_id) {
+            return None;
+        }
         self.merge(incoming, now_millis);
-        self.ping_body(now_millis)
+        Some(self.ping_body(now_millis))
+    }
+
+    /// `handle_ping` as the HTTP answer both coordinator and global ping
+    /// routes give: the reply, or 410 Gone to a decommissioned sender.
+    pub fn answer_ping(&self, incoming: &PingBody, now_millis: i64) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        match self.handle_ping(incoming, now_millis) {
+            Some(reply) => axum::Json(reply).into_response(),
+            None => crate::http::error_response(
+                axum::http::StatusCode::GONE,
+                "this node was decommissioned",
+            ),
+        }
+    }
+
+    /// `remove` as the admin HTTP answer both tiers give. Persisted and
+    /// gossiped by the next heartbeat.
+    pub fn decommission(cluster: Option<&Self>, node_id: &str) -> axum::response::Response {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        let Some(cluster) = cluster else {
+            return crate::http::error_response(
+                StatusCode::NOT_FOUND,
+                "clustering is not configured on this node",
+            );
+        };
+        match cluster.remove(node_id, chrono::Utc::now().timestamp_millis()) {
+            Ok(member) => axum::Json(member).into_response(),
+            Err(RemoveError::IsSelf) => crate::http::error_response(
+                StatusCode::BAD_REQUEST,
+                "a node cannot decommission itself; remove it from another member",
+            ),
+            Err(RemoveError::NotFound) => {
+                crate::http::error_response(StatusCode::NOT_FOUND, "no such cluster member")
+            }
+        }
     }
 
     fn ping_body(&self, now_millis: i64) -> PingBody {
@@ -345,7 +466,7 @@ impl Cluster {
             .members
             .read()
             .values()
-            .filter(|m| m.state != MemberState::Dead)
+            .filter(|m| matches!(m.state, MemberState::Alive | MemberState::Suspect))
             .map(|m| (m.url.clone(), Some(m.node_id.clone())))
             .collect();
         self.ping_targets(targets, now_millis).await;
@@ -362,6 +483,9 @@ impl Cluster {
                 .filter(|m| m.state == MemberState::Dead)
                 .map(|m| (m.url.clone(), Some(m.node_id.clone())))
                 .collect();
+            // A removed member is "not dead" here on purpose: its address
+            // stops being retried as a seed. A replacement at the same address
+            // joins by pinging its own seeds instead.
             for seed in &self.seeds {
                 if seed.trim_end_matches('/') != self.self_url.trim_end_matches('/')
                     && !guard.values().any(|m| {
@@ -378,6 +502,9 @@ impl Cluster {
     }
 
     async fn ping_targets(&self, targets: Vec<(String, Option<String>)>, now_millis: i64) {
+        if self.is_fenced() {
+            return;
+        }
         let body = self.ping_body(now_millis);
         stream::iter(targets)
             .for_each_concurrent(32, |(peer, known_id)| {
@@ -406,6 +533,15 @@ impl Cluster {
                                 LinkOutcome::Connected,
                             );
                             self.merge(&reply, received_at);
+                        }
+                        Ok(Ok(Err(reqwest::StatusCode::GONE))) => {
+                            if !self.fenced.swap(true, Ordering::Relaxed) {
+                                tracing::error!(
+                                    %peer,
+                                    "this node was decommissioned from the cluster; it has stopped \
+                                     gossiping and replicating and should be shut down"
+                                );
+                            }
                         }
                         Ok(Ok(Err(status))) => {
                             if let Some(target) = known_id.clone() {
@@ -457,7 +593,7 @@ impl Cluster {
                     MemberState::Dead => {
                         self.transitions_to_dead.fetch_add(1, Ordering::Relaxed);
                     }
-                    MemberState::Alive => {}
+                    MemberState::Alive | MemberState::Removed => {}
                 }
                 changed.push((m.node_id.clone(), next));
             }
@@ -476,6 +612,9 @@ impl Cluster {
     /// for replication, so a dead node stops costing a timeout per message
     /// once it has been noticed.
     pub fn live_urls(&self) -> Vec<String> {
+        if self.is_fenced() {
+            return Vec::new();
+        }
         self.members
             .read()
             .values()
@@ -502,7 +641,20 @@ impl Cluster {
     }
 
     pub fn link_snapshot(&self) -> Vec<LinkObservation> {
-        let mut links: Vec<_> = self.links.read().values().cloned().collect();
+        let members = self.members.read();
+        let gone = |id: &String| {
+            members
+                .get(id)
+                .is_some_and(|m| m.state == MemberState::Removed)
+        };
+        let mut links: Vec<_> = self
+            .links
+            .read()
+            .values()
+            .filter(|l| !gone(&l.source) && !gone(&l.target))
+            .cloned()
+            .collect();
+        drop(members);
         links.sort_by(|a, b| (&a.source, &a.target).cmp(&(&b.source, &b.target)));
         links
     }
@@ -519,12 +671,13 @@ impl Cluster {
     /// cheap enough for every scrape since cluster size is peer count, never
     /// check or agent count.
     pub fn metrics(&self) -> Vec<crate::openmetrics::MetricSample> {
-        let (mut alive, mut suspect, mut dead) = (0u64, 0u64, 0u64);
+        let (mut alive, mut suspect, mut dead, mut removed) = (0u64, 0u64, 0u64, 0u64);
         for m in self.members.read().values() {
             match m.state {
                 MemberState::Alive => alive += 1,
                 MemberState::Suspect => suspect += 1,
                 MemberState::Dead => dead += 1,
+                MemberState::Removed => removed += 1,
             }
         }
         vec![
@@ -552,6 +705,11 @@ impl Cluster {
                 "lighthouse_cluster_members",
                 vec![("state".into(), "dead".into())],
                 dead as f64,
+            ),
+            crate::openmetrics::MetricSample::new(
+                "lighthouse_cluster_members",
+                vec![("state".into(), "removed".into())],
+                removed as f64,
             ),
         ]
     }
@@ -594,6 +752,33 @@ impl Cluster {
         for peer in targets {
             self.post_json(&peer, path, body).await;
         }
+    }
+}
+
+/// Persist membership when its shape changed since `last`, purging per-peer
+/// state for decommissioned members in the same job. Called from each
+/// heartbeat tick (coordinator and global), so a removal learned by gossip is
+/// as durable as one made here, and a restart cannot forget a tombstone.
+pub async fn persist_membership(
+    cluster: &Cluster,
+    database: &super::database::Database,
+    last: &mut Vec<(String, String, i64, MemberState)>,
+) {
+    let key = cluster.persist_key();
+    if key == *last {
+        return;
+    }
+    let members = cluster.snapshot();
+    let removed = cluster.removed_urls();
+    let saved = database
+        .call(move |storage| {
+            storage.save_cluster_members(&members)?;
+            storage.forget_peer_state(&removed)
+        })
+        .await;
+    match saved {
+        Ok(()) => *last = key,
+        Err(e) => warn!(error = %e, "failed to persist cluster membership"),
     }
 }
 
@@ -669,14 +854,11 @@ mod tests {
                                     if gate.load(Ordering::Relaxed)
                                         && (from < count / 2) != (i < count / 2)
                                     {
-                                        return Err(StatusCode::SERVICE_UNAVAILABLE);
+                                        return axum::response::IntoResponse::into_response(
+                                            StatusCode::SERVICE_UNAVAILABLE,
+                                        );
                                     }
-                                    Ok(Json(
-                                        node.handle_ping(
-                                            &body,
-                                            chrono::Utc::now().timestamp_millis(),
-                                        ),
-                                    ))
+                                    node.answer_ping(&body, chrono::Utc::now().timestamp_millis())
                                 },
                             ),
                         )
@@ -723,6 +905,102 @@ mod tests {
                     .all(|m| m.state == MemberState::Alive));
             }
         }
+    }
+
+    // -- decommissioning --
+
+    fn ping_from(id: &str, url: &str, generation: i64, members: Vec<Member>) -> PingBody {
+        PingBody {
+            node_id: id.into(),
+            url: url.into(),
+            generation,
+            members,
+            links: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_removal_is_terminal_and_refuses_the_removed_node() {
+        let a = cluster("a", "http://a", 1);
+        a.merge(&ping_from("b", "http://b", 1, vec![]), 10);
+        assert_eq!(a.remove("a", 20), Err(RemoveError::IsSelf));
+        assert_eq!(a.remove("zz", 20), Err(RemoveError::NotFound));
+        assert_eq!(a.remove("b", 20).unwrap().state, MemberState::Removed);
+
+        // Neither the node itself (a fresh process) nor a peer's stale view
+        // can bring it back.
+        assert!(a
+            .handle_ping(&ping_from("b", "http://b", 99, vec![]), 30)
+            .is_none());
+        a.merge(
+            &ping_from(
+                "c",
+                "http://c",
+                1,
+                vec![member("b", "http://b", 99, 30, MemberState::Alive)],
+            ),
+            30,
+        );
+        let b = a.snapshot().into_iter().find(|m| m.node_id == "b").unwrap();
+        assert_eq!(b.state, MemberState::Removed);
+        assert_eq!(a.live_urls(), vec!["http://c".to_string()]);
+        assert_eq!(a.removed_urls(), vec!["http://b".to_string()]);
+    }
+
+    #[test]
+    fn a_removal_spreads_through_gossip_and_outranks_any_generation() {
+        let a = cluster("a", "http://a", 1);
+        a.merge(&ping_from("b", "http://b", 1, vec![]), 10);
+        a.remove("b", 20).unwrap();
+
+        let c = cluster("c", "http://c", 1);
+        c.merge(&ping_from("b", "http://b", 50, vec![]), 15);
+        let reply = a.handle_ping(&c.ping_body(25), 25).unwrap();
+        c.merge(&reply, 26);
+        assert!(c.is_removed("b"));
+        assert!(!c.live_urls().contains(&"http://b".to_string()));
+        assert!(c
+            .link_snapshot()
+            .iter()
+            .all(|l| l.source != "b" && l.target != "b"));
+    }
+
+    #[tokio::test]
+    async fn a_removal_survives_a_restart_and_purges_peer_state() {
+        let database = crate::coordinator::database::Database::open(
+            ":memory:".to_string(),
+            crate::coordinator::db_limits::DatabaseLimits::resolve(&Default::default()).unwrap(),
+        )
+        .await
+        .unwrap();
+        database
+            .call(|s| {
+                s.record_raw_data_gap(&crate::coordinator::storage::RawDataGapRow {
+                    check_id: crate::models::CheckId::nil(),
+                    peer: "http://b".into(),
+                    from_ts: 1,
+                    to_ts: 2,
+                    observed_at: 3,
+                })
+            })
+            .await
+            .unwrap();
+
+        let a = cluster("a", "http://a", 1);
+        a.merge(&ping_from("b", "http://b", 1, vec![]), 10);
+        a.remove("b", 20).unwrap();
+        let mut persisted = Vec::new();
+        persist_membership(&a, &database, &mut persisted).await;
+        assert_eq!(persisted, a.persist_key());
+
+        let restarted = cluster("a", "http://a", 2);
+        restarted.restore(database.call(|s| s.list_cluster_members()).await.unwrap());
+        assert!(restarted.is_removed("b"));
+        assert!(database
+            .call(|s| s.list_raw_data_gaps())
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     // -- transitive discovery --

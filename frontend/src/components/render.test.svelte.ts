@@ -12,11 +12,16 @@
 // runtime error in a `$derived`, which is the class that actually reached the
 // user. Behavioural assertions belong with the components themselves.
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
-import { render, cleanup, screen } from '@testing-library/svelte';
+import { render, cleanup, screen, fireEvent } from '@testing-library/svelte';
+import ClusterAdmin from './ClusterAdmin.svelte';
+import RegionsAdmin from './RegionsAdmin.svelte';
+import ProbeResultsAdmin from './ProbeResultsAdmin.svelte';
 import type { Incident, IncidentGroup } from '../lib/api';
 import CheckEditor from './CheckEditor.svelte';
 import IncidentsList from './IncidentsList.svelte';
 import PastIncidents from './PastIncidents.svelte';
+import NotifiersAdmin from './NotifiersAdmin.svelte';
+import MaintenanceAdmin from './MaintenanceAdmin.svelte';
 
 // Components fetch on mount. Give them an endpoint that resolves to nothing
 // interesting so mounting is deterministic and offline.
@@ -51,6 +56,99 @@ afterEach(() => {
 
 describe('component render smoke', () => {
   const noop = () => {};
+
+  it('shows regional origins as unavailable builds and opens node details', async () => {
+    const now = Date.now();
+    const member = (node_id: string, build: string) => ({ node_id, build, url: '', state: 'alive', last_seen: now, generation: 1 });
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => new Response(JSON.stringify(
+      url.includes('/cluster') ? { self: member('global', '0.1.0 (abc123, built today)'), members: [member('us', 'origin us-c1')], mode: 'global', now, links: [] } : { agents: [], regions: [] },
+    ), { headers: { 'content-type': 'application/json' } })));
+    render(ClusterAdmin);
+    expect(await screen.findByText('1 regional builds not reported')).toBeInTheDocument();
+    expect(screen.queryByText(/reported builds differ/)).not.toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('button', { name: /us\s*Region/ }));
+    expect(screen.getByText('Reporting origin')).toBeInTheDocument();
+    expect(screen.getByText('us-c1')).toBeInTheDocument();
+  });
+
+  it('decommissions a peer coordinator only after confirmation', async () => {
+    const now = Date.now();
+    const member = (node_id: string, state: string) => ({ node_id, build: null, url: `http://${node_id}`, state, last_seen: now, generation: 1 });
+    const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => new Response(JSON.stringify(
+      url.includes('/admin/cluster/members/') ? member('b', 'removed')
+        : url.includes('/cluster') ? { self: member('a', 'alive'), members: [member('b', 'dead'), member('c', 'removed')], mode: 'coordinator', now, links: [] }
+        : { agents: [] },
+    ), { headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    render(ClusterAdmin);
+    await fireEvent.click(await screen.findByRole('button', { name: /c\s*Coordinator · removed/ }));
+    expect(screen.queryByRole('button', { name: /Decommission/ })).not.toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('button', { name: /b\s*Coordinator · dead/ }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Decommission…' }));
+    expect(fetchMock).not.toHaveBeenCalledWith(expect.stringContaining('/members/'), expect.anything());
+    await fireEvent.click(screen.getByRole('button', { name: 'Decommission' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/admin/cluster/members/b', expect.objectContaining({ method: 'DELETE' }));
+  });
+
+  it('shows a minted region key once and confirms removal', async () => {
+    const region = { name: 'tw', credential_id: 'wac_1', created_at: 0, endpoints: [], attached: false, stale: true, age_ms: -1, check_count: 0 };
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => new Response(JSON.stringify(
+      init?.method === 'POST' ? { region: 'eu', credential_id: 'wac_2', token: 'wac_2.secret' }
+        : init?.method === 'DELETE' ? { removed: 'tw', checks_updated: 1 }
+        : { regions: [region] },
+    ), { headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    render(RegionsAdmin);
+    expect(await screen.findByText(/Waiting for first push/)).toBeInTheDocument();
+    await fireEvent.input(screen.getByPlaceholderText(/Region/), { target: { value: 'eu' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Register' }));
+    expect(await screen.findByText(/wac_2\.secret/)).toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+    expect(screen.queryByText(/wac_2\.secret/)).not.toBeInTheDocument();
+    await fireEvent.click(screen.getAllByRole('button', { name: 'Remove' })[0]);
+    await fireEvent.click(screen.getByRole('button', { name: 'Remove' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/admin/regions/tw', expect.objectContaining({ method: 'DELETE' }));
+  });
+
+  it('renders probe results as a ledger with inspectable errors', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => new Response(JSON.stringify(
+      url.includes('/admin/checks') ? { checks: [], has_more: false } : { results: [{ check_id: 'api', name: 'Production API', agent_id: 'us-agent', timestamp: Date.now(), status: 'down', latency_ms: 20, status_code: 503, region: 'us', zone: 'east', error: 'Upstream unavailable' }] },
+    ), { headers: { 'content-type': 'application/json' } })));
+    const onopen = vi.fn();
+    render(ProbeResultsAdmin, { props: { onopen, onexpired: noop } });
+    await fireEvent.click(await screen.findByRole('button', { name: 'Production API' }));
+    expect(onopen).toHaveBeenCalledWith('api');
+    expect(screen.getByText('Monitor / agent')).toBeInTheDocument();
+    expect(screen.getByText('HTTP 503')).toBeInTheDocument();
+    expect(screen.getAllByText('Upstream unavailable')).toHaveLength(2);
+  });
+
+  it('renders populated email channel fields with accessible labels', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      notifiers: [{ type: 'email', name: 'Operations', default: true, host: 'smtp.example.com', port: 587, tls: 'starttls', from: 'monitor@example.com', to: 'ops@example.com' }],
+      unrouted_checks: [], undelivered: [],
+    }), { headers: { 'content-type': 'application/json' } })));
+    render(NotifiersAdmin, { props: { onexpired: noop } });
+    expect(await screen.findByLabelText('SMTP host')).toHaveValue('smtp.example.com');
+    expect(screen.getByLabelText('Port')).toHaveValue(587);
+    expect(screen.getByLabelText('Encryption')).toHaveValue('starttls');
+    expect(screen.getByLabelText('From address')).toHaveValue('monitor@example.com');
+    expect(screen.getByLabelText('Default channel')).toBeChecked();
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
+  });
+
+  it('renders a populated maintenance window with labeled controls', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      windows: [{ title: 'Database upgrade', starts_at: 1790000040000, ends_at: 1790003640000, checks: ['api'], announce: true }],
+      checks: [{ id: 'api', name: 'API' }],
+    }), { headers: { 'content-type': 'application/json' } })));
+    render(MaintenanceAdmin, { props: { onexpired: noop } });
+    expect(await screen.findByLabelText('Maintenance title')).toHaveValue('Database upgrade');
+    expect(screen.getByLabelText('Starts')).toHaveAttribute('type', 'datetime-local');
+    expect(screen.getByLabelText('Ends')).toHaveAttribute('type', 'datetime-local');
+    expect(screen.getByLabelText('Announce on status page')).toBeChecked();
+    expect(screen.getByRole('option', { name: 'API' })).toBeInTheDocument();
+  });
 
   // The regression: `placeholder="...?token=${API_TOKEN}"`. Svelte reads
   // `{API_TOKEN}` inside attribute text as an interpolation, so the editor

@@ -259,6 +259,116 @@ async fn an_authenticated_admin_can_round_trip_a_check() {
     assert_eq!(res.status(), 401);
 }
 
+/// Names are display text, not identifiers: anything printable except a slash
+/// is accepted, and a rename keeps the check's UUID and everything keyed by it.
+#[tokio::test]
+async fn free_form_check_names_round_trip_and_rename_keeps_identity() {
+    let addr = spawn_server(coordinator().await);
+    let base = format!("http://{addr}");
+    let admin = reqwest::Client::new();
+    let session = login(&base).await;
+
+    let mut ids = Vec::new();
+    for name in ["h@h", "home assistant", "café ☕"] {
+        let res = admin
+            .post(format!("{base}/api/v1/admin/checks"))
+            .header(reqwest::header::COOKIE, &session)
+            .json(&check_body(name, "https://named.test"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "{name} should be accepted");
+        let created: Value = res.json().await.unwrap();
+        assert_eq!(created["check"]["name"], name);
+        ids.push(created["check"]["id"].as_str().unwrap().to_string());
+    }
+
+    let res = admin
+        .put(format!("{base}/api/v1/admin/checks/{}", ids[1]))
+        .header(reqwest::header::COOKIE, &session)
+        .json(&check_body("Home Assistant (lab)", "https://named.test"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let feed: Value = reqwest::Client::new()
+        .get(format!("{base}/api/v1/agent/checks"))
+        .bearer_auth(AGENT_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let names: std::collections::HashMap<String, String> = feed["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["id"].as_str().unwrap().to_string(),
+                c["name"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(names.get(&ids[0]).map(String::as_str), Some("h@h"));
+    assert_eq!(
+        names.get(&ids[1]).map(String::as_str),
+        Some("Home Assistant (lab)"),
+        "a rename keeps the same id"
+    );
+
+    let history = admin
+        .get(format!("{base}/api/v1/checks/{}/history", ids[0]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(history.status(), 200, "routes are keyed by id, not name");
+}
+
+/// A restarted agent has no failure memory, so the feed tells it which of its
+/// checks are mid-run. Without this a down hourly check waits an hour after
+/// an agent restart before it is probed again and its recovery is noticed.
+#[tokio::test]
+async fn the_agent_feed_hints_each_callers_failure_runs() {
+    let mut api = http_check("api");
+    api.failures_before_down = 3;
+    let coord = coordinator_with(vec![api]).await;
+    let now = chrono::Utc::now().timestamp_millis();
+    coord
+        .ingest(vec![
+            probe("api", now - 2_000, 500),
+            probe("api", now - 1_000, 500),
+        ])
+        .await;
+    let addr = spawn_server(coord.clone());
+    let feed = |agent: &'static str| {
+        let url = format!("http://{addr}/api/v1/agent/checks?agent_id={agent}");
+        async move {
+            reqwest::Client::new()
+                .get(url)
+                .bearer_auth(AGENT_TOKEN)
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        }
+    };
+
+    let body = feed("agent-1").await;
+    assert_eq!(body["failing"][cid("api").to_string()], 2, "{body}");
+    assert!(
+        feed("agent-2").await.get("failing").is_none(),
+        "another agent's run is not this one's"
+    );
+
+    coord.ingest(vec![probe("api", now, 200)]).await;
+    assert!(feed("agent-1").await.get("failing").is_none());
+}
+
 #[tokio::test]
 async fn unplacing_a_check_keeps_history_for_replacement_and_clears_local_state() {
     let addr = spawn_server(coordinator().await);

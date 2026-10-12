@@ -968,7 +968,7 @@ pub(in crate::coordinator) async fn cluster_ping_handler(
         );
     };
     let now = chrono::Utc::now().timestamp_millis();
-    Json(cluster.handle_ping(&body, now)).into_response()
+    cluster.answer_ping(&body, now)
 }
 
 /// `GET /api/v1/cluster`: this node's own membership view, for the admin UI.
@@ -1036,6 +1036,15 @@ pub(in crate::coordinator) async fn cluster_view_handler(
         link_stale_after_ms,
     })
     .into_response()
+}
+
+/// `DELETE /api/v1/admin/cluster/members/:node_id`: decommission a member.
+pub(in crate::coordinator) async fn decommission_member_handler(
+    State(coord): State<Coordinator>,
+    _admin: AdminSession,
+    axum::extract::Path(node_id): axum::extract::Path<String>,
+) -> Response {
+    cluster::Cluster::decommission(coord.inner.cluster.as_deref(), &node_id)
 }
 
 /// One standing raw-data gap, on the wire. Mirrors `storage::RawDataGapRow`.

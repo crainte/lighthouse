@@ -220,6 +220,7 @@
       <div class="nlist">
         {#each rows as row (row.key)}
           <div class="nrow">
+            <div class="channel-heading">
             <input
               class="nname"
                placeholder="Channel name"
@@ -228,38 +229,48 @@
               oninput={() => touched(row.key)}
             />
             <span class="ntype">{row.notifier.type}</span>
+            </div>
+            <div class="channel-fields">
             {#if row.notifier.type === 'webhook'}
+              <label class="channel-field"><span>Webhook URL</span>
               <input
                 class="grow"
                 placeholder="https://hooks.example.com/…"
                 bind:value={row.notifier.url}
                 oninput={() => touched(row.key)}
               />
+              </label>
             {:else if row.notifier.type === 'slack'}
+              <label class="channel-field"><span>Slack webhook URL</span>
               <input
                 class="grow"
                 placeholder="https://hooks.slack.com/services/…"
                 bind:value={row.notifier.webhook_url}
                 oninput={() => touched(row.key)}
               />
+              </label>
             {:else if row.notifier.type === 'pagerduty'}
+              <label class="channel-field"><span>Integration key</span>
               <input
                 class="grow"
                 placeholder="Events API v2 integration key"
                 bind:value={row.notifier.routing_key}
                 oninput={() => touched(row.key)}
               />
+              </label>
             {:else if row.notifier.type === 'email'}
+              <label class="channel-field"><span>SMTP host</span>
               <input
                 class="topic"
                 placeholder="smtp host"
                 bind:value={row.notifier.host}
                 oninput={() => touched(row.key)}
               />
+              </label>
               <!-- A function binding rather than `bind:value`: `port` lives on
                    the email variant alone, and the union does not narrow inside
                    a binding expression the way it does inside this branch. -->
-              <span class="port">
+              <label class="channel-field"><span>Port</span>
               <NumberField
                 min={1}
                 max={65535}
@@ -272,7 +283,8 @@
                 }
                 onchanged={() => touched(row.key)}
               />
-              </span>
+              </label>
+              <label class="channel-field"><span>Encryption</span>
               <select
                 class="tls"
                 bind:value={row.notifier.tls}
@@ -283,18 +295,24 @@
                 <option value="implicit">implicit tls</option>
                 <option value="none">no tls</option>
               </select>
+              </label>
+              <label class="channel-field"><span>From address</span>
               <input
                 class="topic"
                 placeholder="from address"
                 bind:value={row.notifier.from}
                 oninput={() => touched(row.key)}
               />
+              </label>
+              <label class="channel-field"><span>To address</span>
               <input
                 class="topic"
                 placeholder="to address"
                 bind:value={row.notifier.to}
                 oninput={() => touched(row.key)}
               />
+              </label>
+              <label class="channel-field"><span>Username (optional)</span>
               <input
                 class="topic"
                 placeholder="username (optional)"
@@ -304,6 +322,8 @@
                   touched(row.key);
                 }}
               />
+              </label>
+              <label class="channel-field"><span>Password</span>
               <input
                 class="topic"
                 type="password"
@@ -314,13 +334,17 @@
                   touched(row.key);
                 }}
               />
+              </label>
             {:else}
+              <label class="channel-field"><span>Topic</span>
               <input
                 class="topic"
                 placeholder="topic"
                 bind:value={row.notifier.topic}
                 oninput={() => touched(row.key)}
               />
+              </label>
+              <label class="channel-field"><span>Server URL (optional)</span>
               <input
                 class="grow"
                 placeholder="https://ntfy.sh (default)"
@@ -331,15 +355,19 @@
                   touched(row.key);
                 }}
               />
+              </label>
             {/if}
+            </div>
+            <div class="channel-actions">
             <label class="deflt" title="Receives checks that name no notifier">
               <input type="checkbox" bind:checked={row.notifier.default} />
-              <span>default</span>
+              <span>Default channel</span>
             </label>
             <button class="btn" onclick={() => test(row)} disabled={testing === row.key}>
               {testing === row.key ? 'Sending…' : 'Test'}
             </button>
             <button class="btn danger" onclick={() => remove(row.key)}>Remove</button>
+            </div>
             {#if tested[row.key]}
               <span class="result" class:ok={tested[row.key].ok}>{tested[row.key].message}</span>
             {/if}
@@ -389,20 +417,23 @@
     font-size: 0.8rem;
     line-height: 1.6;
   }
-  .nlist {
-    border-top: 1px solid var(--border);
-  }
+  .nlist { display: grid; gap: 16px; margin: 20px 0; }
+  .channel-heading, .channel-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+  .channel-heading { padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+  .channel-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 16px; }
+  .channel-field { display: flex; flex-direction: column; gap: 8px; min-width: 0; font-size: 12px; color: var(--text-dim); }
+  .channel-actions { padding-top: 16px; border-top: 1px solid var(--border); }
+  .channel-actions .deflt { margin-right: auto; }
   .nrow {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    flex-wrap: wrap;
-    padding: 0.45rem 0;
-    border-bottom: 1px solid var(--border);
+    display: grid;
+    gap: 20px;
+    padding: 20px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
   }
   .nname {
-    flex: 0 1 9rem;
-    font-family: var(--mono, ui-monospace, monospace);
+    flex: 1 1 12rem;
+    max-width: 28rem;
   }
   .ntype {
     font-size: 0.72rem;
@@ -411,19 +442,7 @@
     color: var(--text-dim);
     min-width: 4.2rem;
   }
-  .grow {
-    flex: 1 1 12rem;
-  }
-  .topic {
-    flex: 0 1 9rem;
-  }
-  .port {
-    flex: 0 1 5rem;
-    min-width: 0;
-  }
-  .tls {
-    flex: 0 1 8rem;
-  }
+  .grow, .topic, .tls { width: 100%; min-width: 0; }
   .deflt {
     display: inline-flex;
     align-items: center;
@@ -444,7 +463,10 @@
     display: flex;
     align-items: center;
     gap: 0.6rem;
-    margin-top: 1rem;
+    flex-wrap: wrap;
+    margin-top: 24px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
   }
   .spacer {
     flex: 1;

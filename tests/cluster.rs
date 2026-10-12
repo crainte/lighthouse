@@ -427,6 +427,84 @@ async fn a_node_with_no_seeds_stays_alone() {
     assert_eq!(view["link_stale_after_ms"], (NO_TIMEOUT * 1000) as i64);
 }
 
+/// Decommissioning: an admin removes a member from any survivor, the removal
+/// gossips, and the removed process is refused (410) everywhere it was heard
+/// of — including when it returns as a fresh process with the same id.
+#[tokio::test]
+async fn a_decommissioned_member_is_removed_everywhere_and_cannot_return() {
+    let c = spawn_node("c", vec![], NO_TIMEOUT).await;
+    let b = spawn_node("b", vec![format!("http://{}", c.addr)], NO_TIMEOUT).await;
+    let a = spawn_node("a", vec![format!("http://{}", b.addr)], NO_TIMEOUT).await;
+    let (sa, sb, sc) = (
+        login(a.addr).await,
+        login(b.addr).await,
+        login(c.addr).await,
+    );
+    for _ in 0..3 {
+        gossip_step(a.addr, &sa, b.addr).await;
+        gossip_step(b.addr, &sb, c.addr).await;
+    }
+
+    let decommission = |addr: SocketAddr, session: String, id: &'static str| async move {
+        reqwest::Client::new()
+            .delete(format!("http://{addr}/api/v1/admin/cluster/members/{id}"))
+            .header(reqwest::header::COOKIE, session)
+            .send()
+            .await
+            .unwrap()
+            .status()
+    };
+    assert_eq!(decommission(a.addr, sa.clone(), "a").await, 400);
+    assert_eq!(decommission(a.addr, sa.clone(), "nope").await, 404);
+    assert_eq!(
+        reqwest::Client::new()
+            .delete(format!("http://{}/api/v1/admin/cluster/members/c", a.addr))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401,
+        "decommissioning is admin-only"
+    );
+    assert_eq!(decommission(a.addr, sa.clone(), "c").await, 200);
+
+    gossip_step(a.addr, &sa, b.addr).await;
+    let state_of = |view: &Value, id: &str| {
+        view["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["node_id"] == id)
+            .map(|m| m["state"].clone())
+    };
+    assert_eq!(
+        state_of(&cluster_view(b.addr, &sb).await, "c"),
+        Some(json!("removed"))
+    );
+
+    // `c` pings `b` as a fresh process: refused, and nothing it says sticks.
+    let view_c = cluster_view(c.addr, &sc).await;
+    let res = reqwest::Client::new()
+        .post(format!("http://{}/internal/cluster/ping", b.addr))
+        .bearer_auth(PEER_TOKEN)
+        .json(&json!({
+            "node_id": "c",
+            "url": view_c["self"]["url"],
+            "generation": view_c["self"]["generation"].as_i64().unwrap() + 1_000,
+            "members": view_c["members"],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 410);
+    for (addr, session) in [(a.addr, &sa), (b.addr, &sb)] {
+        assert_eq!(
+            state_of(&cluster_view(addr, session).await, "c"),
+            Some(json!("removed"))
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 2. Failure detection
 // ---------------------------------------------------------------------------

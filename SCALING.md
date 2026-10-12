@@ -1506,6 +1506,40 @@ edit is never overwritten, and peers converge through anti-entropy. Node identit
 - Building the push summary is still an O(checks) database job per push interval on
   the publisher: 396 ms every 5 s at 100k, about 8% of the worker.
 
+## Region registration and membership removal
+
+### Regions attach themselves
+
+A region is not declared on the global tier. It holds one registration key (`wac_<id>.<secret>`). The key is minted in global Admin > Cluster > Regions, or provisioned once at boot with `[[global.provision]]`. The global tier stores a salted hash bound to the region name, the same model as agent credentials. A push authenticates by key, and a push that names any region other than the bound one gets 403. The region's first push attaches it. Its coordinators' `advertise_url`s become its endpoints, so a single-node region must set `advertise_url` too.
+
+- **Global → region auth is derived, not shared.** The global tier calls a region with `HMAC-SHA256(key, "lighthouse/global-relay")`. Every coordinator in the region derives this from the key it already holds, and the global tier learns it from the authenticated push. It lets the caller into that one region and cannot be used to push as the region. A compromised region therefore cannot impersonate the global tier to its neighbours, which a shared token allowed.
+- **One record per region.** The record holds the credential hash, learned endpoints and relay token. It is stored as a `Setting` under `region:<name>` and replicated through the existing global-to-global config plane (an immediate broadcast, plus anti-entropy as the backstop). Every global node can then authenticate and reach every region, including nodes that never receive that region's pushes.
+- **Writes happen only when something changes.** The registry is held in memory, so pushes never read the database. A record is rewritten only when a push brings a new endpoint or a new relay token. At steady state the cost is zero writes per push.
+- **Rotation is a re-mint.** The relay token is cleared and relearned on the next push.
+
+### Removing a region
+
+Removal tombstones the record. The LWW tombstone revokes the key on every global node, and neither a stale peer entry nor `[[global.provision]]` on reboot can bring it back. Removal also drops the region's cache and routing entry, which takes its incidents with it. The region's coordinators get 401 on push.
+
+The region is stripped from every check's placement. A check placed only in the removed region is disabled rather than left with an empty placement, because an empty placement means "every region". Disabling is the conservative choice. Stripping is one catalogue pass per removal, which is rare.
+
+The region's own database is not touched, because it may already be gone. Re-adding the region means minting a new key.
+
+### Decommissioning a cluster member
+
+The same `Cluster` type serves coordinators and global nodes. A decommission sets a terminal `removed` member state, which:
+
+- gossips in ping bodies like any other member entry;
+- outranks every generation;
+- is never pinged, replicated to, or retried as a seed;
+- causes the removed node's own pings to be answered 410. That node then fences itself: no pings, empty `live_urls`.
+
+Rejoining requires a new `node_id`. A wiped node gets one automatically. Membership is now persisted (only when its shape changes, not per heartbeat), so a restart cannot forget a tombstone. Per-peer raw-data gaps are purged for the member's address unless a live replacement now holds it.
+
+### Probe cadence across restarts
+
+Retry and down cadence live in the agent. Failure runs are kept in a map that survives check-loop respawns (any config edit). On a cold start, `/api/v1/agent/checks` returns the caller's non-zero runs (`failing`), so a restarted agent resumes down cadence instead of waiting out an hourly schedule. The hint covers only the caller's assigned checks and only the non-zero runs among them, so the payload scales with failures, not with the catalogue.
+
 ## Scaling milestones
 
 ### Now: identity correctness

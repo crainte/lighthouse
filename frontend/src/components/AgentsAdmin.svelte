@@ -53,10 +53,7 @@
   let sortKey = $state<SortKey>('status');
   let sortDir = $state<1 | -1>(1);
 
-  /** Location grouping is subordinate to the flat list: off until asked for,
-   *  because at fleet scale you search and filter far more often than you
-   *  browse a tree. */
-  let grouped = $state(false);
+  let grouped = $state(true);
   /** Keyed by the group row's own key, so one record covers regions and zones. */
   let collapsed = $state<Record<string, boolean>>({});
 
@@ -393,7 +390,7 @@
     </OrphanBanner>
   {/if}
 
-  <div class="admin-panel">
+  <div class="admin-panel fleet-workspace">
     <p class="admin-muted lead">
       Agents appear automatically when they report results. Review connectivity and assignments,
       or retire agents that are no longer in service.

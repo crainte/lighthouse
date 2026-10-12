@@ -20,8 +20,11 @@
   } = $props();
 </script>
 
-<!-- What an operator reads before anything else: one line of counts, no cards,
-     no hero number — the point is comparing six figures at a glance. -->
+<div class="fleet-pulse">
+  <div class="pulse-heading"><span>Fleet connectivity</span><strong>{fleet.up}<span> / {agentCount} reporting</span></strong></div>
+  <div class="pulse-track" role="img" aria-label={`${fleet.up} reporting and ${fleet.silent} silent out of ${agentCount} agents`}><span style={`width: ${agentCount ? fleet.up / agentCount * 100 : 0}%`}></span></div>
+  <p>Agent connectivity, independent of the services they monitor.</p>
+</div>
 <div class="summary">
   <div class="tile">
     <span class="tile-value">{agentCount}</span>
@@ -69,29 +72,41 @@
 {/if}
 
 <style>
+  .fleet-pulse { padding: 24px; border: 1px solid var(--ad-line); border-radius: 9px; background: var(--ad-panel); }
+  .pulse-heading { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 12px; font-size: 14px; }
+  .pulse-heading strong { color: var(--ad-green); font-size: 28px; }
+  .pulse-heading strong span { color: var(--ad-dim); font-size: 13px; font-weight: 400; }
+  .pulse-track { height: 8px; background: #51422c; border-radius: 4px; overflow: hidden; margin-top: 20px; }
+  .pulse-track > span { display: block; height: 100%; background: var(--ad-green); }
+  .fleet-pulse p { color: var(--ad-dim); font-size: 12px; margin: 14px 0 0; }
+  @media (max-width: 700px) { .summary { grid-template-columns: repeat(3, minmax(0, 1fr)); } .tile { padding: 16px; } }
+
   .summary {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: stretch;
-    gap: 1.4rem;
-    padding: 0 0 0.7rem;
-    border-bottom: 1px solid var(--border);
-    margin-bottom: 0.8rem;
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 1px;
+    background: var(--ad-line);
+    border: 1px solid var(--ad-line);
+    border-radius: 8px;
+    overflow: hidden;
+    margin: 16px 0 28px;
   }
   .tile {
     display: flex;
-    align-items: baseline;
-    gap: 0.35rem;
+    flex-direction: column;
+    gap: 10px;
+    padding: 18px 20px;
+    background: var(--ad-panel);
   }
   .tile-value {
-    font-size: 1.05rem;
+    font-size: 24px;
     font-weight: 600;
     font-variant-numeric: tabular-nums;
   }
   .tile-label {
     font-size: 0.72rem;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
+    text-transform: none;
+    letter-spacing: 0;
     color: var(--text-dim);
   }
   .tile-value.up {

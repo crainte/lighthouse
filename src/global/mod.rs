@@ -21,6 +21,7 @@ pub mod cluster;
 pub mod incidents;
 mod merge;
 pub mod reconcile;
+pub mod regions;
 mod relay;
 mod routes;
 pub mod store;
@@ -57,11 +58,9 @@ struct Inner {
     cache: GlobalCache,
     alerter: GlobalAlerter,
     auth: crate::auth::Auth,
-    /// Secret regional coordinators present on `/internal/global/*`. Also the
-    /// credential the global node presents *back* to a region as a `Bearer` to
-    /// relay admin operations an operator drives from the global dashboard,
-    /// and as the push destination for the durable catalogue in `store`.
-    token: Option<String>,
+    /// Registered regions: who may push, and the relay token each one
+    /// accepts back. See `regions`.
+    regions: regions::Registry,
     secure_cookies: bool,
     /// Reverse proxies trusted to supply `X-Forwarded-For` for login rate
     /// limiting, parsed by `GlobalConfig::validate`. `new` is not fallible,
@@ -105,11 +104,11 @@ impl GlobalNode {
     /// needs that a cache-only one did not. Everything else is unchanged
     /// from before Phase 1.
     pub async fn new(cfg: &GlobalConfig) -> anyhow::Result<Self> {
-        let cache = GlobalCache::new(cfg.region_staleness_secs, &cfg.regions);
-        // Signing key from the shared push token when present, so a restart
-        // does not invalidate every admin session — the same trick the
-        // coordinator uses with its peer token.
-        let auth = match cfg.resolved_token() {
+        let cache = GlobalCache::new(cfg.region_staleness_secs);
+        // Signing key from the global peer token when present, so a restart
+        // does not invalidate every admin session and a session is valid on
+        // every global node — the same trick the coordinator uses.
+        let auth = match cfg.resolved_peer_token() {
             Some(token) => {
                 crate::auth::Auth::with_signing_key(cfg.resolved_admin_password(), token.as_bytes())
             }
@@ -136,18 +135,19 @@ impl GlobalNode {
                     Some(token),
                     cfg.peer_timeout_secs,
                 );
+                c.restore(store.cluster_members().await.unwrap_or_default());
                 Some(Arc::new(c))
             }
             _ => None,
         };
         let peer_token = cfg.resolved_peer_token();
         let (events, _) = broadcast::channel(256);
-        Ok(Self {
+        let node = Self {
             inner: Arc::new(Inner {
                 cache,
                 alerter: GlobalAlerter::new(cfg.notifiers.clone()),
                 auth,
-                token: cfg.resolved_token(),
+                regions: regions::Registry::default(),
                 secure_cookies: cfg.secure_cookies,
                 trusted_proxies: crate::security::TrustedProxies::parse(&cfg.trusted_proxies)
                     .unwrap_or_default(),
@@ -173,7 +173,10 @@ impl GlobalNode {
                 region_reconcile_repair_failures: AtomicU64::new(0),
                 region_reconcile_last_success_ms: AtomicI64::new(0),
             }),
-        })
+        };
+        node.load_regions().await?;
+        node.provision_regions(&cfg.provision).await?;
+        Ok(node)
     }
     pub fn spawn_background(&self) {
         cluster::spawn(self);
@@ -313,8 +316,20 @@ mod tests {
 
     // ---- Placement-scoped configuration, Phase 1 & 4 (SCALING.md) ----
 
-    use crate::config::{CoordinatorConfig, GlobalPushConfig, GlobalRegion};
+    use crate::config::{CoordinatorConfig, GlobalPushConfig, ProvisionedCredential};
     use crate::coordinator::Coordinator;
+
+    const US_KEY: &str = "wac_us.us-registration-secret";
+    const TW_KEY: &str = "wac_tw.tw-registration-secret";
+
+    fn push_config(url: &str, key: &str, push_secs: u64) -> Option<GlobalPushConfig> {
+        Some(GlobalPushConfig {
+            url: url.into(),
+            token: Some(key.into()),
+            token_env: None,
+            push_secs,
+        })
+    }
 
     async fn serve_router(router: Router) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -343,17 +358,11 @@ mod tests {
     /// operator.
     #[tokio::test]
     async fn admin_write_survives_an_unreachable_region_and_converges_once_it_returns() {
-        let global_token = "global-token";
         let admin_password = "secret";
         let coord = Coordinator::new(&CoordinatorConfig {
             db_path: ":memory:".into(),
             region: "us".into(),
-            global: Some(GlobalPushConfig {
-                url: "http://ignored.invalid".into(),
-                token: Some(global_token.into()),
-                token_env: None,
-                push_secs: 3600,
-            }),
+            global: push_config("http://ignored.invalid", US_KEY, 3600),
             ..Default::default()
         })
         .await
@@ -361,19 +370,21 @@ mod tests {
         let coord_addr = serve_router(coord.clone().router()).await;
 
         let node = GlobalNode::new(&GlobalConfig {
-            token: Some(global_token.into()),
             admin_password: Some(admin_password.into()),
             db_path: ":memory:".into(),
-            regions: vec![GlobalRegion {
-                name: "us".into(),
-                // Port 1 is a reserved, never-listening port: an admin write
-                // must not depend on this ever answering.
-                endpoints: vec!["http://127.0.0.1:1".into()],
+            provision: vec![ProvisionedCredential {
+                zone: String::new(),
+                region: "us".into(),
+                token: Some(US_KEY.into()),
+                token_env: None,
             }],
             ..Default::default()
         })
         .await
         .unwrap();
+        // Port 1 is a reserved, never-listening port: an admin write must not
+        // depend on this ever answering.
+        node.inner.cache.seed("us", &["http://127.0.0.1:1".into()]);
         let cookie = admin_cookie(&node, admin_password);
         let global_addr = serve_router(node.clone().router()).await;
         let client = reqwest::Client::new();
@@ -420,13 +431,28 @@ mod tests {
             delta_base: None,
             removed: Vec::new(),
         };
-        client
+        // Another region's key, or none, cannot publish as `us`.
+        for (key, status) in [(Some(TW_KEY), 401), (None, 401)] {
+            let mut req = client
+                .post(format!("http://{global_addr}/internal/global/state"))
+                .json(&push);
+            if let Some(key) = key {
+                req = req.bearer_auth(key);
+            }
+            assert_eq!(req.send().await.unwrap().status(), status);
+        }
+        let pushed = client
             .post(format!("http://{global_addr}/internal/global/state"))
-            .bearer_auth(global_token)
+            .bearer_auth(US_KEY)
             .json(&push)
             .send()
             .await
             .unwrap();
+        assert_eq!(pushed.status(), StatusCode::OK);
+        assert!(
+            node.inner.regions.relay_token("us").is_some(),
+            "the first push attaches the region"
+        );
 
         // Drive one reconciliation pass directly rather than waiting on
         // `reconcile::RECONCILE_INTERVAL`.
@@ -444,16 +470,162 @@ mod tests {
         assert_eq!(checks[0].name, "web");
     }
 
+    fn provision(region: &str, key: &str) -> ProvisionedCredential {
+        ProvisionedCredential {
+            zone: String::new(),
+            region: region.into(),
+            token: Some(key.into()),
+            token_env: None,
+        }
+    }
+
+    fn bare_push(region: &str) -> wire::RegionStatePush {
+        wire::RegionStatePush {
+            region: region.into(),
+            origin: format!("coordinator-{region}"),
+            advertise_url: Some(format!("http://coordinator-{region}:8080")),
+            pushed_at: chrono::Utc::now().timestamp_millis(),
+            region_health: crate::models::NodeState::Up,
+            agents_healthy: 1,
+            agents_total: 1,
+            checks: Vec::new(),
+            epoch: 1,
+            seq: 1,
+            delta_base: None,
+            removed: Vec::new(),
+        }
+    }
+
+    /// Removing a region revokes its key on every global node, drops it from
+    /// routing, strips it from placement (disabling a check placed only
+    /// there, since an empty placement means "everywhere"), and nothing —
+    /// a stale peer entry, a reboot's provisioning, the region pushing again
+    /// — brings it back.
+    #[tokio::test]
+    async fn a_removed_region_is_revoked_unplaced_and_never_resurrected() {
+        let password = "secret";
+        let peer_token = "global-peer-token";
+        let node = GlobalNode::new(&GlobalConfig {
+            admin_password: Some(password.into()),
+            db_path: ":memory:".into(),
+            node_id: Some("global-a".into()),
+            peer_token: Some(peer_token.into()),
+            provision: vec![provision("us", US_KEY), provision("tw", TW_KEY)],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let addr = serve_router(node.clone().router()).await;
+        let cookie = admin_cookie(&node, password);
+        let client = reqwest::Client::new();
+        let push = |key: &'static str| {
+            client
+                .post(format!("http://{addr}/internal/global/state"))
+                .bearer_auth(key)
+                .json(&bare_push("tw"))
+                .send()
+        };
+        assert_eq!(push(TW_KEY).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            push(US_KEY).await.unwrap().status(),
+            StatusCode::FORBIDDEN,
+            "a key publishes only as its own region"
+        );
+        let stale_record = node
+            .inner
+            .store
+            .config_entry(
+                crate::coordinator::storage::ConfigKind::Setting,
+                "region:tw",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut ids = std::collections::HashMap::new();
+        for (name, regions) in [
+            ("only-tw", vec!["tw"]),
+            ("both", vec!["us", "tw"]),
+            ("anywhere", vec![]),
+        ] {
+            let (check, _) = node
+                .inner
+                .store
+                .create_check(serde_json::json!({
+                    "name": name, "type": "http", "target": "https://example.com",
+                    "placement": {"regions": regions},
+                }))
+                .await
+                .ok()
+                .unwrap();
+            ids.insert(name, check.id);
+        }
+
+        let removed = client
+            .delete(format!("http://{addr}/api/v1/admin/regions/tw"))
+            .header(reqwest::header::COOKIE, &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(removed.status(), StatusCode::OK);
+        let body: serde_json::Value = removed.json().await.unwrap();
+        assert_eq!(body["checks_updated"], 2);
+
+        assert_eq!(
+            push(TW_KEY).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!(node
+            .inner
+            .cache
+            .roster(now)
+            .iter()
+            .all(|r| r.region != "tw"));
+        let (checks, _, _) = node.inner.store.list_checks(0, 10).await.unwrap();
+        let by_id = |name: &str| checks.iter().find(|c| c.id == ids[name]).unwrap();
+        assert!(!by_id("only-tw").enabled);
+        assert!(by_id("only-tw").placement.regions.is_empty());
+        assert_eq!(by_id("both").placement.regions, vec!["us".to_string()]);
+        assert!(by_id("both").enabled);
+        assert!(by_id("anywhere").placement.regions.is_empty());
+        assert!(by_id("anywhere").enabled);
+
+        // A stale copy of the record arriving from a peer loses to the
+        // tombstone, and reboot provisioning skips a removed region.
+        node.apply_peer_entries(vec![stale_record]).await.unwrap();
+        node.provision_regions(&[provision("tw", TW_KEY)])
+            .await
+            .unwrap();
+        assert!(node.inner.regions.get("tw").is_none());
+        assert_eq!(
+            push(TW_KEY).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // A peer that only learns by anti-entropy agrees.
+        let peer = GlobalNode::new(&GlobalConfig {
+            db_path: ":memory:".into(),
+            node_id: Some("global-b".into()),
+            peer_token: Some(peer_token.into()),
+            advertise_url: Some("http://global-b.invalid".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        cluster::reconcile_with_peer(&peer, &format!("http://{addr}")).await;
+        assert!(peer.inner.regions.get("us").is_some());
+        assert!(peer.inner.regions.get("tw").is_none());
+    }
+
     /// Phase 4: two global nodes reconcile the catalogue between themselves —
     /// a write applied only to one converges onto the other through the same
     /// digest-and-backfill anti-entropy a coordinator's peers already use.
     #[tokio::test]
     async fn two_global_nodes_converge_through_anti_entropy() {
-        let global_token = "global-token";
         let peer_token = "global-peer-token";
 
         let node_a = GlobalNode::new(&GlobalConfig {
-            token: Some(global_token.into()),
             db_path: ":memory:".into(),
             node_id: Some("global-a".into()),
             peer_token: Some(peer_token.into()),
@@ -477,7 +649,6 @@ mod tests {
             .unwrap();
 
         let node_b = GlobalNode::new(&GlobalConfig {
-            token: Some(global_token.into()),
             db_path: ":memory:".into(),
             node_id: Some("global-b".into()),
             peer_token: Some(peer_token.into()),
@@ -516,7 +687,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("global.duckdb").to_string_lossy().to_string();
         let cfg = GlobalConfig {
-            token: Some("global-token".into()),
             db_path: db_path.clone(),
             ..Default::default()
         };
@@ -575,12 +745,7 @@ mod tests {
         let coord = Coordinator::new(&CoordinatorConfig {
             db_path: ":memory:".into(),
             region: "us".into(),
-            global: Some(GlobalPushConfig {
-                url: format!("http://{addr}"),
-                token: Some("global-token".into()),
-                token_env: None,
-                push_secs: 1,
-            }),
+            global: push_config(&format!("http://{addr}"), US_KEY, 1),
             ..Default::default()
         })
         .await
@@ -600,12 +765,7 @@ mod tests {
         let coord = Coordinator::new(&CoordinatorConfig {
             db_path: ":memory:".into(),
             region: "us".into(),
-            global: Some(GlobalPushConfig {
-                url: "http://127.0.0.1:1".into(),
-                token: Some("global-token".into()),
-                token_env: None,
-                push_secs: 1,
-            }),
+            global: push_config("http://127.0.0.1:1", US_KEY, 1),
             ..Default::default()
         })
         .await
@@ -639,17 +799,11 @@ mod tests {
     /// `tw`'s store at all.
     #[tokio::test]
     async fn a_check_placed_to_one_region_never_reaches_another() {
-        let global_token = "global-token";
         let admin_password = "secret";
         let us = Coordinator::new(&CoordinatorConfig {
             db_path: ":memory:".into(),
             region: "us".into(),
-            global: Some(GlobalPushConfig {
-                url: "http://ignored.invalid".into(),
-                token: Some(global_token.into()),
-                token_env: None,
-                push_secs: 3600,
-            }),
+            global: push_config("http://ignored.invalid", US_KEY, 3600),
             ..Default::default()
         })
         .await
@@ -659,12 +813,7 @@ mod tests {
         let tw = Coordinator::new(&CoordinatorConfig {
             db_path: ":memory:".into(),
             region: "tw".into(),
-            global: Some(GlobalPushConfig {
-                url: "http://ignored.invalid".into(),
-                token: Some(global_token.into()),
-                token_env: None,
-                push_secs: 3600,
-            }),
+            global: push_config("http://ignored.invalid", TW_KEY, 3600),
             ..Default::default()
         })
         .await
@@ -672,23 +821,14 @@ mod tests {
         let tw_addr = serve_router(tw.clone().router()).await;
 
         let node = GlobalNode::new(&GlobalConfig {
-            token: Some(global_token.into()),
             admin_password: Some(admin_password.into()),
             db_path: ":memory:".into(),
-            regions: vec![
-                GlobalRegion {
-                    name: "us".into(),
-                    endpoints: vec![format!("http://{us_addr}")],
-                },
-                GlobalRegion {
-                    name: "tw".into(),
-                    endpoints: vec![format!("http://{tw_addr}")],
-                },
-            ],
             ..Default::default()
         })
         .await
         .unwrap();
+        node.attach_for_test("us", US_KEY, &[format!("http://{us_addr}")]);
+        node.attach_for_test("tw", TW_KEY, &[format!("http://{tw_addr}")]);
         let cookie = admin_cookie(&node, admin_password);
         let global_addr = serve_router(node.clone().router()).await;
         let client = reqwest::Client::new();
@@ -737,16 +877,10 @@ mod tests {
     /// `config_digest`'s Check-kind count at 1 (the tombstone row), not 0.
     #[tokio::test]
     async fn unplace_writes_no_tombstone_and_the_holding_region_keeps_the_check() {
-        let global_token = "global-token";
         let us = Coordinator::new(&CoordinatorConfig {
             db_path: ":memory:".into(),
             region: "us".into(),
-            global: Some(GlobalPushConfig {
-                url: "http://ignored.invalid".into(),
-                token: Some(global_token.into()),
-                token_env: None,
-                push_secs: 3600,
-            }),
+            global: push_config("http://ignored.invalid", US_KEY, 3600),
             ..Default::default()
         })
         .await
@@ -756,12 +890,7 @@ mod tests {
         let tw = Coordinator::new(&CoordinatorConfig {
             db_path: ":memory:".into(),
             region: "tw".into(),
-            global: Some(GlobalPushConfig {
-                url: "http://ignored.invalid".into(),
-                token: Some(global_token.into()),
-                token_env: None,
-                push_secs: 3600,
-            }),
+            global: push_config("http://ignored.invalid", TW_KEY, 3600),
             ..Default::default()
         })
         .await
@@ -769,22 +898,13 @@ mod tests {
         let tw_addr = serve_router(tw.clone().router()).await;
 
         let node = GlobalNode::new(&GlobalConfig {
-            token: Some(global_token.into()),
             db_path: ":memory:".into(),
-            regions: vec![
-                GlobalRegion {
-                    name: "us".into(),
-                    endpoints: vec![format!("http://{us_addr}")],
-                },
-                GlobalRegion {
-                    name: "tw".into(),
-                    endpoints: vec![format!("http://{tw_addr}")],
-                },
-            ],
             ..Default::default()
         })
         .await
         .unwrap();
+        node.attach_for_test("us", US_KEY, &[format!("http://{us_addr}")]);
+        node.attach_for_test("tw", TW_KEY, &[format!("http://{tw_addr}")]);
 
         // No placement named: every region admits it, so both get it.
         let (_, entry) = node
@@ -867,16 +987,10 @@ mod tests {
         }
         type RequestLog = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
 
-        let global_token = "global-token";
         let coord = Coordinator::new(&CoordinatorConfig {
             db_path: ":memory:".into(),
             region: "us".into(),
-            global: Some(GlobalPushConfig {
-                url: "http://ignored.invalid".into(),
-                token: Some(global_token.into()),
-                token_env: None,
-                push_secs: 3600,
-            }),
+            global: push_config("http://ignored.invalid", US_KEY, 3600),
             ..Default::default()
         })
         .await
@@ -892,16 +1006,12 @@ mod tests {
         let coord_addr = serve_router(router).await;
 
         let node = GlobalNode::new(&GlobalConfig {
-            token: Some(global_token.into()),
             db_path: ":memory:".into(),
-            regions: vec![GlobalRegion {
-                name: "us".into(),
-                endpoints: vec![format!("http://{coord_addr}")],
-            }],
             ..Default::default()
         })
         .await
         .unwrap();
+        node.attach_for_test("us", US_KEY, &[format!("http://{coord_addr}")]);
         node.inner
             .store
             .create_check(serde_json::json!({
@@ -946,16 +1056,10 @@ mod tests {
     /// everything".
     #[tokio::test]
     async fn a_region_cut_off_from_global_keeps_what_it_was_placed() {
-        let global_token = "global-token";
         let coord = Coordinator::new(&CoordinatorConfig {
             db_path: ":memory:".into(),
             region: "us".into(),
-            global: Some(GlobalPushConfig {
-                url: "http://127.0.0.1:1".into(),
-                token: Some(global_token.into()),
-                token_env: None,
-                push_secs: 3600,
-            }),
+            global: push_config("http://127.0.0.1:1", US_KEY, 3600),
             ..Default::default()
         })
         .await
@@ -963,16 +1067,12 @@ mod tests {
         let coord_addr = serve_router(coord.clone().router()).await;
 
         let node = GlobalNode::new(&GlobalConfig {
-            token: Some(global_token.into()),
             db_path: ":memory:".into(),
-            regions: vec![GlobalRegion {
-                name: "us".into(),
-                endpoints: vec![format!("http://{coord_addr}")],
-            }],
             ..Default::default()
         })
         .await
         .unwrap();
+        node.attach_for_test("us", US_KEY, &[format!("http://{coord_addr}")]);
         node.inner
             .store
             .create_check(serde_json::json!({
@@ -1047,12 +1147,12 @@ mod tests {
         ))
         .await;
         let node = GlobalNode::new(&GlobalConfig {
-            token: Some("global-token".into()),
             db_path: ":memory:".into(),
             ..Default::default()
         })
         .await
         .unwrap();
+        node.attach_for_test("us", US_KEY, &[]);
         reconcile::reconcile_region(
             &node,
             "us",
@@ -1090,7 +1190,6 @@ mod tests {
         ))
         .await;
         let node = GlobalNode::new(&GlobalConfig {
-            token: Some("global-token".into()),
             peer_token: Some("peer-token".into()),
             advertise_url: Some("http://global.invalid".into()),
             db_path: ":memory:".into(),
@@ -1098,6 +1197,7 @@ mod tests {
         })
         .await
         .unwrap();
+        node.attach_for_test("us", US_KEY, &[]);
         reconcile::reconcile_region(&node, "empty", &[]).await;
         assert_eq!(
             reconciliation_metric(
@@ -1148,7 +1248,6 @@ mod tests {
         )
         .await;
         let node = GlobalNode::new(&GlobalConfig {
-            token: Some("global-token".into()),
             peer_token: Some("peer-token".into()),
             advertise_url: Some("http://global.invalid".into()),
             db_path: ":memory:".into(),
@@ -1156,6 +1255,7 @@ mod tests {
         })
         .await
         .unwrap();
+        node.attach_for_test("us", US_KEY, &[]);
         assert!(node
             .inner
             .store
@@ -1261,7 +1361,6 @@ mod tests {
     #[tokio::test]
     async fn global_metrics_report_its_own_catalogue_database_activity() {
         let node = GlobalNode::new(&GlobalConfig {
-            token: Some("global-token".into()),
             admin_password: Some("secret".into()),
             db_path: ":memory:".into(),
             ..Default::default()

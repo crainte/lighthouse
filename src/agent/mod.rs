@@ -7,13 +7,14 @@ mod tcp;
 
 use crate::config::{AgentConfig, CheckConfig};
 use crate::http::ZstdJson;
-use crate::models::{CheckKind, CheckResult, ResultBatch, Status};
+use crate::models::{CheckId, CheckKind, CheckResult, ResultBatch, Status};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::{Resolver, TokioResolver};
 use std::{
+    collections::HashMap,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, OnceLock,
@@ -385,44 +386,41 @@ fn scheduling_status(check: &CheckConfig, result: &CheckResult) -> Status {
     }
 }
 
-fn next_cadence(status: Status, failures: &mut u32, threshold: u32) -> ProbeCadence {
-    match status {
-        Status::Down => {
-            *failures = failures.saturating_add(1);
-            if *failures >= threshold.max(1) {
-                ProbeCadence::Down
-            } else {
-                ProbeCadence::Retry
-            }
-        }
-        Status::Up => {
-            *failures = 0;
-            ProbeCadence::Scheduled
-        }
-        Status::Unknown if *failures > 0 => ProbeCadence::Retry,
-        Status::Unknown => ProbeCadence::Scheduled,
+/// Consecutive failures per check, owned by `sync_loop` and shared with every
+/// check loop. A respawn (any check-list change) or a restarted agent's
+/// coordinator hint resumes retry/down cadence from here instead of falling
+/// back to the normal schedule, which for an hourly check would hide a
+/// recovery for up to an hour. Every probed check has an entry, zero included,
+/// so a lagging hint never overrides a fresher local observation.
+type FailureMemory = Arc<parking_lot::Mutex<HashMap<CheckId, u32>>>;
+
+fn cadence_for(failures: u32, threshold: u32) -> ProbeCadence {
+    if failures == 0 {
+        ProbeCadence::Scheduled
+    } else if failures >= threshold.max(1) {
+        ProbeCadence::Down
+    } else {
+        ProbeCadence::Retry
     }
 }
 
-pub fn spawn_check_loops(
-    cfg: &AgentConfig,
-    checks: Vec<CheckConfig>,
-    tx: mpsc::Sender<CheckResult>,
-) -> Result<Vec<tokio::task::JoinHandle<()>>> {
-    cfg.validate()?;
-    spawn_check_loops_with_permits(
-        cfg,
-        checks,
-        tx,
-        Arc::new(Semaphore::new(cfg.max_in_flight_probes)),
-    )
+/// Unknown leaves the run alone: an un-evaluable probe between two failures
+/// must not cancel a confirmation in progress, and mirrors `StateTracker`.
+fn next_cadence(status: Status, failures: &mut u32, threshold: u32) -> ProbeCadence {
+    match status {
+        Status::Down => *failures = failures.saturating_add(1),
+        Status::Up => *failures = 0,
+        Status::Unknown => {}
+    }
+    cadence_for(*failures, threshold)
 }
 
-fn spawn_check_loops_with_permits(
+fn spawn_check_loops(
     cfg: &AgentConfig,
     checks: Vec<CheckConfig>,
     tx: mpsc::Sender<CheckResult>,
     permits: Arc<Semaphore>,
+    memory: FailureMemory,
 ) -> Result<Vec<tokio::task::JoinHandle<()>>> {
     let probes = Probes::new()?;
     let mut handles = Vec::with_capacity(checks.len());
@@ -444,9 +442,10 @@ fn spawn_check_loops_with_permits(
         let tx = tx.clone();
         let permits = permits.clone();
         let metrics = benchmark_metrics();
+        let memory = memory.clone();
         handles.push(tokio::spawn(async move {
-            let mut cadence = ProbeCadence::Scheduled;
-            let mut failures = 0;
+            let mut failures = memory.lock().get(&check.id).copied().unwrap_or(0);
+            let mut cadence = cadence_for(failures, check.failures_before_down);
             loop {
                 let wait = match cadence {
                     ProbeCadence::Scheduled => {
@@ -498,6 +497,7 @@ fn spawn_check_loops_with_permits(
                     &mut failures,
                     check.failures_before_down,
                 );
+                memory.lock().insert(check.id, failures);
                 debug!(check = %check.name, latency = result.latency_ms, ?cadence, "check done");
                 if tx.send(result).await.is_err() {
                     break; // receiver gone, coordinator shutting down
@@ -532,7 +532,7 @@ fn urlencode(s: &str) -> String {
 /// the difference is a handful of tasks, and an aborted probe simply re-runs on
 /// the next tick. Diffing would buy nothing and could silently keep a stale
 /// interval running.
-pub async fn sync_loop(cfg: AgentConfig, tx: mpsc::Sender<CheckResult>, initial: Vec<CheckConfig>) {
+pub async fn sync_loop(cfg: AgentConfig, tx: mpsc::Sender<CheckResult>) {
     let client = reqwest::Client::new();
     // Identify ourselves so the coordinator can hand back only the checks this
     // agent is assigned, rather than every check it knows about.
@@ -567,19 +567,12 @@ pub async fn sync_loop(cfg: AgentConfig, tx: mpsc::Sender<CheckResult>, initial:
     let token = cfg.resolved_token();
 
     let permits = Arc::new(Semaphore::new(cfg.max_in_flight_probes));
-    let mut current = initial;
-    let mut handles =
-        match spawn_check_loops_with_permits(&cfg, current.clone(), tx.clone(), permits.clone()) {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(error = %e, "failed to start check loops");
-                return;
-            }
-        };
+    let memory = FailureMemory::default();
+    let mut current: Vec<CheckConfig> = Vec::new();
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
+    // The first tick fires immediately: the coordinator owns the check list.
     let mut poll = tokio::time::interval(std::time::Duration::from_secs(cfg.poll_secs.max(1)));
-    // The first tick fires immediately, which is what we want: the config file
-    // is only a cold-start fallback and the coordinator owns the real list.
     let mut last_rtt_ms: Option<u128> = None;
     loop {
         poll.tick().await;
@@ -595,7 +588,7 @@ pub async fn sync_loop(cfg: AgentConfig, tx: mpsc::Sender<CheckResult>, initial:
         let started = Instant::now();
         let sent = req.send().await;
         last_rtt_ms = Some(started.elapsed().as_millis());
-        let fetched = match sent {
+        let (fetched, failing) = match sent {
             Ok(r) if r.status().is_success() => match r.json::<AgentChecksResponse>().await {
                 Ok(body) => {
                     let (usable, skipped) = usable_checks(body.checks);
@@ -608,7 +601,7 @@ pub async fn sync_loop(cfg: AgentConfig, tx: mpsc::Sender<CheckResult>, initial:
                             "skipping checks this agent is too old to run; upgrade it"
                         );
                     }
-                    usable
+                    (usable, body.failing)
                 }
                 Err(e) => {
                     warn!(error = %e, "malformed check list from coordinator");
@@ -628,7 +621,8 @@ pub async fn sync_loop(cfg: AgentConfig, tx: mpsc::Sender<CheckResult>, initial:
             }
         };
 
-        if same_checks(&current, &fetched) {
+        let hinted = adopt_failure_hints(&memory, failing);
+        if !hinted && same_checks(&current, &fetched) {
             continue;
         }
         info!(
@@ -639,11 +633,14 @@ pub async fn sync_loop(cfg: AgentConfig, tx: mpsc::Sender<CheckResult>, initial:
             h.abort();
         }
         current = fetched;
-        handles = match spawn_check_loops_with_permits(
+        let ids: std::collections::HashSet<CheckId> = current.iter().map(|c| c.id).collect();
+        memory.lock().retain(|id, _| ids.contains(id));
+        handles = match spawn_check_loops(
             &cfg,
             current.clone(),
             tx.clone(),
             permits.clone(),
+            memory.clone(),
         ) {
             Ok(h) => h,
             Err(e) => {
@@ -666,15 +663,30 @@ pub async fn sync_loop(cfg: AgentConfig, tx: mpsc::Sender<CheckResult>, initial:
 /// A whole-struct comparison cannot drift. Its cost is a restart for edits that
 /// only affect presentation, which is a cancelled and respawned timer per
 /// check — far cheaper than a probe that is quietly wrong.
+/// Take the coordinator's failure runs for checks this process has not probed
+/// yet — a cold start, or a check newly assigned after failover. Returns
+/// whether any was adopted, since running loops only read memory at spawn.
+fn adopt_failure_hints(memory: &FailureMemory, failing: HashMap<CheckId, u32>) -> bool {
+    let mut memory = memory.lock();
+    let mut adopted = false;
+    for (id, n) in failing {
+        if n > 0 && !memory.contains_key(&id) {
+            memory.insert(id, n);
+            adopted = true;
+        }
+    }
+    adopted
+}
+
 fn same_checks(a: &[CheckConfig], b: &[CheckConfig]) -> bool {
     if a.len() != b.len() {
         return false;
     }
     // The feed's order is the operator's display order, which is not a reason
-    // to restart, so compare as sets keyed by the unique name.
+    // to restart, so compare as sets keyed by the immutable id.
     fn sorted(cs: &[CheckConfig]) -> Vec<&CheckConfig> {
         let mut v: Vec<&CheckConfig> = cs.iter().collect();
-        v.sort_by(|x, y| x.name.cmp(&y.name));
+        v.sort_by_key(|c| c.id);
         v
     }
     sorted(a) == sorted(b)
@@ -695,6 +707,8 @@ fn same_checks(a: &[CheckConfig], b: &[CheckConfig]) -> bool {
 #[derive(serde::Deserialize)]
 struct AgentChecksResponse {
     checks: Vec<serde_json::Value>,
+    #[serde(default)]
+    failing: HashMap<CheckId, u32>,
 }
 
 /// The check kinds this binary can probe, as wire names.
@@ -936,7 +950,8 @@ pub async fn poster_loop(cfg: AgentConfig, mut rx: mpsc::Receiver<CheckResult>) 
 #[cfg(test)]
 mod sync_tests {
     use super::{
-        acquire_probe_permit, next_cadence, poster_loop, same_checks, usable_checks, ProbeCadence,
+        acquire_probe_permit, adopt_failure_hints, next_cadence, poster_loop, same_checks,
+        spawn_check_loops, usable_checks, FailureMemory, ProbeCadence,
     };
     use crate::config::{AgentConfig, CheckConfig};
     use crate::models::{CheckId, CheckKind, CheckResult, ResultBatch, Status};
@@ -1164,6 +1179,68 @@ mod sync_tests {
             ProbeCadence::Scheduled
         );
         assert_eq!(failures, 0);
+        assert_eq!(
+            next_cadence(Status::Unknown, &mut failures, 2),
+            ProbeCadence::Scheduled,
+            "unknown with no failure run keeps the normal schedule"
+        );
+    }
+
+    /// A down check on a long schedule must not wait out that schedule to
+    /// notice recovery just because its loop was respawned (a config edit) or
+    /// the agent restarted and took the coordinator's hint.
+    #[tokio::test]
+    async fn a_respawned_loop_resumes_down_cadence_from_failure_memory() {
+        let check = CheckConfig {
+            name: "yearly".into(),
+            kind: CheckKind::Tcp,
+            target: "127.0.0.1:1".into(),
+            cron: "0 0 0 1 1 *".into(),
+            timeout_secs: 1,
+            failures_before_down: 2,
+            down_interval_secs: Some(1),
+            ..Default::default()
+        };
+        let cfg = AgentConfig::default();
+        let spawn = |memory: FailureMemory| {
+            let (tx, rx) = mpsc::channel(4);
+            let handles = spawn_check_loops(
+                &cfg,
+                vec![check.clone()],
+                tx,
+                Arc::new(Semaphore::new(1)),
+                memory,
+            )
+            .unwrap();
+            (handles, rx)
+        };
+
+        let (handles, mut rx) = spawn(FailureMemory::default());
+        assert!(
+            timeout(Duration::from_millis(2500), rx.recv())
+                .await
+                .is_err(),
+            "a check with no failure run waits for its schedule"
+        );
+        handles.iter().for_each(|h| h.abort());
+
+        let memory = FailureMemory::default();
+        assert!(adopt_failure_hints(
+            &memory,
+            [(check.id, 2), (CheckId::from_u128(9), 0)].into()
+        ));
+        assert!(
+            !adopt_failure_hints(&memory, [(check.id, 5)].into()),
+            "local memory wins over a later hint"
+        );
+        let (handles, mut rx) = spawn(memory.clone());
+        let result = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("down cadence probes within the down interval")
+            .unwrap();
+        assert_eq!(result.check_id, check.id);
+        assert_eq!(memory.lock().get(&check.id), Some(&3));
+        handles.iter().for_each(|h| h.abort());
     }
 
     #[test]

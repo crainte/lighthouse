@@ -411,6 +411,11 @@ struct AgentChecksResponse {
     /// references. Kept alongside the successful assignments so one regional
     /// configuration mistake does not make an entire fleet retain stale work.
     config_errors: Vec<AgentCheckConfigError>,
+    /// The caller's current failure run per assigned check, non-zero only, so
+    /// a restarted agent resumes retry/down cadence rather than waiting a
+    /// whole schedule to notice recovery.
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    failing: std::collections::HashMap<crate::models::CheckId, u32>,
 }
 
 /// A configuration error for an omitted check, naming the missing reference
@@ -470,6 +475,7 @@ pub(in crate::coordinator) async fn agent_checks_handler(
         return Json(AgentChecksResponse {
             checks,
             config_errors,
+            failing: Default::default(),
         })
         .into_response();
     };
@@ -541,10 +547,16 @@ pub(in crate::coordinator) async fn agent_checks_handler(
                 .any(|id| id == caller)
         })
         .collect();
+    let failing = coord
+        .inner
+        .tracker
+        .lock()
+        .failing(caller, mine.iter().map(|c| c.id));
     let (checks, config_errors) = resolve_checks_for_agent(&mine, |name| std::env::var(name).ok());
     Json(AgentChecksResponse {
         checks,
         config_errors,
+        failing,
     })
     .into_response()
 }

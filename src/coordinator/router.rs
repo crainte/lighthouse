@@ -22,8 +22,8 @@ use routes::incidents::{
 };
 use routes::peer::{
     alerts_backfill_handler, backfill_handler, cluster_ping_handler, cluster_view_handler,
-    config_entries_handler, config_handler, digest_handler, global_check_ids_handler,
-    global_config_digest_handler, global_config_handler, gossip_handler,
+    config_entries_handler, config_handler, decommission_member_handler, digest_handler,
+    global_check_ids_handler, global_config_digest_handler, global_config_handler, gossip_handler,
     incident_tombstones_backfill_handler, incidents_backfill_handler,
     latency_hour_backfill_handler, latency_minute_backfill_handler, raw_data_gaps_handler,
     replicate_handler, results_backfill_handler,
@@ -388,6 +388,10 @@ impl Coordinator {
             // The admin-facing membership view. Admin-gated, not peer-gated:
             // this is read by a human in the browser, not by another node.
             .route("/api/v1/cluster", get(cluster_view_handler))
+            .route(
+                "/api/v1/admin/cluster/members/:node_id",
+                delete(decommission_member_handler),
+            )
             // Retention-aware peer recovery (item B): standing raw-data gaps
             // this node has recorded, so an operator can see which checks
             // have holes and over what range instead of only a counter.
@@ -448,7 +452,7 @@ mod tests {
         let check_count = env_usize("LIGHTHOUSE_BENCH_CHECKS", 10_000);
         let region_count = env_usize("LIGHTHOUSE_BENCH_REGIONS", 3);
         let sample_count = env_usize("LIGHTHOUSE_BENCH_SAMPLES", 20).max(1);
-        let token = "benchmark-global-token";
+        let region_key = |region: usize| format!("wac_r{region}.benchmark");
         let coord = Coordinator::new(&CoordinatorConfig {
             db_path: ":memory:".into(),
             region: "region-0".into(),
@@ -515,7 +519,14 @@ mod tests {
         let regional_addr = serve(coord.clone().router()).await;
         let global_addr = serve(
             GlobalNode::new(&GlobalConfig {
-                token: Some(token.into()),
+                provision: (0..region_count)
+                    .map(|region| crate::config::ProvisionedCredential {
+                        zone: String::new(),
+                        region: format!("region-{region}"),
+                        token: Some(region_key(region)),
+                        token_env: None,
+                    })
+                    .collect(),
                 db_path: ":memory:".into(),
                 ..Default::default()
             })
@@ -681,7 +692,7 @@ mod tests {
                 push.seq = sample as u64 + 1;
                 let response = client
                     .post(&push_url)
-                    .bearer_auth(token)
+                    .bearer_auth(region_key(region))
                     .zstd_json(&push)
                     .send()
                     .await

@@ -1945,5 +1945,51 @@ button.ot-id:hover {
 .admin-app .form-actions { padding-top: 16px; border-top: 1px solid var(--ad-line); }
 .admin-app input:not([type=checkbox]):not([type=radio]), .admin-app select, .admin-app textarea { color: var(--ad-text); }
 .admin-app button { transition: background-color 140ms, border-color 140ms, color 140ms; }
+.admin-workspace { min-width: 0; }
+.admin-app .admin-workspace .admin-panel.fleet-workspace,
+.admin-app .admin-workspace .admin-panel.probe-workspace { padding: 0; border: 0; background: transparent; box-shadow: none; }
+.admin-workspace .fleet-workspace .controls,
+.admin-workspace .probe-workspace .controls { background: #0d1723; border: 1px solid var(--ad-line); border-radius: 8px; padding: 20px; margin: 24px 0 16px; }
+.admin-workspace .fleet-list, .admin-workspace .probe-ledger { background: var(--ad-panel); }
+.admin-workspace .fleet-list .region-heading { background: #0d1723; border-top: 12px solid var(--ad-bg); }
+.admin-workspace .fleet-list .region-heading:first-child { border-top: 0; }
+.admin-workspace .fleet-list .zone-heading { background: #101b29; }
+.admin-workspace .probe-heading { background: #0d1723; }
+
+.admin-app .admin-workspace .admin-panel { padding: 24px; margin-bottom: 20px; }
+.admin-app .admin-workspace .panel-title { margin-bottom: 16px; font-size: 14px; font-weight: 550; text-transform: none; letter-spacing: 0; }
+.admin-app .admin-workspace .lead { margin: 0 0 20px; }
+.admin-app .admin-workspace .area-bar { flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }
+.admin-app .admin-workspace .area-bar .panel-title { margin-bottom: 0; }
+.admin-app .admin-workspace .field { min-width: 0; gap: 8px; }
+.admin-app .admin-workspace .field-label { font-size: 12px; text-transform: none; letter-spacing: 0; }
+.admin-app .admin-workspace .field-note { line-height: 1.6; }
+.admin-app .admin-workspace .admin-panel.editor-section { padding: 0; }
+.admin-workspace .editor-summary { padding: 18px 24px; font-size: 13px; text-transform: none; letter-spacing: 0; }
+.admin-workspace .editor-body { padding: 24px; }
+.admin-app .admin-workspace input:not([type=checkbox]):not([type=radio]),
+.admin-app .admin-workspace select { min-height: 38px; min-width: 0; }
+.admin-workspace textarea { resize: vertical; }
+.admin-app .admin-workspace .movers { display: inline-flex; flex-direction: row; gap: 0; border: 1px solid var(--ad-line); border-radius: 6px; overflow: hidden; flex: none; }
+.admin-app .admin-workspace .reorder-step { display: grid; place-items: center; width: 32px; height: 32px; padding: 0; background: transparent; color: var(--ad-dim); border: 0 solid var(--ad-line); cursor: pointer; }
+.admin-app .admin-workspace .reorder-step:not(:first-child) { border-left-width: 1px; }
+.admin-app .admin-workspace .reorder-step:hover:not(:disabled) { color: var(--ad-cyan); background: var(--ad-panel-2); }
+.admin-app .admin-workspace .reorder-step:disabled { opacity: .25; cursor: default; }
+.admin-app .admin-workspace .reorder-step svg { fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.admin-workspace .srow, .admin-workspace .rrow, .admin-workspace .orow { padding-top: 14px; padding-bottom: 14px; }
+@media (max-width: 900px) {
+  .admin-workspace .srow, .admin-workspace .rrow { grid-template-columns: auto auto minmax(0, 1fr); }
+  .admin-workspace .sactions { grid-column: 1 / -1; justify-content: flex-start; }
+  .admin-workspace .orow { flex-wrap: wrap; }
+  .admin-workspace .osection { width: 100%; margin: 0; }
+  .admin-workspace .rname { overflow-wrap: anywhere; }
+}
+@media (max-width: 600px) { .admin-app .admin-workspace .reorder-step { width: 40px; height: 40px; } }
+@media (max-width: 600px) {
+  .admin-app .admin-workspace .admin-panel { padding: 16px; }
+  .admin-app .admin-workspace .admin-panel.editor-section { padding: 0; }
+  .admin-workspace .editor-summary, .admin-workspace .editor-body { padding: 16px; }
+  .admin-workspace .page-head-row { align-items: flex-start; }
+}
 @media (prefers-reduced-motion: reduce) { .admin-app button { transition: none; } }
 @media (max-width: 600px) { .admin-app .btn { min-height: 44px; } .admin-app .stat-grid { grid-template-columns: 1fr 1fr; } .admin-app .stat-card { padding: 12px; border-bottom: 1px solid var(--ad-line); } .admin-app .stat-value { font-size: 22px; } }

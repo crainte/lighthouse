@@ -113,6 +113,19 @@ pub fn split(presented: &str) -> Option<(&str, &str)> {
     Some((id, secret))
 }
 
+/// The bearer a global node presents *to* a region, derived from that
+/// region's registration key. Every regional coordinator holds the key, so
+/// each can verify it locally; the global learns it from the region's first
+/// authenticated push. It authorises calls into that one region and cannot be
+/// used to push as it, so storing it on the global tier never leaks the key.
+pub fn relay_token(registration_key: &str) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac = Hmac::<Sha256>::new_from_slice(registration_key.as_bytes())
+        .expect("HMAC accepts any key length");
+    mac.update(b"lighthouse/global-relay");
+    hex(&mac.finalize().into_bytes())
+}
+
 /// Whether `secret` is the one this credential was minted with. Constant time:
 /// a byte-by-byte early exit would leak the hash prefix to a caller willing to
 /// measure, and the handle is public so guesses can be aimed.

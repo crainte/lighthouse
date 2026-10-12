@@ -438,26 +438,29 @@ Estimated per-region ceilings (SCALING.md capacity model, extrapolated beyond th
 
 ## Existing product issues
 
-- [ ] Convert global coordinator credentials to per-region credentials used to attach regional
-      coordinators to the global coordinator. Today a region is static `[[global.region]]` config
-      on the global node and a shared token; it cannot check in. The target is the agent model:
-      a region holds a registration key and attaches itself to whichever global node exists,
-      so regions are discovered rather than declared. Phase 1's durable global store is the
-      prerequisite that now exists — a registering region has somewhere authoritative to land.
-- [ ] Add a supported way to decommission a cluster member.
-  - [ ] Remove it from persistent membership and configured seeds on every node; stop retries and replication to it.
-  - [ ] Define and test how removal propagates without stale gossip or a returning node resurrecting membership.
-- [ ] Add a supported way to remove a region.
-  - [ ] Define removal behavior for cached state, credentials, checks, incidents, and stale regional coordinators.
-  - [ ] Propagate deletion safely and prevent a removed region from being resurrected by stale state.
-- [ ] Relax or redesign check-name validation so names such as `h@h` and `home assistant` are supported.
-  - [ ] Keep immutable UUID identity separate from human-readable display names.
-  - [ ] Audit URLs, selectors, storage keys, and replication code so they do not depend on restricted names.
-- [ ] Verify and fix downtime accuracy for long-interval checks.
-  - [ ] Confirm failing checks use Kubernetes-style retry/failure probing rather than waiting for the normal interval.
-  - [ ] Confirm recovery is detected promptly while a check is down.
-  - [ ] Add tests for `failures_before_down`, long schedules, retry cadence, recovery cadence, hold-down, and restart behavior.
-  - [ ] Remove the old `TODO` item if current retry/down cadence already solves the issue.
+- [x] Convert global coordinator credentials to per-region credentials used to attach regional
+      coordinators to the global coordinator.
+      Each region holds one registration key (`wac_<id>.<secret>`, salted hash on the global tier, bound to the region name), minted in global Admin > Cluster > Regions or provisioned once with `[[global.provision]]`. Its first authenticated push attaches it; endpoints and the relay token are learned from pushes and replicated among global nodes as a `region:<name>` setting. Global→region calls carry `HMAC(key, "lighthouse/global-relay")`, so a region accepts only its own and a compromised region cannot impersonate the global tier to others. `[[global.region]]`, `[global] token` and `LIGHTHOUSE_GLOBAL_TOKEN` are gone (`deny_unknown_fields` fails stale config loudly) (SCALING.md "Region registration and membership removal").
+- [x] Add a supported way to decommission a cluster member.
+  - [x] Remove it from persistent membership and configured seeds on every node; stop retries and replication to it.
+    `DELETE /api/v1/admin/cluster/members/:node_id` (coordinator and global) writes a terminal `removed` member state; it is never pinged, replicated to, or retried as a seed. Membership is now actually persisted (shape changes only) and per-peer raw-data gaps are purged.
+  - [x] Define and test how removal propagates without stale gossip or a returning node resurrecting membership.
+    The tombstone gossips in ping bodies and outranks every generation; the removed node's pings get 410 and it fences itself. Rejoining needs a new `node_id`.
+- [x] Add a supported way to remove a region.
+  - [x] Define removal behavior for cached state, credentials, checks, incidents, and stale regional coordinators.
+    `DELETE /api/v1/admin/regions/:name` drops the cache/routing entry (and its incidents with it), revokes the key, and strips the region from every check's placement; a check placed only there is disabled, since an empty placement means "every region". The region's own database is untouched. Its coordinators get 401 on push.
+  - [x] Propagate deletion safely and prevent a removed region from being resurrected by stale state.
+    The record's LWW tombstone replicates to global peers (immediate broadcast plus anti-entropy); stale entries and boot provisioning skip it.
+- [x] Relax or redesign check-name validation so names such as `h@h` and `home assistant` are supported.
+  - [x] Keep immutable UUID identity separate from human-readable display names.
+  - [x] Audit URLs, selectors, storage keys, and replication code so they do not depend on restricted names.
+    Already UUID-keyed; the agent's restart comparison was the last name-keyed path (now id). Covered by `free_form_check_names_round_trip_and_rename_keeps_identity`.
+- [x] Verify and fix downtime accuracy for long-interval checks.
+  - [x] Confirm failing checks use Kubernetes-style retry/failure probing rather than waiting for the normal interval.
+  - [x] Confirm recovery is detected promptly while a check is down.
+    Retry/down cadence existed but was lost on every check-loop respawn (any config edit) and on agent restart, so a down hourly check waited up to an hour. Failure runs now survive respawns, and `/api/v1/agent/checks` returns the caller's non-zero runs (`failing`) so a restarted agent resumes down cadence.
+  - [x] Add tests for `failures_before_down`, long schedules, retry cadence, recovery cadence, hold-down, and restart behavior.
+  - [x] Remove the old `TODO` item if current retry/down cadence already solves the issue.
 
 ## Confirmed strengths to preserve
 

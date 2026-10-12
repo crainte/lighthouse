@@ -250,14 +250,14 @@ async fn run_standalone(mut cfg: Config) -> Result<()> {
         .rsplit_once(':')
         .map_or("8080", |(_, port)| port);
     cfg.agent.coordinator_url = vec![format!("http://127.0.0.1:{port}")];
-    tokio::spawn(agent::sync_loop(cfg.agent.clone(), tx, Vec::new()));
+    tokio::spawn(agent::sync_loop(cfg.agent.clone(), tx));
     serve(coord, &cfg.coordinator.listen).await
 }
 
 async fn run_agent(cfg: Config) -> Result<()> {
     cfg.agent.validate()?;
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(agent::sync_loop(cfg.agent.clone(), tx, Vec::new()));
+    tokio::spawn(agent::sync_loop(cfg.agent.clone(), tx));
     agent::poster_loop(cfg.agent, rx).await;
     Ok(())
 }

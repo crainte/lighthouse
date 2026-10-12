@@ -53,7 +53,7 @@ pub(super) async fn ping_handler(
         return super::error_response(StatusCode::NOT_FOUND, "clustering is not configured");
     };
     let now = chrono::Utc::now().timestamp_millis();
-    Json(cluster.handle_ping(&body, now)).into_response()
+    cluster.answer_ping(&body, now)
 }
 
 pub(super) async fn config_handler(
@@ -64,7 +64,7 @@ pub(super) async fn config_handler(
     if let Some(denied) = require_peer(&node, &headers) {
         return denied;
     }
-    match node.inner.store.apply_entries(batch.entries).await {
+    match node.apply_peer_entries(batch.entries).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => super::error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -127,14 +127,22 @@ pub(super) fn spawn(node: &GlobalNode) {
         return;
     };
     let heartbeat_cluster = cluster.clone();
+    let heartbeat_node = node.clone();
     let gossip_interval = node.inner.gossip_interval_secs;
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(gossip_interval));
+        let mut persisted = Vec::new();
         loop {
             tick.tick().await;
             let now = chrono::Utc::now().timestamp_millis();
             heartbeat_cluster.ping_all(now).await;
             heartbeat_cluster.sweep(now);
+            crate::coordinator::cluster::persist_membership(
+                &heartbeat_cluster,
+                heartbeat_node.inner.store.database(),
+                &mut persisted,
+            )
+            .await;
         }
     });
 
@@ -241,7 +249,7 @@ pub(super) async fn reconcile_with_peer(node: &GlobalNode, peer: &str) {
             &config_url,
             peer_token.as_deref(),
             kind,
-            |entries| async { node.inner.store.apply_entries(entries).await.map(|_| ()) },
+            |entries| node.apply_peer_entries(entries),
         )
         .await;
         match result {

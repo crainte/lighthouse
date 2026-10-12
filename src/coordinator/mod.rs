@@ -328,12 +328,12 @@ struct Inner {
     /// when no `[coordinator.global]` block is configured — the push loop is a
     /// no-op, and a Stage A deployment is untouched.
     global_push: Option<(String, String, u64)>,
-    /// Shared cross-region secret the global coordinator presents as a `Bearer`
-    /// to drive admin operations here (add/edit checks, notifiers, etc.) on
-    /// behalf of an operator signed in at the global dashboard. Same value as
-    /// the global push token: a region that trusts the global node with its
-    /// state also trusts it to relay admin writes. `None` outside Phase 6, so a
-    /// Stage A coordinator accepts admin only via a signed session as before.
+    /// The `Bearer` the global tier presents to drive admin operations here on
+    /// behalf of an operator signed in at the global dashboard: the relay
+    /// token derived from this region's registration key
+    /// (`credential::relay_token`), so it is specific to this region. `None`
+    /// without `[coordinator.global]`, so a Stage A coordinator accepts admin
+    /// only via a signed session as before.
     admin_trust_token: Option<String>,
 }
 
@@ -498,6 +498,13 @@ impl Coordinator {
         // block is a hard error, matching how a half-configured cluster
         // refuses to start rather than pushing into a 401.
         let global_push = cfg.resolved_global_push()?;
+        if global_push.is_some() && cfg.resolved_advertise_url().is_none() {
+            warn!(
+                "[coordinator.global] is set but advertise_url is not: the global node learns \
+                 where to reach this region from its pushes, so it cannot relay or distribute \
+                 the catalogue here"
+            );
+        }
         if let Some((url, _, secs)) = &global_push {
             info!(url = %url, push_secs = secs, region = %cfg.region, "global push enabled");
         }
@@ -619,7 +626,11 @@ impl Coordinator {
                 anti_entropy_secs: cfg.anti_entropy_secs,
                 region: cfg.region.clone(),
                 advertise_url: cfg.resolved_advertise_url(),
-                admin_trust_token: global_push.as_ref().map(|(_, token, _)| token.clone()),
+                // The global tier calls back with a token derived from this
+                // region's key, never the key itself; see `regions`.
+                admin_trust_token: global_push
+                    .as_ref()
+                    .map(|(_, key, _)| crate::credential::relay_token(key)),
                 global_push,
             }),
         };
@@ -713,6 +724,7 @@ impl Coordinator {
         let gossip_interval = self.inner.gossip_interval_secs;
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(gossip_interval));
+            let mut persisted = Vec::new();
             loop {
                 tick.tick().await;
                 let now = chrono::Utc::now().timestamp_millis();
@@ -725,6 +737,12 @@ impl Coordinator {
                         .events
                         .send(WsEvent::ClusterChange { node_id, state });
                 }
+                cluster::persist_membership(
+                    &heartbeat_cluster,
+                    &heartbeat_coord.inner.database,
+                    &mut persisted,
+                )
+                .await;
             }
         });
 

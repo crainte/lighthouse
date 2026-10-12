@@ -1182,7 +1182,7 @@ per_zone: draft.placement.count ?? 1,
   .form-grid {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 0.7rem 1rem;
+    gap: 24px;
     align-items: start;
   }
   .field.wide {

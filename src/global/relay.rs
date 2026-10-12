@@ -220,7 +220,7 @@ pub(super) fn region_request(
         .request(method.clone(), &url)
         .body(body.clone());
     if authed {
-        if let Some(token) = node.inner.token.as_deref() {
+        if let Some(token) = node.relay_token_for(base) {
             req = req.bearer_auth(token);
         }
     }

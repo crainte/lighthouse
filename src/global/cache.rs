@@ -21,8 +21,8 @@ pub struct RegionState {
     pub agents_healthy: u32,
     pub agents_total: u32,
     pub checks: HashMap<CheckId, CheckSummary>,
-    /// Endpoints to route drill-down reads to, seeded from config and refreshed
-    /// from each push's `advertise_url`.
+    /// Endpoints to route drill-down reads to, seeded from the region's
+    /// registration and refreshed from each push's `advertise_url`.
     pub endpoints: Vec<String>,
     pub origin: String,
     /// The origin's push chain position, so a delta applies only on top of
@@ -120,34 +120,50 @@ pub struct RegionSummary {
 }
 
 impl GlobalCache {
-    pub fn new(staleness_secs: u64, seed: &[crate::config::GlobalRegion]) -> Self {
-        let regions = seed
-            .iter()
-            .map(|r| {
-                (
-                    r.name.clone(),
-                    RegionState {
-                        health: NodeState::Unknown,
-                        // Seeded regions have not reported agents yet.
-                        agents_healthy: 0,
-                        agents_total: 0,
-                        checks: HashMap::new(),
-                        endpoints: r.endpoints.clone(),
-                        origin: String::new(),
-                        epoch: 0,
-                        seq: 0,
-                        pushed_at: 0,
-                        // Seeded regions start dark: config declares they exist
-                        // and where to reach them, not that they are healthy.
-                        received_at: 0,
-                    },
-                )
-            })
-            .collect();
+    pub fn new(staleness_secs: u64) -> Self {
         Self {
-            regions: RwLock::new(regions),
+            regions: RwLock::new(HashMap::new()),
             staleness_ms: (staleness_secs.max(1) as i64) * 1000,
         }
+    }
+
+    /// Make a registered region routable before (or without) a push, merging
+    /// its known endpoints into whatever is cached.
+    pub fn seed(&self, region: &str, endpoints: &[String]) {
+        let mut guard = self.regions.write();
+        let state = guard
+            .entry(region.to_string())
+            .or_insert_with(|| RegionState {
+                health: NodeState::Unknown,
+                agents_healthy: 0,
+                agents_total: 0,
+                checks: HashMap::new(),
+                endpoints: Vec::new(),
+                origin: String::new(),
+                epoch: 0,
+                seq: 0,
+                pushed_at: 0,
+                // Registered is not healthy: dark until it pushes.
+                received_at: 0,
+            });
+        for e in endpoints {
+            merge_endpoint(&mut state.endpoints, Some(e));
+        }
+    }
+
+    /// Keep only regions `keep` admits — how a removal leaves the cache.
+    pub fn retain_regions(&self, keep: impl Fn(&str) -> bool) {
+        self.regions.write().retain(|name, _| keep(name));
+    }
+
+    /// The region a coordinator base URL belongs to.
+    pub fn region_of_endpoint(&self, base: &str) -> Option<String> {
+        let base = base.trim_end_matches('/');
+        self.regions
+            .read()
+            .iter()
+            .find(|(_, s)| s.endpoints.iter().any(|e| e.trim_end_matches('/') == base))
+            .map(|(name, _)| name.clone())
     }
 
     pub fn staleness_ms(&self) -> i64 {
@@ -561,7 +577,7 @@ mod tests {
 
     #[test]
     fn deltas_apply_only_on_top_of_the_push_they_extend() {
-        let cache = GlobalCache::new(20, &[]);
+        let cache = GlobalCache::new(20);
         let mut delta = push("us", "a", 6, NodeState::Down, &[("api", NodeState::Down)]);
         delta.delta_base = Some(5);
         delta.removed = vec![id("gone")];
@@ -609,14 +625,8 @@ mod tests {
 
     #[test]
     fn staleness_snapshot_counts_seeded_received_and_expired_regions() {
-        use crate::config::GlobalRegion;
-        let cache = GlobalCache::new(
-            20,
-            &[GlobalRegion {
-                name: "seeded".into(),
-                endpoints: vec![],
-            }],
-        );
+        let cache = GlobalCache::new(20);
+        cache.seed("seeded", &[]);
         assert_eq!(cache.staleness_snapshot(1_000), (0, 1, 0));
         cache.apply_push(push("fresh", "a", 1, NodeState::Up, &[]), 1_000);
         cache.apply_push(push("expired", "b", 1, NodeState::Up, &[]), 1);
@@ -626,12 +636,8 @@ mod tests {
 
     #[test]
     fn seeded_endpoints_survive_a_push_with_no_advertise_url() {
-        use crate::config::GlobalRegion;
-        let seed = vec![GlobalRegion {
-            name: "tw".to_string(),
-            endpoints: vec!["http://coordinator-tw:8080".to_string()],
-        }];
-        let cache = GlobalCache::new(20, &seed);
+        let cache = GlobalCache::new(20);
+        cache.seed("tw", &["http://coordinator-tw:8080".to_string()]);
         let mut p = push("tw", "coordinator-tw", 1000, NodeState::Up, &[]);
         p.advertise_url = None; // a single-node region advertises nothing
         cache.apply_push(p, 1000);
@@ -643,11 +649,22 @@ mod tests {
             vec!["http://coordinator-tw:8080".to_string()],
             "seeded endpoint lost when push carried no advertise_url"
         );
+        assert_eq!(
+            cache
+                .region_of_endpoint("http://coordinator-tw:8080/")
+                .as_deref(),
+            Some("tw")
+        );
+        cache.retain_regions(|r| r != "tw");
+        assert!(
+            cache.region_endpoints(2000).is_empty(),
+            "a removed region is gone"
+        );
     }
 
     #[test]
     fn last_writer_wins_by_pushed_at() {
-        let cache = GlobalCache::new(20, &[]);
+        let cache = GlobalCache::new(20);
         cache.apply_push(
             push("us", "a", 100, NodeState::Up, &[("x", NodeState::Up)]),
             1000,
@@ -664,7 +681,7 @@ mod tests {
 
     #[test]
     fn cross_region_rollup_takes_the_worst_live_region() {
-        let cache = GlobalCache::new(20, &[]);
+        let cache = GlobalCache::new(20);
         cache.apply_push(
             push("us", "a", 1, NodeState::Up, &[("api", NodeState::Up)]),
             1000,
@@ -681,7 +698,7 @@ mod tests {
 
     #[test]
     fn a_stale_region_drops_out_of_aggregation() {
-        let cache = GlobalCache::new(20, &[]); // 20_000 ms window
+        let cache = GlobalCache::new(20); // 20_000 ms window
         cache.apply_push(
             push("us", "a", 1, NodeState::Up, &[("api", NodeState::Up)]),
             1_000,
@@ -697,7 +714,7 @@ mod tests {
 
     #[test]
     fn failure_evidence_comes_from_the_freshest_worst_contributor() {
-        let cache = GlobalCache::new(20, &[]);
+        let cache = GlobalCache::new(20);
         let mut failing = push("us", "a", 10, NodeState::Down, &[("api", NodeState::Down)]);
         failing.checks[0].error = Some("connection refused".into());
         failing.checks[0].status_code = Some(503);
@@ -716,7 +733,7 @@ mod tests {
 
     #[test]
     fn owner_endpoints_prefers_the_reporting_region() {
-        let cache = GlobalCache::new(20, &[]);
+        let cache = GlobalCache::new(20);
         cache.apply_push(
             push("us", "a", 1, NodeState::Up, &[("api", NodeState::Up)]),
             1000,

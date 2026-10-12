@@ -44,6 +44,7 @@
 </script>
 
 <div class="controls">
+  <label class="pick search-field"><span class="pick-label">Search fleet</span>
   <input
     class="search"
     type="search"
@@ -51,6 +52,8 @@
     placeholder="Search agent, zone or region"
     aria-label="Search agents by id, zone or region"
   />
+  </label>
+  <div class="status-field"><span class="pick-label">Connectivity</span>
   <div class="range-switch" role="group" aria-label="Status filter">
     <button
       class="range-btn"
@@ -67,6 +70,7 @@
       class:active={statusFilter === 'silent'}
       onclick={() => (statusFilter = 'silent')}>Silent</button
     >
+  </div>
   </div>
   <label class="pick">
     <span class="pick-label">Region</span>
@@ -109,32 +113,37 @@
 
 <style>
   .controls {
-    display: flex;
-    align-items: center;
-    gap: 0.7rem 1rem;
-    flex-wrap: wrap;
-    margin-bottom: 0.5rem;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
+    align-items: end;
+    gap: 16px;
+    margin-bottom: 20px;
   }
   .search {
-    width: 18rem;
+    width: 100%;
     max-width: 100%;
   }
   .pick {
     display: flex;
-    align-items: center;
-    gap: 0.4rem;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    min-width: 0;
   }
   .pick-label {
     font-size: 0.72rem;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
+    text-transform: none;
+    letter-spacing: 0;
     color: var(--text-dim);
   }
   .pick select {
-    width: auto;
-    min-width: 9rem;
+    width: 100%;
+    min-width: 0;
   }
 
+  .status-field { display: grid; gap: 8px; }
+  .status-field .range-btn { min-height: 38px; flex: 1; }
+  .controls .toggle { min-height: 38px; margin: 0; }
   .count-line {
     display: flex;
     align-items: center;

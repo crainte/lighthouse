@@ -273,9 +273,12 @@ pub struct CoordinatorConfig {
 pub struct GlobalPushConfig {
     /// Base URL of the global coordinator, e.g. `http://global:8080`.
     pub url: String,
-    /// Shared secret the global coordinator requires on `/internal/global/*`.
-    /// The same bearer story as `peer_token`, kept separate so a regional
-    /// peer secret never doubles as the cross-region one.
+    /// This region's registration key (`wac_<id>.<secret>`), minted in the
+    /// global Admin > Regions or provisioned with `[[global.provision]]`.
+    /// The global node binds it to this coordinator's `region`, so it attaches
+    /// the region rather than authenticating a shared secret, and the global
+    /// tier calls back with a token derived from it
+    /// (`credential::relay_token`) that only this region accepts.
     #[serde(default)]
     pub token: Option<String>,
     /// Environment variable holding the token, when it is not inline.
@@ -298,7 +301,7 @@ impl GlobalPushConfig {
                     .as_deref()
                     .and_then(|key| std::env::var(key).ok())
             })
-            .or_else(|| std::env::var("LIGHTHOUSE_GLOBAL_TOKEN").ok())
+            .or_else(|| std::env::var("LIGHTHOUSE_REGION_KEY").ok())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     }
@@ -307,7 +310,11 @@ impl GlobalPushConfig {
 /// `[global]` — the global coordinator itself (`lighthouse global`). Caches state
 /// summaries pushed by regional coordinators, serves an aggregated dashboard,
 /// and routes drill-down reads back to the owning region. Holds no raw data.
+///
+/// Unknown keys are refused so a leftover `[[global.region]]` or `token` from
+/// before per-region registration fails loudly instead of being ignored.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GlobalConfig {
     #[serde(default = "default_global_listen")]
     pub listen: String,
@@ -326,11 +333,6 @@ pub struct GlobalConfig {
     /// notion of trust.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
-    /// Secret regional coordinators must present to push state. Required in
-    /// `global` mode: an unauthenticated push endpoint would let anyone rewrite
-    /// what the global dashboard shows. Falls back to `LIGHTHOUSE_GLOBAL_TOKEN`.
-    #[serde(default)]
-    pub token: Option<String>,
     /// Seconds without a push after which a region reads as dark (its health
     /// goes Unknown and, if notifiers are set, a region-down alert fires).
     #[serde(default = "default_region_staleness_secs")]
@@ -341,19 +343,14 @@ pub struct GlobalConfig {
     /// see: a check down in every reporting region, or a region going dark.
     #[serde(default)]
     pub notifiers: Vec<Notifier>,
-    /// Known regions and where to reach a live coordinator in each, seeding the
-    /// query-routing table. Endpoints are also learned from pushes; this is the
-    /// fallback so drill-downs work before the first push and after a restart —
-    /// and, since the seed is the only endpoint a single-node region that
-    /// advertises nothing ever has, it is what admin write fan-out reaches such
-    /// a region by.
-    ///
-    /// `alias = "region"` because the natural TOML spelling of an array-of-
-    /// tables is the singular `[[global.region]]`; without it that block parses
-    /// as an unknown key and is silently dropped, leaving non-advertising
-    /// regions unreachable.
-    #[serde(default, alias = "region")]
-    pub regions: Vec<GlobalRegion>,
+    /// Region registration keys chosen in advance, for a deployment whose
+    /// regional coordinators are configured before this node first runs (a
+    /// compose stack, a manifest). `zone` is not used. Applied once at boot: a
+    /// region already registered, or one an operator removed, is left alone.
+    /// Regions themselves are not declared — one appears when its first
+    /// authenticated push arrives.
+    #[serde(default)]
+    pub provision: Vec<ProvisionedCredential>,
     /// Where the global tier's own catalogue lives (SCALING.md "Placement-scoped
     /// configuration", Phase 1). Unlike a coordinator this holds no results or
     /// rollups — `Storage::open` still creates those tables because it is the
@@ -395,17 +392,6 @@ pub struct GlobalConfig {
     pub anti_entropy_secs: u64,
 }
 
-/// One `[[global.region]]` block: a region name and the coordinator endpoints
-/// the global node proxies drill-down reads to.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct GlobalRegion {
-    pub name: String,
-    /// Base URLs of coordinators in the region. Any one that answers is used;
-    /// the list is failover, not sharding, like an agent's `coordinator_url`.
-    #[serde(default)]
-    pub endpoints: Vec<String>,
-}
-
 impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
@@ -413,10 +399,9 @@ impl Default for GlobalConfig {
             admin_password: None,
             secure_cookies: false,
             trusted_proxies: Vec::new(),
-            token: None,
             region_staleness_secs: default_region_staleness_secs(),
             notifiers: Vec::new(),
-            regions: Vec::new(),
+            provision: Vec::new(),
             db_path: default_db_path(),
             database: DatabaseConfig::default(),
             peers: Vec::new(),
@@ -435,14 +420,6 @@ impl GlobalConfig {
         self.admin_password
             .clone()
             .or_else(|| std::env::var("LIGHTHOUSE_ADMIN_PASSWORD").ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    }
-
-    pub fn resolved_token(&self) -> Option<String> {
-        self.token
-            .clone()
-            .or_else(|| std::env::var("LIGHTHOUSE_GLOBAL_TOKEN").ok())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     }
@@ -474,16 +451,23 @@ impl GlobalConfig {
             .filter(|s| !s.is_empty())
     }
 
-    /// Refuse to start a global node that would accept anonymous pushes, or a
-    /// half-configured global-to-global cluster — same reasoning as
+    /// Refuse to start with a provision block that could never authenticate,
+    /// or a half-configured global-to-global cluster — same reasoning as
     /// `CoordinatorConfig::validate_cluster`.
     pub fn validate(&self) -> Result<()> {
-        if self.resolved_token().is_none() {
-            anyhow::bail!(
-                "global mode needs a token: set [global] token (or \
-                 LIGHTHOUSE_GLOBAL_TOKEN) to the same value the regional \
-                 coordinators present in [coordinator.global] token."
-            );
+        for block in &self.provision {
+            crate::global::regions::valid_name(&block.region)
+                .map_err(|e| anyhow::anyhow!("global.provision region {:?}: {e}", block.region))?;
+            let token = block
+                .resolved_token()
+                .ok_or_else(|| anyhow::anyhow!(block.missing_token_error()))?;
+            if crate::credential::split(&token).is_none() {
+                anyhow::bail!(
+                    "global.provision for region {} has a malformed token: expected \
+                     the `wac_<id>.<secret>` form Admin > Regions mints",
+                    block.region
+                );
+            }
         }
         crate::security::TrustedProxies::parse(&self.trusted_proxies)
             .map_err(|e| anyhow::anyhow!("global.trusted_proxies: {e}"))?;
@@ -517,6 +501,9 @@ impl GlobalConfig {
 /// on location, and the party being placed must not choose it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProvisionedCredential {
+    /// Required for `[[coordinator.provision]]`; unused by `[[global.provision]]`,
+    /// whose key binds a whole region.
+    #[serde(default)]
     pub zone: String,
     pub region: String,
     /// The token itself. Present for a fixture; a deployment should use
@@ -550,16 +537,19 @@ impl ProvisionedCredential {
     /// against nothing, and "no results" is the mode this project treats as
     /// dangerous precisely because it reads like "not scheduled yet".
     pub fn missing_token_error(&self) -> String {
+        let scope = if self.zone.is_empty() {
+            format!("global.provision for region {}", self.region)
+        } else {
+            format!("coordinator.provision for zone {}", self.zone)
+        };
         match self.token_env.as_deref() {
             Some(key) => format!(
-                "coordinator.provision for zone {zone} has no token: neither an \
-                 inline `token` nor the environment variable {key} is set",
-                zone = self.zone
+                "{scope} has no token: neither an inline `token` nor the \
+                 environment variable {key} is set"
             ),
             None => format!(
-                "coordinator.provision for zone {zone} has no token: set `token` \
-                 for a fixture, or `token_env` naming the variable that holds it",
-                zone = self.zone
+                "{scope} has no token: set `token` for a fixture, or `token_env` \
+                 naming the variable that holds it"
             ),
         }
     }
@@ -871,10 +861,16 @@ impl CoordinatorConfig {
         let token = g.resolved_token().ok_or_else(|| {
             anyhow::anyhow!(
                 "coordinator.global is set but its token is not: set \
-                 [coordinator.global] token (or token_env, or LIGHTHOUSE_GLOBAL_TOKEN) \
-                 to the value the global node's [global] token expects."
+                 [coordinator.global] token (or token_env, or LIGHTHOUSE_REGION_KEY) \
+                 to this region's registration key from the global Admin > Regions."
             )
         })?;
+        if crate::credential::split(&token).is_none() {
+            anyhow::bail!(
+                "coordinator.global token is not a region registration key: expected \
+                 the `wac_<id>.<secret>` form the global Admin > Regions mints"
+            );
+        }
         Ok(Some((url, token, g.push_secs.max(1))))
     }
 
@@ -1922,27 +1918,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn global_region_seed_parses_from_singular_table_name() {
-        // The natural array-of-tables spelling is `[[global.region]]`; the field
-        // is `regions`. Without the serde alias this block is silently dropped,
-        // leaving a non-advertising region with no endpoint and unreachable to
-        // admin write fan-out.
+    fn regions_are_provisioned_not_declared() {
         let cfg: Config = toml::from_str(
             r#"
             [global]
-            token = "t"
-            [[global.region]]
-            name = "tw"
-            endpoints = ["http://coordinator-tw:8080"]
+            [[global.provision]]
+            region = "tw"
+            token = "wac_tw.secret"
             "#,
         )
-        .expect("singular [[global.region]] must parse");
-        assert_eq!(cfg.global.regions.len(), 1, "region seed was dropped");
-        assert_eq!(cfg.global.regions[0].name, "tw");
-        assert_eq!(
-            cfg.global.regions[0].endpoints,
-            vec!["http://coordinator-tw:8080".to_string()]
-        );
+        .expect("[[global.provision]] parses");
+        cfg.global.validate().expect("a shaped key is valid");
+        assert_eq!(cfg.global.provision[0].region, "tw");
+
+        for stale in [
+            "[global]\ntoken = \"t\"",
+            "[[global.region]]\nname = \"tw\"",
+        ] {
+            assert!(
+                toml::from_str::<Config>(stale).is_err(),
+                "a pre-registration key must fail loudly: {stale}"
+            );
+        }
+        let bad: Config =
+            toml::from_str("[[global.provision]]\nregion = \"tw\"\ntoken = \"shared\"").unwrap();
+        assert!(bad.global.validate().is_err(), "an unshaped key is refused");
     }
 
     #[test]

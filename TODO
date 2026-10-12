@@ -1,6 +1,0 @@
-* convert credentials on global to be per-region credentials to attach coordinators to global
-* no way to remove a region:
-* check name: change failed in region 'tw': HTTP 400 {"error":"name may only contain letters, digits, dash, underscore and dot"}
-    I want a check named h@h and "home assistant"
-
-* downtime is inaccurate. When a check fails, it goes down, an hour leter on next check it's "resolved". We need kubernetes like probes to ensure down and failure checks to see when it actually comes back.

@@ -148,13 +148,17 @@ degraded_is_downtime = false
 
 # Push this coordinator's state summary up to a global coordinator (Phase 6).
 # Presence of this block is what turns the push loop on; without it the node
-# behaves exactly as a Stage A regional coordinator. Every coordinator in a
-# region cluster may push — the global node keeps last-writer-wins, so three
-# identical pushes collapse to one cached entry.
+# behaves exactly as a Stage A regional coordinator. Give every coordinator of
+# a region the same block; only the lowest-id live member publishes.
+#
+# The token is this region's registration key, minted in the global node's
+# Admin > Cluster > Regions (or provisioned there with [[global.provision]]).
+# It is bound to this coordinator's `region`, so the region attaches itself on
+# its first push; nothing on the global node declares it.
 #
 # [coordinator.global]
 # url = "http://global:8080"           # base URL of the global coordinator
-# token_env = "LIGHTHOUSE_GLOBAL_TOKEN"    # or: token = "..."; the global node's secret
+# token_env = "LIGHTHOUSE_REGION_KEY"  # default; or token = "wac_<id>.<secret>"
 # push_secs = 5                        # 5-10s; default 5
 
 # Placement chooses probes by failure domain with rendezvous hashing: if a
@@ -173,7 +177,6 @@ degraded_is_downtime = false
 #
 # [global]
 # listen = "0.0.0.0:8080"
-# token_env = "LIGHTHOUSE_GLOBAL_TOKEN"    # required: the shared push secret
 # region_staleness_secs = 30           # a region silent this long reads as dark
 #
 # Cross-region alerting. Empty (the default) means the global node never pages:
@@ -186,14 +189,14 @@ degraded_is_downtime = false
 # type = "webhook"
 # url = "https://example.com/hook"
 #
-# Seed the query-routing table so drill-downs work before the first push and
-# after a restart. Endpoints are also learned from each push's advertise_url.
-# [[global.region]]
-# name = "us"
-# endpoints = ["http://coordinator-us-a:8080", "http://coordinator-us-b:8080"]
-# [[global.region]]
-# name = "tw"
-# endpoints = ["http://coordinator-tw:8080"]
+# Region registration keys chosen in advance, for regional coordinators
+# configured before this node first runs. Applied once: a registered region,
+# or one an operator removed, is left alone. Endpoints are learned from each
+# region's pushes (its coordinators' advertise_url) and replicated to peer
+# global nodes, so nothing here lists them.
+# [[global.provision]]
+# region = "us"
+# token_env = "LIGHTHOUSE_REGION_KEY_US"   # a `wac_<id>.<secret>` value
 
 # Agent credentials whose token is chosen in advance instead of minted in the
 # UI. Use this when bare-metal agents must be configured before this coordinator

@@ -148,12 +148,18 @@
 
 <!-- `.admin-panel` is what activates the shared input/select styling (scoped to
      that class in app.css), so the controls match every other admin page. -->
-<div class="admin-panel">
+<div class="admin-panel probe-workspace">
   <p class="admin-muted lead">
     Inspect individual probe attempts, newest first. Filter by monitor, location, or outcome to
     investigate failures, including full error details omitted from the public status page.
   </p>
 
+  <div class="probe-snapshot" aria-label="Filtered result summary">
+    <div><span>Visible attempts</span><strong>{visible.length}</strong><small>Current filtered batch</small></div>
+    <div><span>Successful</span><strong class="snapshot-up">{visible.filter((r) => r.status === 'up').length}</strong><small>Probe returned up</small></div>
+    <div><span>Failed</span><strong class:snapshot-down={visible.some((r) => r.status === 'down')}>{visible.filter((r) => r.status === 'down').length}</strong><small>{visible.filter((r) => r.status === 'unknown').length} unknown outcomes</small></div>
+    <div><span>Reporting sources</span><strong>{new Set(visible.map((r) => r.agent_id)).size}</strong><small>Distinct agents in this batch</small></div>
+  </div>
   <div class="controls">
   <label class="pick">
     <span class="pick-label">Check</span>
@@ -240,40 +246,35 @@
 {:else if visible.length === 0}
   <div class="otable"><div class="ot-empty">No results match these filters.</div></div>
 {:else}
-  <ul class="result-feed">
-    {#each visible as r (r.check_id + r.agent_id + r.timestamp)}
+  <div class="probe-ledger">
+    <div class="probe-heading"><span>Monitor / agent</span><span>Outcome</span><span>Location</span><span>Latency</span><span>Observed</span></div>
+    {#each visible as r (`${r.check_id}-${r.agent_id}-${r.timestamp}`)}
       {@const t = tone(r.status)}
-      <li class="result-card {t.bar}">
-        <div class="rc-top">
-          <span class="opill {t.pill}">{t.label}</span>
-          <button class="rc-check" onclick={() => onopen(r.check_id)} title="Edit this check">
-            {r.name}
-          </button>
-          <span class="rc-agent">{r.agent_id}</span>
-          <span class="rc-when field-note" title={formatAbsolute(r.timestamp)}>
-            {formatRelativeTime(r.timestamp)}
-          </span>
-        </div>
-        <div class="rc-meta">
-          <span class="opill grey">{location(r)}</span>
-          <span class="field-note">{formatLatency(r.latency_ms)}</span>
-          {#if r.status_code != null}
-            <span class="field-note">HTTP {r.status_code}</span>
-          {/if}
+      <article class="probe-entry">
+        <div class="probe-line">
+          <div class="probe-identity"><button onclick={() => onopen(r.check_id)} title="Edit this check">{r.name}</button><span>{r.agent_id}</span></div>
+          <div><span class="opill {t.pill}">{t.label}</span>{#if r.status_code != null}<span class="probe-secondary">HTTP {r.status_code}</span>{/if}</div>
+          <span class="probe-place">{location(r)}</span>
+          <span class="probe-latency">{formatLatency(r.latency_ms)}</span>
+          <time class="probe-time" datetime={new Date(r.timestamp).toISOString()} title={formatAbsolute(r.timestamp)}>{formatRelativeTime(r.timestamp)}</time>
         </div>
         {#if r.error}
-          <!-- The raw probe error, verbatim: the ddns-style line an operator
-               comes here to read. Monospace and wrapping so a long DNS answer
-               stays legible rather than truncating. -->
-          <pre class="rc-error">{r.error}</pre>
+          <details class="probe-error"><summary>{r.error}</summary><pre>{r.error}</pre></details>
         {/if}
-      </li>
+      </article>
     {/each}
-  </ul>
+  </div>
 {/if}
 </div>
 
 <style>
+  .probe-snapshot { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin: 24px 0; }
+  .probe-snapshot > div { display: grid; gap: 10px; padding: 20px; background: var(--ad-panel); border: 1px solid var(--ad-line); border-radius: 8px; }
+  .probe-snapshot span, .probe-snapshot small { color: var(--ad-dim); font-size: 12px; }
+  .probe-snapshot strong { font-size: 28px; font-weight: 500; }
+  .snapshot-up { color: var(--ad-green); } .snapshot-down { color: var(--ad-red); }
+  @media (max-width: 700px) { .probe-snapshot { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; } .probe-snapshot > div { padding: 16px; } }
+
   .lead {
     margin: 0 0 1rem;
   }
@@ -281,25 +282,28 @@
     display: flex;
     flex-wrap: wrap;
     align-items: flex-end;
-    gap: 0.6rem 0.9rem;
-    margin-bottom: 0.8rem;
+    gap: 16px;
+    margin-bottom: 24px;
   }
   .pick {
     display: flex;
     flex-direction: column;
-    gap: 0.25rem;
+    gap: 8px;
+    flex: 1 1 9rem;
+    min-width: 0;
   }
   .pick-label {
-    font-size: 0.68rem;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
+    font-size: 12px;
+    text-transform: none;
+    letter-spacing: 0;
     color: var(--ad-faint);
   }
   /* The global `.admin-panel input/select` rule sets width:100%; in this flex
      row each control should size to its own content instead. */
   .pick select {
-    width: auto;
-    min-width: 9rem;
+    width: 100%;
+    min-width: 0;
+    max-width: 24rem;
   }
   .search {
     width: 16rem;
@@ -316,75 +320,21 @@
     font-size: 0.8rem;
     color: var(--ad-dim);
   }
-  .result-feed {
-    list-style: none;
-    padding: 0;
-    margin: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 0.6rem;
-  }
-  /* Left bar carries severity, so the feed scans by colour before it is read. */
-  .result-card {
-    background: var(--ad-panel);
-    border: 1px solid var(--ad-line);
-    border-left: 3px solid var(--ad-line);
-    border-radius: 8px;
-    padding: 0.7rem 0.9rem 0.75rem;
-  }
-  .result-card.bad {
-    border-left-color: var(--ad-red);
-  }
-  .result-card.warn {
-    border-left-color: var(--ad-amber);
-  }
-  .result-card.ok {
-    border-left-color: var(--ad-green);
-  }
-  .rc-top {
-    display: flex;
-    align-items: center;
-    gap: 0.55rem;
-  }
-  .rc-check {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 0.9rem;
-    color: var(--ad-cyan);
-    background: none;
-    border: none;
-    padding: 0;
-    cursor: pointer;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .rc-check:hover {
-    text-decoration: underline;
-  }
-  .rc-agent {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 0.8rem;
-    color: var(--ad-dim);
-  }
-  .rc-when {
-    margin-left: auto;
-  }
-  .rc-meta {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    flex-wrap: wrap;
-    margin-top: 0.45rem;
-  }
-  .rc-error {
-    margin: 0.55rem 0 0;
-    padding: 0.5rem 0.6rem;
-    background: var(--ad-bg, rgba(0, 0, 0, 0.2));
-    border-radius: 6px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 0.78rem;
-    color: var(--ad-dim);
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
+  .probe-ledger { border: 1px solid var(--ad-line); border-radius: 8px; overflow: hidden; }
+  .probe-heading, .probe-line { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(90px, .65fr) minmax(0, 1fr) minmax(70px, .5fr) minmax(90px, .7fr); align-items: center; gap: 20px; padding: 16px 20px; }
+  .probe-heading { color: var(--ad-dim); font-size: 11px; background: var(--ad-panel-2); }
+  .probe-entry { border-top: 1px solid var(--ad-line-soft); }
+  .probe-entry:hover { background: var(--ad-panel-2); }
+  .probe-line { font-size: 13px; }
+  .probe-identity { min-width: 0; display: grid; gap: 6px; }
+  .probe-identity button { padding: 0; background: none; border: 0; color: var(--ad-text); font: inherit; text-align: left; cursor: pointer; overflow-wrap: anywhere; }
+  .probe-identity button:hover { color: var(--ad-cyan); }
+  .probe-identity > span, .probe-secondary { color: var(--ad-dim); font-size: 11px; overflow-wrap: anywhere; }
+  .probe-secondary { display: block; margin-top: 6px; }
+  .probe-place, .probe-time { color: var(--ad-dim); font-size: 12px; overflow-wrap: anywhere; }
+  .probe-latency { font-variant-numeric: tabular-nums; }
+  .probe-error { padding: 0 20px 16px; color: var(--ad-red); font-size: 12px; }
+  .probe-error summary { cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .probe-error pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: 16px; background: var(--ad-bg); border-radius: 6px; line-height: 1.6; }
+  @media (max-width: 900px) { .probe-heading { display: none; } .probe-line { grid-template-columns: minmax(0, 1fr) auto; gap: 12px; } .probe-place { grid-column: 1; } .probe-time { grid-column: 1 / -1; } }
 </style>

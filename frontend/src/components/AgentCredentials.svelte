@@ -127,8 +127,8 @@
     </p>
 
     <form class="create" onsubmit={(e) => (e.preventDefault(), create())}>
-      <input bind:value={zone} placeholder="Zone (e.g. eu-west-1a)" aria-label="Zone" />
-      <input bind:value={region} placeholder="Region (e.g. eu-west)" aria-label="Region" />
+      <label class="field"><span class="field-label">Zone</span><input bind:value={zone} placeholder="Zone (e.g. eu-west-1a)" /></label>
+      <label class="field"><span class="field-label">Region</span><input bind:value={region} placeholder="Region (e.g. eu-west)" /></label>
       <button class="btn primary" type="submit" disabled={creating}>
         {creating ? 'Generating…' : 'Generate'}
       </button>
@@ -223,12 +223,12 @@
 
   .create {
     display: flex;
-    gap: 0.5rem;
-    margin-bottom: 0.8rem;
+    gap: 16px;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    margin: 24px 0;
   }
-  .create input {
-    max-width: 14rem;
-  }
+  .create .field { flex: 1 1 14rem; max-width: 24rem; }
 
   /* Warning-grade because the cost of scrolling past it is unrecoverable: the
      secret is gone the moment this is dismissed. */
@@ -273,7 +273,8 @@
     gap: 0.6rem;
     align-items: center;
     font-size: 0.8rem;
-    padding: 0.32rem 0;
+    padding: 12px 0;
+    min-width: 720px;
     border-bottom: 1px solid rgba(48, 54, 61, 0.5);
   }
   .row:last-child {

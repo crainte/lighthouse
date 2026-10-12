@@ -1,0 +1,2210 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Lightkeeper · Nightwatch design preview</title>
+    <link rel="icon" href="data:," />
+    <style>
+      :root {
+        --bg: #080f19;
+        --nav: #0a121e;
+        --panel: #101b29;
+        --hover: #152334;
+        --border: #223247;
+        --text: #e8eff5;
+        --muted: #a0afc0;
+        --quiet: #8a9aad;
+        --green: #56c9a1;
+        --amber: #e7b66b;
+        --red: #ee8389;
+        --focus: #83b8ce;
+        font:
+          14px/1.5 -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+        color: var(--text);
+        background: var(--bg);
+        font-variant-numeric: tabular-nums;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+      }
+      button,
+      input,
+      select {
+        font: inherit;
+      }
+      button,
+      select {
+        cursor: pointer;
+      }
+      button,
+      a,
+      input,
+      select {
+        -webkit-tap-highlight-color: transparent;
+      }
+      button {
+        color: inherit;
+      }
+      button {
+        border: 0;
+        background: none;
+      }
+      a {
+        color: var(--focus);
+      }
+      button,
+      input,
+      select {
+        transition:
+          background-color 0.15s,
+          color 0.15s,
+          border-color 0.15s;
+      }
+      button:focus-visible,
+      a:focus-visible,
+      input:focus-visible,
+      select:focus-visible {
+        outline: 2px solid var(--focus);
+        outline-offset: 3px;
+      }
+      h1,
+      h2,
+      h3,
+      p {
+        margin: 0;
+      }
+      h2 {
+        font-size: 14px;
+        font-weight: 600;
+      }
+      h3 {
+        font-size: 14px;
+      }
+      svg {
+        display: block;
+      }
+      button:hover {
+        background-color: var(--hover);
+      }
+      .muted {
+        color: var(--muted);
+      }
+      .quiet {
+        color: var(--quiet);
+      }
+      .good {
+        color: var(--green);
+      }
+      .warn {
+        color: var(--amber);
+      }
+      .bad {
+        color: var(--red);
+      }
+      .tiny {
+        font-size: 12px;
+      }
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      }
+      .eyebrow {
+        font-size: 10px;
+        font-weight: 650;
+        letter-spacing: 0.13em;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+      .icon {
+        width: 18px;
+        height: 18px;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.5;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        flex-shrink: 0;
+      }
+      .skip {
+        position: fixed;
+        top: -60px;
+        left: 20px;
+        z-index: 20;
+        background: var(--panel);
+        padding: 12px;
+      }
+      .skip:focus {
+        top: 8px;
+      }
+      .sidebar {
+        position: fixed;
+        inset: 0 auto 0 0;
+        width: 216px;
+        background: var(--nav);
+        border-right: 1px solid var(--border);
+        display: flex;
+        flex-direction: column;
+        padding: 26px 16px 14px;
+        z-index: 5;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin: 0 4px 26px;
+      }
+      .brand-mark {
+        width: 30px;
+        height: 38px;
+        color: var(--focus);
+      }
+      .brand strong {
+        font-size: 17px;
+        letter-spacing: -0.5px;
+      }
+      .brand small {
+        display: block;
+        color: var(--quiet);
+        font-size: 10px;
+        letter-spacing: 0.06em;
+      }
+      .nav-scroll {
+        overflow: auto;
+        flex: 1;
+      }
+      .nav-group {
+        margin: 23px 12px 7px;
+        font-size: 10px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: var(--quiet);
+      }
+      .nav-item {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        min-height: 36px;
+        width: 100%;
+        padding: 7px 12px;
+        text-align: left;
+        border-radius: 5px;
+        color: var(--muted);
+        font-size: 12px;
+        margin: 2px 0;
+        position: relative;
+      }
+      .nav-item.active {
+        color: #b5e7db;
+        background: #142c32;
+      }
+      .nav-item.active:before {
+        content: "";
+        position: absolute;
+        left: 0;
+        height: 16px;
+        width: 2px;
+        background: var(--green);
+      }
+      .badge {
+        margin-left: auto;
+        font-size: 10px;
+        min-width: 18px;
+        text-align: center;
+        border-radius: 4px;
+        background: #36242d;
+        color: var(--red);
+        padding: 1px 5px;
+      }
+      .nav-footer {
+        border-top: 1px solid var(--border);
+        padding-top: 12px;
+        margin-top: 18px;
+      }
+      .connection {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        font-size: 11px;
+        color: var(--muted);
+        padding: 5px 12px;
+      }
+      .dot {
+        width: 6px;
+        height: 6px;
+        display: inline-block;
+        border-radius: 50%;
+        background: currentColor;
+        flex-shrink: 0;
+      }
+      .account {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        border-top: 1px solid var(--border);
+        margin-top: 10px;
+        padding: 14px 6px 0;
+        font-size: 12px;
+      }
+      .avatar {
+        width: 28px;
+        height: 28px;
+        display: grid;
+        place-items: center;
+        background: #1c2d3b;
+        border-radius: 50%;
+        color: #b2c4d4;
+        font-size: 10px;
+      }
+      .account button {
+        margin-left: auto;
+        min-height: 36px;
+      }
+      .workspace {
+        margin-left: 216px;
+      }
+      .topbar {
+        height: 64px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 0 28px;
+      }
+      .crumb {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        font-size: 12px;
+      }
+      .crumb .slash {
+        color: #61748b;
+      }
+      .top-actions {
+        display: flex;
+        align-items: center;
+        gap: 18px;
+      }
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 7px;
+        min-height: 34px;
+        border: 1px solid var(--border);
+        padding: 6px 11px;
+        border-radius: 6px;
+        background: #111e2b;
+        font-size: 12px;
+        white-space: nowrap;
+      }
+      .btn.primary {
+        background: #c5e3de;
+        color: #122b2c;
+        border-color: #c5e3de;
+        font-weight: 600;
+      }
+      .btn.primary:hover {
+        background: #e1f1ed;
+      }
+      .menu-toggle {
+        display: none;
+      }
+      .content {
+        padding: 0 28px 24px;
+        max-width: 1560px;
+        margin: auto;
+      }
+      .hero {
+        height: 228px;
+        position: relative;
+        isolation: isolate;
+        overflow: hidden;
+        display: flex;
+        align-items: center;
+      }
+      .hero-copy {
+        position: relative;
+        z-index: 2;
+        max-width: 68%;
+        padding-bottom: 6px;
+      }
+      .hero-kicker {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 15px;
+        font-size: 11px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+      .hero h1 {
+        font-size: 32px;
+        line-height: 1.16;
+        letter-spacing: -1.1px;
+        font-weight: 550;
+        margin-bottom: 13px;
+      }
+      .hero p {
+        font-size: 13px;
+        color: var(--muted);
+        max-width: 460px;
+        line-height: 1.7;
+      }
+      .hero-link {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--text);
+        font-size: 12px;
+        padding: 8px 0;
+        margin-top: 10px;
+      }
+      .hero-link:hover {
+        background: none;
+        color: var(--focus);
+      }
+      .landscape {
+        position: absolute;
+        inset: 0 0 0 auto;
+        width: 65%;
+        height: 100%;
+        z-index: 0;
+        mask-image: linear-gradient(90deg, transparent, #000 24%);
+        pointer-events: none;
+      }
+      .hero:after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        z-index: 1;
+        background: linear-gradient(90deg, var(--bg) 5%, transparent 75%);
+        pointer-events: none;
+      }
+      .sweep {
+        transform-origin: 590px 83px;
+        opacity: 0;
+      }
+      .sweeping .sweep {
+        animation: sweep 2.1s cubic-bezier(0.37, 0.05, 0.25, 1) both;
+      }
+      .lantern-aura {
+        opacity: 0.5;
+      }
+      .sweeping .lantern-aura {
+        animation: lantern 2.1s ease-out;
+      }
+      .sweeping .metric-rail {
+        animation: rail 2.1s ease-out;
+      }
+      @keyframes sweep {
+        0%,
+        8% {
+          transform: rotate(-150deg) scaleY(0.4);
+          opacity: 0;
+        }
+        20% {
+          opacity: 0.7;
+        }
+        50% {
+          opacity: 0.45;
+          transform: rotate(20deg) scaleY(1);
+        }
+        80% {
+          opacity: 0.55;
+        }
+        100% {
+          transform: rotate(210deg) scaleY(0.4);
+          opacity: 0;
+        }
+      }
+      @keyframes lantern {
+        0%,
+        100% {
+          opacity: 0.5;
+        }
+        40% {
+          opacity: 1;
+        }
+      }
+      @keyframes rail {
+        0%,
+        100% {
+          border-top-color: var(--border);
+        }
+        55% {
+          border-top-color: #537b7d;
+        }
+      }
+      .metric-rail {
+        display: grid;
+        grid-template-columns: 1.45fr 1fr 1fr 1fr;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: #0d1723;
+        margin-bottom: 20px;
+      }
+      .metric {
+        padding: 15px 20px;
+        position: relative;
+      }
+      .metric + .metric:before {
+        content: "";
+        position: absolute;
+        left: 0;
+        top: 18px;
+        bottom: 18px;
+        border-left: 1px solid var(--border);
+      }
+      .metric-label {
+        font-size: 11px;
+        color: var(--muted);
+        margin-bottom: 6px;
+        display: flex;
+        align-items: center;
+        gap: 7px;
+      }
+      .metric-value {
+        font-size: 26px;
+        letter-spacing: -0.8px;
+        line-height: 1.2;
+      }
+      .metric-value small {
+        font-size: 13px;
+        color: var(--muted);
+        letter-spacing: 0;
+      }
+      .metric-meta {
+        font-size: 11px;
+        color: var(--muted);
+        margin-top: 5px;
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+      .dashboard-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1.9fr) minmax(280px, 1fr);
+        gap: 16px;
+        align-items: start;
+      }
+      .primary-column,
+      .secondary-column {
+        display: grid;
+        gap: 16px;
+        min-width: 0;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        overflow: hidden;
+      }
+      .panel-head {
+        min-height: 51px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 12px 18px;
+        border-bottom: 1px solid var(--border);
+      }
+      .panel-title {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+      }
+      .counter {
+        font-size: 10px;
+        color: var(--muted);
+        border: 1px solid var(--border);
+        padding: 0 5px;
+        border-radius: 4px;
+      }
+      .text-link {
+        font-size: 11px;
+        color: var(--muted);
+        padding: 5px 0;
+        min-height: 28px;
+      }
+      .text-link:hover {
+        background: none;
+        color: var(--text);
+      }
+      .incident {
+        padding: 17px 18px 15px;
+        position: relative;
+      }
+      .incident:before {
+        content: "";
+        position: absolute;
+        left: 0;
+        top: 18px;
+        bottom: 18px;
+        width: 2px;
+        background: var(--red);
+      }
+      .incident-top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-bottom: 10px;
+      }
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        border-radius: 4px;
+        padding: 2px 7px;
+        font-size: 10px;
+        background: #322b24;
+        color: var(--amber);
+        border: 1px solid #554633;
+      }
+      .incident h3 {
+        font-weight: 550;
+        letter-spacing: -0.1px;
+        margin-bottom: 5px;
+      }
+      .incident p {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .incident-update {
+        border-left: 1px solid #3d4b5a;
+        padding-left: 10px;
+        margin-top: 12px;
+        line-height: 1.6;
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .incident-bottom {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-top: 12px;
+        font-size: 11px;
+        color: var(--quiet);
+      }
+      .region-meta {
+        padding: 12px 18px 0;
+        font-size: 10px;
+        color: var(--muted);
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      .stations {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        padding: 19px 18px 17px;
+        gap: 16px;
+        position: relative;
+      }
+      .stations:before {
+        content: "";
+        position: absolute;
+        top: 31px;
+        left: 35px;
+        right: 35px;
+        height: 1px;
+        background: #304454;
+      }
+      .station {
+        min-width: 0;
+        position: relative;
+      }
+      .station-beacon {
+        width: 26px;
+        height: 26px;
+        display: grid;
+        place-items: center;
+        background: var(--panel);
+        border: 1px solid #385d59;
+        border-radius: 50%;
+        color: var(--green);
+        margin-bottom: 12px;
+      }
+      .station.affected .station-beacon {
+        color: var(--amber);
+        border-color: #6d5437;
+      }
+      .station.unknown .station-beacon {
+        color: var(--quiet);
+        border-color: var(--border);
+      }
+      .station-name {
+        font-size: 12px;
+        font-weight: 600;
+      }
+      .station-location {
+        font-size: 10px;
+        color: var(--quiet);
+        margin-top: 1px;
+      }
+      .station-state {
+        font-size: 11px;
+        margin: 9px 0 6px;
+      }
+      .station-details {
+        font-size: 10px;
+        color: var(--muted);
+        line-height: 1.9;
+      }
+      .station button {
+        padding: 0;
+        text-align: left;
+      }
+      .station button:hover {
+        background: none;
+        color: var(--focus);
+      }
+      .region-foot {
+        border-top: 1px solid var(--border);
+        padding: 9px 18px;
+        font-size: 10px;
+        color: var(--quiet);
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+      }
+      .toolbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 16px;
+        border-bottom: 1px solid var(--border);
+      }
+      .tabs {
+        display: flex;
+        gap: 4px;
+      }
+      .tab {
+        font-size: 11px;
+        border-radius: 5px;
+        padding: 5px 8px;
+        color: var(--muted);
+        min-height: 30px;
+      }
+      .tab[aria-pressed="true"] {
+        background: #233344;
+        color: var(--text);
+      }
+      .search {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        padding: 0 8px;
+        max-width: 170px;
+        color: var(--quiet);
+      }
+      .search input {
+        width: 100%;
+        min-width: 0;
+        background: transparent;
+        border: 0;
+        color: var(--text);
+        font-size: 11px;
+        height: 30px;
+      }
+      .search input::placeholder {
+        color: var(--quiet);
+      }
+      .monitor-head,
+      .monitor-row {
+        display: grid;
+        grid-template-columns: minmax(130px, 1.5fr) minmax(90px, 1fr) 60px 70px;
+        gap: 12px;
+        align-items: center;
+      }
+      .monitor-head {
+        padding: 9px 18px;
+        font-size: 10px;
+        color: var(--quiet);
+        background: #0e1926;
+      }
+      .monitor-row {
+        width: 100%;
+        text-align: left;
+        padding: 12px 18px;
+        border-top: 1px solid #1c2c3e;
+        min-height: 61px;
+        border-radius: 0;
+      }
+      .monitor-name {
+        font-size: 12px;
+        font-weight: 550;
+        display: block;
+      }
+      .monitor-type {
+        font-size: 10px;
+        color: var(--quiet);
+      }
+      .monitor-status {
+        font-size: 10px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .number {
+        text-align: right;
+        font-size: 11px;
+      }
+      .monitor-history {
+        grid-column: 1/-1;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-top: -1px;
+      }
+      .bars {
+        display: flex;
+        gap: 2px;
+        flex: 1;
+        height: 12px;
+        min-width: 0;
+      }
+      .bar {
+        background: #347865;
+        flex: 1;
+        border-radius: 1px;
+        min-width: 0;
+      }
+      .bar.down {
+        background: var(--red);
+      }
+      .bar.degraded {
+        background: var(--amber);
+      }
+      .bar.unknown {
+        background: repeating-linear-gradient(135deg, #657489 0 1px, transparent 1px 3px);
+        border: 1px solid #627185;
+      }
+      .history-label {
+        font-size: 9px;
+        color: var(--quiet);
+        white-space: nowrap;
+      }
+      .monitor-footer {
+        padding: 11px 18px;
+        display: flex;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 8px;
+        border-top: 1px solid var(--border);
+        font-size: 10px;
+        color: var(--quiet);
+      }
+      .legend {
+        display: flex;
+        gap: 9px;
+      }
+      .legend span {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+      }
+      .legend i {
+        height: 6px;
+        width: 6px;
+        background: #347865;
+        border-radius: 1px;
+      }
+      .legend .missing {
+        background: none;
+        border: 1px solid var(--quiet);
+      }
+      .attention-item {
+        display: block;
+        text-align: left;
+        width: 100%;
+        padding: 16px 18px;
+      }
+      .attention-item + .attention-item {
+        border-top: 1px solid var(--border);
+      }
+      .attention-title {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        font-size: 12px;
+        font-weight: 550;
+      }
+      .attention-item p {
+        padding-left: 27px;
+        margin-top: 6px;
+        color: var(--muted);
+        font-size: 11px;
+        line-height: 1.7;
+      }
+      .attention-item .action {
+        padding-left: 27px;
+        margin-top: 8px;
+        font-size: 10px;
+        color: var(--focus);
+      }
+      .fleet-content {
+        padding: 15px 18px;
+      }
+      .fleet-line {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        font-size: 12px;
+        margin-bottom: 10px;
+      }
+      .fleet-segments {
+        display: flex;
+        gap: 4px;
+        height: 5px;
+        margin: 12px 0 8px;
+      }
+      .fleet-segments span {
+        flex: 1;
+        border-radius: 1px;
+        background: #347865;
+      }
+      .fleet-segments .stale {
+        background: #a57b46;
+      }
+      .fleet-segments .unknown {
+        background: #536377;
+      }
+      .fleet-note {
+        font-size: 10px;
+        color: var(--muted);
+      }
+      .fleet-divider {
+        border-top: 1px solid var(--border);
+        margin: 16px 0;
+      }
+      .activity {
+        padding: 0 18px;
+      }
+      .event {
+        position: relative;
+        display: grid;
+        grid-template-columns: 10px 1fr auto;
+        gap: 9px;
+        padding: 15px 0;
+        border-bottom: 1px solid var(--border);
+        align-items: start;
+      }
+      .event:last-child {
+        border-bottom: 0;
+      }
+      .event-marker {
+        font-size: 12px;
+        margin-top: 2px;
+      }
+      .event p {
+        font-size: 11px;
+      }
+      .event small {
+        font-size: 10px;
+        color: var(--quiet);
+        display: block;
+        margin-top: 4px;
+      }
+      .event time {
+        font-size: 10px;
+        color: var(--muted);
+        padding-top: 2px;
+      }
+      .activity-foot {
+        font-size: 10px;
+        color: var(--quiet);
+        padding: 10px 18px;
+        border-top: 1px solid var(--border);
+      }
+      .page-footer {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        padding-top: 20px;
+        color: var(--quiet);
+        font-size: 10px;
+      }
+      .prototype-tools {
+        margin-top: 20px;
+        border-top: 1px dashed #304154;
+        padding-top: 13px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        color: var(--muted);
+        font-size: 11px;
+      }
+      .prototype-controls {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .prototype-controls select {
+        background: var(--nav);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        padding: 6px;
+        min-height: 34px;
+      }
+      .sample-tag {
+        font-size: 9px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        padding: 3px 6px;
+        border: 1px solid #364455;
+        border-radius: 3px;
+        color: var(--muted);
+      }
+      .empty {
+        padding: 25px 18px;
+        font-size: 12px;
+        color: var(--muted);
+        line-height: 1.8;
+      }
+      .state-notice {
+        padding: 12px 18px;
+        background: #20232a;
+        color: var(--amber);
+        border-bottom: 1px solid var(--border);
+        font-size: 12px;
+      }
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip-path: inset(50%);
+        white-space: nowrap;
+      }
+      .detail-dialog {
+        width: min(580px, calc(100% - 32px));
+        max-height: 85dvh;
+        border: 1px solid #34475c;
+        border-radius: 12px;
+        background: var(--panel);
+        color: var(--text);
+        padding: 0;
+        box-shadow: 0 25px 100px #0009;
+      }
+      .detail-dialog::backdrop,
+      .mobile-dialog::backdrop {
+        background: #020810b8;
+      }
+      .dialog-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 18px 22px;
+        border-bottom: 1px solid var(--border);
+        gap: 14px;
+      }
+      .close {
+        width: 36px;
+        height: 36px;
+        border-radius: 5px;
+        font-size: 22px;
+      }
+      .dialog-body {
+        padding: 22px;
+        line-height: 1.8;
+        font-size: 13px;
+      }
+      .dialog-body p + p {
+        margin-top: 14px;
+      }
+      .dialog-stats {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+        margin: 20px 0;
+      }
+      .dialog-stats strong {
+        display: block;
+        font-size: 20px;
+      }
+      .dialog-stats small {
+        color: var(--muted);
+        font-size: 11px;
+      }
+      .sparkline {
+        width: 100%;
+        height: 80px;
+        border-bottom: 1px solid var(--border);
+        margin: 15px 0;
+      }
+      .mobile-dialog {
+        margin: 0;
+        height: 100dvh;
+        max-height: none;
+        width: 280px;
+        max-width: 90vw;
+        background: var(--nav);
+        color: var(--text);
+        border: 0;
+        border-right: 1px solid var(--border);
+        padding: 16px;
+      }
+      .mobile-dialog nav {
+        padding-top: 8px;
+      }
+      .mobile-dialog .nav-item {
+        min-height: 44px;
+      }
+      .mobile-dialog .dialog-head {
+        padding: 0 0 10px;
+      }
+      .mobile-dialog .nav-group {
+        margin-top: 14px;
+      }
+      @media (min-width: 768px) {
+        .hero {
+          height: 210px;
+        }
+        .metric {
+          padding: 12px 18px;
+        }
+        .panel-head {
+          min-height: 45px;
+          padding: 8px 18px;
+        }
+        .incident {
+          padding: 13px 18px;
+        }
+        .incident-top {
+          margin-bottom: 7px;
+        }
+        .incident-update {
+          margin-top: 8px;
+        }
+        .incident-bottom {
+          margin-top: 6px;
+        }
+        .stations {
+          padding: 14px 18px 12px;
+          gap: 14px;
+        }
+        .stations:before {
+          top: 27px;
+        }
+        .station-beacon {
+          margin-bottom: 6px;
+        }
+        .station-location {
+          line-height: 1.3;
+        }
+        .station-state {
+          margin: 6px 0 3px;
+        }
+        .station-details {
+          line-height: 1.6;
+        }
+        .region-meta {
+          padding-top: 8px;
+        }
+        .region-foot {
+          padding: 7px 18px;
+        }
+        .monitor-row {
+          padding: 9px 18px;
+          row-gap: 5px;
+        }
+        .monitor-type {
+          display: block;
+          line-height: 1.4;
+        }
+        .monitor-name {
+          line-height: 1.5;
+        }
+        .monitor-head {
+          padding-top: 7px;
+          padding-bottom: 7px;
+        }
+      }
+      @media (min-width: 1600px) {
+        .hero h1 {
+          font-size: 36px;
+        }
+        .hero {
+          height: 245px;
+        }
+        .landscape {
+          width: 60%;
+        }
+        .monitor-row {
+          min-height: 70px;
+        }
+      }
+      @media (max-width: 1150px) {
+        .dashboard-grid {
+          grid-template-columns: minmax(0, 1fr);
+        }
+        .secondary-column {
+          grid-template-columns: 1fr 1fr;
+        }
+        .secondary-column .events-panel {
+          grid-column: 1/-1;
+        }
+        .activity {
+          display: grid;
+          grid-template-columns: repeat(3, 1fr);
+          gap: 20px;
+        }
+        .event {
+          border: 0;
+        }
+        .hero h1 {
+          font-size: 29px;
+        }
+        .metric {
+          padding: 15px;
+        }
+        .top-actions .freshness {
+          display: none;
+        }
+        .landscape {
+          width: 80%;
+        }
+        .monitor-head,
+        .monitor-row {
+          grid-template-columns: minmax(150px, 1.5fr) 1fr 85px 90px;
+        }
+      }
+      @media (max-width: 767px) {
+        .sidebar {
+          display: none;
+        }
+        .workspace {
+          margin: 0;
+        }
+        .topbar {
+          height: 60px;
+          padding: 0 16px;
+          gap: 8px;
+        }
+        .menu-toggle {
+          display: inline-flex;
+          width: 44px;
+          height: 44px;
+          align-items: center;
+          justify-content: center;
+        }
+        .crumb {
+          gap: 8px;
+        }
+        .crumb .context,
+        .crumb .slash {
+          display: none;
+        }
+        .top-actions {
+          gap: 8px;
+        }
+        .content {
+          padding: 0 16px 20px;
+        }
+        .hero {
+          height: 205px;
+        }
+        .hero-copy {
+          max-width: 85%;
+        }
+        .hero h1 {
+          font-size: 28px;
+          max-width: 330px;
+        }
+        .hero p {
+          font-size: 12px;
+          max-width: 300px;
+        }
+        .hero-kicker {
+          font-size: 10px;
+          margin-bottom: 12px;
+        }
+        .landscape {
+          width: 100%;
+          right: -70px;
+          opacity: 0.45;
+        }
+        .metric-rail {
+          grid-template-columns: 1fr 1fr;
+        }
+        .metric:nth-child(3),
+        .metric:nth-child(4) {
+          border-top: 1px solid var(--border);
+        }
+        .metric:nth-child(3):before {
+          display: none;
+        }
+        .metric {
+          padding: 13px 16px;
+        }
+        .metric-value {
+          font-size: 24px;
+        }
+        .secondary-column {
+          grid-template-columns: 1fr;
+        }
+        .secondary-column .events-panel {
+          grid-column: auto;
+        }
+        .activity {
+          display: block;
+        }
+        .event {
+          border-bottom: 1px solid var(--border);
+        }
+        .stations {
+          grid-template-columns: 1fr;
+          padding: 8px 18px;
+          gap: 0;
+        }
+        .stations:before {
+          display: none;
+        }
+        .station {
+          display: grid;
+          grid-template-columns: 28px 1fr 1fr;
+          gap: 10px;
+          padding: 14px 0;
+          align-items: start;
+        }
+        .station + .station {
+          border-top: 1px solid var(--border);
+        }
+        .station-beacon {
+          margin-top: 2px;
+        }
+        .station-state {
+          margin: 0 0 4px;
+        }
+        .station-summary {
+          grid-column: 3;
+        }
+        .station-details {
+          font-size: 10px;
+        }
+        .region-meta {
+          flex-direction: column;
+          gap: 2px;
+        }
+        .region-foot {
+          flex-direction: column;
+          gap: 2px;
+        }
+        .panel-head {
+          padding: 12px 16px;
+        }
+        .toolbar {
+          flex-wrap: wrap;
+        }
+        .search {
+          max-width: none;
+          flex: 1;
+          min-width: 120px;
+        }
+        .monitor-head {
+          display: none;
+        }
+        .monitor-row {
+          grid-template-columns: minmax(0, 1fr) auto;
+          gap: 7px;
+          padding: 14px 16px;
+        }
+        .monitor-status {
+          justify-content: flex-end;
+        }
+        .monitor-row .number {
+          text-align: left;
+          color: var(--muted);
+        }
+        .monitor-row .number.uptime {
+          text-align: right;
+        }
+        .mobile-label {
+          display: inline !important;
+        }
+        .monitor-history {
+          margin-top: 4px;
+        }
+        .monitor-footer {
+          padding: 12px 16px;
+        }
+        .prototype-tools,
+        .page-footer {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+        .prototype-controls {
+          width: 100%;
+        }
+        .prototype-controls select {
+          flex: 1;
+        }
+        .btn,
+        .tab,
+        .text-link,
+        .hero-link {
+          min-height: 44px;
+        }
+        .close {
+          min-height: 44px;
+          min-width: 44px;
+        }
+        .incident-top {
+          flex-wrap: wrap;
+        }
+        .dialog-stats {
+          gap: 6px;
+        }
+        .dialog-stats strong {
+          font-size: 17px;
+        }
+      }
+      .sweep path {
+        transform-box: fill-box;
+        transform-origin: 0 50%;
+        opacity: 0;
+      }
+      .sweeping .beam-right-outer {
+        animation: beam-right 2.1s cubic-bezier(0.37, 0.05, 0.25, 1) both;
+      }
+      .sweeping .beam-right-core {
+        animation: beam-right-core 2.1s cubic-bezier(0.37, 0.05, 0.25, 1) both;
+      }
+      .sweeping .beam-left {
+        animation: beam-left 2.1s cubic-bezier(0.37, 0.05, 0.25, 1) both;
+      }
+      @keyframes beam-right {
+        0%,
+        100% {
+          opacity: 0;
+          transform: scaleX(0.08) skewY(-12deg);
+        }
+        20%,
+        62% {
+          opacity: 0.28;
+        }
+        50% {
+          transform: scaleX(1) skewY(0);
+        }
+      }
+      @keyframes beam-right-core {
+        0%,
+        100% {
+          opacity: 0;
+          transform: scaleX(0.06) skewY(-8deg);
+        }
+        26%,
+        58% {
+          opacity: 0.2;
+        }
+        50% {
+          transform: scaleX(1) skewY(0);
+        }
+      }
+      @keyframes beam-left {
+        0%,
+        100% {
+          opacity: 0;
+          transform: scaleX(0.08) skewY(12deg);
+        }
+        45%,
+        82% {
+          opacity: 0.1;
+        }
+        66% {
+          transform: scaleX(1) skewY(0);
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        *,
+        *:before,
+        *:after {
+          animation: none !important;
+          transition: none !important;
+          scroll-behavior: auto !important;
+        }
+        body:not(.motion-preview) .sweep {
+          opacity: 0 !important;
+        }
+        body.motion-preview .beam-right-outer {
+          animation: beam-right 2.1s cubic-bezier(0.37, 0.05, 0.25, 1) both !important;
+        }
+        body.motion-preview .beam-right-core {
+          animation: beam-right-core 2.1s cubic-bezier(0.37, 0.05, 0.25, 1) both !important;
+        }
+        body.motion-preview .beam-left {
+          animation: beam-left 2.1s cubic-bezier(0.37, 0.05, 0.25, 1) both !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to overview</a>
+    <svg width="0" height="0" style="position: absolute" aria-hidden="true">
+      <defs>
+        <symbol id="i-overview" viewBox="0 0 24 24">
+          <rect x="3" y="3" width="7" height="7" rx="1" />
+          <rect x="14" y="3" width="7" height="7" rx="1" />
+          <rect x="3" y="14" width="7" height="7" rx="1" />
+          <rect x="14" y="14" width="7" height="7" rx="1" />
+        </symbol>
+        <symbol id="i-pulse" viewBox="0 0 24 24"><path d="M2 12h5l3-8 4 16 3-8h5" /></symbol>
+        <symbol id="i-alert" viewBox="0 0 24 24">
+          <path d="m12 3 10 18H2Z" />
+          <path d="M12 9v5m0 3v.1" />
+        </symbol>
+        <symbol id="i-fleet" viewBox="0 0 24 24">
+          <rect x="4" y="3" width="16" height="7" rx="2" />
+          <rect x="4" y="14" width="16" height="7" rx="2" />
+          <path d="M8 6.5h.01M8 17.5h.01M12 6.5h5M12 17.5h5" />
+        </symbol>
+        <symbol id="i-link" viewBox="0 0 24 24">
+          <circle cx="12" cy="5" r="3" />
+          <circle cx="5" cy="19" r="3" />
+          <circle cx="19" cy="19" r="3" />
+          <path d="m10 8-4 8m8-8 4 8M8 19h8" />
+        </symbol>
+        <symbol id="i-file" viewBox="0 0 24 24">
+          <rect x="5" y="3" width="14" height="18" rx="2" />
+          <path d="M9 8h6M9 12h6m-6 4h4" />
+        </symbol>
+        <symbol id="i-key" viewBox="0 0 24 24">
+          <circle cx="8" cy="8" r="5" />
+          <path d="m12 12 9 9m-5-5 3-3m-6 0 3-3" />
+        </symbol>
+        <symbol id="i-bell" viewBox="0 0 24 24"><path d="M5 17h14l-2-4V9a5 5 0 0 0-10 0v4Zm5 4h4" /></symbol>
+        <symbol id="i-clock" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 7v6h4" />
+        </symbol>
+        <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-5-5 5 5-5 5" /></symbol>
+        <symbol id="i-beacon" viewBox="0 0 24 24">
+          <path d="m9 20 1-10h4l1 10M8 20h8M9 7h6l-3-3Zm1 0v3m4-3v3M4 7h2m12 0h2" />
+        </symbol>
+      </defs>
+    </svg>
+    <aside class="sidebar" aria-label="Console navigation">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 32 40" fill="none" aria-hidden="true">
+          <path
+            d="m10 35 3-23h6l3 23M8 35h16M11 12h10M12 7h8l-4-5ZM13 7v5m6-5v5M2 9h6m16 0h6"
+            stroke="currentColor"
+            stroke-width="1.5"
+          />
+          <path d="m15 16-1 15h4l-1-15" fill="currentColor" opacity=".3" />
+        </svg>
+        <div><strong>Lightkeeper</strong><small>LIGHTHOUSE CONSOLE</small></div>
+      </div>
+      <nav class="nav-scroll" id="desktop-nav" aria-label="Main"></nav>
+      <div class="nav-footer">
+        <div class="connection">
+          <span class="dot good" id="nav-live-dot"></span><span id="nav-live">Live updates connected</span>
+        </div>
+        <div class="connection"><span class="mono">global-01</span><span class="quiet">· Global</span></div>
+        <button class="nav-item" data-destination="Public status page">
+          <svg class="icon"><use href="#i-arrow" /></svg>Public status page
+        </button>
+        <div class="account">
+          <span class="avatar">OP</span><span>Operator <span class="quiet tiny">/ admin</span></span
+          ><button data-destination="Log out" aria-label="Log out preview">↗</button>
+        </div>
+      </div>
+    </aside>
+    <div class="workspace">
+      <header class="topbar">
+        <div class="crumb">
+          <button class="menu-toggle" id="open-menu" aria-label="Open navigation" aria-haspopup="dialog">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16" /></svg></button
+          ><span class="muted context">Workspace</span><span class="slash">/</span><strong>Overview</strong
+          ><span class="sample-tag">Sample data</span>
+        </div>
+        <div class="top-actions">
+          <span class="freshness tiny muted" id="freshness">Snapshot · 14:32 UTC</span
+          ><button class="btn" id="hero-replay" aria-label="Replay lighthouse sweep">
+            ↻ <span class="freshness">Sweep</span></button
+          ><button class="btn primary" data-destination="Add monitor">
+            <span aria-hidden="true">＋</span> Add monitor
+          </button>
+        </div>
+      </header>
+      <main class="content" id="main" tabindex="-1">
+        <section class="hero" aria-labelledby="hero-title">
+          <svg
+            class="landscape"
+            viewBox="0 0 800 250"
+            preserveAspectRatio="xMidYMid slice"
+            aria-hidden="true"
+            focusable="false"
+          >
+            <defs>
+              <linearGradient id="sky" x2="0" y2="1">
+                <stop stop-color="#0a1625" />
+                <stop offset=".67" stop-color="#112b36" />
+                <stop offset="1" stop-color="#080f19" />
+              </linearGradient>
+              <radialGradient id="air">
+                <stop stop-color="#49878b" stop-opacity=".16" />
+                <stop offset="1" stop-color="#234451" stop-opacity="0" />
+              </radialGradient>
+              <linearGradient id="sea" x2="0" y2="1">
+                <stop stop-color="#1a3741" stop-opacity=".6" />
+                <stop offset="1" stop-color="#080f19" />
+              </linearGradient>
+              <linearGradient id="stone">
+                <stop stop-color="#233e49" />
+                <stop offset=".45" stop-color="#6c7b7b" />
+                <stop offset=".6" stop-color="#344d57" />
+                <stop offset="1" stop-color="#152a35" />
+              </linearGradient>
+              <linearGradient id="beam">
+                <stop stop-color="#f0dfb4" stop-opacity=".34" />
+                <stop offset="1" stop-color="#a4d8d0" stop-opacity="0" />
+              </linearGradient>
+              <radialGradient id="glow">
+                <stop stop-color="#fff0c9" stop-opacity=".8" />
+                <stop offset=".15" stop-color="#ecd9a9" stop-opacity=".3" />
+                <stop offset="1" stop-color="#e7c98a" stop-opacity="0" />
+              </radialGradient>
+              <linearGradient id="fog">
+                <stop stop-color="#74a8aa" stop-opacity="0" />
+                <stop offset=".6" stop-color="#74a8aa" stop-opacity=".12" />
+                <stop offset="1" stop-color="#74a8aa" stop-opacity="0" />
+              </linearGradient>
+            </defs>
+            <path fill="url(#sky)" d="M0 0h800v250H0z" />
+            <ellipse cx="578" cy="140" rx="280" ry="180" fill="url(#air)" />
+            <path d="M0 169Q160 165 300 168T800 168V250H0Z" fill="url(#sea)" />
+            <path d="M140 168h660" stroke="#678e94" opacity=".12" />
+            <path d="m30 172 96-8 80 4 70-9 60 10 90-2 64 7Z" fill="#0c1c28" />
+            <path d="M590 83 805 44v55Z" fill="url(#beam)" opacity=".42" />
+            <g class="sweep" transform="translate(590 83)">
+              <path class="beam-right-outer" d="M0 0 460-88v185Z" fill="#d9eee0" opacity=".28" />
+              <path class="beam-right-core" d="M0 0 460-35v70Z" fill="#fff0c9" opacity=".2" />
+              <path class="beam-left" d="M0 0-430-71v142Z" fill="#b3d8d5" opacity=".1" />
+            </g>
+            <circle class="lantern-aura" cx="590" cy="83" r="53" fill="url(#glow)" />
+            <path
+              d="m450 232 29-27 38-10 25-15 45-4 44 11 24-3 47 20 26 13 52 14 20 19H420Z"
+              fill="#0b1520"
+            />
+            <path d="m472 217 58-23 25-8 33-2 35 13-30-6-35 8-21-1-23 12Z" fill="#1d3039" />
+            <path d="m616 199 24-6 27 12 31 20-40-13-26 1Z" fill="#152632" />
+            <path d="m568 189 10-89h24l12 91-21 7Z" fill="url(#stone)" />
+            <path d="m580 102-6 86 11 4 2-90Z" fill="#a3aca0" opacity=".09" />
+            <path d="M575 98h31v5h-31Z" fill="#273c43" />
+            <path d="M573 94h35v4h-35Z" fill="#8e9690" opacity=".6" />
+            <path d="M578 72h25v20h-25Z" fill="#112330" />
+            <path d="M581 76h19v13h-19Z" fill="#d7c995" opacity=".56" />
+            <path d="M584 77h12v10h-12Z" fill="#fff0c2" />
+            <path d="M581 74v17m9-17v17m9-17v17" stroke="#304147" stroke-width="2" />
+            <path d="M575 72h31l-16-10Z" fill="#547078" />
+            <path d="M575 72h31" stroke="#8c9d99" />
+            <path d="M590 57v5M571 91h39M572 88v7m6-7v7m24-7v7m7-7v7" stroke="#627c7c" stroke-width="1" />
+            <path d="M587 116h5v9h-5Zm-2 25h6v9h-6Zm-2 27h7v20h-7Z" fill="#0d202b" />
+            <path d="M588 117h2v6h-2Z" fill="#e3ca8d" opacity=".45" />
+            <path d="M550 191h78v5h-78Z" fill="#2a3c42" />
+            <path d="M320 192q180-19 400 3l80 12q-220-17-480-1Z" fill="url(#fog)" />
+            <path d="M220 217q200-15 480 11v10q-260-17-480-12Z" fill="url(#fog)" />
+            <circle cx="344" cy="167" r="1.3" fill="#d1c193" opacity=".7" />
+            <path d="M339 174h12m-16 5h19M712 180h37m-12 7h33M389 185h44" stroke="#9dbdb9" opacity=".09" />
+          </svg>
+          <div class="hero-copy">
+            <div class="hero-kicker">
+              <span id="hero-symbol" class="bad" aria-hidden="true">◈</span>Infrastructure at a glance
+            </div>
+            <h1 id="hero-title">Partial service disruption</h1>
+            <p id="hero-description">
+              Two monitors need attention in Europe. Your other regions are operating normally.
+            </p>
+            <button class="hero-link" id="hero-action">
+              Review active incident <svg class="icon"><use href="#i-arrow" /></svg>
+            </button>
+          </div>
+        </section>
+        <section class="metric-rail" aria-label="Global monitoring summary" id="metrics"></section>
+        <div class="dashboard-grid">
+          <div class="primary-column">
+            <section class="panel" aria-labelledby="incidents-title">
+              <div class="panel-head">
+                <div class="panel-title">
+                  <h2 id="incidents-title">Active incidents</h2>
+                  <span class="counter" id="incident-count">1</span>
+                </div>
+                <button class="text-link" data-destination="Incidents">View all ↗</button>
+              </div>
+              <div id="incident-content"></div>
+            </section>
+            <section class="panel" aria-labelledby="regions-title">
+              <div class="panel-head">
+                <div class="panel-title">
+                  <h2 id="regions-title">Regional stations</h2>
+                  <span class="counter">3</span>
+                </div>
+                <button class="text-link" data-destination="Region tree">Explore regions ↗</button>
+              </div>
+              <div class="region-meta">
+                <span>Service health by region</span
+                ><span>Reporting to <span class="mono">global-01</span></span>
+              </div>
+              <div class="stations" id="stations"></div>
+              <div class="region-foot">
+                <span>Line = reporting relationship, not physical topology</span
+                ><span id="region-freshness">Last reports · 2–5s ago</span>
+              </div>
+            </section>
+            <section class="panel" aria-labelledby="monitors-title">
+              <div class="panel-head">
+                <div class="panel-title">
+                  <h2 id="monitors-title">Monitor health</h2>
+                  <span class="counter">24</span>
+                </div>
+                <button class="text-link" data-destination="Checks">All monitors ↗</button>
+              </div>
+              <div class="toolbar">
+                <div class="tabs" role="group" aria-label="Monitor status filter">
+                  <button class="tab" data-filter="all" aria-pressed="true">All</button
+                  ><button class="tab" data-filter="attention" aria-pressed="false">Needs attention</button>
+                </div>
+                <label class="search"
+                  ><svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <circle cx="10" cy="10" r="6" />
+                    <path d="m15 15 5 5" /></svg
+                  ><span class="sr-only">Filter sample monitors</span
+                  ><input id="monitor-search" placeholder="Filter monitors…" type="search"
+                /></label>
+              </div>
+              <div class="monitor-head" aria-hidden="true">
+                <span>Monitor</span><span>Current state</span><span style="text-align: right">Response</span
+                ><span style="text-align: right">24h uptime</span>
+              </div>
+              <div id="monitor-list"></div>
+              <div class="monitor-footer">
+                <span id="monitor-count">6 featured of 24 monitors</span
+                ><span class="legend"
+                  ><span><i></i>Up</span><span><i style="background: var(--red)"></i>Failure</span
+                  ><span><i style="background: var(--amber)"></i>Degraded</span
+                  ><span><i class="missing"></i>No data</span></span
+                >
+              </div>
+            </section>
+          </div>
+          <div class="secondary-column">
+            <section class="panel" aria-labelledby="attention-title">
+              <div class="panel-head">
+                <h2 id="attention-title">Needs attention</h2>
+                <svg class="icon quiet" aria-hidden="true"><use href="#i-alert" /></svg>
+              </div>
+              <div id="attention-content"></div>
+            </section>
+            <section class="panel" aria-labelledby="connectivity-title">
+              <div class="panel-head">
+                <h2 id="connectivity-title">Fleet connectivity</h2>
+                <button class="text-link" data-destination="Cluster">Details ↗</button>
+              </div>
+              <div class="fleet-content" id="fleet-content"></div>
+            </section>
+            <section class="panel events-panel" aria-labelledby="events-title">
+              <div class="panel-head">
+                <h2 id="events-title">Recent activity</h2>
+                <button class="text-link" data-destination="Alerts">View feed ↗</button>
+              </div>
+              <div class="activity" id="activity"></div>
+              <div class="activity-foot">11 Oct 2026 · UTC · Recent events, not an audit log</div>
+            </section>
+          </div>
+        </div>
+        <footer class="page-footer">
+          <span>Lightkeeper <span class="quiet">/</span> Every signal, in sight.</span
+          ><span id="footer-snapshot">Global view · 3 regions · Sample snapshot at 14:32 UTC</span>
+        </footer>
+        <section class="prototype-tools" aria-label="Design review controls">
+          <div>
+            <span class="eyebrow">Design preview</span><span> · Nightwatch / 01</span>
+            <div class="tiny quiet">Synthetic data. No live connections or production actions.</div>
+          </div>
+          <div class="prototype-controls">
+            <label for="scene" class="sr-only">Preview scenario</label
+            ><select id="scene">
+              <option value="disruption">Partial disruption</option>
+              <option value="healthy">All operational</option>
+              <option value="stale">Data unavailable</option></select
+            ><button class="btn" id="replay">Replay sweep</button
+            ><button class="btn" id="design-notes">Design notes</button>
+          </div>
+        </section>
+        <div class="sr-only" role="status" id="announcement"></div>
+      </main>
+    </div>
+    <dialog class="detail-dialog" id="detail" aria-labelledby="dialog-title">
+      <div class="dialog-head">
+        <div>
+          <div class="eyebrow" style="margin-bottom: 5px">Sample data · Preview only</div>
+          <h2 id="dialog-title"></h2>
+        </div>
+        <button class="close" id="close-detail" aria-label="Close preview">×</button>
+      </div>
+      <div class="dialog-body" id="dialog-body"></div>
+    </dialog>
+    <dialog class="mobile-dialog" id="mobile-menu" aria-labelledby="mobile-title">
+      <div class="dialog-head">
+        <h2 id="mobile-title">Lightkeeper</h2>
+        <button class="close" id="close-menu" aria-label="Close navigation">×</button>
+      </div>
+      <nav id="mobile-nav" aria-label="Mobile main"></nav>
+    </dialog>
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const icon = (name) => `<svg class="icon" aria-hidden="true"><use href="#i-${name}"/></svg>`;
+      const panels = [
+        ["", "Overview", "overview"],
+        ["Monitor", "Checks", "pulse"],
+        ["", "Alerts", "bell"],
+        ["", "Incidents", "alert"],
+        ["Fleet", "Agents", "fleet"],
+        ["", "Credentials", "key"],
+        ["", "Probe results", "file"],
+        ["", "Cluster", "link"],
+        ["", "Region tree", "link"],
+        ["Platform", "Status page", "file"],
+        ["", "Notifications", "bell"],
+        ["", "Maintenance", "clock"],
+        ["", "Data cleanup", "fleet"],
+      ];
+      const navigation = panels
+        .map(
+          ([group, name, symbol]) =>
+            `${group ? `<div class="nav-group">${group}</div>` : ""}<button class="nav-item ${name === "Overview" ? "active" : ""}" ${name === "Overview" ? 'aria-current="page"' : ""} data-destination="${name}">${icon(symbol)}${name}${name === "Incidents" ? '<span class="badge incident-badge">1</span>' : ""}</button>`,
+        )
+        .join("");
+      $("desktop-nav").innerHTML = navigation;
+      $("mobile-nav").innerHTML =
+        navigation +
+        '<button class="nav-item" data-destination="Public status page">Public status page ↗</button>';
+      const monitors = [
+        {
+          name: "Edge certificate",
+          type: "SSL / TLS",
+          region: "eu-west",
+          state: "down",
+          latency: 48,
+          uptime: "99.03",
+          note: "Certificate inside the configured warning threshold. This policy failure does not necessarily mean the endpoint is unreachable.",
+        },
+        {
+          name: "Background workers",
+          type: "OpenMetrics",
+          region: "eu-west",
+          state: "degraded",
+          latency: 186,
+          uptime: "99.72",
+          note: "Worker availability is below the configured evaluation threshold in eu-west.",
+        },
+        {
+          name: "Public API",
+          type: "HTTP",
+          region: "All regions",
+          state: "up",
+          latency: 124,
+          uptime: "99.99",
+          note: "HTTP responses are passing the configured health evaluation.",
+        },
+        {
+          name: "Primary database",
+          type: "TCP",
+          region: "All regions",
+          state: "up",
+          latency: 12,
+          uptime: "100.00",
+          note: "The TCP endpoint is accepting connections.",
+        },
+        {
+          name: "Authoritative DNS",
+          type: "DNS",
+          region: "All regions",
+          state: "up",
+          latency: 28,
+          uptime: "100.00",
+          note: "DNS responses match the configured record policy.",
+        },
+        {
+          name: "Backup heartbeat",
+          type: "Heartbeat",
+          region: "us-east",
+          state: "up",
+          latency: null,
+          uptime: "100.00",
+          note: "The heartbeat has arrived within its configured interval. Response time does not apply.",
+        },
+      ];
+      const stateLabels = { up: "Operational", down: "Down", degraded: "Degraded", unknown: "Unknown" };
+      const tones = { up: "good", down: "bad", degraded: "warn", unknown: "quiet" };
+      const marks = { up: "✓", down: "×", degraded: "△", unknown: "○" };
+      let scene = "disruption";
+      let filter = "all";
+      let detailTrigger;
+      function currentState(m) {
+        return scene === "stale" ? "unknown" : scene === "healthy" ? "up" : m.state;
+      }
+      function uptime(m) {
+        return scene === "stale" ? "—" : `${m.uptime}%`;
+      }
+      function response(m) {
+        return scene === "stale" || m.latency === null ? "—" : `${m.latency} ms`;
+      }
+      function historyBars(m, index) {
+        return Array.from({ length: 48 }, (_, i) => {
+          const state =
+            (scene === "stale" && i === 47) || (index === 5 && i < 4)
+              ? "unknown"
+              : m.state === "down" && i === 47
+                ? "down"
+                : m.state === "degraded" && i === 47
+                  ? "degraded"
+                  : index === 2 && i === 46
+                    ? "down"
+                    : "up";
+          return `<span class="bar ${state}"></span>`;
+        }).join("");
+      }
+      function showDialog(title, body) {
+        detailTrigger = document.activeElement;
+        if ($("mobile-menu").open) {
+          $("mobile-menu").close();
+          detailTrigger = $("open-menu");
+        }
+        $("dialog-title").textContent = title;
+        $("dialog-body").innerHTML = body;
+        $("detail").showModal();
+        $("close-detail").focus();
+      }
+      function showMonitor(index) {
+        const m = monitors[index],
+          s = currentState(m);
+        showDialog(
+          m.name,
+          `<p class="${tones[s]}">${marks[s]} ${stateLabels[s]} <span class="muted">· ${m.type} · ${m.region}</span></p><p>${scene === "stale" ? "Current observations are unavailable. The last-known state must not be treated as current health." : scene === "healthy" ? "The latest observation passes its configured evaluation. Historical disruptions remain visible in the uptime window." : m.note}</p><div class="dialog-stats"><div><strong>${response(m)}</strong><small>Latest response</small></div><div><strong>${uptime(m)}</strong><small>24h uptime</small></div><div><strong>${scene === "stale" ? "Unknown" : "14:32"}</strong><small>Last observation · UTC</small></div></div><h3>Historical uptime · 24 hours</h3><div class="bars" style="margin:14px 0" role="img" aria-label="${m.name}: 24-hour uptime ${uptime(m)}; hatched segments have no observations">${historyBars(m, index)}</div><p class="tiny muted">10 Oct 14:32 → 11 Oct 14:32 UTC. Each bar represents 30 minutes; colored bars mark a failure or degradation within the bucket, not its full duration. The most recent bucket may include a recovery. Unknown time is not counted as downtime. Select a monitor in the production application for bucket-level history and incident updates.</p>${scene !== "stale" && m.latency !== null ? `<h3 style="margin-top:20px">Response trend · last hour</h3><svg class="sparkline" viewBox="0 0 480 80" role="img" aria-label="Illustrative response trend, not actual measurements"><path d="M0 55H480M0 25H480" stroke="#223247"/><path d="m0 56 15-3 15 5 15-10 15 4 15-2 15 5 15-8 15 1 15-8 15 13 15-4 15 7 15-12 15 4 15-8 15 5 15-16 15 5 15 15 15-5 15 4 15-6 15 5 15-10 15 6 15-2 15 8 15-4 15 1 30-8" fill="none" stroke="#56c9a1" stroke-width="1.5"/></svg><p class="tiny quiet">Illustrative sparkline. This design preview has no measurement backend.</p>` : ""}`,
+        );
+      }
+      function incidentDialog() {
+        showDialog(
+          "Certificate policy breach in Europe",
+          `<p><span class="pill">Investigating</span> <span class="muted">INC-0042 · Started 14:18 UTC</span></p><p>The Edge certificate monitor in eu-west entered a failed state because its certificate is inside the configured warning threshold. Endpoint reachability is not implied by this failure.</p><p><strong>14:24 · Operator update</strong><br><span class="muted">Certificate renewal is being investigated. Other regions continue to pass their checks.</span></p><p class="tiny quiet">The same certificate warning appears in Needs attention; it is not a second incident. Incident editing and acknowledgement remain in the existing authenticated workflow.</p>`,
+        );
+      }
+      function renderMonitors() {
+        const query = $("monitor-search").value.toLowerCase();
+        const visible = monitors
+          .map((m, i) => ({ m, i, s: currentState(m) }))
+          .filter(
+            ({ m, s }) =>
+              (filter === "all" || s !== "up") &&
+              `${m.name} ${m.type} ${m.region}`.toLowerCase().includes(query),
+          );
+        $("monitor-list").innerHTML =
+          visible
+            .map(
+              ({ m, i, s }) =>
+                `<button class="monitor-row" data-monitor="${i}" aria-label="${m.name}, ${stateLabels[s]}, response ${response(m)}, 24-hour uptime ${uptime(m)}. Open details"><span><span class="monitor-name">${m.name}</span><span class="monitor-type">${m.type} <span aria-hidden="true">·</span> ${m.region}</span></span><span class="monitor-status ${tones[s]}"><span aria-hidden="true">${marks[s]}</span>${stateLabels[s]}</span><span class="number"><span class="mobile-label" style="display:none">Response </span>${response(m)}</span><span class="number uptime"><span class="mobile-label" style="display:none">24h </span>${uptime(m)}</span><span class="monitor-history" aria-hidden="true"><span class="history-label">24h ago</span><span class="bars">${historyBars(m, i)}</span><span class="history-label">Now</span></span></button>`,
+            )
+            .join("") || '<div class="empty">No featured monitors match this filter.</div>';
+        $("monitor-count").textContent = `${visible.length} of 6 featured · 24 total monitors`;
+      }
+      function render() {
+        const stale = scene === "stale",
+          healthy = scene === "healthy";
+        $("hero-title").textContent = stale
+          ? "Visibility interrupted"
+          : healthy
+            ? "All systems operational"
+            : "Partial service disruption";
+        $("hero-description").textContent = stale
+          ? "The global feed is unavailable. Current service health cannot be confirmed; last snapshot was at 14:27 UTC."
+          : healthy
+            ? "All 24 monitors are passing their checks. Three regions are reporting, and your full agent fleet is connected."
+            : "Two monitors need attention in Europe. Your other regions are operating normally.";
+        $("hero-symbol").className = stale ? "warn" : healthy ? "good" : "bad";
+        $("hero-action").innerHTML =
+          `${stale ? "Inspect reporting status" : healthy ? "Explore regional health" : "Review active incident"} ${icon("arrow")}`;
+        $("nav-live").textContent = stale ? "Live updates disconnected" : "Live updates connected";
+        $("nav-live-dot").className = `dot ${stale ? "warn" : "good"}`;
+        $("freshness").textContent = stale ? "Stale snapshot · 14:27 UTC" : "Snapshot · 14:32 UTC";
+        $("footer-snapshot").textContent =
+          `Global view · 3 regions · ${stale ? "Stale sample snapshot at 14:27" : "Sample snapshot at 14:32"} UTC`;
+        $("incident-count").textContent = stale ? "—" : healthy ? "0" : "1";
+        document.querySelectorAll(".incident-badge").forEach((el) => {
+          el.textContent = stale ? "?" : healthy ? "0" : "1";
+          el.hidden = healthy;
+        });
+        const metrics = [
+          [
+            "Operational monitors",
+            stale ? "—" : healthy ? "24" : "22",
+            " / 24",
+            stale
+              ? "24 current states unknown"
+              : healthy
+                ? "✓ All operational"
+                : '<span class="good">22 operational</span><span class="warn">1 degraded</span><span class="bad">1 down</span>',
+          ],
+          [
+            "Active incidents",
+            stale ? "—" : healthy ? "0" : "1",
+            "",
+            stale
+              ? "Cannot confirm current count"
+              : healthy
+                ? "No active incidents"
+                : "Investigating · eu-west",
+          ],
+          [
+            "Reporting regions",
+            stale ? "—" : "3",
+            " / 3",
+            stale ? "Reporting status unknown" : "Latest reports received",
+          ],
+          [
+            "Live agents",
+            stale ? "—" : healthy ? "12" : "11",
+            " / 12",
+            stale ? "Connectivity unknown" : healthy ? "All agents reporting" : "1 agent not reporting",
+          ],
+        ];
+        $("metrics").innerHTML = metrics
+          .map(
+            ([label, value, total, meta]) =>
+              `<div class="metric"><div class="metric-label">${label}</div><div class="metric-value">${value}<small>${total}</small></div><div class="metric-meta">${meta}</div></div>`,
+          )
+          .join("");
+        $("incident-content").innerHTML = stale
+          ? '<div class="state-notice">△ Incident feed unavailable</div><div class="empty">Last known: 1 investigating incident at 14:27 UTC. Current incident state cannot be confirmed.</div>'
+          : healthy
+            ? '<div class="empty"><span class="good">✓ No active incidents</span><br>All monitors currently pass their configured checks.<br><span class="tiny">Past disruptions remain visible in monitor history.</span></div>'
+            : `<div class="incident"><div class="incident-top"><span class="pill">◈ Investigating</span><span class="tiny quiet">INC-0042 <span aria-hidden="true">·</span> 14 min</span></div><h3>Certificate policy breach in Europe</h3><p>Edge certificate <span class="quiet">/</span> eu-west <span class="quiet">/</span> SSL warning threshold</p><div class="incident-update">Renewal is being investigated. Other regions continue to pass their checks.</div><div class="incident-bottom"><span>Updated 14:24 UTC</span><button class="text-link" data-incident>View incident →</button></div></div>`;
+        $("stations").innerHTML = [
+          ["us-east", "N. Virginia", "4 / 4", "2s"],
+          ["eu-west", "Dublin", healthy ? "4 / 4" : "3 / 4", "5s"],
+          ["ap-southeast", "Singapore", "4 / 4", "3s"],
+        ]
+          .map(
+            ([name, place, agents, age], i) =>
+              `<div class="station ${stale ? "unknown" : !healthy && i === 1 ? "affected" : ""}"><span class="station-beacon">${icon("beacon")}</span><div><button data-region="${name}"><span class="station-name mono">${name}</span></button><div class="station-location">${place}</div></div><div class="station-summary"><div class="station-state ${stale ? "quiet" : !healthy && i === 1 ? "warn" : "good"}">${stale ? "○ Unknown" : !healthy && i === 1 ? "△ 2 affected" : "✓ Operational"}</div><div class="station-details">${stale ? "— / 4" : agents} agents reporting<br>${stale ? "Last known · 14:27" : `Report received · ${age} ago`}</div></div></div>`,
+          )
+          .join("");
+        $("region-freshness").textContent = stale ? "No fresh reports available" : "Last reports · 2–5s ago";
+        $("attention-content").innerHTML = stale
+          ? '<div class="empty"><span class="warn">△ Restore visibility first</span><br>Check regional reporting and the global connection before relying on last-known monitor states.</div>'
+          : healthy
+            ? '<div class="empty"><span class="good">✓ Nothing needs attention</span><br>No certificate policy failures or stale agents in this snapshot.</div>'
+            : `<button class="attention-item" data-monitor="0"><div class="attention-title">${icon("key")}<span class="warn">Certificate warning</span></div><p>Edge certificate is inside its warning threshold. Linked to INC-0042.</p><div class="action">Inspect SSL monitor →</div></button><button class="attention-item" data-destination="Agents"><div class="attention-title">${icon("fleet")}<span>One agent stopped reporting</span></div><p><span class="mono">eu-west-probe-04</span><br>Last seen at 14:28 UTC · 4 min ago</p><div class="action">Inspect agent →</div></button>`;
+        $("fleet-content").innerHTML =
+          `<div class="fleet-line"><span>Probe agents</span><span class="${stale ? "quiet" : healthy ? "good" : "warn"}">${stale ? "Unknown" : healthy ? "12 / 12 online" : "11 / 12 online"}</span></div><div class="fleet-segments" aria-hidden="true">${Array.from({ length: 12 }, (_, i) => `<span class="${stale ? "unknown" : !healthy && i === 11 ? "stale" : ""}"></span>`).join("")}</div><p class="fleet-note">${stale ? "Last-known connectivity is not current health." : healthy ? "All agents are reporting." : "1 stale · eu-west-probe-04"}</p><div class="fleet-divider"></div><div class="fleet-line"><span>Regional reporting</span><span class="${stale ? "quiet" : "good"}">${stale ? "Unknown" : "3 / 3 connected"}</span></div><p class="fleet-note">Global ← regional coordinators<br>Reporting freshness, not peer gossip health.</p>`;
+        const events = healthy
+          ? [
+              ["good", "✓", "Incident resolved", "Certificate evaluation passing", "14:31"],
+              ["good", "✓", "Agent reconnected", "eu-west-probe-04", "14:30"],
+              ["good", "✓", "Workers recovered", "Background workers · eu-west", "14:29"],
+            ]
+          : [
+              ["warn", "◈", "Investigation updated", "Certificate policy · INC-0042", "14:24"],
+              ["bad", "×", "Certificate check failed", "Edge certificate · eu-west", "14:18"],
+              ["good", "✓", "API recovered", "Public API · us-east", "13:56"],
+            ];
+        $("activity").innerHTML =
+          events
+            .map(
+              ([tone, mark, title, detail, time]) =>
+                `<div class="event"><span class="event-marker ${tone}" aria-hidden="true">${mark}</span><div><p>${title}</p><small>${detail}</small></div><time datetime="2026-10-11T${time}:00Z">${time}</time></div>`,
+            )
+            .join("") +
+          (stale
+            ? '<div class="tiny warn" style="padding-bottom:12px">Cached events · feed disconnected</div>'
+            : "");
+        renderMonitors();
+      }
+      const descriptions = {
+        Checks: "Manage check definitions, placement, evaluation policies, and ordering.",
+        Alerts: "Browse confirmed state transitions and follow their linked incidents.",
+        Incidents: "Investigate, acknowledge, edit, and publish incident updates.",
+        Agents: "Inspect probe connectivity, assigned checks, agent capabilities, and orphaned monitors.",
+        Credentials:
+          "Manage zone-scoped agent credentials on regional nodes. This global overview does not mint credentials.",
+        "Probe results": "Filter raw results by monitor, agent, status, or location.",
+        Cluster:
+          "In global mode this shows regional reporting freshness. Regional coordinators expose peer gossip separately.",
+        "Region tree": "Explore effective check state from regions down to zones and agents where available.",
+        "Status page": "Configure public sections, monitor ordering, and fleet visibility.",
+        Notifications: "Configure delivery routes and inspect the sampled failed-delivery queue.",
+        Maintenance: "Manage scheduled windows and alert suppression.",
+        "Data cleanup": "Remove short-lived incident records left by transient probe failures.",
+        "Public status page":
+          "The visitor-facing status page remains separate, with public monitor history and incident updates.",
+        "Add monitor":
+          "The existing editor supports HTTP, TCP, DNS, ICMP, SSL/TLS, heartbeat, and OpenMetrics checks.",
+        "Log out": "The production console retains its existing session and logout behavior.",
+      };
+      document.addEventListener("click", (e) => {
+        const target = e.target.closest("button");
+        if (!target) return;
+        if (target.hasAttribute("data-monitor")) showMonitor(Number(target.dataset.monitor));
+        else if (target.hasAttribute("data-incident")) incidentDialog();
+        else if (target.hasAttribute("data-region")) {
+          const name = target.dataset.region;
+          showDialog(
+            `${name} · Regional station`,
+            `<p>${scene === "stale" ? "Current regional service health is unknown." : scene === "disruption" && name === "eu-west" ? "Two affected monitors: Edge certificate (down under its certificate policy) and Background workers (degraded)." : "All monitor evaluations in this region are currently passing."}</p><p class="muted">Station health represents monitor evaluation state. Agent liveness and regional reporting are independent signals. The faint connecting line describes reporting to global-01, not physical network links.</p><p class="tiny quiet">The existing Region tree supplies per-check regional states. A production aggregate requires an explicit rollup policy; these values are synthetic.</p>`,
+          );
+        } else if (target.hasAttribute("data-destination")) {
+          const name = target.dataset.destination;
+          if (name === "Overview") {
+            $("mobile-menu").close();
+            $("main").focus();
+            window.scrollTo({ top: 0 });
+          } else
+            showDialog(
+              name,
+              `<p>${descriptions[name]}</p><p class="muted">This destination belongs to the existing application. It is intentionally not implemented in this isolated overview mockup.</p><p class="tiny quiet">No production navigation, network request, or mutation was performed.</p>`,
+            );
+        } else if (target.hasAttribute("data-filter")) {
+          filter = target.dataset.filter;
+          document
+            .querySelectorAll("[data-filter]")
+            .forEach((el) => el.setAttribute("aria-pressed", String(el === target)));
+          renderMonitors();
+          $("announcement").textContent = $("monitor-count").textContent;
+        }
+      });
+      $("monitor-search").addEventListener("input", () => {
+        renderMonitors();
+        $("announcement").textContent = $("monitor-count").textContent;
+      });
+      $("scene").addEventListener("change", (e) => {
+        scene = e.target.value;
+        render();
+        $("announcement").textContent = `Preview scenario: ${$("hero-title").textContent}`;
+      });
+      $("hero-action").addEventListener("click", () => {
+        if (scene === "disruption") incidentDialog();
+        else
+          showDialog(
+            scene === "healthy" ? "All systems operational" : "Reporting status",
+            scene === "healthy"
+              ? '<p>All 24 monitors currently pass their configured evaluation. All three regions and twelve agents are reporting.</p><p class="muted">This is present health, not a promise of 100% historical uptime. Prior disruptions remain in monitor timelines.</p>'
+              : '<p>Global live updates are disconnected. Last known snapshot: 14:27 UTC.</p><p class="muted">Check the global connection and regional reporting. Unknown data must not be interpreted as operational or down.</p>',
+          );
+      });
+      $("close-detail").addEventListener("click", () => $("detail").close());
+      $("detail").addEventListener("close", () => {
+        if (detailTrigger?.isConnected) detailTrigger.focus();
+      });
+      $("open-menu").addEventListener("click", () => {
+        $("mobile-menu").showModal();
+        $("close-menu").focus();
+      });
+      $("close-menu").addEventListener("click", () => $("mobile-menu").close());
+      $("mobile-menu").addEventListener("close", () => {
+        if (!$("detail").open) $("open-menu").focus();
+      });
+      const mobileQuery = matchMedia("(max-width:767px)");
+      mobileQuery.addEventListener("change", (e) => {
+        if (!e.matches && $("mobile-menu").open) $("mobile-menu").close();
+      });
+      $("design-notes").addEventListener("click", () =>
+        showDialog(
+          "Nightwatch · Design specification",
+          "<p><strong>Quiet architecture. Clear signals.</strong><br>Navy canvas #080F19, blue-gray panels #101B29, subtle borders #223247. Teal #56C9A1 indicates healthy; amber #E7B66B warnings; coral #EE8389 failures.</p><p><strong>Typography and spacing</strong><br>Local system sans, tabular numerals, 32px hero heading, 14px section headings, 12–14px operational text. A 4px spacing base, 16px grid gaps, 28px desktop gutters, 10px panel radii.</p><p><strong>Motion</strong><br>One 2.1s lighthouse rotation per tab session. Transform and opacity only. Data is readable throughout. The resting scene is static. Reduced motion skips the sweep, including when enabled during playback.</p><p><strong>Data boundaries</strong><br>Uptime is per monitor, not an invented global SLO. Certificate policy failures do not expose an expiry countdown. Reporting is distinct from service health. All values are sample fixtures; the overview has no backend connection.</p>",
+        ),
+      );
+      const motion = matchMedia("(prefers-reduced-motion: reduce)");
+      let played = false;
+      let sweepTimer;
+      const key = "lightkeeper-nightwatch-sweep-v1";
+      try {
+        played = sessionStorage.getItem(key) === "seen";
+      } catch {}
+      function settle() {
+        clearTimeout(sweepTimer);
+        document.body.classList.remove("sweeping", "motion-preview");
+      }
+      function playSweep(forcePreview = false) {
+        settle();
+        if ((motion.matches && !forcePreview) || document.hidden) {
+          $("announcement").textContent = motion.matches
+            ? "Lighthouse motion is disabled by your reduced-motion preference."
+            : "Lighthouse motion is paused while the page is hidden.";
+          return;
+        }
+        document.body.getBoundingClientRect();
+        if (forcePreview) document.body.classList.add("motion-preview");
+        document.body.classList.add("sweeping");
+        sweepTimer = setTimeout(settle, 2150);
+      }
+      function replaySweep() {
+        if (motion.matches) {
+          showDialog(
+            "Reduced motion is enabled",
+            '<p>Your browser reports <strong>prefers-reduced-motion: reduce</strong>. This is commonly inherited from your operating system and disables the automatic lighthouse sweep in every browser that honors it.</p><p>The dashboard will continue to respect this preference. You can explicitly preview one 2.1-second sweep below; this does not change your system settings or enable future automatic animations.</p><button class="btn primary" id="allow-motion-preview">Preview one sweep anyway</button>',
+          );
+          $("allow-motion-preview").addEventListener("click", () => {
+            $("detail").close();
+            startReplay(true);
+          });
+          return;
+        }
+        startReplay(false);
+      }
+      function startReplay(forcePreview) {
+        window.scrollTo({ top: 0, behavior: "instant" });
+        $("hero-replay").focus({ preventScroll: true });
+        requestAnimationFrame(() => requestAnimationFrame(() => playSweep(forcePreview)));
+      }
+      function updateMotionControl() {
+        const label = motion.matches ? "Motion off" : "Sweep";
+        $("hero-replay").innerHTML = `↻ <span class="freshness">${label}</span>`;
+        $("hero-replay").setAttribute(
+          "aria-label",
+          motion.matches
+            ? "Lighthouse motion disabled: reduced-motion preference. Open preview options."
+            : "Replay lighthouse sweep",
+        );
+        $("hero-replay").title = motion.matches
+          ? "Your browser requests reduced motion. Click for an optional one-time preview."
+          : "Replay the lighthouse sweep";
+        $("replay").textContent = motion.matches ? "Motion off · preview options" : "Replay sweep";
+      }
+      updateMotionControl();
+      $("replay").addEventListener("click", replaySweep);
+      $("hero-replay").addEventListener("click", replaySweep);
+      motion.addEventListener("change", (e) => {
+        if (e.matches) settle();
+        updateMotionControl();
+      });
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden) settle();
+      });
+      render();
+      if (!played) {
+        played = true;
+        try {
+          sessionStorage.setItem(key, "seen");
+        } catch {}
+        playSweep();
+      }
+    </script>
+  </body>
+</html>

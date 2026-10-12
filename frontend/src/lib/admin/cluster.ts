@@ -1,9 +1,9 @@
-import { request } from "./client";
+import { request, send } from "./client";
 
 /** Gossip failure-detector state for one coordinator, as another node currently
  *  believes it — the same shape for `self` and for every peer, so the panel
  *  needs no special case to show where it is standing. */
-export type ClusterState = "alive" | "suspect" | "dead";
+export type ClusterState = "alive" | "suspect" | "dead" | "removed";
 export type ClusterMode = "coordinator" | "global";
 export type ClusterLinkOutcome = "connected" | "failed";
 
@@ -18,6 +18,11 @@ export interface ClusterLink {
 export function buildIdentity(build: string): string {
   const match = /^(.*) \((.*), built .*\)$/.exec(build);
   return match ? `${match[1]} (${match[2]})` : build;
+}
+
+export function reportedBuild(build?: string | null): string | null {
+  const value = build?.trim();
+  return !value || value.startsWith("origin ") ? null : value;
 }
 
 export interface ClusterMember {
@@ -58,4 +63,36 @@ export interface ClusterResponse {
  *  same way. */
 export function fetchCluster(): Promise<ClusterResponse> {
   return request<ClusterResponse>("/api/v1/cluster");
+}
+
+/** Permanently remove a peer from the cluster. It cannot rejoin under the
+ *  same node id. */
+export function decommissionMember(nodeId: string): Promise<ClusterMember> {
+  return send("DELETE", `/api/v1/admin/cluster/members/${encodeURIComponent(nodeId)}`);
+}
+
+/** A region registered with the global node. `attached` turns true on its
+ *  first authenticated push. The key itself is never returned again. */
+export interface RegionRegistration {
+  name: string;
+  credential_id: string;
+  created_at: number;
+  endpoints: string[];
+  attached: boolean;
+  stale: boolean;
+  age_ms: number;
+  check_count: number;
+}
+
+export async function fetchRegions(): Promise<RegionRegistration[]> {
+  return (await request<{ regions: RegionRegistration[] }>("/api/v1/admin/regions")).regions;
+}
+
+/** Register a region, or rotate its key. The token is shown exactly once. */
+export function mintRegion(name: string): Promise<{ region: string; credential_id: string; token: string }> {
+  return send("POST", "/api/v1/admin/regions", { name });
+}
+
+export function removeRegion(name: string): Promise<{ removed: string; checks_updated: number }> {
+  return send("DELETE", `/api/v1/admin/regions/${encodeURIComponent(name)}`);
 }

@@ -455,17 +455,18 @@
                 class="chevron"
                 aria-expanded={!collapsed.has(row.node.node_id)}
                 aria-label="{collapsed.has(row.node.node_id) ? 'Expand' : 'Collapse'} {row.node.label}"
-                onclick={() => toggle(row.node.node_id)}>{collapsed.has(row.node.node_id) ? '▸' : '▾'}</button>
+                onclick={() => toggle(row.node.node_id)}><svg class:closed={collapsed.has(row.node.node_id)} width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg></button>
             {:else}
-              <span class="chevron"></span>
+              <span class="tree-leaf" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" /></svg></span>
             {/if}
-            <button class="label pick" aria-pressed={row.node.node_id === selectedId} onclick={() => select(row.node)}>
+            <button class="label pick" aria-expanded={row.node.node_id === selectedId} onclick={() => select(row.node)}>
               {#if row.node.node_type !== 'global'}<span class="node-kind">{row.node.node_type}</span>{/if}
               {row.node.label}
+              <span class="policy-affordance">{row.node.node_id === selectedId ? 'Close policy' : 'Edit policy'}<svg class:policy-open={row.node.node_id === selectedId} width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg></span>
               {#if policies.some((p) => p.node_id === row.node.node_id)}
-                <span class="badge override">override</span>
+                <span class="tree-badge override">override</span>
               {/if}
-              {#if row.node.stale}<span class="badge stale">no agents</span>{/if}
+              {#if row.node.stale}<span class="tree-badge stale">no agents</span>{/if}
             </button>
             <span class="policy">{policyLabel(nodePolicy(row.node))}</span>
             <span class="states">
@@ -610,7 +611,7 @@
 
   .legend, .row {
     display: grid;
-    grid-template-columns: 1.1rem minmax(9rem, 1fr) minmax(9rem, auto) minmax(10rem, auto);
+    grid-template-columns: 32px minmax(0, 1fr) minmax(130px, .65fr) minmax(160px, .8fr);
     align-items: center;
     gap: .65rem;
   }
@@ -623,19 +624,24 @@
     text-transform: uppercase;
     letter-spacing: .08em;
   }
-  .row { padding: .3rem .8rem; min-height: 2.3rem; border-bottom: 1px solid rgba(255, 255, 255, .035); }
+  .row { padding: 16px; min-height: 64px; border-bottom: 1px solid rgba(255, 255, 255, .035); }
   /* Indent encodes depth; the tree is shallow enough that a rule per level is
      unnecessary and a custom property keeps the markup flat. */
   .row { padding-left: calc(.8rem + var(--depth) * 1.15rem); }
   .row.node.selected { background: var(--ad-panel-2); }
-  .row.agent { grid-template-columns: 1.1rem minmax(9rem, 1fr) minmax(9rem, auto) minmax(10rem, auto); }
+  .row.agent { grid-template-columns: 32px minmax(0, 1fr) minmax(130px, .65fr) minmax(160px, .8fr); }
   .row.agent .label { grid-column: 2; }
 
   .chevron {
-    border: 0; background: none; padding: 0; width: 1.1rem;
+    display: grid; place-items: center; border: 1px solid var(--ad-line); border-radius: 6px; background: var(--ad-panel-2); padding: 0; width: 32px; height: 32px;
     color: var(--ad-dim); cursor: pointer; font-size: .7rem; line-height: 1;
   }
   .chevron:hover { color: var(--ad-cyan); }
+  .chevron svg, .tree-leaf svg, .policy-affordance svg { display: block; flex: none; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .tree-leaf { display: grid; place-items: center; width: 32px; height: 32px; color: var(--ad-dim); }
+  .policy-affordance svg.policy-open { transform: rotate(180deg); }
+  .chevron svg.closed { transform: rotate(-90deg); }
+  .policy-affordance { display: flex; align-items: center; gap: 6px; margin-top: 6px; color: var(--ad-cyan); font-size: 11px; font-weight: 400; }
 
   .label { min-width: 0; overflow-wrap: anywhere; font-weight: 500; text-align: left; }
   .pick {
@@ -647,20 +653,20 @@
     color: var(--ad-faint); font-size: .63rem; text-transform: uppercase;
     letter-spacing: .08em; margin-right: .4rem;
   }
-  .badge {
+  .tree-badge {
     margin-left: .45rem; padding: .05rem .3rem; border-radius: 4px;
     font-size: .62rem; text-transform: uppercase; letter-spacing: .06em; vertical-align: middle;
   }
-  .badge.override { background: rgba(86, 212, 228, .13); color: var(--ad-cyan); }
-  .badge.stale { background: var(--ad-panel-2); color: var(--ad-faint); }
+  .tree-badge.override { background: rgba(86, 212, 228, .13); color: var(--ad-cyan); }
+  .tree-badge.stale { background: var(--ad-panel-2); color: var(--ad-faint); }
 
   .policy { color: var(--ad-dim); font: .72rem ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
   .states { display: flex; flex-wrap: wrap; gap: .3rem; }
 
   .editor {
-    padding: .85rem .8rem 1rem;
+    padding: 24px;
     padding-left: calc(.8rem + var(--depth) * 1.15rem + 1.1rem);
-    background: #0c1013;
+    background: var(--ad-panel-2);
     border-bottom: 1px solid var(--ad-line);
     box-shadow: inset 3px 0 0 var(--ad-cyan);
   }
@@ -699,7 +705,10 @@
   @media (max-width: 760px) {
     .head { flex-direction: column; align-items: flex-start; }
     .legend { display: none; }
-    .row, .row.agent { grid-template-columns: 1.1rem minmax(7rem, 1fr) auto; }
+    .row, .row.agent { grid-template-columns: 32px minmax(0, 1fr); }
+    .row { padding-left: calc(8px + var(--depth) * 8px); }
+    .editor { padding: 16px; }
+    .actions { flex-wrap: wrap; }
     .row .policy { grid-column: 2; }
     .row .states { grid-column: 2 / -1; }
     .editor-grid { grid-template-columns: 1fr; }

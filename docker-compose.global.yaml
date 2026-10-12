@@ -27,9 +27,16 @@
 # compose file's environment small, which is enough to demonstrate the
 # catalogue converging across the three without one.
 #
+# Regions are not declared on the global tier. Each holds its own
+# registration key (`wac_<id>.<secret>`, bound to its region name); the global
+# nodes provision both keys once at first boot, and a region attaches itself on
+# its first authenticated push. Further regions are registered in the global
+# Admin > Cluster > Regions, which mints a key, without touching this file.
+#
 # Required env (no committed defaults):
 #   LIGHTHOUSE_PEER_TOKEN        shared by the us coordinator cluster
-#   LIGHTHOUSE_GLOBAL_TOKEN      shared by every coordinator and every global node
+#   LIGHTHOUSE_REGION_KEY_US     us registration key (the us coordinators, global)
+#   LIGHTHOUSE_REGION_KEY_TW     tw registration key (coordinator-tw, global)
 #   LIGHTHOUSE_GLOBAL_PEER_TOKEN shared by the three global nodes' own cluster
 #   LIGHTHOUSE_AGENT_TOKEN_W     the two us-west agents
 #   LIGHTHOUSE_AGENT_TOKEN_E     the one us-east agent
@@ -42,6 +49,18 @@
 
 name: lighthouse-global
 
+x-coordinator-env: &coordinator-env
+  LIGHTHOUSE_ADMIN_PASSWORD: ${LIGHTHOUSE_ADMIN_PASSWORD:-}
+  LIGHTHOUSE_PEER_TOKEN: ${LIGHTHOUSE_PEER_TOKEN:?LIGHTHOUSE_PEER_TOKEN is required}
+  LIGHTHOUSE_AGENT_TOKEN_W: ${LIGHTHOUSE_AGENT_TOKEN_W:?LIGHTHOUSE_AGENT_TOKEN_W is required}
+  LIGHTHOUSE_AGENT_TOKEN_E: ${LIGHTHOUSE_AGENT_TOKEN_E:?LIGHTHOUSE_AGENT_TOKEN_E is required}
+  LIGHTHOUSE_AGENT_TOKEN_TW: ${LIGHTHOUSE_AGENT_TOKEN_TW:?LIGHTHOUSE_AGENT_TOKEN_TW is required}
+
+# Each region's coordinators see only that region's key.
+x-us-env: &us-env
+  <<: *coordinator-env
+  LIGHTHOUSE_REGION_KEY: ${LIGHTHOUSE_REGION_KEY_US:?LIGHTHOUSE_REGION_KEY_US is required}
+
 x-coordinator: &coordinator
   build:
     context: .
@@ -49,13 +68,7 @@ x-coordinator: &coordinator
       GIT_SHA: ${GIT_SHA:-}
   image: lighthouse:latest
   command: ["coordinator"]
-  environment:
-    LIGHTHOUSE_ADMIN_PASSWORD: ${LIGHTHOUSE_ADMIN_PASSWORD:-}
-    LIGHTHOUSE_PEER_TOKEN: ${LIGHTHOUSE_PEER_TOKEN:?LIGHTHOUSE_PEER_TOKEN is required}
-    LIGHTHOUSE_GLOBAL_TOKEN: ${LIGHTHOUSE_GLOBAL_TOKEN:?LIGHTHOUSE_GLOBAL_TOKEN is required}
-    LIGHTHOUSE_AGENT_TOKEN_W: ${LIGHTHOUSE_AGENT_TOKEN_W:?LIGHTHOUSE_AGENT_TOKEN_W is required}
-    LIGHTHOUSE_AGENT_TOKEN_E: ${LIGHTHOUSE_AGENT_TOKEN_E:?LIGHTHOUSE_AGENT_TOKEN_E is required}
-    LIGHTHOUSE_AGENT_TOKEN_TW: ${LIGHTHOUSE_AGENT_TOKEN_TW:?LIGHTHOUSE_AGENT_TOKEN_TW is required}
+  environment: *us-env
   restart: unless-stopped
   networks:
     - lighthouse
@@ -69,9 +82,11 @@ x-global: &global
   command: ["global"]
   environment:
     LIGHTHOUSE_ADMIN_PASSWORD: ${LIGHTHOUSE_ADMIN_PASSWORD:-}
-    LIGHTHOUSE_GLOBAL_TOKEN: ${LIGHTHOUSE_GLOBAL_TOKEN:?LIGHTHOUSE_GLOBAL_TOKEN is required}
+    # Provisioned once at first boot ([[global.provision]]); stored hashed.
+    LIGHTHOUSE_REGION_KEY_US: ${LIGHTHOUSE_REGION_KEY_US:?LIGHTHOUSE_REGION_KEY_US is required}
+    LIGHTHOUSE_REGION_KEY_TW: ${LIGHTHOUSE_REGION_KEY_TW:?LIGHTHOUSE_REGION_KEY_TW is required}
     # This global node's own cluster secret (Phase 4) — distinct from the
-    # cross-region trust token above, which regions present. Named
+    # region registration keys above, which regions present. Named
     # LIGHTHOUSE_PEER_TOKEN inside the container because `GlobalConfig` resolves
     # its peer token from that variable, the same one a coordinator's own
     # cluster uses; the compose-level name is kept separate
@@ -130,6 +145,9 @@ services:
   # ---- Taiwan region: single coordinator ----
   coordinator-tw:
     <<: *coordinator
+    environment:
+      <<: *coordinator-env
+      LIGHTHOUSE_REGION_KEY: ${LIGHTHOUSE_REGION_KEY_TW:?LIGHTHOUSE_REGION_KEY_TW is required}
     ports:
       - "${LIGHTHOUSE_PORT_TW:-9004}:8080"
     configs:
@@ -224,7 +242,7 @@ configs:
 
       [coordinator.global]
       url = "http://global-a:8080"
-      token_env = "LIGHTHOUSE_GLOBAL_TOKEN"
+      token_env = "LIGHTHOUSE_REGION_KEY"
       push_secs = 5
 
       [[coordinator.provision]]
@@ -255,7 +273,7 @@ configs:
 
       [coordinator.global]
       url = "http://global-a:8080"
-      token_env = "LIGHTHOUSE_GLOBAL_TOKEN"
+      token_env = "LIGHTHOUSE_REGION_KEY"
       push_secs = 5
 
       [[coordinator.provision]]
@@ -283,7 +301,7 @@ configs:
 
       [coordinator.global]
       url = "http://global-a:8080"
-      token_env = "LIGHTHOUSE_GLOBAL_TOKEN"
+      token_env = "LIGHTHOUSE_REGION_KEY"
       push_secs = 5
 
       [[coordinator.provision]]
@@ -304,13 +322,15 @@ configs:
       db_path = "/data/lighthouse.duckdb"
       node_id = "coordinator-tw"
       region = "tw"
+      # Pushed with each state summary: how the global tier reaches this region.
+      advertise_url = "http://coordinator-tw:8080"
 
       [coordinator.rollup_defaults]
       min_incident_secs = 60
 
       [coordinator.global]
       url = "http://global-a:8080"
-      token_env = "LIGHTHOUSE_GLOBAL_TOKEN"
+      token_env = "LIGHTHOUSE_REGION_KEY"
       push_secs = 5
 
       [[coordinator.provision]]
@@ -331,7 +351,6 @@ configs:
       [global]
       listen = "0.0.0.0:8080"
       db_path = "/data/lighthouse.duckdb"
-      token_env = "LIGHTHOUSE_GLOBAL_TOKEN"
       region_staleness_secs = 30
       node_id = "global-a"
       advertise_url = "http://global-a:8080"
@@ -340,24 +359,19 @@ configs:
       peer_timeout_secs = 15
       anti_entropy_secs = 30
 
-      [[global.region]]
-      name = "us"
-      endpoints = [
-        "http://coordinator-us-a:8080",
-        "http://coordinator-us-b:8080",
-        "http://coordinator-us-c:8080",
-      ]
+      [[global.provision]]
+      region = "us"
+      token_env = "LIGHTHOUSE_REGION_KEY_US"
 
-      [[global.region]]
-      name = "tw"
-      endpoints = ["http://coordinator-tw:8080"]
+      [[global.provision]]
+      region = "tw"
+      token_env = "LIGHTHOUSE_REGION_KEY_TW"
 
   global-b-toml:
     content: |
       [global]
       listen = "0.0.0.0:8080"
       db_path = "/data/lighthouse.duckdb"
-      token_env = "LIGHTHOUSE_GLOBAL_TOKEN"
       region_staleness_secs = 30
       node_id = "global-b"
       advertise_url = "http://global-b:8080"
@@ -366,24 +380,19 @@ configs:
       peer_timeout_secs = 15
       anti_entropy_secs = 30
 
-      [[global.region]]
-      name = "us"
-      endpoints = [
-        "http://coordinator-us-a:8080",
-        "http://coordinator-us-b:8080",
-        "http://coordinator-us-c:8080",
-      ]
+      [[global.provision]]
+      region = "us"
+      token_env = "LIGHTHOUSE_REGION_KEY_US"
 
-      [[global.region]]
-      name = "tw"
-      endpoints = ["http://coordinator-tw:8080"]
+      [[global.provision]]
+      region = "tw"
+      token_env = "LIGHTHOUSE_REGION_KEY_TW"
 
   global-c-toml:
     content: |
       [global]
       listen = "0.0.0.0:8080"
       db_path = "/data/lighthouse.duckdb"
-      token_env = "LIGHTHOUSE_GLOBAL_TOKEN"
       region_staleness_secs = 30
       node_id = "global-c"
       advertise_url = "http://global-c:8080"
@@ -392,17 +401,13 @@ configs:
       peer_timeout_secs = 15
       anti_entropy_secs = 30
 
-      [[global.region]]
-      name = "us"
-      endpoints = [
-        "http://coordinator-us-a:8080",
-        "http://coordinator-us-b:8080",
-        "http://coordinator-us-c:8080",
-      ]
+      [[global.provision]]
+      region = "us"
+      token_env = "LIGHTHOUSE_REGION_KEY_US"
 
-      [[global.region]]
-      name = "tw"
-      endpoints = ["http://coordinator-tw:8080"]
+      [[global.provision]]
+      region = "tw"
+      token_env = "LIGHTHOUSE_REGION_KEY_TW"
 
   # ---- Agents. Each region's agents fail over across that region's
   #      coordinators; the tw agent has only one. ----

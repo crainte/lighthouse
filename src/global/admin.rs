@@ -269,3 +269,98 @@ pub(super) async fn reorder_sections_handler(
         Err(e) => admin_error(AdminError::Internal(e)),
     }
 }
+
+// ---- Regions (see `regions`) ----
+
+/// A registered region for Admin > Regions. Never carries a secret: the key
+/// is shown once, by `mint_region_handler`, and the relay token not at all.
+#[derive(Serialize)]
+struct RegionDto {
+    name: String,
+    credential_id: String,
+    created_at: i64,
+    endpoints: Vec<String>,
+    /// Whether the region has pushed with this key yet.
+    attached: bool,
+    stale: bool,
+    age_ms: i64,
+    check_count: usize,
+}
+
+pub(super) async fn list_regions_handler(
+    State(node): State<GlobalNode>,
+    _admin: AdminSession,
+) -> Response {
+    let roster = node
+        .inner
+        .cache
+        .roster(chrono::Utc::now().timestamp_millis());
+    let regions: Vec<RegionDto> = node
+        .inner
+        .regions
+        .list()
+        .into_iter()
+        .map(|r| {
+            let live = roster.iter().find(|s| s.region == r.name);
+            RegionDto {
+                attached: r.relay_token.is_some(),
+                stale: live.is_none_or(|s| s.stale),
+                age_ms: live.map_or(-1, |s| s.age_ms),
+                check_count: live.map_or(0, |s| s.check_count),
+                name: r.name,
+                credential_id: r.credential_id,
+                created_at: r.created_at,
+                endpoints: r.endpoints,
+            }
+        })
+        .collect();
+    Json(serde_json::json!({ "regions": regions })).into_response()
+}
+
+#[derive(Deserialize)]
+pub(super) struct MintRegionRequest {
+    name: String,
+}
+
+/// Register a region, or rotate its key. The key is returned exactly once.
+pub(super) async fn mint_region_handler(
+    State(node): State<GlobalNode>,
+    AdminJson(body): AdminJson<MintRegionRequest>,
+) -> Response {
+    let name = body.name.trim();
+    if let Err(e) = super::regions::valid_name(name) {
+        return error_response(StatusCode::BAD_REQUEST, &e);
+    }
+    match node.mint_region(name).await {
+        Ok((record, token)) => Json(serde_json::json!({
+            "region": record.name,
+            "credential_id": record.credential_id,
+            "token": token,
+        }))
+        .into_response(),
+        Err(e) => admin_error(AdminError::Internal(e)),
+    }
+}
+
+pub(super) async fn remove_region_handler(
+    State(node): State<GlobalNode>,
+    Path(name): Path<String>,
+    _admin: AdminSession,
+) -> Response {
+    match node.remove_region(&name).await {
+        Ok(Some(checks)) => {
+            Json(serde_json::json!({ "removed": name, "checks_updated": checks })).into_response()
+        }
+        Ok(None) => error_response(StatusCode::NOT_FOUND, "no such region"),
+        Err(e) => admin_error(AdminError::Internal(e)),
+    }
+}
+
+/// Decommission a peer global node; see `Cluster::decommission`.
+pub(super) async fn decommission_member_handler(
+    State(node): State<GlobalNode>,
+    Path(node_id): Path<String>,
+    _admin: AdminSession,
+) -> Response {
+    crate::coordinator::cluster::Cluster::decommission(node.inner.cluster.as_deref(), &node_id)
+}

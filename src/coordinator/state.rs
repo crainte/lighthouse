@@ -175,6 +175,26 @@ impl StateTracker {
             .unwrap_or(0)
     }
 
+    /// This agent's non-zero failure runs among `checks`: the hint a restarted
+    /// agent uses to resume retry/down cadence instead of waiting out a long
+    /// schedule. One lookup per assigned check, so the cost is the caller's
+    /// share rather than the whole tracker.
+    pub fn failing(
+        &self,
+        agent_id: &str,
+        checks: impl IntoIterator<Item = CheckId>,
+    ) -> HashMap<CheckId, u32> {
+        let mut key = (CheckId::nil(), agent_id.to_string());
+        checks
+            .into_iter()
+            .filter_map(|id| {
+                key.0 = id;
+                let n = self.agents.get(&key)?.consecutive_failures;
+                (n > 0).then_some((id, n))
+            })
+            .collect()
+    }
+
     /// Restore one agent's belief after a restart, so a confirmation in flight
     /// resumes per agent instead of starting over.
     #[allow(clippy::too_many_arguments)]

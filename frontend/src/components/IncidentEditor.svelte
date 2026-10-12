@@ -373,7 +373,8 @@
 <style>
   .head-actions {
     display: flex;
-    gap: 0.4rem;
+    gap: 12px;
+    flex-wrap: wrap;
     align-items: center;
   }
   .confirm {
@@ -391,7 +392,7 @@
      narrative is the thing that gets long. */
   .ed-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
     gap: 1rem;
     align-items: start;
   }
