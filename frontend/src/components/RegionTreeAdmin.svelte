@@ -24,6 +24,7 @@
     thresholdPhrase,
   } from '../lib/rollup';
   import NumberField from './NumberField.svelte';
+  import { flattenTree, type Branch } from '../lib/admin/policyTree';
 
   let { onexpired }: { onexpired: () => void } = $props();
 
@@ -57,9 +58,10 @@
      * visible, or an operator could not delete policy after moving the fleet. */
     stale: boolean;
   };
-  type Row =
-    | { kind: 'node'; key: string; depth: number; node: PolicyNode }
-    | { kind: 'agent'; key: string; depth: number; agent: AgentRow };
+  type Item =
+    | { kind: 'node'; key: string; node: PolicyNode }
+    | { kind: 'agent'; key: string; agent: AgentRow };
+  type Row = Item & Omit<Branch<Item>, 'item'>;
 
   let tree = $state<RegionTreeResponse | null>(null);
   let policies = $state<StoredRollupPolicy[]>([]);
@@ -187,15 +189,24 @@
     return root;
   }
 
-  function flatten(node: PolicyNode, depth: number, out: Row[]): Row[] {
-    out.push({ kind: 'node', key: node.node_id, depth, node });
-    if (!collapsed.has(node.node_id)) {
-      for (const child of node.children) flatten(child, depth + 1, out);
-      for (const agent of node.agents) {
-        out.push({ kind: 'agent', key: `${node.node_id}#${agent.id}`, depth: depth + 1, agent });
-      }
-    }
-    return out;
+  /** Child locations first, then the agents reporting into this one. */
+  function childrenOf(item: Item): Item[] {
+    if (item.kind === 'agent') return [];
+    const node = item.node;
+    return [
+      ...node.children.map((child): Item => ({ kind: 'node', key: child.node_id, node: child })),
+      ...node.agents.map(
+        (agent): Item => ({ kind: 'agent', key: `${node.node_id}#${agent.id}`, agent }),
+      ),
+    ];
+  }
+
+  function flatten(node: PolicyNode): Row[] {
+    return flattenTree<Item>(
+      { kind: 'node', key: node.node_id, node },
+      childrenOf,
+      (item) => item.kind === 'node' && !collapsed.has(item.node.node_id),
+    ).map(({ item, ...branch }) => ({ ...item, ...branch }));
   }
 
   /** A plain loop rather than `.find`, because a compound predicate does not
@@ -209,7 +220,24 @@
   }
 
   let root = $derived(tree ? buildTree(tree, policies) : null);
-  let rows = $derived(root ? flatten(root, 0, []) : []);
+  let rows = $derived(root ? flatten(root) : []);
+
+  /** One indentation column: `pass` is `│`, `branch` is `├──`, `last` is
+   *  `└──`, `blank` is empty — drawn in CSS so lines join across rows of any
+   *  height. */
+  type Seg = 'pass' | 'blank' | 'branch' | 'last';
+  const guideSegs = (row: Row): Seg[] => row.guides.map((g) => (g ? 'pass' : 'blank'));
+
+  function rowSegs(row: Row): Seg[] {
+    return row.depth === 0 ? [] : [...guideSegs(row), row.last ? 'last' : 'branch'];
+  }
+
+  /** Under an open editor the lines keep running: the row's own, down to its
+   *  next sibling, and its children's, down to the first child. */
+  function editorSegs(row: Row): Seg[] {
+    const own: Seg[] = row.depth === 0 ? [] : [...guideSegs(row), row.last ? 'blank' : 'pass'];
+    return row.open ? [...own, 'pass'] : own;
+  }
   let selected = $derived(findNode(rows, selectedId));
   let storedFor = $derived.by(() => {
     const node = selected;
@@ -502,14 +530,38 @@
 
   <div class="admin-panel tree">
     <div class="legend">
-      <span aria-hidden="true"></span><span>Node</span>
+      <span>Node</span>
       <span>Degraded / down</span>
       <span>State per check</span>
     </div>
 
+    {#snippet gutter(segs: Seg[], marker: 'leaf' | 'toggle' | null, row: Row | null)}
+      <span class="tree-gutter" aria-hidden={marker !== 'toggle'}>
+        {#each segs as seg, i (i)}<span class="tree-seg {seg}"></span>{/each}
+        {#if marker === 'leaf'}
+          <span class="tree-node leaf"><span class="tree-dot"></span></span>
+        {:else if marker === 'toggle' && row?.kind === 'node'}
+          {@const node = row.node}
+          <span class="tree-node" class:open={row.open}>
+            <button
+              class="chevron"
+              aria-expanded={row.open}
+              aria-label="{row.open ? 'Collapse' : 'Expand'} {node.label}"
+              onclick={() => toggle(node.node_id)}
+              ><svg class:closed={!row.open} width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"
+                ><path d="m6 9 6 6 6-6" /></svg
+              ></button
+            >
+          </span>
+        {/if}
+      </span>
+    {/snippet}
+
+    <div role="tree" aria-label="Location policies">
     {#each rows as row (row.key)}
       {#if row.kind === 'agent'}
-        <div class="row agent" style="--depth: {row.depth}">
+        <div class="row agent" role="treeitem" aria-level={row.depth + 1} aria-selected="false">
+          {@render gutter(rowSegs(row), 'leaf', row)}
           <span class="label">
             <span class="node-kind">agent</span>{row.agent.id}
           </span>
@@ -522,16 +574,15 @@
         </div>
       {:else}
         <div class="row-wrap">
-          <div class="row node" class:selected={row.node.node_id === selectedId} style="--depth: {row.depth}">
-            {#if row.node.children.length || row.node.agents.length}
-              <button
-                class="chevron"
-                aria-expanded={!collapsed.has(row.node.node_id)}
-                aria-label="{collapsed.has(row.node.node_id) ? 'Expand' : 'Collapse'} {row.node.label}"
-                onclick={() => toggle(row.node.node_id)}><svg class:closed={collapsed.has(row.node.node_id)} width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg></button>
-            {:else}
-              <span class="tree-leaf" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" /></svg></span>
-            {/if}
+          <div
+            class="row node"
+            class:selected={row.node.node_id === selectedId}
+            role="treeitem"
+            aria-level={row.depth + 1}
+            aria-selected={row.node.node_id === selectedId}
+            aria-expanded={row.hasChildren ? row.open : undefined}
+          >
+            {@render gutter(rowSegs(row), row.hasChildren ? 'toggle' : 'leaf', row)}
             <button class="label pick" aria-expanded={row.node.node_id === selectedId} onclick={() => select(row.node)}>
               {#if row.node.node_type !== 'global'}<span class="node-kind">{row.node.node_type}</span>{/if}
               {row.node.label}
@@ -551,7 +602,9 @@
           </div>
 
           {#if selected && row.node.node_id === selectedId}
-            <div class="editor" style="--depth: {row.depth}">
+            <div class="editor">
+              {@render gutter(editorSegs(row), null, null)}
+              <div class="editor-main">
               <div class="editor-grid">
                 <label class="field">
                   <span class="field-label">Degraded when</span>
@@ -672,11 +725,13 @@
 
               {#if error}<p class="admin-error feedback">{error}</p>{/if}
               {#if note}<p class="saved-note feedback">{note}</p>{/if}
+              </div>
             </div>
           {/if}
         </div>
       {/if}
     {/each}
+    </div>
   </div>
 {/if}
 
@@ -720,10 +775,13 @@
 
   .legend, .row {
     display: grid;
-    grid-template-columns: 32px minmax(0, 1fr) minmax(130px, .65fr) minmax(160px, .8fr);
+    grid-template-columns: minmax(0, 1fr) 11rem 16rem;
     align-items: center;
-    gap: .65rem;
+    column-gap: .65rem;
   }
+  /* Each row is its own grid and the gutter's width follows depth, so the
+     data columns are fixed: fractions would shift with every indent. */
+  .row { grid-template-columns: auto minmax(0, 1fr) 11rem 16rem; }
   .legend {
     padding: 12px 16px;
     border-bottom: 1px solid var(--ad-line);
@@ -732,19 +790,40 @@
     text-transform: none;
     letter-spacing: 0;
   }
-  .row { padding: 16px; min-height: 64px; border-bottom: 1px solid rgba(255, 255, 255, .035); }
-  .row .label { padding-left: calc(var(--depth) * 12px); }
+  /* No vertical padding on the row itself: the gutter has to reach both
+     edges so one row's lines meet the next row's. The cells pad instead. */
+  .row { padding: 0 16px; min-height: 56px; border-bottom: 1px solid rgba(255, 255, 255, .035); }
+  .row > :not(.tree-gutter) { padding-block: 12px; }
   .row.node.selected { background: var(--ad-panel-2); }
-  .row.agent { grid-template-columns: 32px minmax(0, 1fr) minmax(130px, .65fr) minmax(160px, .8fr); }
-  .row.agent .label { grid-column: 2; }
+
+  /* tree(1) drawn in CSS. Every column carries its line at 10px, the centre
+     of the 22px node marker, so a parent's toggle sits exactly above the line
+     its children hang from. */
+  /* `--knee`: how far down the row the branch meets its marker. */
+  .tree-gutter { display: flex; align-self: stretch; --tree-line: #3a4f69; --knee: 50%; }
+  .tree-seg, .tree-node { position: relative; flex: none; width: 22px; }
+  .tree-seg { width: 28px; }
+  .tree-seg.pass::before, .tree-seg.branch::before, .tree-seg.last::before, .tree-node.open::after {
+    content: ''; position: absolute; left: 10px; top: 0; bottom: 0; border-left: 1px solid var(--tree-line);
+  }
+  .tree-seg.last::before { bottom: auto; height: var(--knee); }
+  .tree-seg.branch::after, .tree-seg.last::after {
+    content: ''; position: absolute; left: 10px; right: 2px; top: var(--knee); border-top: 1px solid var(--tree-line);
+  }
+  .tree-node { display: grid; justify-items: center; align-items: start; }
+  .tree-node > * { margin-top: calc(var(--knee) - 11px); }
+  .tree-node.leaf > * { margin-top: calc(var(--knee) - 3px); }
+  .tree-node.open::after { top: calc(var(--knee) + 11px); }
+  .tree-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--tree-line); box-shadow: 0 0 0 1px var(--ad-faint); }
+  .row.agent .tree-dot { box-shadow: none; }
 
   .chevron {
-    display: grid; place-items: center; border: 1px solid var(--ad-line); border-radius: 6px; background: var(--ad-panel-2); padding: 0; width: 32px; height: 32px;
+    display: grid; place-items: center; border: 1px solid var(--ad-line); border-radius: 5px; background: var(--ad-panel-2); padding: 0; width: 22px; height: 22px;
     color: var(--ad-dim); cursor: pointer; font-size: .7rem; line-height: 1;
   }
-  .chevron:hover { color: var(--ad-cyan); }
-  .chevron svg, .tree-leaf svg, .policy-affordance svg { display: block; flex: none; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-  .tree-leaf { display: grid; place-items: center; width: 32px; height: 32px; color: var(--ad-dim); }
+  .chevron:hover { color: var(--ad-cyan); border-color: var(--ad-cyan); }
+  .chevron svg, .policy-affordance svg { display: block; flex: none; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .row .label { padding-left: 6px; }
   .policy-affordance svg.policy-open { transform: rotate(180deg); }
   .chevron svg.closed { transform: rotate(-90deg); }
   .policy-affordance { display: flex; align-items: center; gap: 6px; margin-top: 6px; color: var(--ad-cyan); font-size: 11px; font-weight: 400; }
@@ -770,12 +849,13 @@
   .states { display: flex; flex-wrap: wrap; gap: .3rem; }
 
   .editor {
-    padding: 24px;
-    padding-left: 24px;
+    display: flex;
+    padding: 0 16px;
     background: var(--ad-panel-2);
     border-bottom: 1px solid var(--ad-line);
     box-shadow: inset 3px 0 0 var(--ad-cyan);
   }
+  .editor-main { flex: 1; min-width: 0; padding: 24px 24px 24px 12px; }
   .editor-grid { display: grid; grid-template-columns: repeat(2, minmax(9rem, 14rem)); gap: .75rem; align-items: end; }
   .threshold { display: flex; gap: .4rem; }
   .threshold :global(.num) { max-width: 5rem; }
@@ -814,9 +894,15 @@
   @media (max-width: 760px) {
     .head { flex-direction: column; align-items: flex-start; }
     .legend { display: none; }
-    .row, .row.agent { grid-template-columns: 32px minmax(0, 1fr); }
-    .row .label { padding-left: calc(var(--depth) * 6px); }
-    .editor { padding: 16px; }
+    /* The gutter spans every line of a stacked row, so the lines stay joined. */
+    .row { grid-template-columns: auto minmax(0, 1fr); }
+    /* A stacked row is tall; the branch meets the name, not the middle. */
+    .row .tree-gutter { grid-row: 1 / span 3; --knee: 23px; }
+    .row > :not(.tree-gutter) { padding-left: 6px; }
+    .row > :not(.tree-gutter) { padding-block: 6px; }
+    .row > :nth-child(2) { padding-top: 12px; }
+    .row > :last-child { padding-bottom: 12px; }
+    .editor-main { padding: 16px 8px; }
     .actions { flex-wrap: wrap; }
     .row .policy { grid-column: 2; }
     .row .states { grid-column: 2 / -1; }

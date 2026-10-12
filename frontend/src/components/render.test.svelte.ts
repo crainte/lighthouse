@@ -76,6 +76,56 @@ describe('component render smoke', () => {
     expect(screen.getByText('check-9999')).toBeInTheDocument();
   });
 
+  it('draws location policies as a tree whose branches show who owns whom', async () => {
+    const policy = { degraded_when: 'any', down_when: 'all' };
+    const zone = (name: string, agents: string[]) => ({
+      zone: name,
+      state: 'up',
+      effective_policy: policy,
+      agents: agents.map((id) => ({ id, state: 'up', staleness_ms: 1000 })),
+    });
+    const tree = {
+      checks: [
+        {
+          check_id: 'c1',
+          state: 'up',
+          effective_policy: policy,
+          regions: [
+            { region: 'tw', state: 'up', effective_policy: policy, zones: [zone('tw-1', ['a-tw'])] },
+            { region: 'us', state: 'up', effective_policy: policy, zones: [zone('us-1', ['a-1', 'a-2'])] },
+          ],
+        },
+      ],
+    };
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => new Response(JSON.stringify(
+      url.includes('rollup-policies') ? { policies: [] } : tree,
+    ), { headers: { 'content-type': 'application/json' } })));
+    const { container } = render(RegionTreeAdmin, { props: { onexpired: noop } });
+    await screen.findByRole('tree');
+    // Each row's indentation columns, as tree(1) would print them.
+    const glyph: Record<string, string> = { pass: '│', blank: ' ', branch: '├', last: '└' };
+    const drawn = [...container.querySelectorAll('[role="treeitem"]')].map((row) => {
+      const segs = [...row.querySelectorAll('.tree-seg')].map(
+        (s) => glyph[[...s.classList].find((c) => c in glyph)!],
+      );
+      return `${row.getAttribute('aria-level')} ${segs.join('')}`;
+    });
+    expect(drawn).toEqual([
+      '1 ', //       Global
+      '2 ├', //      tw
+      '3 │└', //     tw-1
+      '4 │ └', //    a-tw
+      '2 └', //      us
+      '3  └', //     us-1
+      '4   ├', //    a-1
+      '4   └', //    a-2
+    ]);
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Collapse us' }));
+    expect(container.querySelectorAll('[role="treeitem"]')).toHaveLength(5);
+    expect(screen.getByRole('button', { name: 'Expand us' })).toHaveAttribute('aria-expanded', 'false');
+  });
+
   it('shows regional coordinator rosters, build skew, and which coordinator an agent polls', async () => {
     const now = Date.now();
     const member = (node_id: string, build: string | null) => ({ node_id, build, url: '', state: 'alive', last_seen: now, generation: 1 });
