@@ -25,11 +25,11 @@
 
   /** Severity from the transition itself. A recovery is not an alarm, an
    *  un-evaluable probe is not an outage, and degraded is an amber warning. */
-  function tone(a: Alert): { pill: string; label: string; bar: string } {
-    if (a.current_state === 'down') return { pill: 'red', label: 'down', bar: 'bad' };
-    if (a.current_state === 'degraded') return { pill: 'amber', label: 'degraded', bar: 'warn' };
-    if (a.current_state === 'unknown') return { pill: 'amber', label: 'unknown', bar: 'warn' };
-    return { pill: 'green', label: 'recovered', bar: 'ok' };
+  function tone(a: Alert): { pill: string; label: string } {
+    if (a.current_state === 'down') return { pill: 'red', label: 'down' };
+    if (a.current_state === 'degraded') return { pill: 'amber', label: 'degraded' };
+    if (a.current_state === 'unknown') return { pill: 'amber', label: 'unknown' };
+    return { pill: 'green', label: 'recovered' };
   }
 
   const counts = $derived({
@@ -80,7 +80,11 @@
   <ul class="alert-feed">
     {#each alerts as a (a.id)}
       {@const t = tone(a)}
-      <li class="alert-card {t.bar}">
+      <li
+        class="alert-card"
+        class:flagged={a.current_state !== 'up'}
+        class:bad={a.current_state === 'down'}
+      >
         <div class="ac-top">
           <span class="opill {t.pill}">{t.label}</span>
           <span class="ac-title">{alertLabel(a)}</span>
@@ -113,22 +117,28 @@
     flex-direction: column;
     gap: 0.6rem;
   }
-  /* Left bar carries the severity, so a feed scans by colour before it is read. */
+  /* The same 2px accent the incidents table uses: cyan for a transition that
+     still wants attention, red for down, none for a recovery. The pill says
+     which state; the stripe only says "look here". */
   .alert-card {
+    position: relative;
+    overflow: hidden;
     background: var(--ad-panel);
     border: 1px solid var(--ad-line);
-    border-left: 3px solid var(--ad-line);
     border-radius: 8px;
     padding: 0.7rem 0.9rem 0.75rem;
   }
-  .alert-card.bad {
-    border-left-color: var(--ad-red);
+  .alert-card.flagged::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: var(--ad-cyan);
   }
-  .alert-card.warn {
-    border-left-color: var(--ad-amber);
-  }
-  .alert-card.ok {
-    border-left-color: var(--ad-green);
+  .alert-card.flagged.bad::before {
+    background: var(--ad-red);
   }
   .ac-top {
     display: flex;
