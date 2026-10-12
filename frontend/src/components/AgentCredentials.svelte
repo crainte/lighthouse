@@ -13,6 +13,7 @@
   let credentials = $state<AgentCredential[]>([]);
   let loading = $state(true);
   let loadError = $state<string | null>(null);
+  let unavailableRegions = $state<string[]>([]);
   let formError = $state<string | null>(null);
   let expired = $state(false);
 
@@ -48,7 +49,9 @@
     loading = true;
     loadError = null;
     try {
-      credentials = await fetchAgentCredentials();
+      const r = await fetchAgentCredentials();
+      credentials = r.credentials;
+      unavailableRegions = r.unavailable_regions ?? [];
     } catch (e) {
       loadError = fail(e);
     } finally {
@@ -157,6 +160,7 @@
       </div>
     {/if}
 
+    {#if unavailableRegions.length}<p class="admin-error">Credentials not read from {unavailableRegions.join(', ')}: those regions did not answer, so their credentials are missing below.</p>{/if}
     {#if loading}
       <p class="admin-muted">Loading…</p>
     {:else if loadError}

@@ -508,10 +508,11 @@ instead of guessing; remove the label when the backend closes it.
 
 ### Global tier: missing actions
 
-- [ ] Issue agent credentials from the global node, scoped to a registered region and zone, and
+- [x] Issue agent credentials from the global node, scoped to a registered region and zone, and
       deliver them to that region. Admin > Topology on the global node shows this flow as a labelled
       preview that generates an invalid placeholder token and never calls a write API; the
       Credentials page is hidden on the global node.
+      On the global node, `POST /api/v1/admin/agent-credentials` goes only to the named region (404 if that region is not registered/reporting); fanning it out would mint a different secret in every region. The region mints the credential, hashes it and replicates it, and the token passes through once. `GET` lists every region's credentials, with `unavailable_regions`. Revocation keeps the idempotent fan-out. Topology issues real tokens, and the Credentials page is shown on the global node.
 
 ### Scale and query shape
 

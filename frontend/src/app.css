@@ -1953,7 +1953,6 @@ button.ot-id:hover {
 .admin-app .admin-workspace .section-heading h3 { margin: 0; font-size: 16px; font-weight: 550; letter-spacing: -.01em; }
 .admin-app .admin-workspace .section-heading p { max-width: 75ch; margin: 8px 0 0; color: var(--ad-dim); font-size: 13px; line-height: 1.6; }
 .admin-app .admin-workspace .surface { min-width: 0; background: var(--ad-panel); border: 1px solid var(--ad-line); border-radius: 9px; }
-.admin-app .admin-workspace .preview-flag { display: inline-flex; align-items: center; gap: 6px; width: fit-content; padding: 4px 8px; color: var(--ad-amber); background: #30291f; border: 1px solid #51422c; border-radius: 5px; font-size: 11px; font-weight: 500; }
 .admin-app .btn.primary:disabled { opacity: 1; color: #8fb8b1; background: rgba(197, 227, 222, .06); border-color: rgba(197, 227, 222, .42); }
 .admin-app .admin-workspace :is(input:not([type=checkbox]):not([type=radio]), select, textarea) { color: var(--ad-text); background: #0b1520; border: 1px solid var(--ad-line); border-radius: 6px; font: inherit; font-size: 13px; padding: 8px 10px; }
 .admin-app .admin-workspace :is(input:not([type=checkbox]):not([type=radio]), select, textarea):focus { outline: none; border-color: rgba(86, 212, 228, .55); }

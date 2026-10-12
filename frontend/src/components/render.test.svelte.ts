@@ -100,21 +100,23 @@ describe('component render smoke', () => {
     expect(screen.getByRole('button', { name: /us-c2/ })).toHaveClass('polled');
   });
 
-  it('labels global agent tokens as previews and never calls the credential API', async () => {
+  it('issues a real region-scoped agent token from the global node', async () => {
     const now = Date.now();
     const member = (node_id: string) => ({ node_id, build: null, url: '', state: 'alive', last_seen: now, generation: 1 });
-    const fetchMock = vi.fn(async (url: string) => new Response(JSON.stringify(
-      url.includes('/cluster') ? { self: member('global'), members: [member('us')], mode: 'global', now, links: [] } : url.includes('/regions') ? { regions: [] } : { agents: [] },
-    ), { headers: { 'content-type': 'application/json' } }));
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => new Response(JSON.stringify(
+      url.includes('agent-credentials') && init?.method === 'POST'
+        ? { credential: { id: 'c1', zone: 'us-east-1a', region: 'us', created_at: now, revoked: false }, token: 'wa_c1.secret' }
+        : url.includes('/cluster') ? { self: member('global'), members: [member('us')], mode: 'global', now, links: [] } : url.includes('/regions') ? { regions: [] } : { agents: [] },
+    ), { status: init?.method === 'POST' ? 201 : 200, headers: { 'content-type': 'application/json' } }));
     vi.stubGlobal('fetch', fetchMock);
     render(ClusterAdmin);
-    expect(await screen.findByText(/Preview · Not issued/)).toBeInTheDocument();
-    await fireEvent.change(screen.getByLabelText('Region', { selector: 'select' }), { target: { value: 'us' } });
+    await fireEvent.change(await screen.findByLabelText('Region', { selector: 'select' }), { target: { value: 'us' } });
     await fireEvent.input(screen.getByPlaceholderText('e.g. us-east-1a'), { target: { value: 'us-east-1a' } });
-    await fireEvent.click(screen.getByRole('button', { name: 'Generate preview' }));
-    expect(screen.getByText(/this token is not valid/)).toBeInTheDocument();
-    expect(screen.getByText(/PREVIEW-NOT-A-REAL-AGENT-TOKEN/)).toBeInTheDocument();
-    expect(fetchMock).not.toHaveBeenCalledWith(expect.stringContaining('agent-credentials'), expect.anything());
+    await fireEvent.click(screen.getByRole('button', { name: 'Issue token' }));
+    expect(await screen.findByText(/Copy the token for us \/ us-east-1a now/)).toBeInTheDocument();
+    expect(screen.getByText(/wa_c1\.secret/)).toBeInTheDocument();
+    const post = fetchMock.mock.calls.find(([url, init]) => url.includes('agent-credentials') && init?.method === 'POST');
+    expect(JSON.parse(String(post?.[1]?.body))).toEqual({ zone: 'us-east-1a', region: 'us' });
   });
 
   it('simulates rollup state transitions from child states', async () => {

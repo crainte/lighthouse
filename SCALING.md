@@ -1547,6 +1547,7 @@ Fleet, coordinator rosters, the rollup tree and credentials are admin diagnostic
 - **Concurrent, bounded, partial.** Regions are queried at the same time, each within a 5 s deadline. The view is built from the regions that answer, and `unavailable_regions` (or `available: false` on a roster) names the rest. Drill-down data merges (`relay_merge`) still fail closed, because partial history misleads, while a partial diagnostic does not.
 - **Steady-state cost is zero.** The push carries no roster, build or tree. Each open Topology tab costs one GET per region per refresh.
 - **The region answers for its subtree; the global tier answers for the root.** In the merged rollup tree, each region's node is kept verbatim: zones, agents, and the policies that region stores and applies. The check root is what the global tier computes. That is the worst-of fold (`cache::ROLLUP`, degraded = any, down = any), not a stored override. A stored `global` override is applied only by the regions, to their own roots.
+- **Agent credentials are minted where they are used.** On the global node, a mint goes to the one region named. The region stores the hash and replicates it to its peers, and the token passes back through the global node once. The global tier stores nothing.
 - **Agent → coordinator** is part of the replicated poll row (`agent_polls.coordinator`), not a separate stream. It costs nothing beyond the row it already rides on.
 - **Next ceiling.** The merged tree is still a full catalogue per region. Paging it server-side is the "Scale and query shape" item.
 

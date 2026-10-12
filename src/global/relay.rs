@@ -232,7 +232,7 @@ pub(super) fn region_request(
 }
 /// Relay a read to the first endpoint that answers, returning its response
 /// verbatim. `authed` attaches the trust token (admin reads).
-async fn relay_single_path(
+pub(super) async fn relay_single_path(
     node: &GlobalNode,
     method: &Method,
     pq: &str,

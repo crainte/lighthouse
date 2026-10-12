@@ -23,11 +23,10 @@ export interface AgentCredential {
   revoked: boolean;
 }
 
-export async function fetchAgentCredentials(): Promise<AgentCredential[]> {
-  const r = await request<{ credentials: AgentCredential[] }>(
-    "/api/v1/admin/agent-credentials",
-  );
-  return r.credentials;
+/** `unavailable_regions` is set only by a global node: regions whose
+ *  credentials could not be read, so the list is missing them. */
+export function fetchAgentCredentials(): Promise<{ credentials: AgentCredential[]; unavailable_regions?: string[] }> {
+  return request("/api/v1/admin/agent-credentials");
 }
 
 /** The only moment `token` exists in cleartext anywhere: the server hashes it

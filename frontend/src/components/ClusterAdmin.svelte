@@ -65,8 +65,11 @@
   let onboardingZone = $state('');
   let issuing = $state(false);
   let issueError = $state<string | null>(null);
-  let issued = $state<{ region: string; zone: string; token: string; preview: boolean } | null>(null);
-  const onboardingRegions = $derived([...new Set(lanes.map((l) => l.name))].sort());
+  let issued = $state<{ region: string; zone: string; token: string } | null>(null);
+  // A global node mints in a region it can reach, so only reporting regions.
+  const onboardingRegions = $derived(cluster?.mode === 'global'
+    ? cluster.members.map((m) => m.node_id).sort()
+    : [...new Set(lanes.map((l) => l.name))].sort());
 
   async function issueAgentToken() {
     const region = onboardingRegion.trim();
@@ -76,14 +79,10 @@
       return;
     }
     issueError = null;
-    if (cluster?.mode === 'global') {
-      issued = { region, zone, token: 'PREVIEW-NOT-A-REAL-AGENT-TOKEN', preview: true };
-      return;
-    }
     issuing = true;
     try {
       const minted = await createAgentCredential(zone, region);
-      issued = { region, zone, token: minted.token, preview: false };
+      issued = { region, zone, token: minted.token };
       onboardingZone = '';
     } catch (e) {
       issueError = fail(e);
@@ -294,15 +293,14 @@
       </div>
       <div class="onboarding-card">
         <div class="card-heading"><span class="step-number">3</span><div><h4>Agent token</h4><p>Credentials are scoped to one region and zone. The secret is shown once.</p></div></div>
-        {#if cluster.mode === 'global'}<span class="preview-flag">Preview · Not issued — requires backend support for global-scope agent tokens</span>{/if}
         <form class="token-form" onsubmit={(e) => (e.preventDefault(), issueAgentToken())}>
           <label class="field"><span class="field-label">Region</span><select bind:value={onboardingRegion}><option value="">Choose region</option>{#each onboardingRegions as region (region)}<option value={region}>{region}</option>{/each}</select></label>
           <label class="field"><span class="field-label">Zone</span><input bind:value={onboardingZone} placeholder="e.g. us-east-1a" /></label>
-          <button class="btn primary" type="submit" disabled={issuing || !onboardingRegion || !onboardingZone.trim()}>{cluster.mode === 'global' ? 'Generate preview' : issuing ? 'Issuing…' : 'Issue token'}</button>
+          <button class="btn primary" type="submit" disabled={issuing || !onboardingRegion || !onboardingZone.trim()}>{issuing ? 'Issuing…' : 'Issue token'}</button>
         </form>
         {#if issueError}<p class="admin-error">{issueError}</p>{/if}
         {#if issued}
-          <div class="issued-token" class:preview={issued.preview} role="status"><strong>{issued.preview ? 'Preview configuration — this token is not valid' : `Copy the token for ${issued.region} / ${issued.zone} now`}</strong><pre>[agent]{'\n'}region = "{issued.region}"{'\n'}zone = "{issued.zone}"{'\n'}token = "{issued.token}"</pre><button class="btn" type="button" onclick={() => (issued = null)}>Dismiss</button></div>
+          <div class="issued-token" role="status"><strong>{`Copy the token for ${issued.region} / ${issued.zone} now`}</strong><pre>[agent]{'\n'}region = "{issued.region}"{'\n'}zone = "{issued.zone}"{'\n'}token = "{issued.token}"</pre><button class="btn" type="button" onclick={() => (issued = null)}>Dismiss</button></div>
         {/if}
       </div>
     </div>
@@ -375,7 +373,6 @@
   .card-heading p { margin: 8px 0 0; color: var(--ad-dim); font-size: 12px; line-height: 1.6; }
   .token-form { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; align-items: end; gap: 12px; margin-top: 18px; }
   .issued-token { margin-top: 20px; padding: 16px; border: 1px solid var(--ad-green); border-radius: 7px; font-size: 12px; }
-  .issued-token.preview { border-color: #51422c; background: #30291f33; }
   .issued-token pre { padding: 14px; overflow-wrap: anywhere; white-space: pre-wrap; background: var(--ad-bg); border-radius: 6px; user-select: all; }
   @media (max-width: 1180px) { .topology-layout, .onboarding-grid { grid-template-columns: minmax(0, 1fr); } .node-inspector { position: static; } }
   @media (max-width: 900px) { .cluster-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } .region-lane { grid-template-columns: minmax(0, 1fr) 82px; } .lane-flow { grid-column: 1 / -1; grid-row: 2; border-top: 1px solid var(--ad-line); } .lane-total { border-left: 1px solid var(--ad-line); } .lane-region { border-right: 0; } .onboarding-steps { grid-template-columns: repeat(2, minmax(0, 1fr)); } }

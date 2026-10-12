@@ -115,7 +115,7 @@
       label: 'Credentials',
       group: 'Fleet',
       title: 'Credentials',
-      blurb: 'Zone-scoped agent credentials for this regional coordinator.',
+      blurb: 'Zone-scoped agent credentials, minted in the region whose agents use them.',
     },
     {
       id: 'results',
@@ -230,18 +230,9 @@
   let view = $state<View<AdminPanel>>(currentView());
   let dayModal = $state<DayModal>(null);
   let authenticated = $state(false);
-  // Which node the SPA is talking to. A global node has no fleet credentials of
-  // its own, so the Credentials panel is hidden there. Defaults to coordinator
-  // until the session probe reports otherwise.
+  // Which node the SPA is talking to. Defaults to coordinator until the
+  // session probe reports otherwise.
   let nodeMode = $state<NodeMode>('coordinator');
-  // Panels the current node actually supports. Credentials are minted per zone
-  // on a regional coordinator; a global node relays config but owns no zones.
-  const GLOBAL_HIDDEN_PANELS: AdminPanel[] = ['credentials'];
-  const visiblePanels = $derived(
-    nodeMode === 'global'
-      ? ADMIN_PANELS.filter((p) => !GLOBAL_HIDDEN_PANELS.includes(p.id))
-      : ADMIN_PANELS,
-  );
   // Until the session probe answers, "logged out" is a guess — and on #/admin
   // acting on that guess flashes a sign-in prompt at someone already signed in.
   let sessionChecked = $state(false);
@@ -821,7 +812,7 @@
     {@const openCount = adminIncidents.filter((i) => i.state !== 'resolved').length}
     {@const unacked = adminIncidents.filter((i) => i.state === 'detected').length}
     <ConsoleShell
-      panels={visiblePanels}
+      panels={ADMIN_PANELS}
       active={panel}
       title={meta?.title ?? 'Admin'}
       incidentCount={openCount}
@@ -846,7 +837,7 @@
             </div>
           </div>
         {:else if panel === 'overview'}
-          <NightwatchOverview {checks} totalChecks={statusTotal} hasMore={statusHasMore || statusPage > 0} incidents={adminIncidents} groups={adminIncidentGroups} {alerts} {fleet} {maintenance} {loading} {error} {wsStatus} {nodeMode} onOpenCheck={openDetail} onOpenIncident={openIncidentEditor} onPanel={(id) => { const target = visiblePanels.find((p) => p.id === id); if (target) openAdmin(target.id); }} onAddCheck={() => openCheckEditor(null)} onRetry={load} onExpired={onExpired} />
+          <NightwatchOverview {checks} totalChecks={statusTotal} hasMore={statusHasMore || statusPage > 0} incidents={adminIncidents} groups={adminIncidentGroups} {alerts} {fleet} {maintenance} {loading} {error} {wsStatus} {nodeMode} onOpenCheck={openDetail} onOpenIncident={openIncidentEditor} onPanel={(id) => { const target = ADMIN_PANELS.find((p) => p.id === id); if (target) openAdmin(target.id); }} onAddCheck={() => openCheckEditor(null)} onRetry={load} onExpired={onExpired} />
         {:else if panel === 'checks' && editing}
           <!-- Keyed so back/forward between two checks rebuilds the editor
                instead of leaving one check's draft under another's id. -->
@@ -885,7 +876,7 @@
             <AgentDisplayAdmin onchanged={load} onexpired={onExpired} />
           {:else if panel === 'agents'}
             <AgentsAdmin onopen={openCheckEditor} onexpired={onExpired} />
-          {:else if panel === 'credentials' && nodeMode !== 'global'}
+          {:else if panel === 'credentials'}
             <AgentCredentials onexpired={onExpired} />
           {:else if panel === 'results'}
             <ProbeResultsAdmin onopen={openCheckEditor} onexpired={onExpired} />

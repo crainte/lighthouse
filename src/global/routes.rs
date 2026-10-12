@@ -43,6 +43,14 @@ pub(super) fn router(node: GlobalNode) -> Router {
         // first region's agents. Explicit route so it never falls through to
         // that relay.
         .route("/api/v1/agents", get(agents_handler))
+        // Agent credentials live in the region whose agents present them.
+        // Listing gathers every region; minting goes to the one region named,
+        // never fanned out (that would mint a different secret per region).
+        // Revocation keeps the fan-out: a region without the id answers 404.
+        .route(
+            "/api/v1/admin/agent-credentials",
+            get(list_credentials_handler).post(mint_credential_handler),
+        )
         // The catalogue this node holds authoritatively (Phase 1): checks
         // and sections. Explicit routes so they never fall through to the
         // regional relay below.
@@ -705,6 +713,81 @@ fn merge_agents(gathered: relay::Gathered) -> serde_json::Value {
     out
 }
 
+/// Every region's agent credentials in one list. Each region holds only its
+/// own, so a single-region relay would hide the rest.
+async fn list_credentials_handler(
+    State(node): State<GlobalNode>,
+    _admin: crate::http::AdminSession,
+) -> Response {
+    match relay::gather_some(&node, "/api/v1/admin/agent-credentials").await {
+        Ok(gathered) => Json(merge_credentials(gathered)).into_response(),
+        Err(response) => response,
+    }
+}
+
+fn merge_credentials(gathered: relay::Gathered) -> serde_json::Value {
+    let mut seen = std::collections::HashSet::new();
+    let mut credentials: Vec<serde_json::Value> = gathered
+        .answers
+        .into_iter()
+        .flat_map(|(_, mut body)| take_array(&mut body["credentials"]))
+        .filter(|c| seen.insert(c["id"].as_str().unwrap_or_default().to_string()))
+        .collect();
+    credentials.sort_by_key(|c| {
+        (
+            c["region"].as_str().unwrap_or_default().to_string(),
+            c["zone"].as_str().unwrap_or_default().to_string(),
+            c["created_at"].as_i64().unwrap_or_default(),
+        )
+    });
+    serde_json::json!({
+        "credentials": credentials,
+        "unavailable_regions": gathered.unavailable,
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct MintCredentialRequest {
+    region: String,
+}
+
+/// Mint an agent credential in the region it is scoped to. The region's
+/// coordinator mints, stores the hash and replicates it to its peers; the
+/// token passes through here once, on the way back to the operator.
+async fn mint_credential_handler(
+    State(node): State<GlobalNode>,
+    crate::http::AdminJson(body): crate::http::AdminJson<serde_json::Value>,
+) -> Response {
+    let Ok(request) = serde_json::from_value::<MintCredentialRequest>(body.clone()) else {
+        return error_response(StatusCode::BAD_REQUEST, "region is required");
+    };
+    let region = request.region.trim();
+    let now = chrono::Utc::now().timestamp_millis();
+    let Some((_, endpoints)) = node
+        .inner
+        .cache
+        .region_endpoints(now)
+        .into_iter()
+        .find(|(name, _)| name == region)
+    else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            &format!("region {region:?} is not registered or has never reported"),
+        );
+    };
+    // The region validates and answers; its response, token included, is
+    // returned verbatim.
+    relay::relay_single_path(
+        &node,
+        &Method::POST,
+        "/api/v1/admin/agent-credentials",
+        &Bytes::from(body.to_string()),
+        &endpoints,
+        true,
+    )
+    .await
+}
+
 /// Global has no incidents or alerts of its own — the regions own those. Return
 /// empty envelopes so the SPA's incident and alert panels load cleanly rather
 /// than erroring on a 404.
@@ -890,6 +973,28 @@ mod tests {
         assert_eq!(merged["checks_with_no_live_agent_total"], 122);
         assert_eq!(merged["checks_no_agent_can_run_total"], 1);
         assert_eq!(merged["unavailable_regions"], json!(["eu"]));
+    }
+
+    #[test]
+    fn credentials_from_every_region_are_listed_once_in_location_order() {
+        let cred = |id: &str, region: &str, zone: &str| json!({"id": id, "region": region, "zone": zone, "created_at": 1, "revoked": false});
+        let merged = merge_credentials(gathered(
+            vec![
+                ("tw", json!({"credentials": [cred("t1", "tw", "a")]})),
+                (
+                    "us",
+                    json!({"credentials": [cred("u2", "us", "b"), cred("u1", "us", "a"), cred("t1", "tw", "a")]}),
+                ),
+            ],
+            &[],
+        ));
+        let ids: Vec<&str> = merged["credentials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["t1", "u1", "u2"]);
     }
 
     #[test]
