@@ -92,19 +92,29 @@
   }
 </script>
 
-<div class="admin-panel">
-  <p class="cleanup-warning">Permanent actions. Review the scope before confirming; deleted records cannot be recovered.</p>
+<div class="data-sections">
+  <p class="cleanup-warning">Every action here is permanent. Review the scope before confirming; deleted records cannot be recovered.</p>
 
-  <section class="results-cleanup">
-    <div class="field-label">Raw probe results</div>
-    {#if resultsLoading}
-      <p class="admin-muted">Loading result count…</p>
-    {:else if resultsCount !== null}
-      <p class="field-note">{resultsCount} {resultsCount === 1 ? 'raw result is' : 'raw results are'} stored. Purging clears probe history but keeps the published status.</p>
-    {/if}
-    {#if resultsError}<p class="admin-error">{resultsError}</p>{/if}
-    {#if resultsNote}<p class="admin-muted">{resultsNote}</p>{/if}
-    <div class="form-actions">
+  <details class="admin-panel editor-section danger" open>
+    <summary class="editor-summary">
+      <span class="chev" aria-hidden="true">▸</span> Raw probe results
+      <span class="admin-muted sum-note mono-text">
+        {resultsLoading ? 'counting…' : resultsCount === null ? '—' : `${resultsCount.toLocaleString()} stored`}
+      </span>
+    </summary>
+    <div class="editor-body">
+      <p class="field-note lede">
+        Every probe attempt agents have reported. Purging clears probe history, uptime bars and
+        latency graphs; each check keeps its published status and keeps probing.
+      </p>
+      {#if resultsLoading}
+        <p class="admin-muted">Loading result count…</p>
+      {:else if resultsCount !== null}
+        <p class="stored"><strong>{resultsCount.toLocaleString()}</strong> {resultsCount === 1 ? 'raw result' : 'raw results'} stored.</p>
+      {/if}
+      {#if resultsError}<p class="admin-error">{resultsError}</p>{/if}
+      {#if resultsNote}<p class="admin-muted">{resultsNote}</p>{/if}
+      <div class="form-actions">
       {#if resultsConfirming && resultsCount !== null}
         <span class="confirm">Purge exactly {resultsCount} {resultsCount === 1 ? 'raw result' : 'raw results'}?</span>
         <button class="btn danger" onclick={confirmResultsPurge} disabled={resultsPurging}>
@@ -115,76 +125,93 @@
         <button class="btn danger" onclick={armResultsPurge} disabled={resultsLoading || resultsCount === null}>Purge raw results</button>
         <button class="btn" onclick={loadResultsCount} disabled={resultsLoading || resultsPurging}>Refresh count</button>
       {/if}
+      </div>
     </div>
-  </section>
+  </details>
 
-  <div class="cleanup-form">
-    <div class="panel-title">Short-lived incidents</div>
-    <label class="field">
-      <span class="field-label">Maximum incident duration (seconds)</span>
-      <NumberField min={1} max={3600} step={1} bind:value={maxSecs} disabled={purging} />
-    </label>
-    <span class="field-note">Only resolved incidents lasting this long or less are removed.</span>
-  </div>
+  <details class="admin-panel editor-section danger" open>
+    <summary class="editor-summary">
+      <span class="chev" aria-hidden="true">▸</span> Short-lived incidents
+      <span class="admin-muted sum-note mono-text">≤ {maxSecs ?? '—'} s</span>
+    </summary>
+    <div class="editor-body">
+      <p class="field-note lede">
+        Blips that opened and resolved an incident within seconds. Removing them tidies the
+        incident history; open incidents and longer ones are never touched.
+      </p>
+      <label class="field duration">
+        <span class="field-label">Maximum incident duration (seconds)</span>
+        <NumberField min={1} max={3600} step={1} bind:value={maxSecs} disabled={purging} />
+        <span class="field-note">Only resolved incidents lasting this long or less are removed.</span>
+      </label>
 
-  {#if error}<p class="admin-error">{error}</p>{/if}
-  {#if note}<p class="admin-muted">{note}</p>{/if}
+      {#if error}<p class="admin-error">{error}</p>{/if}
+      {#if note}<p class="admin-muted">{note}</p>{/if}
 
-  <div class="form-actions">
-    {#if confirming}
-      <span class="confirm">Purge resolved incidents lasting {maxSecs} seconds or less?</span>
-      <button class="btn danger" onclick={purge} disabled={purging}>
-        {purging ? 'Purging…' : 'Yes, purge short incidents'}
-      </button>
-      <button class="btn" onclick={() => (confirming = false)} disabled={purging}>Cancel</button>
-    {:else}
-      <button class="btn danger" onclick={arm}>Purge short incidents</button>
-    {/if}
-  </div>
+      <div class="form-actions">
+        {#if confirming}
+          <span class="confirm">Purge resolved incidents lasting {maxSecs} seconds or less?</span>
+          <button class="btn danger" onclick={purge} disabled={purging}>
+            {purging ? 'Purging…' : 'Yes, purge short incidents'}
+          </button>
+          <button class="btn" onclick={() => (confirming = false)} disabled={purging}>Cancel</button>
+        {:else}
+          <button class="btn danger" onclick={arm}>Purge short incidents</button>
+        {/if}
+      </div>
+    </div>
+  </details>
 </div>
 
 <style>
-  .cleanup-warning { padding: 12px 16px; border: 1px solid #56323e; border-left: 2px solid var(--ad-red); border-radius: 6px; color: var(--ad-red); font-size: 13px; background: #221a25; }
-  .results-cleanup {
+  /* Separate surfaces with a gap, not one panel: each section destroys a
+     different kind of record and should read as its own decision. */
+  .data-sections {
     display: grid;
-    gap: 0.3rem;
-    margin-top: 0.85rem;
+    gap: 16px;
   }
-
-  .cleanup-form {
-    display: grid;
-    gap: 0.3rem;
-    margin-top: 28px;
-    padding-top: 24px;
-    border-top: 1px solid var(--border);
-    max-width: 32rem;
+  .data-sections > .admin-panel {
+    margin: 0;
   }
-
-  .field {
-    display: grid;
-    gap: 0.3rem;
+  .data-sections > .editor-section[open] > .editor-summary {
+    border-bottom-color: rgba(248, 81, 73, 0.45);
   }
-
-  .field-label {
-    font-size: 0.75rem;
+  .editor-body > .form-actions {
+    margin-top: 16px;
+  }
+  .cleanup-warning {
+    margin: 0;
+    padding: 12px 16px;
+    border: 1px solid #56323e;
+    border-left: 2px solid var(--ad-red);
+    border-radius: 6px;
+    color: var(--ad-red);
+    font-size: 13px;
+    background: #221a25;
+  }
+  .lede {
+    margin: 0 0 14px;
+    max-width: 68ch;
+    line-height: 1.5;
+  }
+  .stored {
+    margin: 0;
+    font-size: 0.85rem;
     color: var(--text-dim);
   }
-
-  .field-note,
+  .stored strong {
+    color: var(--text);
+    font-size: 1.05rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .duration {
+    max-width: 22rem;
+  }
+  .mono-text {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
   .confirm {
     font-size: 0.75rem;
-    color: var(--text-dim);
-  }
-
-  .confirm {
     color: var(--down);
-  }
-
-  .form-actions {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    flex-wrap: wrap;
-    margin-top: 0.85rem;
   }
 </style>
