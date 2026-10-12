@@ -1,6 +1,7 @@
 // Shared presentation for the incident model. Kept out of `format.ts` because
 // that file is about numbers and clocks; this is about one domain type.
 import type { AffectSource, Incident, IncidentState } from './api';
+import { INCIDENT_STATES } from './api';
 
 /// `Incident.checks` carries only the immutable `check_id` — the server never
 /// repeats a check's mutable name onto every incident row it appears on.
@@ -111,6 +112,15 @@ export function openIncidentForCheck(incidents: Incident[], checkId: string): In
     if (best === null || i.started_at > best.started_at) best = i;
   }
   return best;
+}
+
+/// The states an operator may post from `current`, mirroring the server's
+/// rule: `detected` is the coordinator's alone, and a resolved incident can
+/// only be reopened, not resolved a second time.
+export function postableStates(current: IncidentState): IncidentState[] {
+  return INCIDENT_STATES.filter(
+    (s) => s !== 'detected' && !(current === 'resolved' && s === 'resolved'),
+  );
 }
 
 /// Where a global node can open a hand-made incident: only a region that is

@@ -1,6 +1,5 @@
 <script lang="ts">
   import {
-    INCIDENT_STATES,
     addIncidentUpdate,
     createIncident,
     editIncident,
@@ -18,6 +17,7 @@
     fromDatetimeLocal,
     incidentRegionChoices,
     incidentStateColor,
+    postableStates,
     stateTone,
     toDatetimeLocal,
   } from '../lib/incident';
@@ -123,7 +123,7 @@
   // `detected` — posting is what acknowledges it, so offer the next step.
   $effect(() => {
     const s = current?.state;
-    updateState = s === undefined || s === 'detected' ? 'investigating' : s;
+    updateState = s === undefined || s === 'detected' || s === 'resolved' ? 'investigating' : s;
   });
 
   const manualChecks = $derived(
@@ -398,14 +398,22 @@
           <div class="post-box">
             <textarea rows="2" bind:value={updateBody} placeholder="What changed"></textarea>
             <div class="post-row">
+              {#if current.state === 'resolved'}<span class="field-label">Reopen as</span>{/if}
               <select bind:value={updateState}>
-                {#each INCIDENT_STATES as s (s)}
+                {#each postableStates(current.state) as s (s)}
                   <option value={s}>{s}</option>
                 {/each}
               </select>
-              <button class="btn primary" onclick={postUpdate}>Post update</button>
+              <button class="btn primary" onclick={postUpdate}>
+                {current.state === 'resolved' ? 'Reopen incident' : 'Post update'}
+              </button>
               <span class="field-note">
-                Posting is the only way the state moves — and the first one acknowledges it.
+                {#if current.state === 'resolved'}
+                  Resolved is final unless you reopen it.{#if current.origin_check}{' '}While its
+                    check keeps passing, the coordinator will resolve it again on the next probe.{/if}
+                {:else}
+                  Posting is the only way the state moves — and the first one acknowledges it.
+                {/if}
               </span>
             </div>
           </div>

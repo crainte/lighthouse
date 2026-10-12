@@ -401,12 +401,20 @@ impl Coordinator {
             }
         }
         let downtime = format_duration(ts - inc.started_at);
+        // `ts` is when the agent probed, which can predate an update an
+        // operator posted while the batch was in flight. Stamping the resolve
+        // there would sort it before that update, leaving the timeline ending
+        // on a state the incident is no longer in.
+        let latest = store
+            .updates_for_incident(&inc.id)?
+            .last()
+            .map_or(i64::MIN, |u| u.created_at);
         store.add_update(
             &inc.id,
             storage::IncidentState::Resolved,
             &format!("Recovered automatically. Total downtime: {downtime}."),
             None,
-            ts,
+            ts.max(latest.saturating_add(1)),
         )?;
         Ok(true)
     }

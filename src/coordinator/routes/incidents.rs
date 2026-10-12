@@ -504,10 +504,14 @@ pub(in crate::coordinator) async fn incident_update_handler(
     Path(id): Path<String>,
     AdminJson(req): AdminJson<IncidentUpdateRequest>,
 ) -> Response {
-    let Some(state) = parse_incident_state(Some(&req.state)) else {
+    // `detected` is the coordinator's own word for "nobody has looked yet"; a
+    // human posting is, by definition, somebody looking.
+    let Some(state) = parse_incident_state(Some(&req.state))
+        .filter(|s| *s != crate::coordinator::storage::IncidentState::Detected)
+    else {
         return error_response(
             StatusCode::BAD_REQUEST,
-            "state must be detected, investigating, identified, monitoring or resolved",
+            "state must be investigating, identified, monitoring or resolved",
         );
     };
     let now = chrono::Utc::now().timestamp_millis();
@@ -518,6 +522,11 @@ pub(in crate::coordinator) async fn incident_update_handler(
             let Some(current) = storage.incident(&update_id)? else {
                 return Ok(None);
             };
+            // Resolved ends the incident. Reopening is a non-resolved update;
+            // a second resolve would only append another ending.
+            if current.state.is_resolved() && state.is_resolved() {
+                return Ok(Some(Err(())));
+            }
             // An empty-bodied update that does not move the state carries no
             // information, and the acknowledgement it would have recorded is
             // already on the record. Writing one anyway lets a repeated "Ack"
@@ -536,11 +545,15 @@ pub(in crate::coordinator) async fn incident_update_handler(
             let updates = storage.updates_for_incident(&row.id).unwrap_or_default();
             let mut dto = IncidentDto::from_row(row, now, true);
             dto.updates = Some(updates.into_iter().map(IncidentUpdateDto::from).collect());
-            Ok(Some(dto))
+            Ok(Some(Ok(dto)))
         })
         .await
     {
-        Ok(Some(dto)) => {
+        Ok(Some(Err(()))) => error_response(
+            StatusCode::CONFLICT,
+            "incident is already resolved; post another state to reopen it",
+        ),
+        Ok(Some(Ok(dto))) => {
             let _ = coord.inner.events.send(WsEvent::IncidentUpdated {
                 incident: dto.clone(),
             });

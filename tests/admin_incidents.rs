@@ -551,6 +551,100 @@ async fn a_manual_incident_is_never_auto_resolved() {
     assert_ne!(own[0].id, id);
 }
 
+/// The lifecycle an operator drives: `detected` is the coordinator's word for
+/// "nobody has looked yet", so a human can never post it; `resolved` ends the
+/// incident, so resolving it again is refused rather than appended as a second
+/// ending; and a reopen is a non-resolved update, which clears the resolution.
+#[tokio::test]
+async fn an_operator_cannot_resolve_twice_or_post_detected() {
+    let addr = spawn_server(coordinator().await);
+    let base = format!("http://{addr}");
+    let session = login(&base).await;
+    let client = reqwest::Client::new();
+    let id = create_incident(&base, &session, "Planned work", &[]).await;
+    let post = |state: &'static str| {
+        client
+            .post(format!("{base}/api/v1/admin/incidents/{id}/updates"))
+            .header(reqwest::header::COOKIE, &session)
+            .json(&json!({ "state": state, "body": "note" }))
+            .send()
+    };
+
+    assert_eq!(post("detected").await.unwrap().status(), 400);
+    assert_eq!(post("resolved").await.unwrap().status(), 200);
+    let again = post("resolved").await.unwrap();
+    assert_eq!(again.status(), 409, "an ended incident cannot end again");
+
+    let detail: Value = client
+        .get(format!("{base}/api/v1/incidents/{id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let states: Vec<&str> = detail["incident"]["updates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["state"].as_str().unwrap())
+        .collect();
+    assert_eq!(states.iter().filter(|s| **s == "resolved").count(), 1);
+
+    let reopened: Value = post("investigating").await.unwrap().json().await.unwrap();
+    assert_eq!(reopened["incident"]["state"], "investigating");
+    assert_eq!(reopened["incident"]["resolved_at"], Value::Null);
+}
+
+/// An automatic resolve is stamped with the probe's timestamp, which an agent
+/// takes before the batch reaches the coordinator. An operator update landing
+/// in that gap would otherwise sort *after* the resolve, and the timeline would
+/// end on "investigating" for an incident that is resolved.
+#[tokio::test]
+async fn an_automatic_resolve_never_sorts_before_the_update_it_follows() {
+    let coord = coordinator_with(vec![http_check("db")]).await;
+    let addr = spawn_server(coord.clone());
+    let base = format!("http://{addr}");
+    let session = login(&base).await;
+    let now = chrono::Utc::now().timestamp_millis();
+
+    coord.ingest(vec![probe("db", now - 60_000, 500)]).await;
+    let id = coord
+        .incidents_for_test(10)
+        .await
+        .into_iter()
+        .find(|i| i.origin_check == Some(cid("db")))
+        .expect("the failure opened an incident")
+        .id;
+    let posted = reqwest::Client::new()
+        .post(format!("{base}/api/v1/admin/incidents/{id}/updates"))
+        .header(reqwest::header::COOKIE, &session)
+        .json(&json!({ "state": "investigating", "body": "looking" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(posted.status(), 200);
+
+    // Probed before the operator's update was written, delivered after.
+    coord.ingest(vec![probe("db", now - 30_000, 200)]).await;
+
+    let detail: Value = reqwest::Client::new()
+        .get(format!("{base}/api/v1/incidents/{id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["incident"]["state"], "resolved");
+    let updates = detail["incident"]["updates"].as_array().unwrap();
+    assert_eq!(
+        updates.last().unwrap()["state"],
+        "resolved",
+        "the timeline ends where the incident does: {updates:?}"
+    );
+}
+
 /// Acknowledging is posting an empty-bodied `investigating` update, and the
 /// console offers it on every render of a `detected` row. A double click, a
 /// stale list, or a relay that answers from a lagging region therefore posts it

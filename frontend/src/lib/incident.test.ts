@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { checkLabel, checkNameMap, incidentRegionChoices, openGlobalIncidents, openIncidentForCheck } from './incident';
+import { checkLabel, checkNameMap, incidentRegionChoices, postableStates, openGlobalIncidents, openIncidentForCheck } from './incident';
 import type { Incident, IncidentState } from './api';
 
 function inc(over: Partial<Incident> & { id: string }): Incident {
@@ -91,5 +91,16 @@ describe('incidentRegionChoices', () => {
 
   it('is empty when nothing has reported yet', () => {
     expect(incidentRegionChoices([reg('us', false)])).toEqual([]);
+  });
+});
+
+describe('postableStates', () => {
+  it('never offers detected, which only the coordinator sets', () => {
+    expect(postableStates('detected')).toEqual(['investigating', 'identified', 'monitoring', 'resolved']);
+    expect(postableStates('monitoring')).not.toContain('detected');
+  });
+
+  it('offers a resolved incident only a reopen, never a second resolve', () => {
+    expect(postableStates('resolved')).toEqual(['investigating', 'identified', 'monitoring']);
   });
 });
