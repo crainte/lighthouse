@@ -406,8 +406,6 @@
       return (saveError = 'Certificate warning must be a whole number of days, at least 0.');
     if (k === 'openmetrics' && !draft.metric.name.trim())
       return (saveError = 'Metric name is required.');
-    if (k === 'dns' && draft.dns.mode === 'dnssec' && !draft.dns.nameserver.trim())
-      return (saveError = 'DNSSEC validation requires the resolver nameserver.');
       if (k === 'heartbeat' && !whole(draft.grace_secs, 10))
         return (saveError = 'Grace must be a whole number of seconds, at least 10.');
     if (!whole(draft.failures_before_down, 1))

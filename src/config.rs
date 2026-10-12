@@ -1733,18 +1733,14 @@ impl CheckConfig {
                 CheckKind::Heartbeat => {}
             }
         }
-        if self.kind == CheckKind::Dns {
-            if self.dns.mode == DnsMode::Dnssec && self.dns.nameserver.is_none() {
-                return Err("DNSSEC validation checks require a nameserver".into());
-            }
-            if self.dns.mode == DnsMode::Standard
-                && !matches!(
-                    self.dns.record.to_ascii_uppercase().as_str(),
-                    "A" | "AAAA" | "CNAME" | "MX" | "TXT" | "NS"
-                )
-            {
-                return Err("lookup record must be one of A, AAAA, CNAME, MX, TXT, NS".into());
-            }
+        if self.kind == CheckKind::Dns
+            && self.dns.mode == DnsMode::Standard
+            && !matches!(
+                self.dns.record.to_ascii_uppercase().as_str(),
+                "A" | "AAAA" | "CNAME" | "MX" | "TXT" | "NS"
+            )
+        {
+            return Err("lookup record must be one of A, AAAA, CNAME, MX, TXT, NS".into());
         }
         if self.kind == CheckKind::Openmetrics {
             // One scrape selects one sample; aggregating across several exporters
@@ -1957,7 +1953,7 @@ mod tests {
     }
 
     #[test]
-    fn dnssec_checks_require_the_resolver_under_test() {
+    fn dnssec_checks_default_to_the_system_resolver() {
         let mut check = CheckConfig {
             name: "resolver DNSSEC".into(),
             kind: CheckKind::Dns,
@@ -1968,10 +1964,9 @@ mod tests {
             },
             ..Default::default()
         };
-        assert_eq!(
-            check.validate().unwrap_err(),
-            "DNSSEC validation checks require a nameserver"
-        );
+        check
+            .validate()
+            .expect("no nameserver means the system resolver");
         check.dns.nameserver = Some("192.0.2.1:53".into());
         check.validate().expect("explicit resolver is valid");
     }

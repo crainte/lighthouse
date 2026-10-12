@@ -164,7 +164,9 @@ async fn probe_one(probes: &Probes, check: &CheckConfig, target: &str) -> Observ
     match check.kind {
         CheckKind::Http => http::probe_http(&probes.http, check, target).await,
         CheckKind::Tcp => tcp::probe_tcp(check, target).await,
-        CheckKind::Dns => dns::probe_dns(&probes.resolver, check, target).await,
+        CheckKind::Dns => {
+            dns::probe_dns(&probes.resolver, &probes.system_nameservers, check, target).await
+        }
         CheckKind::Icmp => icmp::probe_icmp(&probes.resolver, check, target).await,
         CheckKind::Ssl => ssl::probe_ssl(check, target).await,
         // Each OpenMetrics host is scraped and selected independently, exactly
@@ -190,6 +192,9 @@ async fn probe_one(probes: &Probes, check: &CheckConfig, target: &str) -> Observ
 pub struct Probes {
     http: reqwest::Client,
     resolver: TokioResolver,
+    /// The servers `resolver` was built from, in order. DNSSEC checks speak to
+    /// them directly, because they must read the AD bit off a raw response.
+    system_nameservers: Arc<[std::net::SocketAddr]>,
 }
 
 pub(super) fn resolver_for(addr: std::net::SocketAddr) -> Result<TokioResolver, String> {
@@ -207,6 +212,20 @@ pub(super) fn resolver_for(addr: std::net::SocketAddr) -> Result<TokioResolver, 
         .with_options(opts)
         .build()
         .map_err(|e| e.to_string())
+}
+
+/// One address per configured server, in resolv.conf order, deduplicated —
+/// hickory lists a server once per transport, both on the same port.
+fn nameserver_addrs(config: &ResolverConfig) -> Arc<[std::net::SocketAddr]> {
+    let mut addrs: Vec<std::net::SocketAddr> = Vec::new();
+    for server in config.name_servers() {
+        let port = server.connections.first().map_or(53, |c| c.port);
+        let addr = std::net::SocketAddr::new(server.ip, port);
+        if !addrs.contains(&addr) {
+            addrs.push(addr);
+        }
+    }
+    addrs.into()
 }
 
 impl Probes {
@@ -228,19 +247,19 @@ impl Probes {
         // Prefer the host's resolvers; fall back to public ones when
         // /etc/resolv.conf is missing or empty (possible in minimal containers),
         // which would otherwise fail resolver construction outright.
-        let builder = match TokioResolver::builder_tokio() {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(error = %e, "no system resolver config, falling back to public DNS");
+        let config = match hickory_resolver::system_conf::read_system_conf() {
+            Ok((config, _)) if !config.name_servers().is_empty() => config,
+            Ok(_) | Err(_) => {
+                warn!("no system resolver config, falling back to public DNS");
                 let servers = ["1.1.1.1", "8.8.8.8"]
                     .iter()
                     .map(|ip| NameServerConfig::udp_and_tcp(ip.parse().expect("literal IP")))
                     .collect();
-                let config = ResolverConfig::from_parts(None, Vec::new(), servers);
-                Resolver::builder_with_config(config, TokioRuntimeProvider::default())
+                ResolverConfig::from_parts(None, Vec::new(), servers)
             }
         };
-        let resolver = builder
+        let system_nameservers = nameserver_addrs(&config);
+        let resolver = Resolver::builder_with_config(config, TokioRuntimeProvider::default())
             .with_options(opts)
             .build()
             .context("building DNS resolver for checks")?;
@@ -248,6 +267,7 @@ impl Probes {
         Ok(Self {
             http: reqwest::Client::new(),
             resolver,
+            system_nameservers,
         })
     }
 }

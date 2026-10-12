@@ -33,14 +33,14 @@
 
 <label class="field">
   <span class="field-label">Nameserver</span>
-  <input
-    class="mono"
-    bind:value={draft.dns.nameserver}
-    placeholder={draft.dns.mode === 'dnssec' ? '10.0.0.53 or 10.0.0.53:5353' : '(system resolver)'}
-  />
-  {#if draft.dns.mode === 'dnssec'}
-    <span class="field-note">Required. Point this at the Knot Resolver instance being monitored.</span>
-  {/if}
+  <input class="mono" bind:value={draft.dns.nameserver} placeholder="(system resolver)" />
+  <span class="field-note">
+    Optional: an IP, with a port if not 53. Blank uses the agent's system resolver(s).
+    {#if draft.dns.mode === 'dnssec'}
+      Set it to test a specific validating resolver — a local stub (Docker's, systemd-resolved)
+      may strip the authenticated flag and read as a failure.
+    {/if}
+  </span>
 </label>
 
 {#if draft.dns.mode === 'standard'}

@@ -6,15 +6,17 @@ use hickory_resolver::proto::{
 };
 use hickory_resolver::TokioResolver;
 use std::net::SocketAddr;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub(super) async fn probe_dns(
     resolver: &TokioResolver,
+    system_nameservers: &[SocketAddr],
     check: &CheckConfig,
     target: &str,
 ) -> Observation {
     if check.dns.mode == DnsMode::Dnssec {
-        return probe_dnssec(check).await;
+        return probe_dnssec(check, system_nameservers).await;
     }
 
     let fqdn = if target.ends_with('.') {
@@ -87,22 +89,49 @@ pub(super) async fn probe_dns(
     }
 }
 
-async fn probe_dnssec(check: &CheckConfig) -> Observation {
-    let Some(value) = check.dns.nameserver.as_deref() else {
+/// Ask the configured resolver, or else the agent's system resolvers, whether
+/// it can authenticate the root DNSKEY set.
+///
+/// System resolvers are tried in order, but only an unreachable or silent one
+/// hands over to the next. An answer — even SERVFAIL or one without AD — is
+/// the verdict: skipping past a resolver that fails validation would hide
+/// exactly the fault this check exists to report.
+async fn probe_dnssec(check: &CheckConfig, system: &[SocketAddr]) -> Observation {
+    let servers = match check.dns.nameserver.as_deref() {
+        Some(value) => match crate::config::dns_nameserver(value) {
+            Ok(addr) => vec![addr],
+            Err(e) => return Observation::failed(crate::models::FailureKind::DnssecValidation, e),
+        },
+        None => system.to_vec(),
+    };
+    if servers.is_empty() {
         return Observation::failed(
             crate::models::FailureKind::DnssecValidation,
-            "DNSSEC validation check has no nameserver",
+            "no resolver available: none configured and the system has none",
         );
-    };
-    let addr = match crate::config::dns_nameserver(value) {
-        Ok(addr) => addr,
-        Err(e) => return Observation::failed(crate::models::FailureKind::DnssecValidation, e),
-    };
-    match tokio::time::timeout(check.timeout(), dnssec_query(addr)).await {
+    }
+    let per_server = (check.timeout() / servers.len() as u32).max(Duration::from_secs(1));
+    match tokio::time::timeout(check.timeout(), dnssec_first_answer(&servers, per_server)).await {
         Err(_) => Observation::failed(crate::models::FailureKind::Timeout, "timeout"),
         Ok(Err(e)) => Observation::failed(crate::models::FailureKind::DnssecValidation, e),
-        Ok(Ok(message)) => evaluate_dnssec(&message),
+        Ok(Ok((addr, message))) => evaluate_dnssec(addr, &message),
     }
+}
+
+/// The first response any server gives, with the server that gave it.
+async fn dnssec_first_answer(
+    servers: &[SocketAddr],
+    per_server: Duration,
+) -> Result<(SocketAddr, Message), String> {
+    let mut errors = Vec::new();
+    for &addr in servers {
+        match tokio::time::timeout(per_server, dnssec_query(addr)).await {
+            Ok(Ok(message)) => return Ok((addr, message)),
+            Ok(Err(e)) => errors.push(format!("{addr}: {e}")),
+            Err(_) => errors.push(format!("{addr}: no response")),
+        }
+    }
+    Err(errors.join("; "))
 }
 
 async fn dnssec_query(addr: SocketAddr) -> Result<Message, String> {
@@ -179,12 +208,12 @@ async fn dnssec_query_tcp(
     Ok(message)
 }
 
-fn evaluate_dnssec(message: &Message) -> Observation {
+fn evaluate_dnssec(addr: SocketAddr, message: &Message) -> Observation {
     if message.metadata.response_code != ResponseCode::NoError {
         return Observation::failed(
             crate::models::FailureKind::DnssecValidation,
             format!(
-                "resolver returned {} for the root DNSKEY query",
+                "resolver {addr} returned {} for the root DNSKEY query",
                 message.metadata.response_code
             ),
         );
@@ -192,7 +221,7 @@ fn evaluate_dnssec(message: &Message) -> Observation {
     if !message.metadata.authentic_data {
         return Observation::failed(
             crate::models::FailureKind::DnssecValidation,
-            "resolver did not authenticate the root DNSKEY response",
+            format!("resolver {addr} did not authenticate the root DNSKEY response"),
         );
     }
     if !message
@@ -202,7 +231,7 @@ fn evaluate_dnssec(message: &Message) -> Observation {
     {
         return Observation::failed(
             crate::models::FailureKind::DnssecValidation,
-            "authenticated response contained no root DNSKEY records",
+            format!("resolver {addr} sent an authenticated response with no root DNSKEY records"),
         );
     }
     Observation::ok()
@@ -236,6 +265,11 @@ async fn lookup_record(
 mod tests {
     use super::*;
     use hickory_resolver::proto::op::OpCode;
+
+    const ADDR: SocketAddr = SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 53)),
+        53,
+    );
 
     fn response(code: ResponseCode, authenticated: bool, dnskey: bool) -> Message {
         let mut message = Message::response(1, OpCode::Query);
@@ -283,21 +317,69 @@ mod tests {
 
     #[tokio::test]
     async fn dnssec_query_requests_dnskey_with_do_and_preserves_servfail() {
-        let success = dnssec_query(serve_once(true).await).await.unwrap();
-        assert!(evaluate_dnssec(&success).error.is_none());
+        let addr = serve_once(true).await;
+        let success = dnssec_query(addr).await.unwrap();
+        assert!(evaluate_dnssec(addr, &success).error.is_none());
 
-        let servfail = dnssec_query(serve_once(false).await).await.unwrap();
+        let addr = serve_once(false).await;
+        let servfail = dnssec_query(addr).await.unwrap();
         assert_eq!(servfail.metadata.response_code, ResponseCode::ServFail);
+        let result = evaluate_dnssec(addr, &servfail);
         assert_eq!(
-            evaluate_dnssec(&servfail).failure,
+            result.failure,
             Some(crate::models::FailureKind::DnssecValidation)
         );
+        assert!(result.error.unwrap().contains(&addr.to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_silent_system_resolver_fails_over_to_the_next() {
+        // Bound but never answers: the shape of an unreachable resolver.
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let live = serve_once(true).await;
+        let (addr, message) = dnssec_first_answer(
+            &[silent.local_addr().unwrap(), live],
+            Duration::from_millis(200),
+        )
+        .await
+        .expect("the second resolver answers");
+        assert_eq!(addr, live);
+        assert!(evaluate_dnssec(addr, &message).error.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_servfail_is_a_verdict_not_a_reason_to_fail_over() {
+        let failing = serve_once(false).await;
+        let healthy = serve_once(true).await;
+        let (addr, message) = dnssec_first_answer(&[failing, healthy], Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(addr, failing);
+        assert_eq!(message.metadata.response_code, ResponseCode::ServFail);
+    }
+
+    #[tokio::test]
+    async fn dnssec_without_any_resolver_fails_plainly() {
+        let check = CheckConfig {
+            kind: crate::models::CheckKind::Dns,
+            dns: crate::config::DnsOptions {
+                mode: DnsMode::Dnssec,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = probe_dnssec(&check, &[]).await;
+        assert_eq!(
+            result.failure,
+            Some(crate::models::FailureKind::DnssecValidation)
+        );
+        assert!(result.error.unwrap().contains("no resolver"));
     }
 
     #[test]
     fn dnssec_requires_success_authenticated_data_and_a_dnskey() {
         assert!(
-            evaluate_dnssec(&response(ResponseCode::NoError, true, true))
+            evaluate_dnssec(ADDR, &response(ResponseCode::NoError, true, true))
                 .error
                 .is_none()
         );
@@ -306,7 +388,7 @@ mod tests {
             response(ResponseCode::NoError, false, false),
             response(ResponseCode::NoError, true, false),
         ] {
-            let result = evaluate_dnssec(&message);
+            let result = evaluate_dnssec(ADDR, &message);
             assert_eq!(
                 result.failure,
                 Some(crate::models::FailureKind::DnssecValidation)
