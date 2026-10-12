@@ -620,18 +620,18 @@ per_zone: draft.placement.count ?? 1,
   <!-- Enabled lives up here rather than inside a section: it governs the whole
        check, and a switch you have to go looking for is one you forget is off.
        With every panel shut, the header still says so. -->
-  <div class="area-bar" class:off={!draft.enabled}>
+  <div class="page-head page-head-row" class:off={!draft.enabled}>
     <div class="title-line">
-      <span class="panel-title no-gap mono">{creating ? 'New check' : draft.name || 'unnamed'}</span>
+      <h2 class="check-title">{creating ? 'New check' : draft.name || 'unnamed'}</h2>
       <span class="kind-pill">{kind}</span>
       {#if !draft.enabled}<span class="off-pill">not probing</span>{/if}
     </div>
-    <div class="range-switch head-acts">
-      <label class="toggle enable-toggle">
+    <div class="head-acts">
+      <label class="toggle">
         <input type="checkbox" bind:checked={draft.enabled} />
-        <span>Enabled</span>
+        <span>Enabled <em>— probe this check</em></span>
       </label>
-      <button class="range-btn" onclick={onclose}>← All checks</button>
+      <button class="btn" onclick={onclose}>← All checks</button>
     </div>
   </div>
 
@@ -1081,36 +1081,23 @@ per_zone: draft.placement.count ?? 1,
 {/if}
 
 <style>
-  .area-bar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 1rem;
-    margin-bottom: 0.6rem;
-  }
-  .no-gap {
-    margin-bottom: 0;
-    text-transform: none;
-    letter-spacing: 0;
-    font-size: 0.95rem;
-    color: var(--text);
+  .check-title {
+    overflow-wrap: anywhere;
   }
 
   .head-acts {
+    display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 0.9rem;
   }
-  .enable-toggle {
-    font-size: 0.75rem;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--text-dim);
+  .head-acts .toggle {
     cursor: pointer;
     white-space: nowrap;
   }
   /* A disabled check is not a broken one, so the header dims rather than
      reddens — but it must not read as normal either, with every panel shut. */
-  .area-bar.off .no-gap {
+  .off .check-title {
     color: var(--text-dim);
   }
   .off-pill {
@@ -1198,6 +1185,22 @@ per_zone: draft.placement.count ?? 1,
     grid-column: 1 / -1;
     gap: 0.35rem;
   }
+  @media (max-width: 1000px) {
+    .form-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+  /* One column on a phone. `wide` has to become a full row explicitly: `span 2`
+     in a one-column grid would invent a second, overflowing column. */
+  @media (max-width: 640px) {
+    .form-grid {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 18px;
+    }
+    .field.wide {
+      grid-column: 1 / -1;
+    }
+  }
   .agent-picker {
     display: flex;
     flex-wrap: wrap;
@@ -1270,12 +1273,17 @@ per_zone: draft.placement.count ?? 1,
     align-self: center;
   }
 
-  .form-actions {
+  /* `:global(.admin-app)` outranks the console theme's footer rule, which
+     draws a divider over every action row. Here each row sits right under the
+     text it acts on, and the save bar draws its own. */
+  :global(.admin-app) .form-actions {
     display: flex;
     align-items: center;
     gap: 0.5rem;
     margin-top: 0.6rem;
     flex-wrap: wrap;
+    padding-top: 0;
+    border-top: 0;
   }
 
   .save-bar {

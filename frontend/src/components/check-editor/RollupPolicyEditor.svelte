@@ -70,8 +70,7 @@
     margin-top: 0.5rem;
   }
   .policy-level {
-    border-top: 1px solid var(--border);
-    padding-top: 0.45rem;
+    min-width: 0;
   }
   .policy-thresholds {
     display: grid;

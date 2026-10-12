@@ -1878,7 +1878,7 @@ button.ot-id:hover {
   color: var(--ad-text);
   margin-bottom: 0.8rem;
 }
-.admin-app .admin-panel input,
+.admin-app .admin-panel input:not([type='checkbox']):not([type='radio']),
 .admin-app .admin-panel select,
 .admin-app .admin-panel textarea {
   background: #0b1520;
@@ -1957,7 +1957,7 @@ button.ot-id:hover {
 .admin-app .admin-workspace :is(input:not([type=checkbox]):not([type=radio]), select, textarea) { color: var(--ad-text); background: #0b1520; border: 1px solid var(--ad-line); border-radius: 6px; font: inherit; font-size: 13px; padding: 8px 10px; }
 .admin-app .admin-workspace :is(input:not([type=checkbox]):not([type=radio]), select, textarea):focus { outline: none; border-color: rgba(86, 212, 228, .55); }
 .admin-app .admin-workspace :is(input, textarea)::placeholder { color: var(--ad-faint); }
-.admin-app .admin-workspace .field :is(input, select, textarea) { width: 100%; }
+.admin-app .admin-workspace .field :is(input:not([type=checkbox]):not([type=radio]), select, textarea) { width: 100%; }
 .admin-app .admin-workspace .admin-panel .retry, .admin-app .admin-workspace .admin-panel .expired-action { margin-top: 16px; }
 .admin-app .admin-workspace .admin-panel.fleet-workspace,
 .admin-app .admin-workspace .admin-panel.probe-workspace { padding: 0; border: 0; background: transparent; box-shadow: none; }
