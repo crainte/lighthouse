@@ -850,6 +850,7 @@
 
               incidentId={incEditing.id}
               checks={checks.map((c) => ({ id: c.check_id, name: c.name }))}
+              regionScoped={nodeMode === 'global'}
               onClose={() => openAdmin('incidents')}
                 onSaved={onIncidentSaved}
               /></div>

@@ -9,13 +9,14 @@
   } from '../lib/api';
   import { untrack } from 'svelte';
   import type { Incident, IncidentState } from '../lib/api';
-  import { deleteIncident } from '../lib/admin';
+  import { deleteIncident, fetchRegions } from '../lib/admin';
   import { formatDuration, formatRelativeTime } from '../lib/format';
   import {
     affectSourceNote,
     checkLabel,
     checkNameMap,
     fromDatetimeLocal,
+    incidentRegionChoices,
     incidentStateColor,
     stateTone,
     toDatetimeLocal,
@@ -24,6 +25,7 @@
   let {
     incidentId,
     checks,
+    regionScoped = false,
     onClose,
     onSaved,
   }: {
@@ -33,6 +35,9 @@
     /** Every check's id and mutable name, for the affects picker: the id is
      *  what `setIncidentChecks` sends, the name is what the picker shows. */
     checks: { id: string; name: string }[];
+    /** On a global node incidents belong to one region, so creating one asks
+     *  which. A coordinator owns its own and never asks. */
+    regionScoped?: boolean;
     onClose: () => void;
     onSaved: (i: Incident) => void;
   } = $props();
@@ -49,6 +54,8 @@
   let updateState = $state<IncidentState>('investigating');
   let updateBody = $state('');
   let checkFilter = $state('');
+  let regions = $state<string[] | null>(null);
+  let region = $state('');
   let error = $state<string | null>(null);
   let busy = $state(false);
   // Seeded so the first paint of an existing incident is the spinner, not an
@@ -61,6 +68,27 @@
   let deleteBusy = $state(false);
 
   const creating = $derived(current === null);
+  const needsRegion = $derived(creating && regionScoped);
+  const canCreate = $derived(!needsRegion || region !== '');
+
+  $effect(() => {
+    if (!needsRegion || regions !== null) return;
+    let cancelled = false;
+    fetchRegions()
+      .then((all) => {
+        if (cancelled) return;
+        regions = incidentRegionChoices(all);
+        region = regions[0] ?? '';
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        regions = [];
+        error = e instanceof Error ? e.message : String(e);
+      });
+    return () => {
+      cancelled = true;
+    };
+  });
 
   // Load by id. Also re-seeds the detail fields, which is what makes a save
   // followed by a reload show the saved values rather than the stale draft.
@@ -142,6 +170,7 @@
           global,
           checks: [],
           body: body.trim(),
+          ...(needsRegion ? { region } : {}),
         }),
       );
     } else if (current) {
@@ -260,6 +289,22 @@
           <input type="checkbox" bind:checked={global} />
           <span>Global incident <em>— shown page-wide, not just on its checks.</em></span>
         </label>
+        {#if needsRegion}
+          <label class="field">
+            <span class="field-label">Region</span>
+            <select bind:value={region} disabled={!regions?.length}>
+              {#if regions === null}
+                <option value="">Loading regions…</option>
+              {:else if regions.length === 0}
+                <option value="">No region is reporting</option>
+              {/if}
+              {#each regions ?? [] as r (r)}
+                <option value={r}>{r}</option>
+              {/each}
+            </select>
+            <span class="field-note">The incident is kept by this region's coordinators.</span>
+          </label>
+        {/if}
         {#if creating}
           <label class="field">
             <span class="field-label">First update</span>
@@ -267,7 +312,7 @@
           </label>
         {/if}
         <div class="row-end">
-          <button class="btn primary" onclick={saveDetails}>
+          <button class="btn primary" onclick={saveDetails} disabled={!canCreate}>
             {creating ? 'Open incident' : 'Save details'}
           </button>
         </div>

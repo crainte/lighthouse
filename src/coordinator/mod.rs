@@ -1103,6 +1103,14 @@ impl Coordinator {
             .unwrap_or_default()
     }
 
+    /// Every incident this coordinator holds, for asserting from outside that
+    /// a write relayed by the global node landed here exactly once.
+    pub async fn list_incidents_for_test(&self) -> Vec<storage::IncidentRow> {
+        self.db(|storage| storage.list_incidents(10_000, None, None))
+            .await
+            .unwrap_or_default()
+    }
+
     /// This node's own config digest, for asserting an unplace left no
     /// tombstone behind — a tombstone would show up here as the Check kind's
     /// count staying at 1 rather than falling to 0.

@@ -24,8 +24,11 @@ use tracing::warn;
 ///   the region authorizes it. De-duplication of list results is left to the
 ///   region: they run identical config, so any one region's list is the fleet's.
 /// * **Admin writes** (`POST`/`PUT`/`PATCH`/`DELETE`) not covered by
-///   `global::admin` — notifiers, credentials, rollup policies, maintenance,
-///   incidents — are fanned out to *every* region so the fleet stays uniform.
+///   `global::admin` — notifiers, credentials, rollup policies, maintenance —
+///   are fanned out to *every* region so the fleet stays uniform. Incidents
+///   are the exception: they are regional, so a write to a composite id goes
+///   only to its owner, and a create goes to the region the operator names
+///   (`routes::create_incident_handler`).
 ///   The operator sees the first region's response; a failure on any region is
 ///   surfaced so a partial fan-out is never silently reported as success. This
 ///   is the pre-Phase-1 mechanism, unreconciled if a region misses it; see
@@ -78,8 +81,11 @@ pub(super) async fn relay_handler(
                     "incident owner region is unavailable",
                 );
             };
+            // The region answers with its local id; re-namespace it so the
+            // editor keeps addressing the incident through its owner.
             let pq = rewrite_incident_path(&uri, &local_id);
-            return relay_single_path(&node, &method, &pq, &body, &endpoints, true).await;
+            return relay_incident_detail(&node, &method, &pq, &body, &endpoints, true, &region)
+                .await;
         }
         return fan_out_write(&node, &method, &uri, &body, now).await;
     }
@@ -455,7 +461,9 @@ async fn fetch_region_json(
     }
     Err(last_error)
 }
-async fn relay_incident_detail(
+/// Relay to one region and namespace the `incident` in its answer as that
+/// region's, so the id the SPA gets back routes to the same owner again.
+pub(super) async fn relay_incident_detail(
     node: &GlobalNode,
     method: &Method,
     pq: &str,

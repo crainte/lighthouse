@@ -113,6 +113,17 @@ export function openIncidentForCheck(incidents: Incident[], checkId: string): In
   return best;
 }
 
+/// Where a global node can open a hand-made incident: only a region that is
+/// reporting has a coordinator to take it, so the rest are left off the list.
+export function incidentRegionChoices(
+  regions: { name: string; attached: boolean; stale: boolean }[],
+): string[] {
+  return regions
+    .filter((r) => r.attached && !r.stale)
+    .map((r) => r.name)
+    .sort((a, b) => a.localeCompare(b));
+}
+
 /// A global node stamps every incident id it relays as `"<region>:<local>"`
 /// (see `composite_incident_id` in `src/global/mod.rs`) so an editor targets
 /// the right region without a separate lookup. `id` is a check id (a UUID,

@@ -51,6 +51,11 @@ pub(super) fn router(node: GlobalNode) -> Router {
             "/api/v1/admin/agent-credentials",
             get(list_credentials_handler).post(mint_credential_handler),
         )
+        // Incidents are regional and never replicated: a hand-made one is
+        // opened in the one region the operator names, not fanned out (that
+        // would open a separate copy per region). Edits to an existing one
+        // route by its composite id through the relay below.
+        .route("/api/v1/admin/incidents", post(create_incident_handler))
         // The catalogue this node holds authoritatively (Phase 1): checks
         // and sections. Explicit routes so they never fall through to the
         // regional relay below.
@@ -125,9 +130,9 @@ pub(super) fn router(node: GlobalNode) -> Router {
         // relayed to regions: drill-down reads (history, uptime,
         // sparklines) to the owning region, and admin operations this
         // node is not authoritative for (notifiers, credentials, rollup
-        // policies, incidents, maintenance…) fanned out to every region so
-        // the fleet stays uniform. `any` so writes, not just GETs, reach
-        // the relay.
+        // policies, maintenance…) fanned out to every region so the fleet
+        // stays uniform; incident writes go only to the incident's owner.
+        // `any` so writes, not just GETs, reach the relay.
         .fallback(any(relay::relay_handler))
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(axum::middleware::from_fn(crate::security::security_headers));
@@ -784,6 +789,46 @@ async fn mint_credential_handler(
         &Bytes::from(body.to_string()),
         &endpoints,
         true,
+    )
+    .await
+}
+
+/// Open a hand-made incident in the region named by `region`. The region
+/// validates the rest of the body; its answer comes back with the incident's
+/// composite id, so the editor can keep addressing it through its owner.
+async fn create_incident_handler(
+    State(node): State<GlobalNode>,
+    crate::http::AdminJson(mut body): crate::http::AdminJson<serde_json::Value>,
+) -> Response {
+    let region = body
+        .as_object_mut()
+        .and_then(|fields| fields.remove("region"))
+        .and_then(|value| value.as_str().map(|s| s.trim().to_string()))
+        .filter(|region| !region.is_empty());
+    let Some(region) = region else {
+        return error_response(StatusCode::BAD_REQUEST, "region is required");
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    let Some((_, endpoints)) = node
+        .inner
+        .cache
+        .region_endpoints(now)
+        .into_iter()
+        .find(|(name, _)| *name == region)
+    else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            &format!("region {region:?} is not registered or has never reported"),
+        );
+    };
+    relay::relay_incident_detail(
+        &node,
+        &Method::POST,
+        "/api/v1/admin/incidents",
+        &Bytes::from(body.to_string()),
+        &endpoints,
+        true,
+        &region,
     )
     .await
 }

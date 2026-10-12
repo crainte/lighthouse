@@ -429,6 +429,8 @@ export function createIncident(body: {
   global?: boolean;
   checks?: string[];
   body?: string;
+  /** Global node only: the region that will own the incident. */
+  region?: string;
 }): Promise<Incident> {
   return incidentWrite("/api/v1/admin/incidents", "POST", body);
 }

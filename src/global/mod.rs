@@ -470,6 +470,119 @@ mod tests {
         assert_eq!(checks[0].name, "web");
     }
 
+    /// Incidents are regional. From the global view a hand-made one is opened
+    /// in exactly the region the operator names, and every write — create,
+    /// edit, affects, update — answers with the composite id, so the editor
+    /// re-loading by that id reaches the same owner instead of a 404.
+    #[tokio::test]
+    async fn global_incident_writes_answer_with_the_owners_composite_id() {
+        let password = "secret";
+        let coord = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            region: "us".into(),
+            global: push_config("http://ignored.invalid", US_KEY, 3600),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let coord_addr = serve_router(coord.clone().router()).await;
+        let node = GlobalNode::new(&GlobalConfig {
+            admin_password: Some(password.into()),
+            db_path: ":memory:".into(),
+            provision: vec![provision("us", US_KEY)],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let global_addr = serve_router(node.clone().router()).await;
+        let cookie = admin_cookie(&node, password);
+        let client = reqwest::Client::new();
+        let mut push = bare_push("us");
+        push.advertise_url = Some(format!("http://{coord_addr}"));
+        let pushed = client
+            .post(format!("http://{global_addr}/internal/global/state"))
+            .bearer_auth(US_KEY)
+            .json(&push)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pushed.status(), StatusCode::OK);
+
+        let base = format!("http://{global_addr}/api/v1");
+        let send = |method: reqwest::Method, path: &str, body: serde_json::Value| {
+            client
+                .request(method, format!("{base}{path}"))
+                .header(reqwest::header::COOKIE, &cookie)
+                .json(&body)
+                .send()
+        };
+        let create = |region: Option<&str>| {
+            let mut body = serde_json::json!({"title": "Planned work", "checks": [], "body": "x"});
+            if let Some(region) = region {
+                body["region"] = region.into();
+            }
+            send(reqwest::Method::POST, "/admin/incidents", body)
+        };
+
+        assert_eq!(
+            create(None).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            create(Some("eu")).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let created: serde_json::Value = create(Some("us")).await.unwrap().json().await.unwrap();
+        let id = created["incident"]["id"].as_str().unwrap().to_string();
+        assert!(id.starts_with("us:manual-"), "composite id, got {id}");
+        let regional = coord.list_incidents_for_test().await;
+        assert_eq!(regional.len(), 1, "opened once, in the named region");
+        assert_eq!(format!("us:{}", regional[0].id), id);
+
+        let path = format!("/admin/incidents/{}", urlencoding_colon(&id));
+        let writes = [
+            (
+                reqwest::Method::PATCH,
+                path.clone(),
+                serde_json::json!({"title": "Planned work (extended)", "started_at": 1, "global": false}),
+            ),
+            (
+                reqwest::Method::PUT,
+                format!("{path}/checks"),
+                serde_json::json!({"checks": []}),
+            ),
+            (
+                reqwest::Method::POST,
+                format!("{path}/updates"),
+                serde_json::json!({"state": "identified", "body": "found it"}),
+            ),
+        ];
+        for (method, path, body) in writes {
+            let resp = send(method.clone(), &path, body).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{method} {path}");
+            let answer: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(answer["incident"]["id"], id.as_str(), "{method} {path}");
+        }
+
+        let detail: serde_json::Value = client
+            .get(format!("{base}/incidents/{}", urlencoding_colon(&id)))
+            .header(reqwest::header::COOKIE, &cookie)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(detail["incident"]["id"], id.as_str());
+        assert_eq!(detail["incident"]["state"], "identified");
+        assert_eq!(detail["incident"]["title"], "Planned work (extended)");
+    }
+
+    fn urlencoding_colon(id: &str) -> String {
+        id.replace(':', "%3A")
+    }
+
     fn provision(region: &str, key: &str) -> ProvisionedCredential {
         ProvisionedCredential {
             zone: String::new(),

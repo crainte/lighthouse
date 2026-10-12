@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { checkLabel, checkNameMap, openGlobalIncidents, openIncidentForCheck } from './incident';
+import { checkLabel, checkNameMap, incidentRegionChoices, openGlobalIncidents, openIncidentForCheck } from './incident';
 import type { Incident, IncidentState } from './api';
 
 function inc(over: Partial<Incident> & { id: string }): Incident {
@@ -77,5 +77,19 @@ describe('checkNameMap / checkLabel', () => {
   it('falls back to the raw id for a check no longer in the list', () => {
     const names = checkNameMap([{ check_id: 'uuid-1', name: 'API' }]);
     expect(checkLabel(names, 'uuid-deleted')).toBe('uuid-deleted');
+  });
+});
+
+describe('incidentRegionChoices', () => {
+  const reg = (name: string, attached = true, stale = false) => ({ name, attached, stale });
+
+  it('offers only regions that are reporting, in name order', () => {
+    expect(
+      incidentRegionChoices([reg('us'), reg('eu', false), reg('tw'), reg('ap', true, true)]),
+    ).toEqual(['tw', 'us']);
+  });
+
+  it('is empty when nothing has reported yet', () => {
+    expect(incidentRegionChoices([reg('us', false)])).toEqual([]);
   });
 });
