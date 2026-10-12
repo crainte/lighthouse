@@ -277,6 +277,65 @@ async fn revoking_a_credential_takes_effect_without_a_restart() {
     assert_eq!(row["revoked"], true);
 }
 
+/// Deleting only clears away what revocation already disabled: a live
+/// credential is refused, a revoked one disappears, and a second delete is a
+/// plain 404 rather than a fake success.
+#[tokio::test]
+async fn only_a_revoked_credential_can_be_deleted() {
+    let addr = serve(coordinator(None).await).await;
+    let base = format!("http://{addr}");
+    let session = login(&base).await;
+    let token = mint(&base, &session, "eu-west-1a", "eu-west").await;
+    let id = token.split('.').next().unwrap().to_string();
+    let client = reqwest::Client::new();
+    let purge = || {
+        client
+            .post(format!("{base}/api/v1/admin/agent-credentials/{id}/purge"))
+            .header(reqwest::header::COOKIE, &session)
+            .send()
+    };
+    let listed = || async {
+        let v: Value = client
+            .get(format!("{base}/api/v1/admin/agent-credentials"))
+            .header(reqwest::header::COOKIE, &session)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        v["credentials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == id)
+    };
+
+    assert_eq!(purge().await.unwrap().status(), 409, "revoke comes first");
+    assert_eq!(post_result(&base, &token, "agent-9", "z", "r").await, 202);
+    assert!(listed().await);
+
+    let res = client
+        .delete(format!("{base}/api/v1/admin/agent-credentials/{id}"))
+        .header(reqwest::header::COOKIE, &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(purge().await.unwrap().status(), 200);
+    assert!(!listed().await, "a deleted credential leaves the list");
+    assert_eq!(post_result(&base, &token, "agent-9", "z", "r").await, 401);
+    assert_eq!(purge().await.unwrap().status(), 404);
+
+    // Admin-only, like every other credential operation.
+    let anon = client
+        .post(format!("{base}/api/v1/admin/agent-credentials/{id}/purge"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anon.status(), 401);
+}
+
 /// Minting must never hand back something that lets the caller read it again.
 #[tokio::test]
 async fn the_secret_is_returned_once_and_never_listed() {

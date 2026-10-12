@@ -699,6 +699,27 @@ impl Coordinator {
             if self.inner.credentials.read().contains_key(id) {
                 continue;
             }
+            // Deleted by an operator — always after revoking it. Re-minting
+            // from the block would hand a revoked fleet its access back, which
+            // the existence check above prevents for a revoked row but cannot
+            // for one that is gone.
+            let owned_id = id.to_string();
+            let deleted = self
+                .db(move |storage| {
+                    storage.config_tombstone(storage::ConfigKind::Credential, &owned_id)
+                })
+                .await?
+                .is_some();
+            if deleted {
+                warn!(
+                    %id,
+                    zone,
+                    region,
+                    "not provisioning a credential an operator deleted; remove its \
+                     coordinator.provision block"
+                );
+                continue;
+            }
             self.provision_agent_credential(&token, zone, region)
                 .await?;
             info!(%id, zone, region, "provisioned agent credential from config");

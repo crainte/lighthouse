@@ -721,6 +721,109 @@ async fn a_credential_minted_on_one_node_works_on_its_peer_until_revoked() {
     .await;
 }
 
+/// Deleting a revoked credential on A removes it from B too, and the
+/// anti-entropy sweep afterwards does not carry B's old copy back: the
+/// delete travels as a tombstone, not a bare row removal.
+#[tokio::test]
+async fn a_deleted_credential_stays_deleted_on_its_peer() {
+    let b = spawn_node("b", vec![], vec![check_cfg(CHECK)]).await;
+    let a = spawn_node(
+        "a",
+        vec![format!("http://{}", b.addr)],
+        vec![check_cfg(CHECK)],
+    )
+    .await;
+    let session_a = login(a.addr).await;
+    let session_b = login(b.addr).await;
+    gossip_step(a.addr, &session_a, b.addr).await;
+    let client = reqwest::Client::new();
+
+    let minted: Value = client
+        .post(format!("http://{}/api/v1/admin/agent-credentials", a.addr))
+        .header(reqwest::header::COOKIE, &session_a)
+        .json(&json!({"zone":"eu-west-1a","region":"eu-west"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = minted["token"]
+        .as_str()
+        .unwrap()
+        .split('.')
+        .next()
+        .unwrap()
+        .to_string();
+    let held_by = |addr: std::net::SocketAddr, session: String| {
+        let client = client.clone();
+        let id = id.clone();
+        async move {
+            let v: Value = client
+                .get(format!("http://{addr}/api/v1/admin/agent-credentials"))
+                .header(reqwest::header::COOKIE, &session)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            v["credentials"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == id.as_str())
+                .map(|c| c["revoked"] == true)
+        }
+    };
+
+    let res = client
+        .delete(format!(
+            "http://{}/api/v1/admin/agent-credentials/{id}",
+            a.addr
+        ))
+        .header(reqwest::header::COOKIE, &session_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    eventually(
+        "B to hold the revoked credential",
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        || async { (held_by(b.addr, session_b.clone()).await == Some(true)).then_some(()) },
+    )
+    .await;
+
+    let res = client
+        .post(format!(
+            "http://{}/api/v1/admin/agent-credentials/{id}/purge",
+            a.addr
+        ))
+        .header(reqwest::header::COOKIE, &session_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "deleting a revoked credential on A");
+    eventually(
+        "B to drop the deleted credential",
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        || async {
+            held_by(b.addr, session_b.clone())
+                .await
+                .is_none()
+                .then_some(())
+        },
+    )
+    .await;
+
+    a.coord.anti_entropy_sweep().await;
+    b.coord.anti_entropy_sweep().await;
+    assert_eq!(held_by(a.addr, session_a.clone()).await, None);
+    assert_eq!(held_by(b.addr, session_b.clone()).await, None);
+}
+
 // ---------------------------------------------------------------------------
 // 14. Session portability
 // ---------------------------------------------------------------------------

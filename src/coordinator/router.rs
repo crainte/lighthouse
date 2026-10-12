@@ -8,7 +8,8 @@ use axum::Router;
 use fleet::{fleet_rows, FleetMemberDto, FleetRowDto};
 use routes::agents::{
     agent_checks_handler, agents_handler, ingest_handler, list_agent_credentials_handler,
-    mint_agent_credential_handler, purge_agent_handler, revoke_agent_credential_handler,
+    mint_agent_credential_handler, purge_agent_credential_handler, purge_agent_handler,
+    revoke_agent_credential_handler,
 };
 use routes::checks::{
     create_check_handler, delete_check_handler, eval_test_handler, heartbeat_handler,
@@ -316,6 +317,10 @@ impl Coordinator {
             .route(
                 "/api/v1/admin/agent-credentials/:id",
                 delete(revoke_agent_credential_handler),
+            )
+            .route(
+                "/api/v1/admin/agent-credentials/:id/purge",
+                post(purge_agent_credential_handler),
             )
             // Peer replication. Agent-gated rather than public: it mutates
             // published state, so an anonymous POST could mark every check down.

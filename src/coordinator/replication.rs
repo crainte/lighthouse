@@ -555,6 +555,19 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Remove a credential's row everywhere. A tombstone, not a bare DELETE:
+    /// a peer still holding the revoked row would otherwise hand it back on
+    /// the next anti-entropy sweep, and a `coordinator.provision` block still
+    /// naming it would re-mint it live on the next boot. Applying the
+    /// tombstone reloads the credential cache itself.
+    pub(in crate::coordinator) async fn delete_agent_credential(&self, id: &str) -> Result<()> {
+        let entry = self
+            .write_config(storage::ConfigKind::Credential, id, None)
+            .await?;
+        self.replicate_config(vec![entry]);
+        Ok(())
+    }
+
     /// Push a batch of just-applied config entries to every live peer,
     /// mirroring `ingest`'s replication broadcast: spawned, never awaited, so
     /// an admin edit costs a wedged or slow peer replication lag rather than

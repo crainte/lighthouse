@@ -817,6 +817,41 @@ struct RevokedResponse {
     revoked: String,
 }
 
+/// Delete a revoked credential's row, so the list stops carrying it. A live
+/// one is refused: revocation is the security action and has to come first,
+/// so deleting can never be the step that silently cuts a fleet off.
+pub(in crate::coordinator) async fn purge_agent_credential_handler(
+    State(coord): State<Coordinator>,
+    Path(id): Path<String>,
+    _admin: AdminSession,
+) -> Response {
+    let lookup_id = id.clone();
+    match coord
+        .db(move |storage| storage.agent_credential_revoked(&lookup_id))
+        .await
+    {
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "no such credential"),
+        Ok(Some(false)) => {
+            return error_response(
+                StatusCode::CONFLICT,
+                "credential is still live; revoke it before deleting it",
+            )
+        }
+        Ok(Some(true)) => {}
+        Err(e) => return internal_error(e),
+    }
+    if let Err(e) = coord.delete_agent_credential(&id).await {
+        return internal_error(e);
+    }
+    warn!(id = %id, "deleted revoked agent credential");
+    Json(DeletedCredentialResponse { deleted: id }).into_response()
+}
+
+#[derive(Serialize)]
+struct DeletedCredentialResponse {
+    deleted: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

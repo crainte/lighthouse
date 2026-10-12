@@ -579,6 +579,106 @@ mod tests {
         assert_eq!(detail["incident"]["title"], "Planned work (extended)");
     }
 
+    /// A credential lives in one region. Revoking or deleting it from the
+    /// global view must answer with that region's verdict — the other
+    /// regions' 404s mean "not here", and must neither mask a 409 nor turn
+    /// the holder's success into "no such credential".
+    #[tokio::test]
+    async fn global_credential_writes_answer_with_the_holding_regions_verdict() {
+        let password = "secret";
+        let client = reqwest::Client::new();
+        let mut provisioned = Vec::new();
+        let mut regional = Vec::new();
+        for (region, key) in [("us", US_KEY), ("tw", TW_KEY)] {
+            let coord = Coordinator::new(&CoordinatorConfig {
+                db_path: ":memory:".into(),
+                region: region.into(),
+                global: push_config("http://ignored.invalid", key, 3600),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            regional.push(serve_router(coord.router()).await);
+            provisioned.push(provision(region, key));
+        }
+        let node = GlobalNode::new(&GlobalConfig {
+            admin_password: Some(password.into()),
+            db_path: ":memory:".into(),
+            provision: provisioned,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let global_addr = serve_router(node.clone().router()).await;
+        let cookie = admin_cookie(&node, password);
+        for ((region, key), addr) in [("us", US_KEY), ("tw", TW_KEY)].into_iter().zip(&regional) {
+            let mut push = bare_push(region);
+            push.advertise_url = Some(format!("http://{addr}"));
+            let pushed = client
+                .post(format!("http://{global_addr}/internal/global/state"))
+                .bearer_auth(key)
+                .json(&push)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(pushed.status(), StatusCode::OK);
+        }
+
+        let base = format!("http://{global_addr}/api/v1/admin/agent-credentials");
+        let minted: serde_json::Value = client
+            .post(&base)
+            .header(reqwest::header::COOKIE, &cookie)
+            .json(&serde_json::json!({"region": "tw", "zone": "tw-1"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let token = minted["token"].as_str().expect("minted in tw");
+        let id = token.split('.').next().unwrap().to_string();
+        let write = |method: reqwest::Method, suffix: &str| {
+            client
+                .request(method, format!("{base}/{id}{suffix}"))
+                .header(reqwest::header::COOKIE, &cookie)
+                .send()
+        };
+        let listed = || async {
+            let v: serde_json::Value = client
+                .get(&base)
+                .header(reqwest::header::COOKIE, &cookie)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            v["credentials"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["id"] == id.as_str())
+        };
+
+        let purge = || write(reqwest::Method::POST, "/purge");
+        assert_eq!(purge().await.unwrap().status(), StatusCode::CONFLICT);
+        assert_eq!(
+            write(reqwest::Method::DELETE, "").await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert!(listed().await, "revoked, still listed");
+        assert_eq!(purge().await.unwrap().status(), StatusCode::OK);
+        assert!(!listed().await, "deleted in the region that held it");
+        assert_eq!(purge().await.unwrap().status(), StatusCode::NOT_FOUND);
+        let traversal = client
+            .post(format!("{base}/..%2Fchecks/purge"))
+            .header(reqwest::header::COOKIE, &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(traversal.status(), StatusCode::NOT_FOUND);
+    }
+
     fn urlencoding_colon(id: &str) -> String {
         id.replace(':', "%3A")
     }

@@ -601,6 +601,72 @@ async fn fan_out_write(
         )
     })
 }
+/// Send a write about one record to every region, for a record that lives in
+/// just one of them under an id the others have never seen (an agent
+/// credential). A 404 means "not here", not failure; the region that holds
+/// the record decides the answer. A rejection from it (a 409, say) is
+/// returned as-is rather than drowned by the 404s, and "found nowhere" only
+/// becomes a 404 when every region actually answered — with one unreachable,
+/// the record may be sitting there, so that is a 502 naming it.
+pub(super) async fn write_to_holding_region(
+    node: &GlobalNode,
+    method: &Method,
+    pq: &str,
+) -> Response {
+    let regions = node
+        .inner
+        .cache
+        .region_endpoints(chrono::Utc::now().timestamp_millis());
+    if regions.is_empty() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no region is available to apply this change yet",
+        );
+    }
+    let body = Bytes::new();
+    let mut applied: Option<Response> = None;
+    let mut unreachable: Vec<String> = Vec::new();
+    for (region, endpoints) in &regions {
+        let mut answered = false;
+        for base in endpoints {
+            let Ok(resp) = region_request(node, method, base, pq, &body, true)
+                .send()
+                .await
+            else {
+                continue;
+            };
+            answered = true;
+            let status = resp.status();
+            if status == StatusCode::NOT_FOUND {
+                break;
+            }
+            if !status.is_success() {
+                return passthrough(resp).await;
+            }
+            if applied.is_none() {
+                applied = Some(passthrough(resp).await);
+            }
+            break;
+        }
+        if !answered {
+            unreachable.push(region.clone());
+        }
+    }
+    match applied {
+        Some(resp) => resp,
+        None if unreachable.is_empty() => {
+            error_response(StatusCode::NOT_FOUND, "no such credential")
+        }
+        None => error_response(
+            StatusCode::BAD_GATEWAY,
+            &format!(
+                "not found in any reachable region; unreachable: {}",
+                unreachable.join(", ")
+            ),
+        ),
+    }
+}
+
 /// Apply a write to a region by trying its coordinators until one answers.
 /// A non-2xx from a reachable coordinator is a real rejection (validation, a
 /// duplicate name) — return it as the region's error rather than trying the

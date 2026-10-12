@@ -215,6 +215,22 @@ impl Storage {
         })
     }
 
+    /// `None` when no credential has this id, else whether it is revoked.
+    /// Deleting is gated on it: only a credential that already refuses
+    /// agents may disappear, so removing a row can never be what cuts a live
+    /// fleet off.
+    pub fn agent_credential_revoked(&self, id: &str) -> Result<Option<bool>> {
+        let revoked_at: Option<Option<i64>> = self
+            .conn
+            .query_row(
+                "SELECT revoked_at FROM agent_credentials WHERE id = ?",
+                duckdb::params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(revoked_at.map(|at| at.is_some()))
+    }
+
     /// Every agent that has ever reported, newest-seen first. Agents are not
     /// registered anywhere — they exist because results carry their `agent_id`,
     /// so this reflects what is actually reporting rather than what is configured.

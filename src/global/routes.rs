@@ -46,10 +46,19 @@ pub(super) fn router(node: GlobalNode) -> Router {
         // Agent credentials live in the region whose agents present them.
         // Listing gathers every region; minting goes to the one region named,
         // never fanned out (that would mint a different secret per region).
-        // Revocation keeps the fan-out: a region without the id answers 404.
         .route(
             "/api/v1/admin/agent-credentials",
             get(list_credentials_handler).post(mint_credential_handler),
+        )
+        // Revoke and delete address one credential that only its own region
+        // holds, so the others' 404s must not decide the answer.
+        .route(
+            "/api/v1/admin/agent-credentials/:id",
+            delete(revoke_credential_handler),
+        )
+        .route(
+            "/api/v1/admin/agent-credentials/:id/purge",
+            post(purge_credential_handler),
         )
         // Incidents are regional and never replicated: a hand-made one is
         // opened in the one region the operator names, not fanned out (that
@@ -749,6 +758,40 @@ fn merge_credentials(gathered: relay::Gathered) -> serde_json::Value {
         "credentials": credentials,
         "unavailable_regions": gathered.unavailable,
     })
+}
+
+async fn revoke_credential_handler(
+    State(node): State<GlobalNode>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    _admin: crate::http::AdminSession,
+) -> Response {
+    credential_write(&node, Method::DELETE, &id, "").await
+}
+
+async fn purge_credential_handler(
+    State(node): State<GlobalNode>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    _admin: crate::http::AdminSession,
+) -> Response {
+    credential_write(&node, Method::POST, &id, "/purge").await
+}
+
+async fn credential_write(node: &GlobalNode, method: Method, id: &str, suffix: &str) -> Response {
+    // The id is spliced into a region URL: anything beyond the minted
+    // alphabet could address a different path there.
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return error_response(StatusCode::NOT_FOUND, "no such credential");
+    }
+    relay::write_to_holding_region(
+        node,
+        &method,
+        &format!("/api/v1/admin/agent-credentials/{id}{suffix}"),
+    )
+    .await
 }
 
 #[derive(serde::Deserialize)]

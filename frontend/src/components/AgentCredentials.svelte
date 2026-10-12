@@ -5,6 +5,7 @@
     fetchAgentCredentials,
     createAgentCredential,
     revokeAgentCredential,
+    deleteAgentCredential,
   } from '../lib/admin';
   import { formatRelativeTime } from '../lib/format';
 
@@ -21,6 +22,7 @@
   let region = $state('');
   let creating = $state(false);
   let pendingRevoke = $state<string | null>(null);
+  let pendingDelete = $state<string | null>(null);
   let busy = $state<string | null>(null);
 
   /** The one-time secret, held apart from `credentials` on purpose: `refresh()`
@@ -110,6 +112,20 @@
       busy = null;
     }
   }
+
+  async function confirmDelete(id: string) {
+    pendingDelete = null;
+    busy = id;
+    formError = null;
+    try {
+      await deleteAgentCredential(id);
+      await refresh();
+    } catch (e) {
+      formError = fail(e);
+    } finally {
+      busy = null;
+    }
+  }
 </script>
 
 {#if expired}
@@ -127,6 +143,7 @@
       Credentials authorize agents for a specific zone and region. Agents in a zone share the same
       <code class="mono">[agent] token</code>. Tokens are shown only once when generated.
       Revoking a credential immediately disconnects every agent using it. Deploy a replacement before revoking.
+      A revoked credential stays listed until you delete it.
     </p>
 
     <form class="create" onsubmit={(e) => (e.preventDefault(), create())}>
@@ -193,9 +210,16 @@
             <span title={new Date(c.created_at).toLocaleString()}
               >{formatRelativeTime(c.created_at)}</span
             >
-            <span class="actions">
-              {#if c.revoked}
+            <span class="actions" class:confirming={pendingDelete === c.id || pendingRevoke === c.id}>
+              {#if c.revoked && pendingDelete === c.id}
+                <span class="confirm">Delete “{c.zone}” from this list? It is already revoked.</span>
+                <button class="btn danger" onclick={() => confirmDelete(c.id)}>Delete</button>
+                <button class="btn" onclick={() => (pendingDelete = null)}>Cancel</button>
+              {:else if c.revoked}
                 <span class="tag">Revoked</span>
+                <button class="btn" disabled={busy !== null} onclick={() => (pendingDelete = c.id)}
+                  >Delete</button
+                >
               {:else if pendingRevoke === c.id}
                 <span class="confirm">
                   Revoke “{c.zone}”? Agents in that zone stop reporting immediately, and this cannot
@@ -273,7 +297,9 @@
 
   .row {
     display: grid;
-    grid-template-columns: minmax(7rem, 1fr) minmax(6rem, 0.8fr) minmax(7rem, 0.9fr) 6rem auto;
+    /* Fixed action column: rows are separate grids, so an `auto` one sized
+       per row and dragged every other column out of line with the header. */
+    grid-template-columns: minmax(7rem, 1fr) minmax(6rem, 0.8fr) minmax(7rem, 0.9fr) 6rem 11rem;
     gap: 0.6rem;
     align-items: center;
     font-size: 0.8rem;
@@ -298,8 +324,14 @@
     color: var(--text-dim);
   }
   /* Kept legible for audit, but plainly no longer usable. */
-  .row.revoked {
+  .row.revoked > span:not(.actions),
+  .row.revoked .tag {
     opacity: 0.55;
+  }
+  /* A confirmation needs a sentence, so it takes its own line under the row
+     instead of squeezing the columns. */
+  .actions.confirming {
+    grid-column: 1 / -1;
   }
   .row.revoked .zone,
   .row.revoked .id {

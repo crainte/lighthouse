@@ -415,6 +415,71 @@ async fn a_revoked_credential_is_not_resurrected_by_its_own_config_block() {
     let _ = std::fs::remove_file(&db);
 }
 
+/// Deleting a revoked credential removes the row the existence check above
+/// relies on. The tombstone it leaves has to do that job instead, or the
+/// next boot would re-mint a live credential from the stale block.
+#[tokio::test]
+async fn a_deleted_credential_is_not_resurrected_by_its_own_config_block() {
+    let db = db_file("deleted");
+    let credentials = |base: String, session: String| async move {
+        let v: Value = reqwest::Client::new()
+            .get(format!("{base}/api/v1/admin/agent-credentials"))
+            .header(reqwest::header::COOKIE, &session)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        v["credentials"].as_array().unwrap().len()
+    };
+    {
+        let (addr, handle) = serve(
+            boot(&db, vec![block("us-east-1a", "us-east", Some(TOKEN), None)])
+                .await
+                .unwrap(),
+        )
+        .await;
+        let base = format!("http://{addr}");
+        let session = login(&base).await;
+        let id = TOKEN.split('.').next().unwrap();
+        let client = reqwest::Client::new();
+        let res = client
+            .delete(format!("{base}/api/v1/admin/agent-credentials/{id}"))
+            .header(reqwest::header::COOKIE, &session)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "revocation should succeed");
+        let res = client
+            .post(format!("{base}/api/v1/admin/agent-credentials/{id}/purge"))
+            .header(reqwest::header::COOKIE, &session)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "deleting the revoked credential");
+        assert_eq!(credentials(base.clone(), session.clone()).await, 0);
+        stop(handle).await;
+    }
+
+    let (addr, handle) = serve(
+        boot(&db, vec![block("us-east-1a", "us-east", Some(TOKEN), None)])
+            .await
+            .unwrap(),
+    )
+    .await;
+    let base = format!("http://{addr}");
+    assert_eq!(
+        post_result(&base, TOKEN, "agent-a", "us-east-1a", "us-east").await,
+        401,
+        "restarting with the block still present must not re-mint a deleted credential"
+    );
+    let session = login(&base).await;
+    assert_eq!(credentials(base, session).await, 0);
+    stop(handle).await;
+    let _ = std::fs::remove_file(&db);
+}
+
 // ---------------------------------------------------------------------------
 // 4. An unusable block stops the boot
 // ---------------------------------------------------------------------------

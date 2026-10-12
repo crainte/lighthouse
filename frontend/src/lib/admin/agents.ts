@@ -50,6 +50,15 @@ export async function revokeAgentCredential(id: string): Promise<void> {
   );
 }
 
+/** Remove a revoked credential from the list for good. The server refuses a
+ *  live one: revoking is the security action and has to come first. */
+export async function deleteAgentCredential(id: string): Promise<void> {
+  await send(
+    "POST",
+    `/api/v1/admin/agent-credentials/${encodeURIComponent(id)}/purge`,
+  );
+}
+
 export type AgentsMode = "regions" | "flat" | "off";
 
 /** One row an operator placed on the public page: a single agent, or a whole
