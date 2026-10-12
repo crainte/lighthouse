@@ -840,21 +840,19 @@ per_zone: draft.placement.count ?? 1,
       <span class="admin-muted sum-note mono">{alertNote}</span>
     </summary>
     <div class="editor-body">
-      <div class="form-grid">
-        <div class="field wide switches">
-          <span class="field-label">Notify</span>
+      <div class="alerting-stack">
+        <div class="field">
           <label class="toggle">
             <input type="checkbox" bind:checked={draft.notify} />
-            <span
-              >Send state changes to the notifiers <em
-                >— off still records the incident; it just doesn't page anyone.</em
-              ></span
-            >
+            <span>Send state changes to notifiers</span>
           </label>
+          <span class="field-note">
+            Off still records the incident; it just doesn't page anyone.
+          </span>
         </div>
 
         {#if draft.notify}
-          <div class="field wide">
+          <div class="field">
             <span class="field-label">Send alerts to</span>
             {#if notifierNames.length === 0}
               <span class="field-note">
@@ -862,11 +860,12 @@ per_zone: draft.placement.count ?? 1,
                 alert is recorded and sent nowhere.
               </span>
             {:else}
-              <div class="agent-picker">
+              <div class="pick-chips">
                 {#each notifierNames as n (n)}
-                  <label class="toggle">
+                  <label class="pick-chip">
                     <input type="checkbox" value={n} bind:group={draft.notifiers} />
-                    <span class="agent-pill">{n}</span>
+                    <span>{n}</span>
+                    {#if defaultNotifiers.includes(n)}<span class="pick-chip-tag">default</span>{/if}
                   </label>
                 {/each}
               </div>
@@ -881,7 +880,7 @@ per_zone: draft.placement.count ?? 1,
             {/if}
           </div>
 
-          <label class="field">
+          <label class="field notify-degraded">
             <span class="field-label">Notify on DEGRADED</span>
             <select bind:value={draft.notify_degraded}>
               <option value="">inherit (default: on)</option>
@@ -889,8 +888,7 @@ per_zone: draft.placement.count ?? 1,
               <option value="false">off</option>
             </select>
             <span class="field-note">
-              Whether a partial outage pages as well as a full one. Off means only DOWN and
-              recovery are sent.
+              Whether a partial outage pages as well as a full one. Off sends only DOWN and recovery.
             </span>
           </label>
         {/if}
@@ -1198,11 +1196,6 @@ per_zone: draft.placement.count ?? 1,
     .field.wide {
       grid-column: 1 / -1;
     }
-  }
-  .agent-picker {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.25rem 0.9rem;
   }
   .field code {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;

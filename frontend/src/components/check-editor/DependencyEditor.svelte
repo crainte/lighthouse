@@ -12,11 +12,11 @@
   {#if otherChecks.length === 0}
     <span class="field-note">No other checks to depend on yet.</span>
   {:else}
-    <div class="agent-picker">
+    <div class="pick-chips">
       {#each otherChecks as dep (dep.id)}
-        <label class="toggle">
+        <label class="pick-chip">
           <input type="checkbox" value={dep.id} bind:group={draft.depends_on} />
-          <span class="agent-pill">{dep.name}</span>
+          <span>{dep.name}</span>
         </label>
       {/each}
     </div>
@@ -32,11 +32,3 @@
     {/if}
   </span>
 </div>
-
-<style>
-  .agent-picker {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.25rem 0.9rem;
-  }
-</style>
