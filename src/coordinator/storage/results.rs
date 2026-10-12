@@ -807,6 +807,36 @@ impl Storage {
         Ok(())
     }
 
+    /// Record a peer's published state. Unlike `record_state`, a span is only
+    /// ever appended: a replayed or out-of-order batch carrying an older state
+    /// must not wedge a stale span under the history this node already has.
+    pub fn record_replicated_state(
+        &self,
+        check_id: CheckId,
+        state: NodeState,
+        since: i64,
+    ) -> Result<()> {
+        let newest: Option<(String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT state, since FROM state_history WHERE check_id = ?
+                 ORDER BY since DESC LIMIT 1",
+                duckdb::params![check_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        if let Some((newest_state, newest_since)) = newest {
+            if NodeState::from_db(&newest_state) == state || since <= newest_since {
+                return Ok(());
+            }
+        }
+        self.conn.execute(
+            "INSERT OR REPLACE INTO state_history (check_id, state, since) VALUES (?, ?, ?)",
+            duckdb::params![check_id, state.as_str(), since],
+        )?;
+        Ok(())
+    }
+
     /// Every span for a check, oldest first.
     pub fn state_spans(&self, check_id: CheckId) -> Result<Vec<StateSpan>> {
         let mut stmt = self.conn.prepare(
@@ -2167,6 +2197,27 @@ mod tests {
         assert_eq!(row.state, NodeState::Up);
         assert_eq!(row.latency_ms, 10);
         assert_eq!(row.last_check, now - 1);
+    }
+
+    #[test]
+    fn replicated_states_only_ever_extend_the_history() {
+        let s = Storage::open(":memory:").unwrap();
+        let id = CheckId::from_u128(7);
+        let spans = || {
+            s.state_spans(id)
+                .unwrap()
+                .into_iter()
+                .map(|span| (span.state, span.since))
+                .collect::<Vec<_>>()
+        };
+        s.record_replicated_state(id, NodeState::Up, 1_000).unwrap();
+        // Same state again, later: the open span already says so.
+        s.record_replicated_state(id, NodeState::Up, 2_000).unwrap();
+        s.record_replicated_state(id, NodeState::Down, 3_000)
+            .unwrap();
+        // A stale batch arriving late must not wedge a span under the history.
+        s.record_replicated_state(id, NodeState::Up, 2_500).unwrap();
+        assert_eq!(spans(), [(NodeState::Up, 1_000), (NodeState::Down, 3_000)]);
     }
 
     #[test]

@@ -194,6 +194,17 @@ pub struct ReplicatedBelief {
     pub last_check: i64,
 }
 
+/// A check's published state as of `since`, from the coordinator that
+/// observed it. Uptime is read from these spans, and a state that never
+/// changes yields no transition alert to carry it, so without this a peer
+/// holds a healthy check's results but no idea it was up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicatedState {
+    pub check_id: crate::models::CheckId,
+    pub state: crate::models::NodeState,
+    pub since: i64,
+}
+
 /// One confirmed transition as it replicates. Mirrors `storage::AlertRow`
 /// field-for-field, but on the wire — `AlertRow` itself has no `Serialize`,
 /// being owned by a different concern, and `AlertScope` travels as its
@@ -265,6 +276,9 @@ pub struct ReplicationBatch {
     /// same tree instead of only the part of the fleet it personally observed.
     #[serde(default)]
     pub beliefs: Vec<ReplicatedBelief>,
+    /// The sender's published state for every check the batch touched.
+    #[serde(default)]
+    pub states: Vec<ReplicatedState>,
     /// Incident ids deleted on the sender. Applied as a delete *plus a local
     /// tombstone*, so this node will not hand the incident back later either.
     #[serde(default)]

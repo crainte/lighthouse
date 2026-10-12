@@ -647,6 +647,48 @@ async fn results_ingested_on_one_node_are_visible_on_its_peer() {
     assert_eq!(rows[0]["status"], "up");
 }
 
+/// Uptime is read from state spans, not result counts. A check whose first
+/// confirmed state never changes produces no transition and so no alert —
+/// which used to be the only way a peer learnt a state — leaving the peer with
+/// the results but no spans, and an all-"no data" strip for a healthy check
+/// whenever a reader happened to ask that peer.
+#[tokio::test]
+async fn a_never_transitioned_check_has_uptime_on_its_peer() {
+    let b = spawn_node("b", vec![], NO_TIMEOUT).await;
+    let a = spawn_node("a", vec![format!("http://{}", b.addr)], NO_TIMEOUT).await;
+    let session_a = login(a.addr).await;
+    gossip_step(a.addr, &session_a, b.addr).await;
+
+    let now = chrono::Utc::now().timestamp_millis();
+    a.coord
+        .ingest(vec![result(200, now - 2_000), result(200, now - 1_000)])
+        .await;
+
+    let url = |addr: SocketAddr| {
+        format!(
+            "http://{addr}/api/v1/checks/{}/uptime?days=1&buckets=24",
+            cid_str(CHECK)
+        )
+    };
+    let known = |body: &Value| {
+        body["buckets"]
+            .as_array()
+            .map(|b| b.iter().filter(|b| !b["uptime"].is_null()).count())
+            .unwrap_or(0)
+    };
+    assert!(
+        known(&get_json(&url(a.addr)).await) > 0,
+        "the observer has spans"
+    );
+    eventually(
+        "B to know the check's state, not just its results",
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        || async { (known(&get_json(&url(b.addr)).await) > 0).then_some(()) },
+    )
+    .await;
+}
+
 // ---------------------------------------------------------------------------
 // 4. Idempotency
 // ---------------------------------------------------------------------------

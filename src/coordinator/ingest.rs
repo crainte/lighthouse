@@ -649,6 +649,14 @@ impl Coordinator {
             .collect();
         let rows_for_replication = rows.clone();
         let leaf_updates_for_replication = leaf_updates.clone();
+        let states_for_replication: Vec<ReplicatedState> = state_updates
+            .iter()
+            .map(|row| ReplicatedState {
+                check_id: row.check_id,
+                state: row.state,
+                since: row.last_check,
+            })
+            .collect();
         let transitions_for_publish = transitions.clone();
         let coord = self.clone();
         let persisted = self
@@ -934,6 +942,7 @@ impl Coordinator {
                                 last_check: state.last_check,
                             })
                             .collect(),
+                        states: states_for_replication,
                         alerts: replicated_alerts,
                         incidents: replicated_incidents,
                         ..Default::default()

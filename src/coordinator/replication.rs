@@ -818,6 +818,11 @@ impl Coordinator {
                         store.update_current_state(*check_id, *current, None, *ts)?;
                         store.record_state(*check_id, *current, *ts)?;
                     }
+                    // After the transitions above, so a batch carrying both
+                    // an alert and the state it produced records one span.
+                    for s in &batch.states {
+                        store.record_replicated_state(s.check_id, s.state, s.since)?;
+                    }
                     let leaves: Vec<storage::AgentCheckStateRow> = batch
                         .beliefs
                         .iter()

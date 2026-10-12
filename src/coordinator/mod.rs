@@ -35,7 +35,7 @@ use routes::checks::CheckResponse;
 pub use routes::incidents::{IncidentCheckDto, IncidentDto, IncidentUpdateDto};
 pub use routes::peer::{
     CheckDigestDto, DigestResponse, ReplicatedAlert, ReplicatedBelief, ReplicatedResult,
-    ReplicationBatch, RollupDigestDto, StreamDigestDto,
+    ReplicatedState, ReplicationBatch, RollupDigestDto, StreamDigestDto,
 };
 use serde::Serialize;
 use state::StateTracker;
