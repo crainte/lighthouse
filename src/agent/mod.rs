@@ -192,6 +192,23 @@ pub struct Probes {
     resolver: TokioResolver,
 }
 
+pub(super) fn resolver_for(addr: std::net::SocketAddr) -> Result<TokioResolver, String> {
+    let mut server = NameServerConfig::udp_and_tcp(addr.ip());
+    for connection in &mut server.connections {
+        connection.port = addr.port();
+    }
+    let config = ResolverConfig::from_parts(None, Vec::new(), vec![server]);
+    let mut opts = ResolverOpts::default();
+    opts.cache_size = 0;
+    opts.attempts = 2;
+    opts.timeout = Duration::from_secs(3);
+    opts.try_tcp_on_error = true;
+    Resolver::builder_with_config(config, TokioRuntimeProvider::default())
+        .with_options(opts)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 impl Probes {
     /// Build the shared probe clients.
     ///

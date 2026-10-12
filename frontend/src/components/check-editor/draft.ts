@@ -48,7 +48,13 @@ export type Draft = Omit<
   description: string;
   image: string;
   tag: string;
-  dns: { nameserver: string; record: string; match_type: MatchMode; expected: string[] };
+  dns: {
+    mode: 'standard' | 'dnssec';
+    nameserver: string;
+    record: string;
+    match_type: MatchMode;
+    expected: string[];
+  };
   ping: { ip_type: string; count: number | null };
   cert_warning_days: number | null;
   grace_secs: number | null;
@@ -135,7 +141,7 @@ export function blank(): Draft {
     default_status: 'unknown',
     headers: [],
     allow_self_signed: false,
-    dns: { nameserver: '', record: 'A', match_type: 'all', expected: [] },
+    dns: { mode: 'standard', nameserver: '', record: 'A', match_type: 'all', expected: [] },
     ping: { ip_type: 'any', count: 1 },
     metric: { name: '', labels: [] },
     cert_warning_days: 14,
@@ -183,6 +189,7 @@ export function fromCheck(c: AdminCheck): Draft {
     headers: (c.headers ?? []).map((h) => ({ name: h.name, value: h.value })),
     allow_self_signed: c.allow_self_signed ?? false,
     dns: {
+      mode: c.dns?.mode ?? 'standard',
       nameserver: c.dns?.nameserver ?? '',
       record: c.dns?.record ?? d.dns.record,
       match_type: c.dns?.match_type ?? d.dns.match_type,

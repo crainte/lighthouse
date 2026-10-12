@@ -394,7 +394,8 @@
     const n = draft.name.trim();
     if (!n) return (saveError = 'Name is required.');
     const k = draft.type;
-    if (k !== 'heartbeat' && !draft.target.trim()) return (saveError = 'Target is required.');
+    if (k !== 'heartbeat' && !(k === 'dns' && draft.dns.mode === 'dnssec') && !draft.target.trim())
+      return (saveError = 'Target is required.');
     const secretError = secretReferenceError(draft.target.trim(), k === 'http' ? draft.headers : []);
     if (secretError) return (saveError = secretError);
     if (k !== 'heartbeat' && !whole(draft.timeout_secs, 1))
@@ -405,6 +406,8 @@
       return (saveError = 'Certificate warning must be a whole number of days, at least 0.');
     if (k === 'openmetrics' && !draft.metric.name.trim())
       return (saveError = 'Metric name is required.');
+    if (k === 'dns' && draft.dns.mode === 'dnssec' && !draft.dns.nameserver.trim())
+      return (saveError = 'DNSSEC validation requires the resolver nameserver.');
       if (k === 'heartbeat' && !whole(draft.grace_secs, 10))
         return (saveError = 'Grace must be a whole number of seconds, at least 10.');
     if (!whole(draft.failures_before_down, 1))
@@ -440,7 +443,7 @@
       type: k,
       // A heartbeat is pinged rather than probed, so it is the one kind with
       // nothing to point at.
-      target: k === 'heartbeat' ? '' : draft.target.trim(),
+      target: k === 'heartbeat' ? '' : k === 'dns' && draft.dns.mode === 'dnssec' ? '.' : draft.target.trim(),
       hosts: multiHost ? trimmed(draft.hosts) : [],
       host_match: draft.host_match,
       cron: draft.cron.trim(),
@@ -465,9 +468,10 @@
       headers: k === 'http' ? draft.headers.filter((h) => h.name.trim()) : [],
       allow_self_signed: k === 'http' || k === 'ssl' ? draft.allow_self_signed : false,
       dns: {
+        mode: k === 'dns' ? draft.dns.mode : 'standard',
         record: draft.dns.record,
         match_type: draft.dns.match_type,
-        expected: k === 'dns' ? trimmed(draft.dns.expected) : [],
+        expected: k === 'dns' && draft.dns.mode === 'standard' ? trimmed(draft.dns.expected) : [],
       },
       ping: { ip_type: draft.ping.ip_type, count: draft.ping.count ?? 1 },
       metric:

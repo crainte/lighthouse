@@ -2,6 +2,7 @@ use crate::models::CheckKind;
 use crate::notify::Notifier;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -1030,6 +1031,14 @@ impl MatchMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsMode {
+    #[default]
+    Standard,
+    Dnssec,
+}
+
 /// What a DNS probe asks for and what counts as a correct answer.
 ///
 /// `Default` is written out rather than derived: a derived one would give
@@ -1037,6 +1046,8 @@ impl MatchMode {
 /// DNS check that didn't name a record fail validation.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct DnsOptions {
+    #[serde(default)]
+    pub mode: DnsMode,
     /// Resolver to query. Absent uses the system resolver.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nameserver: Option<String>,
@@ -1054,6 +1065,7 @@ pub struct DnsOptions {
 impl Default for DnsOptions {
     fn default() -> Self {
         Self {
+            mode: DnsMode::default(),
             nameserver: None,
             record: default_record(),
             match_type: MatchMode::default(),
@@ -1064,6 +1076,17 @@ impl Default for DnsOptions {
 
 fn default_record() -> String {
     "A".into()
+}
+
+pub(crate) fn dns_nameserver(value: &str) -> std::result::Result<SocketAddr, String> {
+    let value = value.trim();
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    value
+        .parse::<IpAddr>()
+        .map(|ip| SocketAddr::new(ip, 53))
+        .map_err(|_| "nameserver must be an IP address, optionally with a port".into())
 }
 
 /// ICMP specifics. `count` echoes are sent and the check passes if any reply.
@@ -1710,13 +1733,18 @@ impl CheckConfig {
                 CheckKind::Heartbeat => {}
             }
         }
-        if self.kind == CheckKind::Dns
-            && !matches!(
-                self.dns.record.to_ascii_uppercase().as_str(),
-                "A" | "AAAA" | "CNAME" | "MX" | "TXT" | "NS"
-            )
-        {
-            return Err("lookup record must be one of A, AAAA, CNAME, MX, TXT, NS".into());
+        if self.kind == CheckKind::Dns {
+            if self.dns.mode == DnsMode::Dnssec && self.dns.nameserver.is_none() {
+                return Err("DNSSEC validation checks require a nameserver".into());
+            }
+            if self.dns.mode == DnsMode::Standard
+                && !matches!(
+                    self.dns.record.to_ascii_uppercase().as_str(),
+                    "A" | "AAAA" | "CNAME" | "MX" | "TXT" | "NS"
+                )
+            {
+                return Err("lookup record must be one of A, AAAA, CNAME, MX, TXT, NS".into());
+            }
         }
         if self.kind == CheckKind::Openmetrics {
             // One scrape selects one sample; aggregating across several exporters
@@ -1916,6 +1944,37 @@ impl Default for CoordinatorConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dns_options_default_to_standard_and_nameservers_accept_ip_or_port() {
+        let dns: DnsOptions =
+            serde_json::from_value(serde_json::json!({})).expect("old DNS documents still parse");
+        assert_eq!(dns.mode, DnsMode::Standard);
+        assert_eq!(dns_nameserver("192.0.2.1").unwrap().port(), 53);
+        assert_eq!(dns_nameserver("192.0.2.1:5353").unwrap().port(), 5353);
+        assert_eq!(dns_nameserver("[2001:db8::1]:5353").unwrap().port(), 5353);
+        assert!(dns_nameserver("resolver.example").is_err());
+    }
+
+    #[test]
+    fn dnssec_checks_require_the_resolver_under_test() {
+        let mut check = CheckConfig {
+            name: "resolver DNSSEC".into(),
+            kind: CheckKind::Dns,
+            target: ".".into(),
+            dns: DnsOptions {
+                mode: DnsMode::Dnssec,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            check.validate().unwrap_err(),
+            "DNSSEC validation checks require a nameserver"
+        );
+        check.dns.nameserver = Some("192.0.2.1:53".into());
+        check.validate().expect("explicit resolver is valid");
+    }
 
     #[test]
     fn regions_are_provisioned_not_declared() {

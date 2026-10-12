@@ -150,8 +150,9 @@ export interface AdminCheck {
   /** HTTP/SSL: accept an untrusted certificate. */
   allow_self_signed: boolean;
   dns: {
+    mode: "standard" | "dnssec";
     nameserver?: string;
-    /** A | AAAA | CNAME | MX | TXT | NS */
+    /** A | AAAA | CNAME | MX | TXT | NS; ignored in DNSSEC mode. */
     record: string;
     match_type: MatchMode;
     expected: string[];
