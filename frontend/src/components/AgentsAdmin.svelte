@@ -423,6 +423,7 @@
 
       <AgentTable
         {rendered}
+        {grouped}
         {sortKey}
         {sortDir}
         onToggleSort={toggleSort}

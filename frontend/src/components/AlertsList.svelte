@@ -117,28 +117,11 @@
     flex-direction: column;
     gap: 0.6rem;
   }
-  /* The same 2px accent the incidents table uses: cyan for a transition that
-     still wants attention, red for down, none for a recovery. The pill says
-     which state; the stripe only says "look here". */
   .alert-card {
-    position: relative;
-    overflow: hidden;
     background: var(--ad-panel);
     border: 1px solid var(--ad-line);
     border-radius: 8px;
     padding: 0.7rem 0.9rem 0.75rem;
-  }
-  .alert-card.flagged::before {
-    content: '';
-    position: absolute;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    width: 2px;
-    background: var(--ad-cyan);
-  }
-  .alert-card.flagged.bad::before {
-    background: var(--ad-red);
   }
   .ac-top {
     display: flex;

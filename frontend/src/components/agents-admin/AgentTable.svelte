@@ -6,6 +6,7 @@
 
   let {
     rendered,
+    grouped,
     sortKey,
     sortDir,
     onToggleSort,
@@ -23,6 +24,7 @@
     onClearFilters,
   }: {
     rendered: Row[];
+    grouped: boolean;
     sortKey: SortKey;
     sortDir: 1 | -1;
     onToggleSort: (key: SortKey) => void;
@@ -66,7 +68,7 @@
       </button>
     {:else}
       {@const a = row.agent}
-      <article class="fleet-agent" class:retired={a.retired}>
+      <article class="fleet-agent" class:retired={a.retired} class:grouped>
         <div class="agent-identity">
           <span class="agent-signal" class:reporting={a.status === 'up'}></span>
           <div><strong class="agent-name">{a.agent_id}</strong><span class="agent-location">{placeName(a.region)} / {placeName(a.zone)}</span></div>
@@ -113,6 +115,9 @@
   .zone-heading { background: var(--ad-panel); padding: 12px 20px; font-size: 13px; }
   .location-heading .silent { color: var(--ad-amber); }
   .fleet-agent { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(110px, .7fr) minmax(0, 2fr); gap: 20px; padding: 20px; }
+  /* Group headings establish region → zone. Child agents step inward so the
+     location hierarchy does not read as one left-aligned flat list. */
+  .fleet-agent.grouped { padding-left: 52px; }
   .fleet-agent:not(:first-child) { border-top: 1px solid var(--ad-line-soft); }
   .fleet-agent.retired { opacity: .65; }
   .agent-identity { display: flex; align-items: flex-start; gap: 12px; min-width: 0; }
@@ -135,5 +140,5 @@
   .fleet-more { margin-top: 20px; }
   .fleet-empty { padding: 24px; color: var(--ad-dim); }
   @media (max-width: 1100px) { .fleet-agent { grid-template-columns: minmax(0, 1fr) auto; } .agent-metrics { grid-column: 1 / -1; } }
-  @media (max-width: 600px) { .fleet-agent { padding: 16px; gap: 16px; } .agent-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } .location-heading { padding: 16px; } .location-heading span { width: 100%; margin-left: 28px; } }
+  @media (max-width: 600px) { .fleet-agent { padding: 16px; gap: 16px; } .fleet-agent.grouped { padding-left: 36px; } .agent-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } .location-heading { padding: 16px; } .location-heading span { width: 100%; margin-left: 28px; } }
 </style>

@@ -804,11 +804,11 @@
   .tree-seg, .tree-node { position: relative; flex: none; width: 22px; }
   .tree-seg { width: 28px; }
   .tree-seg.pass::before, .tree-seg.branch::before, .tree-seg.last::before, .tree-node.open::after {
-    content: ''; position: absolute; left: 10px; top: 0; bottom: 0; border-left: 1px solid var(--tree-line);
+    content: ''; position: absolute; left: 11px; top: 0; bottom: 0; border-left: 1px solid var(--tree-line);
   }
   .tree-seg.last::before { bottom: auto; height: var(--knee); }
   .tree-seg.branch::after, .tree-seg.last::after {
-    content: ''; position: absolute; left: 10px; right: 2px; top: var(--knee); border-top: 1px solid var(--tree-line);
+    content: ''; position: absolute; left: 11px; right: -1px; top: var(--knee); border-top: 1px solid var(--tree-line);
   }
   .tree-node { display: grid; justify-items: center; align-items: start; }
   .tree-node > * { margin-top: calc(var(--knee) - 11px); }
