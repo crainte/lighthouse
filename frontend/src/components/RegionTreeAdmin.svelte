@@ -806,7 +806,9 @@
   .row > * { padding-block: 12px; }
   .row.node.selected { background: var(--ad-panel-2); }
   .node-cell { display: flex; align-self: stretch; align-items: stretch; min-width: 0; padding-block: 0; }
-  .node-content { display: grid; align-content: start; min-width: 0; padding: 14px 0 12px 6px; font-weight: 500; text-align: left; }
+  /* Fill the available Node column instead of shrink-wrapping the label: agent
+     IDs should only wrap when they genuinely outgrow the column. */
+  .node-content { display: grid; flex: 1 1 auto; align-content: start; min-width: 0; padding: 14px 0 12px 6px; font-weight: 500; text-align: left; }
   .row.agent .node-content { align-content: center; padding-block: 12px; }
   .node-primary { display: flex; align-items: baseline; min-width: 0; gap: 8px; line-height: 20px; }
   .node-name { min-width: 0; overflow-wrap: anywhere; }
