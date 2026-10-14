@@ -9,3 +9,8 @@
 
 # Vitest JSON reporter output, written by the frontend test gate.
 /frontend/.vitest
+
+# Per-user agent tooling and local dependency/worktree directories.
+/.maki
+/.wt
+node_modules/
