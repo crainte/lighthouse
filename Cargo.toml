@@ -10,7 +10,7 @@ axum = { version = "0.8", features = ["ws"] }
 # Accept-Encoding (reqwest decodes them), request bodies sent with
 # Content-Encoding: zstd and decoded by the server layer — see crate::http.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "zstd"] }
-tower-http = { version = "0.6", features = ["compression-zstd", "decompression-zstd"] }
+tower-http = { version = "0.7", features = ["compression-zstd", "decompression-zstd"] }
 zstd = "0.13"
 duckdb = { version = "1", features = ["bundled", "uuid"] }
 serde = { version = "1", features = ["derive"] }
