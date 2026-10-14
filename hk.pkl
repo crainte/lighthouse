@@ -1,9 +1,11 @@
-// Fast subsets of `scripts/release-gate.sh`, which is the full release gate
-// (adds Rust/frontend dependency audits, production and container builds,
-// and a backup/restore smoke test) run before a release rather than on
-// every commit. The clippy and test invocations below use the same flags
-// as the gate script's equivalent steps on purpose — this is a smaller,
-// quicker slice of it, not a different check.
+// Quality gates, defined once and used three ways:
+//   - git hooks: `pre-commit` runs the fast steps, `pre-push` the full Rust suite
+//   - locally:   `hk check` (fast) or `hk check --all --slow` (everything CI runs)
+//   - CI:        .github/workflows/ci.yml runs one job per step via
+//                `hk check --all --slow -S <step>`, so a failure names its cause
+// Steps tagged `slow` (audits, builds, full test suite) stay out of the hooks.
+// `backup-restore-smoke` is in the local-only `smoke` profile and never runs in CI:
+//   hk check -p smoke -S backup-restore-smoke
 amends "package://github.com/jdx/hk/releases/download/v1.49.0/hk@1.49.0#/Config.pkl"
 import "package://github.com/jdx/hk/releases/download/v1.49.0/hk@1.49.0#/Builtins.pkl"
 
@@ -21,14 +23,12 @@ local linters = new Mapping<String, Step> {
   // Check-only: the builtin's `clippy --fix` would rewrite code mid-commit.
   ["clippy"] {
     glob = rust
-    depends = "fmt"
     check = "cargo clippy --locked --all-targets -- -D warnings"
   }
   // Unit tests only: ~20s. The integration suites (cluster, gossip, restart)
   // take minutes of compiling and server spin-up, so they gate the push instead.
   ["unit-test"] {
     glob = rust
-    depends = "clippy"
     check = "cargo test --locked --lib"
   }
   ["svelte-check"] {
@@ -37,8 +37,42 @@ local linters = new Mapping<String, Step> {
   }
   ["vitest"] {
     glob = frontend
-    depends = "svelte-check"
     check = "cd frontend && npx vitest run"
+  }
+}
+
+// CI-only gates. Frontend steps expect `bun install --frozen-lockfile` to have run.
+local slow = new Mapping<String, Step> {
+  // Unset: several tests assert behaviour for an agent with no ambient credential
+  // (see tests/ws_api.rs), so an exported token would make them flaky.
+  ["test"] {
+    profiles = List("slow")
+    check = "env -u LIGHTHOUSE_AGENT_TOKEN cargo test --locked"
+  }
+  ["frontend-build"] {
+    profiles = List("slow")
+    check = "cd frontend && bun run build"
+  }
+  ["cargo-audit"] {
+    profiles = List("slow")
+    check = "cargo audit"
+  }
+  ["bun-audit"] {
+    profiles = List("slow")
+    check = "cd frontend && bun audit"
+  }
+  ["docker-build"] {
+    profiles = List("slow")
+    check = "docker build --build-arg GIT_SHA=$(git rev-parse --short=12 HEAD) -t lighthouse:gate ."
+  }
+  ["actionlint"] {
+    profiles = List("slow")
+    check = "actionlint"
+  }
+  // Starts a real node and round-trips `lighthouse backup` / `restore`.
+  ["backup-restore-smoke"] {
+    profiles = List("smoke")
+    check = "scripts/backup-restore-smoke.sh"
   }
 }
 
@@ -66,6 +100,6 @@ hooks {
     steps = linters
   }
   ["check"] {
-    steps = linters
+    steps = (linters) { ...slow }
   }
 }

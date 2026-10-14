@@ -365,7 +365,7 @@ Follow-ups implemented in P1:
   - [x] Notification retry/give-up counts
   - [x] Cluster membership transitions
   - [x] Retention duration and rows removed
-- [x] Establish release gates: `scripts/release-gate.sh` (CI: `.github/workflows/release-gate.yml`, fast subset in `hk.pkl`).
+- [x] Establish release gates: gates are defined in `hk.pkl` (`hk check --all --slow`) and run as separate jobs in `.github/workflows/ci.yml`.
   - [x] Clean `cargo check --all-targets`.
   - [x] Clean `cargo clippy --all-targets -- -D warnings`.
   - [x] Passing Rust and frontend tests.

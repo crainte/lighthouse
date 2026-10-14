@@ -1,0 +1,9 @@
+# Developer tool versions. CI installs from this file via jdx/mise-action, so a
+# local `hk check` and a GitHub Actions run use the same binaries.
+[tools]
+# Must match the hk version amended in hk.pkl.
+hk = "1.49.0"
+pkl = "latest"
+git-cliff = "latest"
+actionlint = "1.7.12"
+bun = "latest"
