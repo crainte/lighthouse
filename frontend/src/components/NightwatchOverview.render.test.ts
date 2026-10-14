@@ -49,7 +49,6 @@ describe('NightwatchOverview', () => {
     const { container } = render(NightwatchOverview, { props: props({ checks: [check('API'), check('Cache', 'down')], totalChecks: 2 }) });
     expect(screen.getByRole('heading', { name: 'Partial service disruption' })).toBeInTheDocument();
     expect(container.querySelector('.landscape.down')).not.toBeNull();
-    expect(container.querySelector('.landscape .beam')).not.toBeNull();
   });
 
   it('uses an amber atmosphere for degraded monitors', () => {

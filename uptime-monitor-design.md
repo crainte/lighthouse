@@ -42,16 +42,16 @@ request time, without retaining raw regional data.
 │                         GLOBAL COORDINATOR                              │
 │                            (1-3 nodes)                                  │
 │                                                                         │
-│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐                   │
-│  │  Global-1   │◄─►│  Global-2   │◄─►│  Global-3   │  (gossip)         │
-│  │  (cached    │   │  (cached    │   │  (cached    │                   │
-│  │   state)    │   │   state)    │   │   state)    │                   │
-│  └──────▲──────┘   └──────▲──────┘   └──────▲──────┘                   │
+│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐                    │
+│  │  Global-1   │◄─►│  Global-2   │◄─►│  Global-3   │  (gossip)          │
+│  │  (cached    │   │  (cached    │   │  (cached    │                    │
+│  │   state)    │   │   state)    │   │   state)    │                    │
+│  └──────▲──────┘   └──────▲──────┘   └──────▲──────┘                    │
 │         │                 │                 │                           │
 │         └─────────────────┼─────────────────┘                           │
 │                           │                                             │
 │  Serves: Dashboard, global alerts, cross-region status                  │
-│  Stores: Cached state summaries only (no raw data)                     │
+│  Stores: Cached state summaries only (no raw data)                      │
 └───────────────────────────▲─────────────────────────────────────────────┘
                             │
               state push (every 5-10s)
@@ -77,14 +77,14 @@ Full replication within region. All coordinators have all data.
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                  REGIONAL COORDINATOR CLUSTER                   │
-│                                                                  │
+│                                                                 │
 │  ┌───────────┐      ┌───────────┐      ┌───────────┐            │
 │  │  Coord-1  │◄────►│  Coord-2  │◄────►│  Coord-3  │  (gossip)  │
 │  │  DuckDB   │      │  DuckDB   │      │  DuckDB   │            │
 │  │  (full)   │      │  (full)   │      │  (full)   │            │
 │  └─────▲─────┘      └─────▲─────┘      └─────▲─────┘            │
-│        │                  │                  │                   │
-└────────┼──────────────────┼──────────────────┼───────────────────┘
+│        │                  │                  │                  │
+└────────┼──────────────────┼──────────────────┼──────────────────┘
          │                  │                  │
     POST to any ───────────►│◄─────── broadcast to peers
          │                  

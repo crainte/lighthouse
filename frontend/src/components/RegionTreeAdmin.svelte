@@ -561,10 +561,12 @@
     {#each rows as row (row.key)}
       {#if row.kind === 'agent'}
         <div class="row agent" role="treeitem" aria-level={row.depth + 1} aria-selected="false">
-          {@render gutter(rowSegs(row), 'leaf', row)}
-          <span class="label">
-            <span class="node-kind">agent</span>{row.agent.id}
-          </span>
+          <div class="node-cell">
+            {@render gutter(rowSegs(row), 'leaf', row)}
+            <span class="node-content">
+              <span class="node-primary"><span class="node-kind">agent</span><span class="node-name">{row.agent.id}</span></span>
+            </span>
+          </div>
           <span class="policy">last seen {staleness(row.agent.staleness_ms)} ago</span>
           <span class="states">
             {#each counts(row.agent.perCheck) as c (c.state)}
@@ -582,16 +584,20 @@
             aria-selected={row.node.node_id === selectedId}
             aria-expanded={row.hasChildren ? row.open : undefined}
           >
-            {@render gutter(rowSegs(row), row.hasChildren ? 'toggle' : 'leaf', row)}
-            <button class="label pick" aria-expanded={row.node.node_id === selectedId} onclick={() => select(row.node)}>
-              {#if row.node.node_type !== 'global'}<span class="node-kind">{row.node.node_type}</span>{/if}
-              {row.node.label}
-              <span class="policy-affordance">{row.node.node_id === selectedId ? 'Close policy' : 'Edit policy'}<svg class:policy-open={row.node.node_id === selectedId} width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg></span>
-              {#if policies.some((p) => p.node_id === row.node.node_id)}
-                <span class="tree-badge override">override</span>
-              {/if}
-              {#if row.node.stale}<span class="tree-badge stale">no agents</span>{/if}
-            </button>
+            <div class="node-cell">
+              {@render gutter(rowSegs(row), row.hasChildren ? 'toggle' : 'leaf', row)}
+              <button class="node-content pick" aria-expanded={row.node.node_id === selectedId} onclick={() => select(row.node)}>
+                <span class="node-primary">
+                  <span class="node-kind">{row.node.node_type}</span>
+                  <span class="node-name">{row.node.label}</span>
+                  {#if policies.some((p) => p.node_id === row.node.node_id)}
+                    <span class="tree-badge override">override</span>
+                  {/if}
+                  {#if row.node.stale}<span class="tree-badge stale">no agents</span>{/if}
+                </span>
+                <span class="policy-affordance">{row.node.node_id === selectedId ? 'Close policy' : 'Edit policy'}<svg class:policy-open={row.node.node_id === selectedId} width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg></span>
+              </button>
+            </div>
             <span class="policy">{policyLabel(nodePolicy(row.node))}</span>
             <span class="states">
               {#each counts(row.node.perCheck.map((c) => c.state)) as c (c.state)}
@@ -603,8 +609,9 @@
 
           {#if selected && row.node.node_id === selectedId}
             <div class="editor">
-              {@render gutter(editorSegs(row), null, null)}
-              <div class="editor-main">
+              <div class="editor-node-cell">
+                {@render gutter(editorSegs(row), null, null)}
+                <div class="editor-main">
               <div class="editor-grid">
                 <label class="field">
                   <span class="field-label">Degraded when</span>
@@ -725,6 +732,7 @@
 
               {#if error}<p class="admin-error feedback">{error}</p>{/if}
               {#if note}<p class="saved-note feedback">{note}</p>{/if}
+                </div>
               </div>
             </div>
           {/if}
@@ -771,17 +779,21 @@
   @media (max-width: 600px) { .pipeline-track { grid-template-columns: 1fr; } .pipeline-stage { min-height: 0; border-left: 0; } .lab-copy, .lab-stage { padding: 20px; } .lab-children { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   .head { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin: 0 0 .6rem; }
   .lede { max-width: 62ch; margin: .3rem 0 0; }
-  .tree { padding: 0; overflow: hidden; }
+  .tree {
+    --tree-columns: minmax(20rem, 1fr) 11rem 13rem;
+    --tree-indent: 28px;
+    padding: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
 
   .legend, .row {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 11rem 16rem;
+    grid-template-columns: var(--tree-columns);
     align-items: center;
     column-gap: .65rem;
+    min-width: 44rem;
   }
-  /* Each row is its own grid and the gutter's width follows depth, so the
-     data columns are fixed: fractions would shift with every indent. */
-  .row { grid-template-columns: auto minmax(0, 1fr) 11rem 16rem; }
   .legend {
     padding: 12px 16px;
     border-bottom: 1px solid var(--ad-line);
@@ -790,19 +802,21 @@
     text-transform: none;
     letter-spacing: 0;
   }
-  /* No vertical padding on the row itself: the gutter has to reach both
-     edges so one row's lines meet the next row's. The cells pad instead. */
   .row { padding: 0 16px; min-height: 56px; border-bottom: 1px solid rgba(255, 255, 255, .035); }
-  .row > :not(.tree-gutter) { padding-block: 12px; }
+  .row > * { padding-block: 12px; }
   .row.node.selected { background: var(--ad-panel-2); }
+  .node-cell { display: flex; align-self: stretch; align-items: stretch; min-width: 0; padding-block: 0; }
+  .node-content { display: grid; align-content: center; min-width: 0; padding: 12px 0 12px 6px; font-weight: 500; text-align: left; }
+  .node-primary { display: flex; align-items: baseline; min-width: 0; gap: 8px; }
+  .node-name { min-width: 0; overflow-wrap: anywhere; }
 
   /* tree(1) drawn in CSS. Every column carries its line at 10px, the centre
      of the 22px node marker, so a parent's toggle sits exactly above the line
      its children hang from. */
   /* `--knee`: how far down the row the branch meets its marker. */
-  .tree-gutter { display: flex; align-self: stretch; --tree-line: #3a4f69; --knee: 50%; }
+  .tree-gutter { display: flex; align-self: stretch; flex: none; --tree-line: #3a4f69; --knee: 50%; }
   .tree-seg, .tree-node { position: relative; flex: none; width: 22px; }
-  .tree-seg { width: 28px; }
+  .tree-seg { width: var(--tree-indent); }
   .tree-seg.pass::before, .tree-seg.branch::before, .tree-seg.last::before, .tree-node.open::after {
     content: ''; position: absolute; left: 11px; top: 0; bottom: 0; border-left: 1px solid var(--tree-line);
   }
@@ -823,23 +837,21 @@
   }
   .chevron:hover { color: var(--ad-cyan); border-color: var(--ad-cyan); }
   .chevron svg, .policy-affordance svg { display: block; flex: none; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-  .row .label { padding-left: 6px; }
   .policy-affordance svg.policy-open { transform: rotate(180deg); }
   .chevron svg.closed { transform: rotate(-90deg); }
   .policy-affordance { display: flex; align-items: center; gap: 6px; margin-top: 6px; color: var(--ad-cyan); font-size: 11px; font-weight: 400; }
 
-  .label { min-width: 0; overflow-wrap: anywhere; font-weight: 500; text-align: left; }
   .pick {
-    border: 0; background: none; padding: .2rem 0; color: inherit;
+    width: 100%; border: 0; background: none; color: inherit;
     font: inherit; font-weight: 500; cursor: pointer;
   }
   .pick:hover { color: var(--ad-cyan); }
   .node-kind {
-    color: var(--ad-dim); font-size: 11px; text-transform: capitalize;
-    letter-spacing: 0; margin-right: 8px;
+    flex: 0 0 3.25rem; color: var(--ad-dim); font-size: 11px; text-transform: capitalize;
+    letter-spacing: 0;
   }
   .tree-badge {
-    margin-left: .45rem; padding: .05rem .3rem; border-radius: 4px;
+    flex: none; padding: .05rem .3rem; border-radius: 4px;
     font-size: .62rem; text-transform: uppercase; letter-spacing: .06em; vertical-align: middle;
   }
   .tree-badge.override { background: rgba(86, 212, 228, .13); color: var(--ad-cyan); }
@@ -849,12 +861,13 @@
   .states { display: flex; flex-wrap: wrap; gap: .3rem; }
 
   .editor {
-    display: flex;
+    min-width: 44rem;
     padding: 0 16px;
     background: var(--ad-panel-2);
     border-bottom: 1px solid var(--ad-line);
     box-shadow: inset 3px 0 0 var(--ad-cyan);
   }
+  .editor-node-cell { display: flex; align-items: stretch; }
   .editor-main { flex: 1; min-width: 0; padding: 24px 24px 24px 12px; }
   .editor-grid { display: grid; grid-template-columns: repeat(2, minmax(9rem, 14rem)); gap: .75rem; align-items: end; }
   .threshold { display: flex; gap: .4rem; }
@@ -893,19 +906,8 @@
 
   @media (max-width: 760px) {
     .head { flex-direction: column; align-items: flex-start; }
-    .legend { display: none; }
-    /* The gutter spans every line of a stacked row, so the lines stay joined. */
-    .row { grid-template-columns: auto minmax(0, 1fr); }
-    /* A stacked row is tall; the branch meets the name, not the middle. */
-    .row .tree-gutter { grid-row: 1 / span 3; --knee: 23px; }
-    .row > :not(.tree-gutter) { padding-left: 6px; }
-    .row > :not(.tree-gutter) { padding-block: 6px; }
-    .row > :nth-child(2) { padding-top: 12px; }
-    .row > :last-child { padding-bottom: 12px; }
     .editor-main { padding: 16px 8px; }
     .actions { flex-wrap: wrap; }
-    .row .policy { grid-column: 2; }
-    .row .states { grid-column: 2 / -1; }
     .editor-grid { grid-template-columns: 1fr; }
     .editor-foot { flex-direction: column; align-items: flex-start; }
     .pcount { margin-left: 0; width: 100%; }

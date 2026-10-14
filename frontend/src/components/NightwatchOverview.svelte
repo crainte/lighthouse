@@ -689,7 +689,8 @@
     height: 228px;
     position: relative;
     isolation: isolate;
-    overflow: hidden;
+    overflow: visible;
+    z-index: 10;
     display: flex;
     align-items: center;
   }
