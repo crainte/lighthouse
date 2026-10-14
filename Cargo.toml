@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-axum = { version = "0.7", features = ["ws"] }
+axum = { version = "0.8", features = ["ws"] }
 # Inter-node HTTP is zstd-compressed both ways: responses negotiated by
 # Accept-Encoding (reqwest decodes them), request bodies sent with
 # Content-Encoding: zstd and decoded by the server layer — see crate::http.
