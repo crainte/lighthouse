@@ -806,15 +806,17 @@
   .row > * { padding-block: 12px; }
   .row.node.selected { background: var(--ad-panel-2); }
   .node-cell { display: flex; align-self: stretch; align-items: stretch; min-width: 0; padding-block: 0; }
-  .node-content { display: grid; align-content: center; min-width: 0; padding: 12px 0 12px 6px; font-weight: 500; text-align: left; }
-  .node-primary { display: flex; align-items: baseline; min-width: 0; gap: 8px; }
+  .node-content { display: grid; align-content: start; min-width: 0; padding: 14px 0 12px 6px; font-weight: 500; text-align: left; }
+  .row.agent .node-content { align-content: center; padding-block: 12px; }
+  .node-primary { display: flex; align-items: baseline; min-width: 0; gap: 8px; line-height: 20px; }
   .node-name { min-width: 0; overflow-wrap: anywhere; }
 
-  /* tree(1) drawn in CSS. Every column carries its line at 10px, the centre
-     of the 22px node marker, so a parent's toggle sits exactly above the line
-     its children hang from. */
-  /* `--knee`: how far down the row the branch meets its marker. */
-  .tree-gutter { display: flex; align-self: stretch; flex: none; --tree-line: #3a4f69; --knee: 50%; }
+  /* The gutter uses one fixed vertical anchor for its lines and markers.
+     A percentage margin-top is width-relative, unlike top: 50%, so it makes
+     toggles drift away from connectors. Keep both at the first line's centre;
+     agent rows centre their single line in a shorter row. */
+  .tree-gutter { display: flex; align-self: stretch; flex: none; --tree-line: #3a4f69; --knee: 24px; }
+  .row.agent .tree-gutter { --knee: 28px; }
   .tree-seg, .tree-node { position: relative; flex: none; width: 22px; }
   .tree-seg { width: var(--tree-indent); }
   .tree-seg.pass::before, .tree-seg.branch::before, .tree-seg.last::before, .tree-node.open::after {
@@ -822,11 +824,10 @@
   }
   .tree-seg.last::before { bottom: auto; height: var(--knee); }
   .tree-seg.branch::after, .tree-seg.last::after {
-    content: ''; position: absolute; left: 11px; right: -1px; top: var(--knee); border-top: 1px solid var(--tree-line);
+    content: ''; position: absolute; left: 11px; right: -11px; top: var(--knee); border-top: 1px solid var(--tree-line);
   }
-  .tree-node { display: grid; justify-items: center; align-items: start; }
-  .tree-node > * { margin-top: calc(var(--knee) - 11px); }
-  .tree-node.leaf > * { margin-top: calc(var(--knee) - 3px); }
+  .tree-node > * { position: absolute; left: 0; top: calc(var(--knee) - 11px); }
+  .tree-node.leaf > * { left: 8px; top: calc(var(--knee) - 3px); }
   .tree-node.open::after { top: calc(var(--knee) + 11px); }
   .tree-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--tree-line); box-shadow: 0 0 0 1px var(--ad-faint); }
   .row.agent .tree-dot { box-shadow: none; }
