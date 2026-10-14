@@ -53,11 +53,11 @@ pub(super) fn router(node: GlobalNode) -> Router {
         // Revoke and delete address one credential that only its own region
         // holds, so the others' 404s must not decide the answer.
         .route(
-            "/api/v1/admin/agent-credentials/:id",
+            "/api/v1/admin/agent-credentials/{id}",
             delete(revoke_credential_handler),
         )
         .route(
-            "/api/v1/admin/agent-credentials/:id/purge",
+            "/api/v1/admin/agent-credentials/{id}/purge",
             post(purge_credential_handler),
         )
         // Incidents are regional and never replicated: a hand-made one is
@@ -77,7 +77,7 @@ pub(super) fn router(node: GlobalNode) -> Router {
             put(admin::reorder_checks_handler),
         )
         .route(
-            "/api/v1/admin/checks/:id",
+            "/api/v1/admin/checks/{id}",
             put(admin::update_check_handler).delete(admin::delete_check_handler),
         )
         .route(
@@ -87,7 +87,7 @@ pub(super) fn router(node: GlobalNode) -> Router {
                 .put(admin::reorder_sections_handler),
         )
         .route(
-            "/api/v1/admin/sections/:name",
+            "/api/v1/admin/sections/{name}",
             put(admin::rename_section_handler).delete(admin::delete_section_handler),
         )
         .route("/api/v1/sections", get(admin::public_sections_handler))
@@ -98,11 +98,11 @@ pub(super) fn router(node: GlobalNode) -> Router {
             get(admin::list_regions_handler).post(admin::mint_region_handler),
         )
         .route(
-            "/api/v1/admin/regions/:name",
+            "/api/v1/admin/regions/{name}",
             delete(admin::remove_region_handler),
         )
         .route(
-            "/api/v1/admin/cluster/members/:node_id",
+            "/api/v1/admin/cluster/members/{node_id}",
             delete(admin::decommission_member_handler),
         )
         // Auth: same contract as the coordinator so the SPA's login flow
@@ -249,7 +249,7 @@ async fn handle_ws(mut socket: WebSocket, node: GlobalNode) {
                 let Ok(txt) = serde_json::to_string(&ev) else {
                     continue;
                 };
-                if socket.send(Message::Text(txt)).await.is_err() {
+                if socket.send(Message::Text(txt.into())).await.is_err() {
                     break; // client gone
                 }
             }

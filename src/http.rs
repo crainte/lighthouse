@@ -116,7 +116,6 @@ pub trait AdminGate {
 /// `require_admin`-style check used to return, before the handler body runs.
 pub struct AdminSession;
 
-#[axum::async_trait]
 impl<S> FromRequestParts<S> for AdminSession
 where
     S: AdminGate + Send + Sync,
@@ -152,7 +151,6 @@ fn admin_gate<S: AdminGate>(state: &S, headers: &HeaderMap) -> Result<(), Box<Re
 /// the body.
 pub struct AdminJson<T>(pub T);
 
-#[axum::async_trait]
 impl<S, T> FromRequest<S> for AdminJson<T>
 where
     S: AdminGate + Send + Sync,
@@ -177,7 +175,6 @@ where
 /// required" does.
 pub struct AdminBytes(pub axum::body::Bytes);
 
-#[axum::async_trait]
 impl<S> FromRequest<S> for AdminBytes
 where
     S: AdminGate + Send + Sync,
