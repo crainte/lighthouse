@@ -1,0 +1,6 @@
+# Pinned so CI and local builds agree. Newer stable releases add deprecations
+# that `clippy -D warnings` turns into failures; bump this deliberately.
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

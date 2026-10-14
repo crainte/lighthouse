@@ -3,8 +3,8 @@ name: CI
 # One job per gate so a failure names its cause. Every job runs a single step
 # from hk.pkl (`hk check --all --slow -S <step>`), which is the one definition
 # of what each gate does; run the same command locally to reproduce a failure.
-# Tool versions come from mise.toml and the toolchain from the runner's stable
-# Rust. The backup/restore smoke test is deliberately not run here.
+# Tool versions come from mise.toml and the Rust toolchain from
+# rust-toolchain.toml. The backup/restore smoke test is deliberately not run here.
 on:
   push:
     branches: [main]
@@ -27,9 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - run: rustup toolchain install
       - uses: jdx/mise-action@v4
       - run: hk check --all --slow -S fmt
 
@@ -47,9 +45,7 @@ jobs:
           command -v cc >/dev/null && exit 0
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends build-essential
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - uses: jdx/mise-action@v4
       # rust-embed needs frontend/dist at compile time.
@@ -67,7 +63,7 @@ jobs:
           command -v cc >/dev/null && exit 0
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends build-essential
-      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - uses: jdx/mise-action@v4
       # rust-embed needs frontend/dist at compile time.
@@ -110,7 +106,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup toolchain install
       - uses: taiki-e/install-action@cargo-audit
       - uses: jdx/mise-action@v4
       - run: hk check --all --slow -S cargo-audit
