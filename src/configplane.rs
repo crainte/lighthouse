@@ -71,9 +71,9 @@ pub fn load_or_generate(
             return v;
         }
     }
-    use rand::RngCore;
+    use rand::Rng;
     let mut buf = vec![0u8; len];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     let generated = crate::auth::hex(&buf);
     if let Err(e) = storage.put_setting(key, &generated) {
         tracing::warn!(error = %e, key, "could not persist generated value");

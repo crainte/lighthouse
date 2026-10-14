@@ -2,7 +2,7 @@ use super::ingest::{check_meta, meta_by_id};
 use super::*;
 use crate::configplane::ConfigBatch;
 use crate::models::{CheckResult, Status};
-use rand::seq::SliceRandom;
+use rand::seq::IndexedRandom;
 use routes::peer::{read_config_entry_for_replication, RollupBatch, RollupRowDto};
 use std::time::Duration;
 
@@ -954,7 +954,7 @@ impl Coordinator {
                 .as_ref()
                 .filter(|peer| cursors.in_progress() && live.contains(peer))
                 .cloned()
-                .or_else(|| live.choose(&mut rand::thread_rng()).cloned())
+                .or_else(|| live.choose(&mut rand::rng()).cloned())
         };
         let Some(peer) = peer else {
             return;
