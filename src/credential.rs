@@ -18,7 +18,7 @@
 //! human-chosen.
 
 use crate::auth::hex;
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -52,7 +52,7 @@ impl AgentCredential {
 
 fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     hex(&buf)
 }
 

@@ -35,7 +35,7 @@
 
 use hmac::{Hmac, KeyInit, Mac};
 use parking_lot::Mutex;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -97,7 +97,7 @@ impl Auth {
     /// nothing else to keep the key in sync with.
     pub fn new(admin_password: Option<String>) -> Self {
         let mut key = vec![0u8; 32];
-        rand::thread_rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut key);
         Self::from_signing_key(admin_password, key)
     }
 
@@ -151,7 +151,7 @@ impl Auth {
         self.clear_failures(from);
 
         let mut jti_raw = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut jti_raw);
+        rand::rng().fill_bytes(&mut jti_raw);
         let payload = Payload {
             issued_at: now_millis,
             expires_at: now_millis + SESSION_TTL_MS,

@@ -179,9 +179,9 @@ async fn anti_entropy_sweep(node: &GlobalNode) {
         return;
     };
     let peer = {
-        use rand::seq::SliceRandom;
+        use rand::seq::IndexedRandom;
         let live = cluster.live_urls();
-        let Some(peer) = live.choose(&mut rand::thread_rng()).cloned() else {
+        let Some(peer) = live.choose(&mut rand::rng()).cloned() else {
             return;
         };
         peer
