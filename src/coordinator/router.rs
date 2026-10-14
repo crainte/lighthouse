@@ -123,7 +123,7 @@ async fn handle_ws(mut socket: WebSocket, coord: Coordinator) {
                     Ok(t) => t,
                     Err(_) => continue,
                 };
-                if socket.send(Message::Text(txt)).await.is_err() {
+                if socket.send(Message::Text(txt.into())).await.is_err() {
                     break; // client gone
                 }
             }
@@ -168,10 +168,10 @@ impl Coordinator {
                 }),
             )
             .route("/api/v1/status", get(status_handler))
-            .route("/api/v1/checks/:id/history", get(history_handler))
-            .route("/api/v1/checks/:id/uptime", get(uptime_handler))
+            .route("/api/v1/checks/{id}/history", get(history_handler))
+            .route("/api/v1/checks/{id}/uptime", get(uptime_handler))
             .route(
-                "/api/v1/checks/:id/latency-sparkline",
+                "/api/v1/checks/{id}/latency-sparkline",
                 get(latency_sparkline_handler),
             )
             // Batched twins of the two routes above. The status page draws a
@@ -184,8 +184,11 @@ impl Coordinator {
             // narrative is the point of writing it, so an anonymous visitor
             // gets the same record the operator sees.
             .route("/api/v1/incidents", get(incidents_handler))
-            .route("/api/v1/incidents/:id", get(incident_handler))
-            .route("/api/v1/checks/:id/incidents", get(check_incidents_handler))
+            .route("/api/v1/incidents/{id}", get(incident_handler))
+            .route(
+                "/api/v1/checks/{id}/incidents",
+                get(check_incidents_handler),
+            )
             // Writes are admin-gated inside each handler, like the check
             // editor. There is no acknowledge route: an authored update on a
             // `detected` incident is the acknowledgement.
@@ -195,15 +198,15 @@ impl Coordinator {
                 post(purge_short_incidents_handler),
             )
             .route(
-                "/api/v1/admin/incidents/:id",
+                "/api/v1/admin/incidents/{id}",
                 axum::routing::patch(edit_incident_handler).delete(delete_incident_handler),
             )
             .route(
-                "/api/v1/admin/incidents/:id/checks",
+                "/api/v1/admin/incidents/{id}/checks",
                 axum::routing::put(incident_checks_handler),
             )
             .route(
-                "/api/v1/admin/incidents/:id/updates",
+                "/api/v1/admin/incidents/{id}/updates",
                 post(incident_update_handler),
             )
             .route("/api/v1/agents", get(agents_handler))
@@ -220,7 +223,7 @@ impl Coordinator {
                     .delete(delete_rollup_policy_handler),
             )
             .route("/api/v1/admin/region-tree", get(region_tree_handler))
-            .route("/api/v1/admin/agents/:id", delete(purge_agent_handler))
+            .route("/api/v1/admin/agents/{id}", delete(purge_agent_handler))
             // Section names and their display flags. Public because the status
             // page needs them to render groups; it carries no targets.
             .route("/api/v1/sections", get(public_sections_handler))
@@ -238,27 +241,27 @@ impl Coordinator {
             // DOWN when the pings stop. Unauthenticated by design — the URL is
             // the credential, and it is only ever shown to an admin.
             .route(
-                "/api/v1/heartbeat/:id",
+                "/api/v1/heartbeat/{id}",
                 get(heartbeat_handler).post(heartbeat_handler),
             )
             .route(
-                "/api/v1/admin/checks/:id/data",
+                "/api/v1/admin/checks/{id}/data",
                 delete(purge_check_data_handler),
             )
             // The whole erase: the check AND everything it ever produced.
-            // Ordered before the `:id` route for the same reason
+            // Ordered before the `{id}` route for the same reason
             // `checks/order` is — a suffix must never be read as a check id.
             .route(
-                "/api/v1/admin/checks/:id/everything",
+                "/api/v1/admin/checks/{id}/everything",
                 delete(purge_check_everything_handler),
             )
             // Unplacing is regional: it removes only this coordinator's
             // definition and derived state, never a replicated config tombstone.
             .route(
-                "/api/v1/admin/checks/:id/unplace",
+                "/api/v1/admin/checks/{id}/unplace",
                 delete(unplace_check_handler),
             )
-            // Ordering is its own route, ahead of the `:id` route so "order"
+            // Ordering is its own route, ahead of the `{id}` route so "order"
             // is never taken for a check id. Reordering is a bulk operation
             // over ids, not an edit to any one check.
             .route("/api/v1/admin/checks/order", put(reorder_checks_handler))
@@ -267,7 +270,7 @@ impl Coordinator {
                 get(list_checks_handler).post(create_check_handler),
             )
             .route(
-                "/api/v1/admin/checks/:id",
+                "/api/v1/admin/checks/{id}",
                 put(update_check_handler).delete(delete_check_handler),
             )
             // Status-page presentation: sections exist independently of checks,
@@ -279,7 +282,7 @@ impl Coordinator {
                     .put(reorder_sections_handler),
             )
             .route(
-                "/api/v1/admin/sections/:name",
+                "/api/v1/admin/sections/{name}",
                 put(rename_section_handler).delete(delete_section_handler),
             )
             // Which agents the public page names, and how. Admin-only in both
@@ -315,11 +318,11 @@ impl Coordinator {
                 get(list_agent_credentials_handler).post(mint_agent_credential_handler),
             )
             .route(
-                "/api/v1/admin/agent-credentials/:id",
+                "/api/v1/admin/agent-credentials/{id}",
                 delete(revoke_agent_credential_handler),
             )
             .route(
-                "/api/v1/admin/agent-credentials/:id/purge",
+                "/api/v1/admin/agent-credentials/{id}/purge",
                 post(purge_agent_credential_handler),
             )
             // Peer replication. Agent-gated rather than public: it mutates
@@ -394,7 +397,7 @@ impl Coordinator {
             // this is read by a human in the browser, not by another node.
             .route("/api/v1/cluster", get(cluster_view_handler))
             .route(
-                "/api/v1/admin/cluster/members/:node_id",
+                "/api/v1/admin/cluster/members/{node_id}",
                 delete(decommission_member_handler),
             )
             // Retention-aware peer recovery (item B): standing raw-data gaps
