@@ -224,15 +224,16 @@
     bottom: 110px;
     height: min(38vh, 340px);
     background-size: auto 100%;
-    /* The subject sits on the right side of every seasonal scene.
-       Anchor the crop to the far-left coast/water so the sidebar stays
-       atmospheric without showing even an edge of the lighthouse. */
-    background-position: left center;
+    /* The far-left edge of the source is nearly black. Show the water and
+       illuminated shore just left of the lighthouse, without framing the
+       structure itself. This crop is shared by all seasonal scenes. */
+    background-position: 58% center;
     background-repeat: no-repeat;
-    opacity: .34;
+    opacity: .58;
+    filter: brightness(1.22) saturate(1.08);
     pointer-events: none;
-    -webkit-mask-image: linear-gradient(to bottom, transparent 0%, #000 29%, #000 56%, transparent 100%);
-    mask-image: linear-gradient(to bottom, transparent 0%, #000 29%, #000 56%, transparent 100%);
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0%, #000 24%, #000 66%, transparent 100%);
+    mask-image: linear-gradient(to bottom, transparent 0%, #000 24%, #000 66%, transparent 100%);
   }
   .brand, .nav-scroll, .nav-footer { position: relative; z-index: 1; }
   .brand {
