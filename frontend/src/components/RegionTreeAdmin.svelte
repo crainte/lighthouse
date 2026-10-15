@@ -70,6 +70,9 @@
   let previewPage = $state(0);
   const PREVIEW_PAGE_SIZE = 25;
   const SIM_STATES: RegionTreeState[] = ['up', 'degraded', 'down', 'unknown'];
+  // Unknown is an absence of observations, not a DOWN verdict. The backend
+  // may also return unknown for checks with no placement at this location.
+  const UNKNOWN_HINT = 'No known observation for this check at this location. It may be unplaced here, not yet reporting, or temporarily unavailable—not necessarily down.';
   const TIER_ORDER: RollupNodeType[] = ['zone', 'region', 'global'];
   let simTier = $state<RollupNodeType>('region');
   let simChildren = $state<RegionTreeState[]>(['up', 'up', 'degraded', 'up', 'down']);
@@ -526,7 +529,7 @@
     </div>
   </section>
 
-  <div class="section-heading"><div><h3>Location policies</h3><p>Choose a location to adjust its thresholds. Overrides apply to every check rolled up through that location.</p></div></div>
+  <div class="section-heading"><div><h3>Location policies</h3><p>Choose a location to adjust its thresholds. Overrides apply to every check rolled up through that location.</p><p class="unknown-hint">Unknown means no known observation at that location—not necessarily an outage.</p></div></div>
 
   <div class="admin-panel tree">
     <div class="legend">
@@ -570,7 +573,7 @@
           <span class="policy">last seen {staleness(row.agent.staleness_ms)} ago</span>
           <span class="states">
             {#each counts(row.agent.perCheck) as c (c.state)}
-              <span class="opill {tone(c.state)}"><span class="pdot"></span>{c.n} {c.state}</span>
+              <span class="opill {tone(c.state)}" title={c.state === 'unknown' ? UNKNOWN_HINT : undefined}><span class="pdot"></span>{c.n} {c.state}</span>
             {/each}
           </span>
         </div>
@@ -601,7 +604,7 @@
             <span class="policy">{policyLabel(nodePolicy(row.node))}</span>
             <span class="states">
               {#each counts(row.node.perCheck.map((c) => c.state)) as c (c.state)}
-                <span class="opill {tone(c.state)}"><span class="pdot"></span>{c.n} {c.state}</span>
+                <span class="opill {tone(c.state)}" title={c.state === 'unknown' ? UNKNOWN_HINT : undefined}><span class="pdot"></span>{c.n} {c.state}</span>
               {/each}
               {#if row.node.perCheck.length === 0}<span class="admin-muted">no checks</span>{/if}
             </span>
@@ -694,10 +697,10 @@
                   {#each previewRows as p (p.check_id)}
                     <div class="preview-row" class:changed={p.changed}>
                       <span class="pcheck">{p.name}</span>
-                      <span class="opill {tone(p.now)}"><span class="pdot"></span>{p.now}</span>
+                      <span class="opill {tone(p.now)}" title={p.now === 'unknown' ? UNKNOWN_HINT : undefined}><span class="pdot"></span>{p.now}</span>
                       {#if p.changed}
                         <span class="arrow">→</span>
-                        <span class="opill {tone(p.next)}"><span class="pdot"></span>{p.next}</span>
+                        <span class="opill {tone(p.next)}" title={p.next === 'unknown' ? UNKNOWN_HINT : undefined}><span class="pdot"></span>{p.next}</span>
                       {:else}
                         <span class="arrow muted">{p.unavailable ? 'Preview unavailable' : p.shadowed ? 'Different effective policy' : 'unchanged'}</span>
                       {/if}
@@ -718,13 +721,13 @@
                 <p class="admin-muted">
                   {storedFor
                     ? 'Stored override.'
-                    : `No override; using the built-in ${selected.node_type} default (${policyLabel(DEFAULTS[selected.node_type])}).`}
+                    : `No override; using the built-in ${selected.node_type} default (${policyLabel(DEFAULTS[selected.node_type])}). Create one to store these thresholds explicitly.`}
                 </p>
                 <div class="actions">
                   {#if storedFor}
                     <button class="btn danger" disabled={saving} onclick={remove}>Delete override</button>
                   {/if}
-                  <button class="btn primary" disabled={saving || !!problem || !dirty} onclick={save}>
+                  <button class="btn primary" disabled={saving || !!problem || (!!storedFor && !dirty)} onclick={save} title={!storedFor && !dirty ? 'Save explicit thresholds even when they match the built-in default' : undefined}>
                     {saving ? 'Saving…' : storedFor ? 'Save override' : 'Create override'}
                   </button>
                 </div>
@@ -777,6 +780,7 @@
   .lab-result.green { color: var(--ad-green); } .lab-result.amber { color: var(--ad-amber); } .lab-result.red { color: var(--ad-red); } .lab-result.grey { color: var(--ad-dim); }
   @media (max-width: 1050px) { .pipeline-track { grid-template-columns: repeat(2, minmax(0, 1fr)); } .pipeline-stage:nth-child(3) { border-left: 0; } .pipeline-stage { border-bottom: 1px solid var(--ad-line); } .pipeline-stage::after { display: none; } .rollup-lab { grid-template-columns: 1fr; } .lab-copy { border-right: 0; border-bottom: 1px solid var(--ad-line); } }
   @media (max-width: 600px) { .pipeline-track { grid-template-columns: 1fr; } .pipeline-stage { min-height: 0; border-left: 0; } .lab-copy, .lab-stage { padding: 20px; } .lab-children { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .unknown-hint { color: var(--ad-faint); font-size: 12px; }
   .head { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin: 0 0 .6rem; }
   .lede { max-width: 62ch; margin: .3rem 0 0; }
   .tree {
@@ -804,7 +808,18 @@
   }
   .row { padding: 0 16px; min-height: 56px; border-bottom: 1px solid rgba(255, 255, 255, .035); }
   .row > * { padding-block: 12px; }
-  .row.node.selected { background: var(--ad-panel-2); }
+  /* Preserve row geometry and tree connector alignment while adding
+     a full-width locator highlight. Agent rows are read-only. */
+  .row { transition: background-color 120ms ease; }
+  .row.node:hover, .row.node:focus-within { background: #14283a; }
+  .row.agent:hover { background: rgba(86, 212, 228, .035); }
+  .row.node.selected, .row.node.selected:hover, .row.node.selected:focus-within {
+    background: #172d40;
+    box-shadow: inset 3px 0 0 var(--ad-cyan);
+  }
+  .row.node:focus-within .pick { color: var(--ad-cyan); }
+  .pick:focus-visible, .chevron:focus-visible { outline: 2px solid var(--ad-cyan); outline-offset: -2px; }
+  @media (prefers-reduced-motion: reduce) { .row { transition: none; } }
   .node-cell { display: flex; align-self: stretch; align-items: stretch; min-width: 0; padding-block: 0; }
   /* Fill the available Node column instead of shrink-wrapping the label: agent
      IDs should only wrap when they genuinely outgrow the column. */

@@ -6,12 +6,14 @@ import type { RegionTreeResponse } from '../lib/admin';
 const mocks = vi.hoisted(() => ({
   fetchRegionTree: vi.fn(),
   listRollupPolicies: vi.fn(),
+  upsertRollupPolicy: vi.fn(),
 }));
 
 vi.mock('../lib/admin', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/admin')>()),
   fetchRegionTree: mocks.fetchRegionTree,
   listRollupPolicies: mocks.listRollupPolicies,
+  upsertRollupPolicy: mocks.upsertRollupPolicy,
 }));
 
 const policy = { degraded_when: 'any', down_when: 'majority' } as const;
@@ -47,6 +49,7 @@ const tree: RegionTreeResponse = {
 async function setup() {
   mocks.fetchRegionTree.mockResolvedValue(tree);
   mocks.listRollupPolicies.mockResolvedValue([]);
+  mocks.upsertRollupPolicy.mockImplementation(async (value) => value);
   const view = render(RegionTreeAdmin, { props: { onexpired: vi.fn() } });
   await screen.findByRole('tree', { name: 'Location policies' });
   return view;
@@ -82,4 +85,33 @@ describe('RegionTreeAdmin location tree', () => {
     expect(screen.getByText(/No override; using the built-in global default/)).toBeInTheDocument();
     expect(container.querySelector('.editor-node-cell > .tree-gutter')).not.toBeNull();
   });
+
+  it('explains unknown as missing observations, not an outage', async () => {
+    const withUnknown = structuredClone(tree);
+    withUnknown.checks[0].regions[0].zones[0].agents[1].state = 'unknown';
+    mocks.fetchRegionTree.mockResolvedValueOnce(withUnknown);
+    mocks.listRollupPolicies.mockResolvedValue([]);
+    render(RegionTreeAdmin, { props: { onexpired: vi.fn() } });
+    await screen.findByRole('tree', { name: 'Location policies' });
+    expect(screen.getByText(/Unknown means no known observation/)).toBeInTheDocument();
+    const unknown = screen.getByText('1 unknown');
+    expect(unknown).toHaveAttribute('title', expect.stringMatching(/may be unplaced here/));
+  });
+
+  it('allows an explicit override even when the default thresholds are unchanged', async () => {
+    const { container } = await setup();
+    await fireEvent.click(screen.getAllByRole('button', { name: /Edit policy/ })[0]);
+    const create = screen.getByRole('button', { name: 'Create override' });
+    expect(create).toBeEnabled();
+    expect(create).toHaveClass('primary');
+    await fireEvent.click(create);
+    await waitFor(() => expect(mocks.upsertRollupPolicy).toHaveBeenCalledWith({
+      node_id: 'global',
+      node_type: 'global',
+      policy,
+    }));
+    expect(screen.getByText('Override saved.')).toBeInTheDocument();
+    expect(container.querySelector('.row.node.selected')).not.toBeNull();
+  });
+
 });
