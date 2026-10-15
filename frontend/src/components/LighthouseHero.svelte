@@ -1,10 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import normalScene from '../assets/lighthouse-normal.png';
-  import springScene from '../assets/lighthouse-spring.png';
-  import summerScene from '../assets/lighthouse-summer.png';
-  import fallScene from '../assets/lighthouse-fall.png';
-  import winterScene from '../assets/lighthouse-winter.png';
+  import { sceneForSeason } from '../lib/seasonalScene';
   import {
     DEFAULT_SEASONAL_PREFERENCES,
     loadSeasonalPreferences,
@@ -17,7 +13,17 @@
 
   export type LighthouseHealth = 'operational' | 'degraded' | 'down' | 'unknown';
 
-  let { health = 'operational' }: { health?: LighthouseHealth } = $props();
+  let {
+    health = 'operational',
+    seasonalPreferences,
+    seasonalNow,
+    onSeasonalPreferencesChange,
+  }: {
+    health?: LighthouseHealth;
+    seasonalPreferences?: SeasonalPreferences;
+    seasonalNow?: Date;
+    onSeasonalPreferencesChange?: (next: SeasonalPreferences) => void;
+  } = $props();
 
   let recovering = $state(false);
   let previousHealth: LighthouseHealth | null = null;
@@ -63,14 +69,11 @@
     };
   }
 
-  const activeSeason = $derived(resolveSeason(preferences, currentDate));
-  const sceneImage = $derived(
-    activeSeason === 'spring' ? springScene
-      : activeSeason === 'summer' ? summerScene
-        : activeSeason === 'fall' ? fallScene
-          : activeSeason === 'winter' ? winterScene
-            : normalScene,
-  );
+  // Overview and the sidebar use one parent-owned preference when provided.
+  // Local state remains for standalone hero uses and existing embedded views.
+  const effectivePreferences = $derived(seasonalPreferences ?? preferences);
+  const activeSeason = $derived(resolveSeason(effectivePreferences, seasonalNow ?? currentDate));
+  const sceneImage = $derived(sceneForSeason(activeSeason));
   const ambientMotion = $derived(!reducedMotion && visible);
 
   $effect(() => {
@@ -88,15 +91,16 @@
 
   function persist(next: SeasonalPreferences) {
     preferences = next;
-    saveSeasonalPreferences(localStorage, next);
+    if (onSeasonalPreferencesChange) onSeasonalPreferencesChange(next);
+    else saveSeasonalPreferences(localStorage, next);
   }
 
   function setMode(mode: SeasonalMode) {
-    persist({ ...preferences, mode });
+    persist({ ...effectivePreferences, mode });
   }
 
   function setSeason(season: Season) {
-    persist({ ...preferences, season });
+    persist({ ...effectivePreferences, season });
   }
 
   function closeSettings(restoreFocus = false) {
@@ -271,15 +275,15 @@
     <div class="setting-head"><strong>Seasonal atmosphere</strong><span>Local to this browser</span></div>
     <div class="segmented" aria-label="Seasonal atmosphere mode">
       {#each ['off', 'auto', 'on'] as mode}
-        <button class:active={preferences.mode === mode} aria-pressed={preferences.mode === mode} onclick={() => setMode(mode as SeasonalMode)}>{mode === 'on' ? 'On' : mode[0].toUpperCase() + mode.slice(1)}</button>
+        <button class:active={effectivePreferences.mode === mode} aria-pressed={effectivePreferences.mode === mode} onclick={() => setMode(mode as SeasonalMode)}>{mode === 'on' ? 'On' : mode[0].toUpperCase() + mode.slice(1)}</button>
       {/each}
     </div>
-    {#if preferences.mode === 'auto'}<p>Auto follows your browser’s local date.</p>{/if}
-    {#if preferences.mode === 'on'}
+    {#if effectivePreferences.mode === 'auto'}<p>Auto follows your browser’s local date.</p>{/if}
+    {#if effectivePreferences.mode === 'on'}
       <div class="setting-label">Season</div>
       <div class="season-grid" aria-label="Season">
         {#each ['fall', 'winter', 'spring', 'summer'] as season}
-          <button class:active={preferences.season === season} aria-pressed={preferences.season === season} onclick={() => setSeason(season as Season)}>{season[0].toUpperCase() + season.slice(1)}</button>
+          <button class:active={effectivePreferences.season === season} aria-pressed={effectivePreferences.season === season} onclick={() => setSeason(season as Season)}>{season[0].toUpperCase() + season.slice(1)}</button>
         {/each}
       </div>
     {/if}

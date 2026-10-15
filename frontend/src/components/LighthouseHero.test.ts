@@ -68,6 +68,30 @@ describe('LighthouseHero', () => {
     expect(photo.querySelector('img')?.getAttribute('src')).not.toBe(summerSource);
   });
 
+  it('reports preference changes to a shared parent and follows the updated scene', async () => {
+    const onSeasonalPreferencesChange = vi.fn();
+    const seasonalNow = new Date(2026, 6, 15, 12);
+    const summer = { mode: 'on' as const, season: 'summer' as const, holidayExtras: true };
+    const { container, rerender } = render(LighthouseHero, {
+      props: { seasonalPreferences: summer, seasonalNow, onSeasonalPreferencesChange },
+    });
+    expect(container.querySelector('.photo-landscape')).toHaveAttribute('data-season', 'summer');
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Seasonal atmosphere settings' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Winter' }));
+    expect(onSeasonalPreferencesChange).toHaveBeenCalledWith({ ...summer, season: 'winter' });
+    // Parent controls persistence. The isolated hero must not write its own
+    // competing browser preference when a shared handler is present.
+    expect(localStorage.getItem(SEASONAL_STORAGE_KEY)).toBeNull();
+
+    await rerender({
+      seasonalPreferences: { ...summer, season: 'winter' },
+      seasonalNow,
+      onSeasonalPreferencesChange,
+    });
+    expect(container.querySelector('.photo-landscape')).toHaveAttribute('data-season', 'winter');
+  });
+
   it('suppresses all ambient behavior when reduced motion is requested', async () => {
     reduced = true;
     vi.useFakeTimers();

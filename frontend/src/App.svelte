@@ -41,6 +41,14 @@
     hashForIncidentEditor,
   } from './lib/router';
   import { createSessionChecker } from './lib/session';
+  import {
+    DEFAULT_SEASONAL_PREFERENCES,
+    SEASONAL_STORAGE_KEY,
+    loadSeasonalPreferences,
+    resolveSeason,
+    saveSeasonalPreferences,
+    type SeasonalPreferences,
+  } from './lib/seasonalAtmosphere';
   import { debounce, debounceByKey } from './lib/debounce';
   import {
     formatAbsolute,
@@ -222,6 +230,17 @@
   // acting on that guess flashes a sign-in prompt at someone already signed in.
   let sessionChecked = $state(false);
   let adminView = $state<'none' | 'login'>('none');
+
+  // The hero controls and the persistent navigation share one seasonal choice.
+  // It is local to this browser, with updates also reflected across tabs.
+  let seasonalPreferences = $state<SeasonalPreferences>({ ...DEFAULT_SEASONAL_PREFERENCES });
+  let seasonalNow = $state(new Date());
+  const selectedSeason = $derived(resolveSeason(seasonalPreferences, seasonalNow));
+
+  function updateSeasonalPreferences(next: SeasonalPreferences) {
+    seasonalPreferences = next;
+    saveSeasonalPreferences(localStorage, next);
+  }
 
   // Tracks whether we pushed our own entry, so the in-app Back button never
   // walks off the site when someone deep-linked straight to a subpage.
@@ -715,6 +734,17 @@
   });
 
   onMount(() => {
+    seasonalPreferences = loadSeasonalPreferences(localStorage);
+    seasonalNow = new Date();
+    // Auto mode follows the local date even when Overview isn't mounted.
+    const dateInterval = window.setInterval(() => (seasonalNow = new Date()), 60_000);
+    const refreshDate = () => { if (document.visibilityState === 'visible') seasonalNow = new Date(); };
+    const syncFromStorage = (event: StorageEvent) => {
+      if (event.key === SEASONAL_STORAGE_KEY || event.key === null)
+        seasonalPreferences = loadSeasonalPreferences(localStorage);
+    };
+    window.addEventListener('storage', syncFromStorage);
+    document.addEventListener('visibilitychange', refreshDate);
     load();
     // Cookie-only: the server is the sole authority on whether we're signed in.
     void checkSession();
@@ -756,6 +786,9 @@
     };
     window.addEventListener('popstate', onPop);
     return () => {
+      window.clearInterval(dateInterval);
+      window.removeEventListener('storage', syncFromStorage);
+      document.removeEventListener('visibilitychange', refreshDate);
       conn.close();
       window.removeEventListener('popstate', onPop);
       refreshStatusSoon.cancel();
@@ -813,6 +846,7 @@
       {nodeMode}
       authenticated={sessionChecked && authenticated}
       overview={panel === 'overview' && sessionChecked && authenticated}
+      season={selectedSeason}
       onSelect={(id) => selectPanel(id as AdminPanel)}
       onHome={goHome}
       onSignOut={signOut}
@@ -829,7 +863,7 @@
             </div>
           </div>
         {:else if panel === 'overview'}
-          <NightwatchOverview {checks} totalChecks={statusTotal} hasMore={statusHasMore || statusPage > 0} incidents={adminIncidents} groups={adminIncidentGroups} {alerts} {fleet} {maintenance} {loading} {error} {wsStatus} {nodeMode} onOpenCheck={openDetail} onOpenIncident={openIncidentEditor} onPanel={(id) => { const target = ADMIN_PANELS.find((p) => p.id === id); if (target) openAdmin(target.id); }} onAddCheck={() => openCheckEditor(null)} onRetry={load} onExpired={onExpired} />
+          <NightwatchOverview seasonalPreferences={seasonalPreferences} seasonalNow={seasonalNow} onSeasonalPreferencesChange={updateSeasonalPreferences} {checks} totalChecks={statusTotal} hasMore={statusHasMore || statusPage > 0} incidents={adminIncidents} groups={adminIncidentGroups} {alerts} {fleet} {maintenance} {loading} {error} {wsStatus} {nodeMode} onOpenCheck={openDetail} onOpenIncident={openIncidentEditor} onPanel={(id) => { const target = ADMIN_PANELS.find((p) => p.id === id); if (target) openAdmin(target.id); }} onAddCheck={() => openCheckEditor(null)} onRetry={load} onExpired={onExpired} />
         {:else if panel === 'checks' && editing}
           <!-- Keyed so back/forward between two checks rebuilds the editor
                instead of leaving one check's draft under another's id. -->
