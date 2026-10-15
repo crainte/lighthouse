@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import ConsoleIcon from './ConsoleIcon.svelte';
+  import lighthouseScene from '../assets/lighthouse-normal.png';
   import { fetchCluster } from '../lib/admin';
 
   type NavPanel = { id: string; label: string; group: string };
@@ -208,6 +209,22 @@
     flex-direction: column;
     padding: 26px 16px 14px;
     z-index: 5;
+    isolation: isolate;
+  }
+  /* Reuse Lightkeeper's existing lighthouse art; no separate Fleet-only
+     branding or animation, and no overlay on interactive controls. */
+  .sidebar::before {
+    content: '';
+    position: absolute;
+    z-index: -1;
+    pointer-events: none;
+    left: 0;
+    right: 0;
+    bottom: 120px;
+    height: min(44vh, 420px);
+    background: linear-gradient(to bottom, var(--nav) 0%, transparent 26%, rgba(10,18,30,.15) 70%, var(--nav) 100%),
+      url(${lighthouseScene}) center 40% / cover no-repeat;
+    opacity: .55;
   }
   .brand {
     display: flex;
