@@ -4,7 +4,7 @@
 // building (`hashFor*`) live here as pure functions so the routes themselves
 // are unit-testable without mounting the app.
 
-export type FleetTab = 'overview' | 'agents' | 'regions' | 'credentials' | 'registration';
+export type FleetTab = 'overview' | 'agents' | 'regions' | 'access';
 
 export type View<Panel extends string> =
   | { name: 'home' }
@@ -57,13 +57,16 @@ export function viewFromHash<Panel extends string>(
     };
   }
   // Fleet tabs have their own permalinks and Back/Forward history.
-  const fleet = hash.match(/^#\/admin\/fleet(?:\/(overview|agents|regions|credentials|registration))?\/?$/);
-  if (fleet) return { name: 'admin', panel: 'fleet' as Panel, fleetTab: (fleet[1] ?? 'overview') as FleetTab };
+  const fleet = hash.match(/^#\/admin\/fleet(?:\/(overview|agents|regions|access|credentials|registration))?\/?$/);
+  if (fleet) {
+    const oldTab = fleet[1] === 'credentials' || fleet[1] === 'registration';
+    return { name: 'admin', panel: 'fleet' as Panel, fleetTab: oldTab ? 'access' : (fleet[1] ?? 'overview') as FleetTab };
+  }
 
   // Preserve old bookmarked admin pages after the Fleet consolidation.
   const oldFleet = hash.match(/^#\/admin\/(agents|credentials|cluster)\/?$/);
   if (oldFleet) {
-    const tab: FleetTab = oldFleet[1] === 'agents' ? 'agents' : oldFleet[1] === 'credentials' ? 'credentials' : 'overview';
+    const tab: FleetTab = oldFleet[1] === 'agents' ? 'agents' : oldFleet[1] === 'credentials' ? 'access' : 'overview';
     return { name: 'admin', panel: 'fleet' as Panel, fleetTab: tab };
   }
   const admin = hash.match(/^#\/admin(?:\/([^/]*))?\/?$/);
