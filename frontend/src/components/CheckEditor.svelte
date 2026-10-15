@@ -207,11 +207,13 @@
   );
 
   const placementNote = $derived.by(() => {
-    if (pinned)
-      return `pinned to ${draft.agents.length} ${draft.agents.length === 1 ? 'agent' : 'agents'}`;
-    if (effect.total === 0) return 'nothing probes this';
-    const domains = effect.domains.length;
-    return `${effect.total} ${effect.total === 1 ? 'probe' : 'probes'} across ${domains} ${draft.placement.mode}${domains === 1 ? '' : 's'}`;
+    if (pinned) {
+      const active = draft.agents.filter((agentId) => reporting.has(agentId)).length;
+      return `Pinned to ${draft.agents.length} ${draft.agents.length === 1 ? 'agent' : 'agents'} · ${active} reporting`;
+    }
+    const location = draft.placement.regions.length || draft.placement.zones.length ? 'Selected locations' : 'All locations';
+    const count = draft.placement.count ?? 1;
+    return `${location} · ${count} per ${draft.placement.mode} · ${effect.total} projected ${effect.total === 1 ? 'probe' : 'probes'}`;
   });
 
   /** Counts only what departs from the coordinator's own defaults, so the badge
