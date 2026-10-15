@@ -34,7 +34,7 @@ rand = "0.10"
 subtle = "2"
 # Custom UP/DOWN eval. Vendored so the build needs no system Lua; the runtime is
 # sandboxed in script.rs — this executes user-supplied code.
-mlua = { version = "0.9", features = ["lua54", "vendored"] }
+mlua = { version = "0.12", features = ["lua54", "vendored"] }
 # Cron schedules for checks. Six-field (seconds-first) expressions keep
 # sub-minute intervals expressible, which a five-field cron cannot do.
 cron = "0.17"
