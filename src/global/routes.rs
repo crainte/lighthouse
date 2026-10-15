@@ -485,7 +485,7 @@ fn take_array(value: &mut serde_json::Value) -> Vec<serde_json::Value> {
 #[derive(Serialize)]
 struct ClusterLinkDto {
     source: String,
-    target: &'static str,
+    target: String,
     source_generation: i64,
     observed_at: i64,
     outcome: &'static str,
@@ -549,7 +549,7 @@ async fn cluster_handler(
         .filter(|r| r.age_ms >= 0)
         .map(|r| ClusterLinkDto {
             source: r.region.clone(),
-            target: "global",
+            target: "global".into(),
             source_generation: 0,
             observed_at: now - r.age_ms,
             outcome: if r.stale { "failed" } else { "connected" },
@@ -585,6 +585,15 @@ async fn cluster_handler(
             };
             (me.clone(), vec![me], vec![], None)
         };
+    // Region reports terminate at the serving global peer, not a
+    // synthetic "global" id when global clustering is configured.
+    let links: Vec<ClusterLinkDto> = links
+        .into_iter()
+        .map(|mut link| {
+            link.target = me.node_id.clone();
+            link
+        })
+        .collect();
     Json(ClusterResponse {
         me,
         members,
