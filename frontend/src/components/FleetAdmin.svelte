@@ -17,25 +17,18 @@
     { id: 'overview', title: 'Overview' },
     { id: 'agents', title: 'Agents' },
     { id: 'regions', title: 'Regions & zones' },
-    { id: 'credentials', title: 'Credentials' },
-    { id: 'registration', title: 'Registration' },
+    { id: 'access', title: 'Access & enrollment' },
   ];
 </script>
 
 <section class="fleet-workspace" aria-label="Fleet workspace">
-  <div class="fleet-toolbar">
-    <nav class="fleet-tabs" aria-label="Fleet views">
-      {#each tabs as item (item.id)}
-        <button class:active={tab === item.id} aria-current={tab === item.id ? 'page' : undefined} onclick={() => onNavigate(item.id)}>
-          {item.title}
-        </button>
-      {/each}
-    </nav>
-    <div class="fleet-quick-actions">
-      {#if nodeMode === 'global'}<button class="fleet-quick" onclick={() => onNavigate('registration')}>+ Register region</button>{/if}
-      <button class="fleet-quick" onclick={() => onNavigate('credentials')}>+ Issue agent token</button>
-    </div>
-  </div>
+  <nav class="fleet-tabs" aria-label="Fleet views">
+    {#each tabs as item (item.id)}
+      <button class:active={tab === item.id} aria-current={tab === item.id ? 'page' : undefined} onclick={() => onNavigate(item.id)}>
+        {item.title}
+      </button>
+    {/each}
+  </nav>
 
   {#if tab === 'overview'}
     <FleetOverview mode="overview" {onNavigate} {onexpired} />
@@ -44,54 +37,59 @@
     <AgentsAdmin {onexpired} {onopen} />
   {:else if tab === 'regions'}
     <FleetOverview mode="regions" {onNavigate} {onexpired} />
-  {:else if tab === 'credentials'}
-    <div class="fleet-tab-intro"><h3>Credentials</h3><p>Generate, rotate, and revoke the zone-scoped tokens your agents use to join the fleet.</p></div>
-    <AgentCredentials {onexpired} />
-  {:else if tab === 'registration'}
-    <div class="fleet-tab-intro"><h3>Expand the deployment</h3><p>Onboard regions and agents without leaving the Fleet workspace.</p></div>
-    <div class="setup-steps" aria-label="Deployment setup steps">
-      <div><span>1</span>Register region <small>Global deployments only</small></div>
-      <div><span>2</span>Configure coordinator <small>Use the issued region key</small></div>
-      <div><span>3</span>Issue agent token <small>Choose region and zone</small></div>
-      <div><span>4</span>Verify reporting <small>Inspect agents in Fleet</small></div>
-    </div>
-    {#if nodeMode === 'global'}
-      <div class="registration-block"><h4>Region registration</h4><p>Create or rotate keys used by regional coordinators when they report to the global control plane.</p><RegionsAdmin {onexpired} /></div>
-    {:else}
-      <div class="registration-block"><h4>Regional deployment</h4><p>Global registration isn't needed in a regional-only or standalone deployment. Your agent credentials are scoped to the region and zone where those agents run.</p></div>
-    {/if}
-    <div class="registration-block">
-      <h4>Enroll agents</h4>
-      <p>Generate a zone-scoped credential, configure your agent with the issued token, then verify that it reports. Tokens are only shown once, so credential generation and revocation stay together in the Credentials view.</p>
-      <div class="setup-actions">
-        <button class="btn primary" onclick={() => onNavigate('credentials')}>Open credentials →</button>
-        <button class="btn" onclick={() => onNavigate('agents')}>Verify agents →</button>
+  {:else if tab === 'access'}
+    <section class="enrollment-hero" aria-label="Enrollment steps">
+      <span class="hero-symbol" aria-hidden="true">♧</span>
+      <div class="hero-description">
+        <h3>Onboard agents in two steps</h3>
+        <p>{nodeMode === 'global' ? 'First register a region to create its coordinator key, then issue agent credentials for zones inside that region.' : 'Issue agent credentials for zones in this region. Regional-only and standalone deployments do not need global registration.'}</p>
       </div>
-    </div>
+      <div class="hero-steps">
+        {#if nodeMode === 'global'}
+          <div><span class="step-disc">1</span><div><strong>Register region</strong><small>Generate a regional coordinator key</small></div></div>
+          <span class="step-arrow">›</span>
+        {/if}
+        <div><span class="step-disc">2</span><div><strong>Issue agent credentials</strong><small>Generate zone-scoped agent tokens</small></div></div>
+      </div>
+    </section>
+
+    {#if nodeMode === 'global'}
+      <section class="access-panel" aria-label="Regional coordinator access">
+        <header class="access-heading"><span class="section-number">1</span><div><h3>Region registration</h3><p>Register regions that can report to the global control plane. A key is issued only when registered or rotated.</p></div></header>
+        <RegionsAdmin {onexpired} />
+      </section>
+    {/if}
+    <section class="access-panel" aria-label="Zone agent credentials">
+      <header class="access-heading"><span class="section-number">2</span><div><h3>Agent credentials</h3><p>Create zone-scoped keys after registering the region. Agents within one zone can share a credential.</p></div></header>
+      <AgentCredentials {onexpired} {nodeMode} embedded />
+    </section>
   {/if}
 </section>
 
 <style>
   .fleet-workspace { min-width:0; }
-  .fleet-toolbar {display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;margin-bottom:20px;border-bottom:1px solid #243b51;}
-  .fleet-tabs {display:flex;align-items:center;gap:3px;overflow-x:auto;max-width:100%;}
-  .fleet-tabs button {flex:none;min-height:45px;padding:10px 15px;background:transparent;border:0;border-bottom:2px solid transparent;font:inherit;font-size:12px;color:#9bb0c4;cursor:pointer;}
+  .fleet-tabs {display:flex;align-items:center;gap:3px;overflow-x:auto;max-width:100%;border-bottom:1px solid #243b51;margin-bottom:20px;}
+  .fleet-tabs button {flex:none;min-height:45px;padding:10px 16px;background:transparent;border:0;border-bottom:2px solid transparent;font:inherit;font-size:12px;color:#9bb0c4;cursor:pointer;}
   .fleet-tabs button:hover {background:#132839;color:#e5eef6;}
   .fleet-tabs button.active {color:#e6f4fa;border-bottom-color:#56d4e4;background:#102a3f;}
-  .fleet-tabs button:focus-visible,.fleet-quick:focus-visible {outline:2px solid #56d4e4;outline-offset:-2px;}
-  .fleet-quick-actions {display:flex;gap:8px;flex-wrap:wrap;padding-bottom:8px;}
-  .fleet-quick {font:inherit;font-size:12px;border:1px solid #2c607d;color:#8bd2e5;background:#0d2637;border-radius:7px;padding:8px 11px;cursor:pointer;}
-  .fleet-quick:hover {background:#14394b;border-color:#56d4e4;}
+  .fleet-tabs button:focus-visible {outline:2px solid #56d4e4;outline-offset:-2px;}
   .fleet-tab-intro {margin:6px 0 18px;}
   .fleet-tab-intro h3 {font-size:16px;font-weight:600;margin:0 0 5px;}
   .fleet-tab-intro p {font-size:12px;color:#96acc0;margin:0;}
-  .setup-steps {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:18px;}
-  .setup-steps>div {display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:13px;color:#d8e7f0;font-size:12px;background:#0f1d2e;border:1px solid #294054;border-radius:8px;}
-  .setup-steps span {display:grid;place-items:center;width:23px;height:23px;border:1px solid #36748e;border-radius:50%;color:#72c8e0;}
-  .setup-steps small {display:block;flex-basis:100%;color:#8fa4b7;margin-left:31px;}
-  .registration-block {min-width:0;padding:18px;margin-bottom:16px;background:#101b29;border:1px solid #22364b;border-radius:9px;}
-  .registration-block h4 {font-size:14px;margin:0 0 7px;}.registration-block>p {font-size:12px;color:#94aabe;line-height:1.5;max-width:70ch;}
-  .setup-actions {display:flex;flex-wrap:wrap;gap:10px;margin-top:14px;}
-  @media (max-width:950px) {.setup-steps {grid-template-columns:repeat(2,minmax(0,1fr));}}
-  @media (max-width:650px) {.setup-steps {grid-template-columns:1fr;}.fleet-tabs {width:100%;}.fleet-quick-actions {padding-bottom:12px;}}
+  .enrollment-hero {display:flex;align-items:center;gap:22px;flex-wrap:wrap;padding:20px;margin-bottom:16px;background:linear-gradient(100deg,#102438,#101d30);border:1px solid #2c4860;border-radius:9px;}
+  .hero-symbol {display:grid;place-items:center;flex:none;width:45px;height:45px;border:1px solid #3c8197;color:#78ddeb;border-radius:10px;font-size:24px;}
+  .hero-description {flex:1;min-width:230px;}
+  .hero-description h3 {margin:0 0 5px;font-size:15px;font-weight:650;}
+  .hero-description p {color:#a0b5c6;max-width:67ch;margin:0;font-size:12px;line-height:1.55;}
+  .hero-steps {display:flex;align-items:center;flex-wrap:wrap;gap:13px;}
+  .hero-steps>div {display:flex;align-items:center;gap:10px;max-width:175px;}
+  .hero-steps strong {display:block;font-size:11px;}
+  .hero-steps small {display:block;margin-top:3px;font-size:10px;color:#93aabe;line-height:1.4;}
+  .step-disc,.section-number {display:grid;place-items:center;flex:none;width:33px;height:33px;border:1px solid #5bd1d7;border-radius:50%;color:#71dfe5;font-size:14px;}
+  .step-arrow {color:#6ca9bb;font-size:24px;}
+  .access-panel {min-width:0;padding:20px;margin-bottom:16px;background:#101b29;border:1px solid #284157;border-radius:9px;}
+  .access-heading {display:flex;align-items:center;gap:13px;margin:0 0 18px;}
+  .access-heading h3 {margin:0 0 4px;font-size:15px;font-weight:650;}
+  .access-heading p {margin:0;font-size:11px;color:#a0b2c4;line-height:1.5;}
+  @media (max-width:650px) {.enrollment-hero,.access-panel {padding:13px;}.hero-steps{width:100%;}.fleet-tabs button{padding:10px 12px;}}
 </style>
