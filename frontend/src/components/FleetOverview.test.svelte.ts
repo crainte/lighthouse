@@ -43,6 +43,7 @@ describe('Fleet overview', () => {
       self: member('global-a'),
       global_peers: [member('global-a'), member('global-b')],
       members: [member('tw'), member('us')],
+      regions: [{ region: 'tw', members: [member('coordinator-tw')], links: [], now, link_stale_after_ms: 30000, available: true }],
       now,
     } satisfies ClusterResponse);
     mocks.fetchAgents.mockResolvedValue({
@@ -58,6 +59,7 @@ describe('Fleet overview', () => {
     expect(plane).not.toHaveTextContent('tw-coordinator');
     const tw = screen.getByRole('region', { name: 'Region tw' });
     expect(tw).toHaveTextContent('tw-north-1a');
+    expect(tw).toHaveTextContent('coordinator-tw');
     expect(tw).toHaveTextContent('agent-tw');
     expect(screen.getByRole('complementary', { name: 'Fleet health and recent agent reports' })).toHaveTextContent('Connectivity only');
 
@@ -65,8 +67,7 @@ describe('Fleet overview', () => {
     expect(tw).not.toHaveTextContent('agent-tw');
     await fireEvent.click(within(tw).getByRole('button', { name: /tw-north-1a/ }));
     expect(tw).toHaveTextContent('agent-tw');
-    await fireEvent.click(screen.getByRole('button', { name: /All regions/ }));
-    expect(onNavigate).toHaveBeenCalledWith('regions');
+    expect(screen.getByText('2 regions')).toBeInTheDocument();
   });
 
   it('does not invent a global control plane for a regional singleton', async () => {
