@@ -224,7 +224,10 @@
     bottom: 110px;
     height: min(38vh, 340px);
     background-size: auto 100%;
-    background-position: 76% center;
+    /* The subject sits on the right side of every seasonal scene.
+       Anchor the crop to the far-left coast/water so the sidebar stays
+       atmospheric without showing even an edge of the lighthouse. */
+    background-position: left center;
     background-repeat: no-repeat;
     opacity: .34;
     pointer-events: none;
