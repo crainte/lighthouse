@@ -392,7 +392,7 @@ async fn status_handler(State(node): State<GlobalNode>, uri: Uri) -> Response {
 
 // The region roster, shaped as the cluster-membership view so the admin
 // "cluster" panel lists regions instead of peer coordinators.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ClusterMemberDto {
     node_id: String,
     url: String,
@@ -418,6 +418,11 @@ struct ClusterResponse {
     links: Vec<ClusterLinkDto>,
     link_stale_after_ms: i64,
     regions: Vec<RegionRosterDto>,
+    /// Global-to-global peers, distinct from `members` (regional reports).
+    global_peers: Vec<ClusterMemberDto>,
+    /// Observed links between global control-plane peers.
+    global_links: Vec<crate::coordinator::cluster::LinkObservation>,
+    global_link_stale_after_ms: Option<i64>,
 }
 
 /// One region's own coordinator cluster, exactly as that region's
@@ -486,6 +491,19 @@ struct ClusterLinkDto {
     outcome: &'static str,
 }
 
+fn global_member_dto(member: crate::coordinator::cluster::Member) -> ClusterMemberDto {
+    ClusterMemberDto {
+        node_id: member.node_id,
+        url: member.url,
+        generation: member.generation,
+        last_seen: member.last_seen,
+        state: member.state.as_str(),
+        build: member.build,
+        protocol: member.protocol,
+        origin: None,
+    }
+}
+
 async fn cluster_handler(
     State(node): State<GlobalNode>,
     _admin: crate::http::AdminSession,
@@ -537,23 +555,47 @@ async fn cluster_handler(
             outcome: if r.stale { "failed" } else { "connected" },
         })
         .collect();
+    // Global peers are a separate cluster, not regional report members.
+    let (me, global_peers, global_links, global_link_stale_after_ms) =
+        if let Some(cluster) = node.inner.cluster.as_ref() {
+            let me = global_member_dto(cluster.self_member(now));
+            let mut peers: Vec<_> = cluster
+                .snapshot()
+                .into_iter()
+                .filter(|peer| peer.node_id != me.node_id)
+                .map(global_member_dto)
+                .collect();
+            peers.insert(0, me.clone());
+            (
+                me,
+                peers,
+                cluster.link_snapshot(),
+                Some(cluster.link_stale_after_ms()),
+            )
+        } else {
+            let me = ClusterMemberDto {
+                node_id: "global".into(),
+                url: String::new(),
+                generation: 0,
+                last_seen: now,
+                state: "alive",
+                build: Some(crate::version::current().to_string()),
+                protocol: None,
+                origin: None,
+            };
+            (me.clone(), vec![me], vec![], None)
+        };
     Json(ClusterResponse {
-        me: ClusterMemberDto {
-            node_id: "global".into(),
-            url: String::new(),
-            generation: 0,
-            last_seen: now,
-            state: "alive",
-            build: Some(crate::version::current().to_string()),
-            protocol: None,
-            origin: None,
-        },
+        me,
         members,
         now,
         mode: "global",
         links,
         link_stale_after_ms: node.inner.cache.staleness_ms(),
         regions,
+        global_peers,
+        global_links,
+        global_link_stale_after_ms,
     })
     .into_response()
 }
