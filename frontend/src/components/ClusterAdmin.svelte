@@ -220,7 +220,7 @@
                 class:chosen={!agentSelection && selected?.node_id === m.node_id}
                 class:polled={agentSelection?.coordinator === m.node_id}
                 onclick={() => selectMember(m.node_id)}
-                aria-label={m.node_id + ', ' + m.state + (m.node_id === cluster.self.node_id ? ', current node' : '')}
+                aria-label={m.node_id + ' Coordinator · ' + m.state + (m.node_id === cluster.self.node_id ? ' · This node' : '')}
               >
                 <span class="node-dot {tone(m.state)}"></span>
                 <strong>{m.node_id}</strong>
@@ -303,7 +303,7 @@
                               onclick={() => selectAgent(a.agent_id)}
                             >
                               <span class="node-dot" class:green={a.status === 'up'} class:amber={a.status !== 'up'}></span>
-                              <span class="agent-copy"><strong>{a.agent_id}</strong><small>{a.status === 'up' ? 'Reporting' : 'Silent'}{a.coordinator ? ' · polls ' + a.coordinator : ''}</small></span>
+                              <span class="agent-copy"><strong>{a.agent_id}</strong><small>{a.status === 'up' ? 'Reporting' : 'Silent'}</small></span>
                             </button>
                           {/each}
                         </div>
