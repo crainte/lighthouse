@@ -565,6 +565,8 @@ async fn cluster_handler(
                 .filter(|peer| peer.node_id != me.node_id)
                 .map(global_member_dto)
                 .collect();
+            // HashMap-backed membership snapshots have no stable peer order.
+            peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
             peers.insert(0, me.clone());
             (
                 me,
