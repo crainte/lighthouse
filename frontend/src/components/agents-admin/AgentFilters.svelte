@@ -8,6 +8,7 @@
     zoneFilter = $bindable(),
     showRetired = $bindable(),
     grouped,
+    hideGrouping = false,
     onSetGrouped,
     regionOptions,
     zoneOptions,
@@ -24,6 +25,7 @@
     zoneFilter: string;
     showRetired: boolean;
     grouped: boolean;
+    hideGrouping?: boolean;
     onSetGrouped: (on: boolean) => void;
     regionOptions: string[];
     zoneOptions: string[];
@@ -49,8 +51,8 @@
     class="search"
     type="search"
     bind:value={search}
-    placeholder="Search agent, zone or region"
-    aria-label="Search agents by id, zone or region"
+    placeholder="Search agent, zone, region, coordinator or build"
+    aria-label="Search agents by id, zone, region, coordinator or build"
   />
   </label>
   <div class="status-field"><span class="pick-label">Connectivity</span>
@@ -97,10 +99,12 @@
       <span>Retired <em>({retiredCount})</em></span>
     </label>
   {/if}
-  <label class="toggle">
-    <input type="checkbox" checked={grouped} onchange={(e) => onSetGrouped(e.currentTarget.checked)} />
-    <span>Group by location</span>
-  </label>
+  {#if !hideGrouping}
+    <label class="toggle">
+      <input type="checkbox" checked={grouped} onchange={(e) => onSetGrouped(e.currentTarget.checked)} />
+      <span>Group by location</span>
+    </label>
+  {/if}
 </div>
 
 <div class="count-line">
