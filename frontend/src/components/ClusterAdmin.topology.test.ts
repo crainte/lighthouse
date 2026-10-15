@@ -104,6 +104,6 @@ describe('Topology deployment map', () => {
 
     render(ClusterAdmin);
     expect(await screen.findByRole('region', { name: 'Global control plane' })).toHaveTextContent('1 node · standalone');
-    expect(screen.getByRole('button', { name: 'global, alive, current node' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'global Coordinator · alive · This node' })).toBeInTheDocument();
   });
 });
