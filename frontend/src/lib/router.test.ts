@@ -55,12 +55,15 @@ describe('viewFromHash', () => {
 
   it('keeps Fleet tabs addressable and old admin bookmarks compatible', () => {
     const fleetPanels = ['overview', 'fleet', 'checks'] as const;
-    for (const tab of ['overview', 'agents', 'regions', 'access'] as const) {
+    for (const tab of ['overview', 'agents', 'access'] as const) {
       expect(viewFromHash(hashForFleet(tab), fleetPanels, 'overview')).toEqual({
         name: 'admin', panel: 'fleet', fleetTab: tab,
       });
     }
     expect(viewFromHash('#/admin/fleet', fleetPanels, 'overview')).toEqual({
+      name: 'admin', panel: 'fleet', fleetTab: 'overview',
+    });
+    expect(viewFromHash('#/admin/fleet/regions', fleetPanels, 'overview')).toEqual({
       name: 'admin', panel: 'fleet', fleetTab: 'overview',
     });
     expect(viewFromHash('#/admin/fleet/credentials', fleetPanels, 'overview')).toEqual({
