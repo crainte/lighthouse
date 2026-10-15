@@ -4,10 +4,12 @@
   import { fetchAgents, UNKNOWN_LOCATION } from '../lib/api';
   import { AdminError, fetchCluster, type ClusterResponse, type ClusterMember } from '../lib/admin';
   import { formatRelativeTime } from '../lib/format';
+  import { regionFlag } from '../lib/regionFlag';
+  import type { FleetTab } from '../lib/router';
 
   let { mode = 'overview', onNavigate, onexpired }: {
     mode?: 'overview' | 'regions';
-    onNavigate: (tab: 'overview' | 'agents' | 'regions' | 'credentials' | 'registration') => void;
+    onNavigate: (tab: FleetTab) => void;
     onexpired?: () => void;
   } = $props();
 
@@ -120,7 +122,7 @@
       {#if cluster && mode === 'overview'}
         <section class="control-plane" aria-label="Control-plane membership">
           <div class="control-title">
-            <span class="plane-icon" aria-hidden="true">◇</span>
+            <span class="plane-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="4.5" r="3"/><circle cx="5" cy="19" r="3"/><circle cx="19" cy="19" r="3"/><path d="M10.3 7 6 16m8-9 4 9M8 19h8"/></svg></span>
             <div>
               <h3>{cluster.mode === 'global' ? 'Global control plane' : 'Regional control plane'}</h3>
               <p>{peers.length} {peers.length === 1 ? 'node' : 'nodes'} · {peers.length > 1 ? 'Clustered' : 'Standalone'} · {cluster.mode === 'global' ? 'Global role' : 'Regional role'}</p>
@@ -153,7 +155,7 @@
           <section class="fleet-region" aria-label={'Region ' + label(region.name)}>
             <button class="region-toggle" onclick={() => toggle(region.name)} aria-expanded={!collapsed.has(region.name)}>
               <span class="chev" class:closed={collapsed.has(region.name)}>⌄</span>
-              <span class="region-mark" class:warning={regionStatus(region) === 'silent'}>◎</span>
+              <span class="region-mark" class:warning={regionStatus(region) === 'silent'} class:flagged={!!regionFlag(region.name)} aria-hidden="true">{regionFlag(region.name) ?? '◎'}</span>
               <strong>{label(region.name)}</strong>
               <span class="state-chip" class:warning={regionStatus(region) !== 'connected' && regionStatus(region) !== 'reporting'}>{regionStatus(region)}</span>
               <span class="region-summary">{region.zones.length} {region.zones.length === 1 ? 'zone' : 'zones'} · {region.agents.length} {region.agents.length === 1 ? 'agent' : 'agents'}</span>
@@ -193,7 +195,7 @@
                   {/if}
                 </div>
               {:else}
-                <div class="empty-zone">No zones have reported yet. <button class="quiet-link" onclick={() => onNavigate('registration')}>Add a location →</button></div>
+                <div class="empty-zone">No zones have reported yet. <button class="quiet-link" onclick={() => onNavigate('access')}>Add a location →</button></div>
               {/each}
             {/if}
           </section>
@@ -201,7 +203,7 @@
           <div class="fleet-empty">
             <h3>No locations yet</h3>
             <p>Start a regional coordinator or enroll an agent. Single-node deployments don't require extra hierarchy.</p>
-            <button class="btn primary" onclick={() => onNavigate('registration')}>Set up deployment</button>
+            <button class="btn primary" onclick={() => onNavigate('access')}>Set up deployment</button>
           </div>
         {/each}
       </div>
@@ -248,7 +250,7 @@
   .control-title { display:flex;align-items:center;gap:12px; }
   .control-title h3,.aside-heading h3,.regions-topline h3 { color:#e6eef6;font-size:14px;margin:0;font-weight:650; }
   .control-title p,.regions-topline p { color:#8ca2b6;font-size:11px;margin:5px 0 0; }
-  .plane-icon { display:grid;place-items:center;width:39px;height:39px;border:1px solid #275b71;border-radius:9px;color:#65d5e3;font-size:27px;background:#0c2738; }
+  .plane-icon { display:grid;place-items:center;flex:none;line-height:0;width:39px;height:39px;border:1px solid #275b71;border-radius:9px;color:#65d5e3;font-size:27px;background:#0c2738; }
   .plane-badge { margin-left:auto;font-size:11px;color:#62d8af;border-radius:20px;background:#0e302b;border:1px solid #255d4c;padding:5px 9px;white-space:nowrap; }
   .plane-badge.warning { color:#e8b578;background:#312618;border-color:#785433; }
   .plane-peers { display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,165px),1fr));gap:8px;margin-top:15px; }
@@ -264,7 +266,7 @@
   .region-toggle { min-height:60px;padding:12px 16px; }.region-toggle:hover,.zone-toggle:hover { background:#172b3c; }
   .region-toggle:focus-visible,.zone-toggle:focus-visible,.agent-drill:focus-visible { outline:2px solid #56d4e4;outline-offset:-3px; }
   .chev { color:#80a3bb;transform:rotate(0);transition:transform .15s ease; }.chev.closed { transform:rotate(-90deg); }
-  .region-mark { display:grid;place-items:center;width:28px;height:28px;color:#55cae1;background:#0e293c;border:1px solid #245a6e;border-radius:7px; }.region-mark.warning { color:#eab06f; }
+  .region-mark { display:grid;place-items:center;width:28px;height:28px;color:#55cae1;background:#0e293c;border:1px solid #245a6e;border-radius:7px; }.region-mark.warning { color:#eab06f; }.region-mark.flagged { font-size:19px;line-height:1; }
   .region-toggle strong { font-size:15px; }.region-summary { font-size:11px;color:#9db1c3; }
   .state-chip { font-size:10px;color:#51cfa8;background:#0b302b;border:1px solid #245c49;border-radius:14px;padding:4px 8px;white-space:nowrap; }
   .state-chip.warning { color:#e9b06f;background:#2d231c;border-color:#705237; }
