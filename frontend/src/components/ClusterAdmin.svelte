@@ -267,7 +267,7 @@
                     <p class="topology-note">Regional coordinator roster unavailable</p>
                   {:else if lane.roster?.members.length}
                     <div class="region-coordinators">
-                      {#each lane.roster.members as m (m.node_id)}
+                      {#each lane.roster?.members ?? [] as m (m.node_id)}
                         <button
                           class="coordinator-chip"
                           class:chosen={!agentSelection && selected?.node_id === m.node_id}
