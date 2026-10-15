@@ -1,17 +1,21 @@
 <script lang="ts">
-  import type { AgentCredential } from '../lib/admin';
+  import type { AgentCredential, RegionRegistration } from '../lib/admin';
+  import { regionFlag } from '../lib/regionFlag';
+  import CredentialId from './CredentialId.svelte';
   import {
     AdminError,
     fetchAgentCredentials,
     createAgentCredential,
     revokeAgentCredential,
     deleteAgentCredential,
+    fetchRegions,
   } from '../lib/admin';
   import { formatRelativeTime } from '../lib/format';
 
-  let { onexpired }: { onexpired?: () => void } = $props();
+  let { onexpired, embedded = false, nodeMode = 'global' }: { onexpired?: () => void; embedded?: boolean; nodeMode?: string } = $props();
 
   let credentials = $state<AgentCredential[]>([]);
+  let knownRegions = $state<RegionRegistration[]>([]);
   let loading = $state(true);
   let loadError = $state<string | null>(null);
   let unavailableRegions = $state<string[]>([]);
@@ -62,6 +66,9 @@
   }
 
   refresh();
+  if (nodeMode === 'global') {
+    void fetchRegions().then((items) => (knownRegions = items)).catch(() => { /* Region suggestions are optional; manual names still work. */ });
+  }
 
   async function create() {
     if (creating) return;
@@ -137,20 +144,19 @@
     </div>
   </div>
 {:else}
-  <div class="admin-panel">
-    <div class="panel-title">Zone credentials</div>
+  <div class="credential-container" class:admin-panel={!embedded}>
+    {#if !embedded}<div class="panel-title">Zone credentials</div>{/if}
     <p class="admin-muted lead">
-      Credentials authorize agents for a specific zone and region. Agents in a zone share the same
-      <code class="mono">[agent] token</code>. Tokens are shown only once when generated.
-      Revoking a credential immediately disconnects every agent using it. Deploy a replacement before revoking.
-      A revoked credential stays listed until you delete it.
+      Issue credentials to agents in a region and zone. Agents within a zone can share one
+      <code class="mono">[agent] token</code>. Secrets are shown only once. Deploy replacements
+      before revoking existing credentials, or agents using them will disconnect.
     </p>
 
     <form class="create" onsubmit={(e) => (e.preventDefault(), create())}>
-      <label class="field"><span class="field-label">Zone</span><input bind:value={zone} placeholder="Zone (e.g. eu-west-1a)" /></label>
-      <label class="field"><span class="field-label">Region</span><input bind:value={region} placeholder="Region (e.g. eu-west)" /></label>
+      <label class="field"><span class="field-label">Region</span><input bind:value={region} placeholder="Region (e.g. eu-west)" required list="registered-fleet-regions" /><datalist id="registered-fleet-regions">{#each knownRegions as r (r.name)}<option value={r.name}></option>{/each}</datalist></label>
+      <label class="field"><span class="field-label">Zone</span><input bind:value={zone} placeholder="Zone (e.g. eu-west-1a)" required /></label>
       <button class="btn primary" type="submit" disabled={creating}>
-        {creating ? 'Generating…' : 'Generate'}
+        {creating ? 'Issuing…' : 'Issue agent token'}
       </button>
     </form>
 
@@ -194,22 +200,23 @@
         recovered afterwards.
       </p>
     {:else}
+      <div class="list-heading"><strong>Issued agent credentials</strong><span>{ordered.length} credential{ordered.length === 1 ? '' : 's'} · IDs only, not recoverable secrets</span></div>
       <div class="admin-rows">
         <div class="row head">
-          <span>Zone</span>
           <span>Region</span>
-          <span>ID</span>
+          <span>Zone</span>
+          <span>Credential ID</span>
+          <span>Status</span>
           <span>Created</span>
-          <span></span>
+          <span>Actions</span>
         </div>
         {#each ordered as c (c.id)}
           <div class="row" class:revoked={c.revoked}>
+            <span class="region"><span class="flag" aria-hidden="true">{regionFlag(c.region) ?? '◎'}</span>{c.region}</span>
             <span class="zone">{c.zone}</span>
-            <span>{c.region}</span>
-            <span class="mono id">{c.id}</span>
-            <span title={new Date(c.created_at).toLocaleString()}
-              >{formatRelativeTime(c.created_at)}</span
-            >
+            <span class="mono id"><CredentialId id={c.id} /></span>
+            <span><span class="status" class:revoked={c.revoked}>{c.revoked ? 'Revoked' : 'Active'}</span></span>
+            <span title={new Date(c.created_at).toLocaleString()}>{formatRelativeTime(c.created_at)}</span>
             <span class="actions" class:confirming={pendingDelete === c.id || pendingRevoke === c.id}>
               {#if c.revoked && pendingDelete === c.id}
                 <span class="confirm">Delete “{c.zone}” from this list? It is already revoked.</span>
@@ -299,12 +306,12 @@
     display: grid;
     /* Fixed action column: rows are separate grids, so an `auto` one sized
        per row and dragged every other column out of line with the header. */
-    grid-template-columns: minmax(7rem, 1fr) minmax(6rem, 0.8fr) minmax(7rem, 0.9fr) 6rem 11rem;
+    grid-template-columns: minmax(6rem, .7fr) minmax(7rem, .9fr) minmax(11rem, 1.35fr) 6rem 6rem minmax(10rem, 1fr);
     gap: 0.6rem;
     align-items: center;
     font-size: 0.8rem;
     padding: 12px 0;
-    min-width: 720px;
+    min-width: 870px;
     border-bottom: 1px solid rgba(48, 54, 61, 0.5);
   }
   .row:last-child {
@@ -358,6 +365,14 @@
     line-height: 1.4;
   }
 
+  .credential-container {min-width:0;}
+  .list-heading {display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;padding:10px 0;border-bottom:1px solid var(--border);font-size:13px;}
+  .list-heading span {font-size:11px;color:var(--text-dim);}
+  .admin-rows {max-width:100%;overflow-x:auto;}
+  .region {display:flex;align-items:center;gap:8px;}
+  .flag {font-size:18px;line-height:1;}
+  .status {display:inline-block;padding:4px 9px;border-radius:14px;background:#10362e;border:1px solid #245b4a;color:#64d8af;font-size:11px;}
+  .status.revoked {color:#f19a98;background:#30232c;border-color:#65404b;}
   .mono {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   }
