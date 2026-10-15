@@ -1,6 +1,8 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import ConsoleIcon from './ConsoleIcon.svelte';
+  import { sceneForSeason } from '../lib/seasonalScene';
+  import type { Season } from '../lib/seasonalAtmosphere';
   import { fetchCluster } from '../lib/admin';
 
   type NavPanel = { id: string; label: string; group: string };
@@ -15,6 +17,7 @@
     nodeMode,
     authenticated,
     overview,
+    season = null,
     onSelect,
     onHome,
     onSignOut,
@@ -29,6 +32,7 @@
     nodeMode: string;
     authenticated: boolean;
     overview: boolean;
+    season?: Season | null;
     onSelect: (id: string) => void;
     onHome: () => void;
     onSignOut: () => void;
@@ -57,6 +61,7 @@
   );
   const liveTone = $derived(wsStatus === 'open' ? 'good' : wsStatus === 'connecting' ? 'warn' : 'bad');
   const modeLabel = $derived(nodeMode === 'global' ? 'Global' : 'Coordinator');
+  const sidebarScene = $derived(sceneForSeason(season));
 
   function choose(id: string) {
     menu?.close();
@@ -97,6 +102,9 @@
 
 <div class="console">
   <aside class="sidebar" aria-label="Console navigation">
+    <!-- Ambient artwork only. The brand, links and status footer remain above
+         the image layer with solid contrast, even in seasonal modes. -->
+    <div class="sidebar-art" aria-hidden="true" style:background-image={`url("${sidebarScene}")`}></div>
     <div class="brand">
       <svg class="brand-mark" viewBox="0 0 32 40" fill="none" aria-hidden="true">
         <path d="m10 35 3-23h6l3 23M8 35h16M11 12h10M12 7h8l-4-5ZM13 7v5m6-5v5M2 9h6m16 0h6" stroke="currentColor" stroke-width="1.5" />
@@ -209,6 +217,21 @@
     padding: 26px 16px 14px;
     z-index: 5;
   }
+  .sidebar-art {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 110px;
+    height: min(38vh, 340px);
+    background-size: auto 100%;
+    background-position: 76% center;
+    background-repeat: no-repeat;
+    opacity: .34;
+    pointer-events: none;
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0%, #000 29%, #000 56%, transparent 100%);
+    mask-image: linear-gradient(to bottom, transparent 0%, #000 29%, #000 56%, transparent 100%);
+  }
+  .brand, .nav-scroll, .nav-footer { position: relative; z-index: 1; }
   .brand {
     display: flex;
     align-items: center;
