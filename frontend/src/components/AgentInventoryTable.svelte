@@ -78,7 +78,7 @@
               <td>{agent.checks_reporting}</td>
               <td>{agent.results_24h.toLocaleString()}</td>
               <td class="mono">{agent.coordinator ?? 'Not reported'}</td>
-              <td class="mono" title={agent.version ?? 'Not reported'}>{agent.version ?? '—'}</td>
+              <td class="mono build-cell" title={agent.version ?? 'Not reported'}><span>{agent.version ?? '—'}</span></td>
             </tr>
           {:else}
             <tr><td colspan="10" class="empty">No agents match these filters.</td></tr>
@@ -89,13 +89,13 @@
   </section>
   {#if selected}
     <aside class="agent-inspector" aria-label={'Agent details for ' + selected.agent_id}>
-      <header>
+      <header class="inspector-header">
         <span class="agent-cube" aria-hidden="true">⬡</span>
         <div><h3>{selected.agent_id}</h3><p>{placeName(selected.region)} / {placeName(selected.zone)}</p></div>
         <button class="inspector-close" aria-label="Close agent details" onclick={() => onSelect(null)}>×</button>
       </header>
       <div class="inspector-section">
-        <h4>Connectivity</h4>
+        <h4>Agent status</h4>
         <span class="state" class:good={selected.status === 'up' && !selected.retired} class:retired={selected.retired}><i></i>{state(selected)}</span>
         <dl>
           <div><dt>Last seen</dt><dd title={new Date(selected.last_seen).toLocaleString()}>{formatRelativeTime(selected.last_seen)}</dd></div>
@@ -153,8 +153,9 @@
 </div>
 
 <style>
-  .inventory-layout {display:grid;grid-template-columns:minmax(0,1fr) 290px;gap:14px;align-items:start;}
-  .inventory-panel,.agent-inspector {min-width:0;background:#101b29;border:1px solid #294056;border-radius:8px;overflow:hidden;}
+  .inventory-layout {display:grid;grid-template-columns:minmax(0,1fr) 325px;gap:14px;align-items:start;}
+  .inventory-panel {min-width:0;background:#101b29;border:1px solid #294056;border-radius:8px;overflow:hidden;}
+  .agent-inspector {min-width:0;}
   .inventory-scroll {max-width:100%;overflow-x:auto;}
   table {width:100%;border-collapse:collapse;font-size:12px;white-space:nowrap;min-width:920px;text-align:left;}
   th {padding:0;background:#0c1928;border-bottom:1px solid #294056;color:#91a8bd;font-size:11px;font-weight:500;}
@@ -177,14 +178,16 @@
   .state.retired {color:#a1afbd;background:#20303e;border-color:#35495d;}
   .state i {width:6px;height:6px;border-radius:50%;background:currentColor;}
   .mono {font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;}
+  .build-cell {max-width:105px;}
+  .build-cell>span {display:block;max-width:105px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .empty {padding:30px;text-align:center;color:#91a8bd;}
-  .agent-inspector {padding:14px;display:grid;gap:12px;position:sticky;top:14px;max-height:calc(100vh - 45px);overflow-y:auto;}
-  .agent-inspector header {display:flex;align-items:center;gap:10px;}
+  .agent-inspector {display:grid;gap:9px;position:sticky;top:14px;max-height:calc(100vh - 45px);overflow-y:auto;align-content:start;}
+  .agent-inspector header {display:flex;align-items:center;gap:10px;padding:16px;background:#101e2d;border:1px solid #29445c;border-radius:8px;}
   .agent-inspector header>div {flex:1;min-width:0;}
   h3 {font-size:14px;margin:0;overflow-wrap:anywhere;}
   .agent-inspector header p {margin:3px 0 0;color:#93a9bc;font-size:11px;}
   .inspector-close {background:none;border:0;color:#9db5c8;cursor:pointer;font-size:23px;}
-  .inspector-section {border-top:1px solid #294056;padding-top:12px;}
+  .inspector-section {padding:14px;background:#101e2d;border:1px solid #294056;border-radius:8px;}
   h4 {margin:0 0 12px;font-size:12px;color:#e1eaf2;}
   dl {display:grid;gap:11px;margin:12px 0 0;}
   dl>div {display:flex;justify-content:space-between;gap:12px;align-items:baseline;font-size:12px;}
@@ -194,7 +197,7 @@
   .hint {font-size:11px;line-height:1.55;color:#91a7bc;}
   .purge-confirm {font-size:11px;color:#e9a4a0;line-height:1.5;}
   .purge-actions {display:flex;flex-wrap:wrap;gap:7px;}
-  .inspector-empty {place-items:center;text-align:center;gap:8px;padding:50px 18px;}
+  .inspector-empty {place-items:center;text-align:center;gap:8px;padding:50px 18px;background:#101e2d;border:1px solid #294056;border-radius:8px;}
   .inspector-empty p {color:#90a8bc;font-size:12px;line-height:1.6;}
   .empty-symbol {font-size:32px;color:#4f8299;}
   @media (max-width:1100px) {.inventory-layout {grid-template-columns:minmax(0,1fr);}.agent-inspector {position:static;max-height:none;}.inspector-empty {display:none;}}
