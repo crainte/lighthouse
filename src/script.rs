@@ -189,9 +189,10 @@ fn sandbox() -> Result<Lua, String> {
                     "script exceeded its instruction budget (infinite loop?)".into(),
                 ));
             }
-            Ok(())
+            Ok(mlua::VmState::Continue)
         },
-    );
+    )
+    .map_err(|e| format!("could not install Lua instruction hook: {e}"))?;
     Ok(lua)
 }
 
