@@ -5,6 +5,7 @@
   import { fetchCluster, fetchRegionTree, type NodeMode, type RegionTreeResponse } from '../lib/admin';
   import { barColor, failureReason, formatDuration, formatLatency, formatRelativeTime, formatUptime } from '../lib/format';
   import LighthouseHero from './LighthouseHero.svelte';
+  import type { SeasonalPreferences } from '../lib/seasonalAtmosphere';
   import ConsoleIcon from './ConsoleIcon.svelte';
   import { activeIncidentCount, alertLabel, attentionChecks, incidentFeed, isUnauthorized } from './nightwatchOverview';
 
@@ -27,6 +28,9 @@
     onAddCheck,
     onRetry,
     onExpired,
+    seasonalPreferences,
+    seasonalNow,
+    onSeasonalPreferencesChange,
   }: {
     checks: Check[];
     totalChecks: number;
@@ -46,6 +50,9 @@
     onAddCheck: () => void;
     onRetry: () => void;
     onExpired: () => void;
+    seasonalPreferences?: SeasonalPreferences;
+    seasonalNow?: Date;
+    onSeasonalPreferencesChange?: (next: SeasonalPreferences) => void;
   } = $props();
 
   const FEATURED = 6;
@@ -388,7 +395,7 @@
 
 <div class="overview">
   <section class="hero" aria-labelledby="hero-title">
-    <LighthouseHero health={lighthouseHealth} />
+    <LighthouseHero health={lighthouseHealth} {seasonalPreferences} {seasonalNow} {onSeasonalPreferencesChange} />
     <div class="hero-copy">
       <div class="hero-kicker"><span class={hero.tone} aria-hidden="true">◈</span>Infrastructure at a glance</div>
       <h1 id="hero-title">{hero.title}</h1>
