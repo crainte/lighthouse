@@ -111,6 +111,15 @@ jobs:
       - uses: jdx/mise-action@v4
       - run: hk check --all --slow -S cargo-audit
 
+  cargo-machete:
+    name: cargo-machete
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: jdx/mise-action@v4
+      - run: hk check --all --slow -S cargo-machete
+
   bun-audit:
     name: bun-audit
     runs-on: ubuntu-latest

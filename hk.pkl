@@ -57,6 +57,10 @@ local slow = new Mapping<String, Step> {
     profiles = List("slow")
     check = "cargo audit"
   }
+  ["cargo-machete"] {
+    profiles = List("slow")
+    check = "cargo-machete --with-metadata"
+  }
   ["bun-audit"] {
     profiles = List("slow")
     check = "cd frontend && bun audit"
