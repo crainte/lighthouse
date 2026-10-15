@@ -55,13 +55,19 @@ describe('viewFromHash', () => {
 
   it('keeps Fleet tabs addressable and old admin bookmarks compatible', () => {
     const fleetPanels = ['overview', 'fleet', 'checks'] as const;
-    for (const tab of ['overview', 'agents', 'regions', 'credentials', 'registration'] as const) {
+    for (const tab of ['overview', 'agents', 'regions', 'access'] as const) {
       expect(viewFromHash(hashForFleet(tab), fleetPanels, 'overview')).toEqual({
         name: 'admin', panel: 'fleet', fleetTab: tab,
       });
     }
     expect(viewFromHash('#/admin/fleet', fleetPanels, 'overview')).toEqual({
       name: 'admin', panel: 'fleet', fleetTab: 'overview',
+    });
+    expect(viewFromHash('#/admin/fleet/credentials', fleetPanels, 'overview')).toEqual({
+      name: 'admin', panel: 'fleet', fleetTab: 'access',
+    });
+    expect(viewFromHash('#/admin/fleet/registration', fleetPanels, 'overview')).toEqual({
+      name: 'admin', panel: 'fleet', fleetTab: 'access',
     });
     expect(viewFromHash('#/admin/cluster', fleetPanels, 'overview')).toEqual({
       name: 'admin', panel: 'fleet', fleetTab: 'overview',
@@ -70,7 +76,7 @@ describe('viewFromHash', () => {
       name: 'admin', panel: 'fleet', fleetTab: 'agents',
     });
     expect(viewFromHash('#/admin/credentials', fleetPanels, 'overview')).toEqual({
-      name: 'admin', panel: 'fleet', fleetTab: 'credentials',
+      name: 'admin', panel: 'fleet', fleetTab: 'access',
     });
   });
 
