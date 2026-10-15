@@ -39,7 +39,7 @@
     <FleetOverview mode="regions" {onNavigate} {onexpired} />
   {:else if tab === 'access'}
     <section class="enrollment-hero" aria-label="Enrollment steps">
-      <span class="hero-symbol" aria-hidden="true">♧</span>
+      <span class="hero-symbol" aria-hidden="true"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg></span>
       <div class="hero-description">
         <h3>Onboard agents in two steps</h3>
         <p>{nodeMode === 'global' ? 'First register a region to create its coordinator key, then issue agent credentials for zones inside that region.' : 'Issue agent credentials for zones in this region. Regional-only and standalone deployments do not need global registration.'}</p>
