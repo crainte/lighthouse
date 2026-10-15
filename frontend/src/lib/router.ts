@@ -4,7 +4,7 @@
 // building (`hashFor*`) live here as pure functions so the routes themselves
 // are unit-testable without mounting the app.
 
-export type FleetTab = 'overview' | 'agents' | 'regions' | 'access';
+export type FleetTab = 'overview' | 'agents' | 'access';
 
 export type View<Panel extends string> =
   | { name: 'home' }
@@ -60,7 +60,8 @@ export function viewFromHash<Panel extends string>(
   const fleet = hash.match(/^#\/admin\/fleet(?:\/(overview|agents|regions|access|credentials|registration))?\/?$/);
   if (fleet) {
     const oldTab = fleet[1] === 'credentials' || fleet[1] === 'registration';
-    return { name: 'admin', panel: 'fleet' as Panel, fleetTab: oldTab ? 'access' : (fleet[1] ?? 'overview') as FleetTab };
+    const tab: FleetTab = oldTab ? 'access' : fleet[1] === 'agents' ? 'agents' : 'overview';
+    return { name: 'admin', panel: 'fleet' as Panel, fleetTab: tab };
   }
 
   // Preserve old bookmarked admin pages after the Fleet consolidation.
