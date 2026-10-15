@@ -544,7 +544,7 @@ async fn cluster_handler(
             }
         })
         .collect();
-    let links = roster
+    let links: Vec<ClusterLinkDto> = roster
         .iter()
         .filter(|r| r.age_ms >= 0)
         .map(|r| ClusterLinkDto {
