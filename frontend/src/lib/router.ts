@@ -4,6 +4,8 @@
 // building (`hashFor*`) live here as pure functions so the routes themselves
 // are unit-testable without mounting the app.
 
+export type FleetTab = 'overview' | 'agents' | 'access';
+
 export type View<Panel extends string> =
   | { name: 'home' }
   | { name: 'detail'; checkId: string }
@@ -17,6 +19,7 @@ export type View<Panel extends string> =
   | {
       name: 'admin';
       panel: Panel;
+      fleetTab?: FleetTab;
       edit?: { id: string | null };
       incident?: { id: string | null };
     }
@@ -53,6 +56,20 @@ export function viewFromHash<Panel extends string>(
       incident: { id: raw === 'new' ? null : raw },
     };
   }
+  // Fleet tabs have their own permalinks and Back/Forward history.
+  const fleet = hash.match(/^#\/admin\/fleet(?:\/(overview|agents|regions|access|credentials|registration))?\/?$/);
+  if (fleet) {
+    const oldTab = fleet[1] === 'credentials' || fleet[1] === 'registration';
+    const tab: FleetTab = oldTab || fleet[1] === 'access' ? 'access' : fleet[1] === 'agents' ? 'agents' : 'overview';
+    return { name: 'admin', panel: 'fleet' as Panel, fleetTab: tab };
+  }
+
+  // Preserve old bookmarked admin pages after the Fleet consolidation.
+  const oldFleet = hash.match(/^#\/admin\/(agents|credentials|cluster)\/?$/);
+  if (oldFleet) {
+    const tab: FleetTab = oldFleet[1] === 'agents' ? 'agents' : oldFleet[1] === 'credentials' ? 'access' : 'overview';
+    return { name: 'admin', panel: 'fleet' as Panel, fleetTab: tab };
+  }
   const admin = hash.match(/^#\/admin(?:\/([^/]*))?\/?$/);
   if (admin) {
     // An unknown or absent id lands on the first panel rather than rendering
@@ -76,6 +93,7 @@ export const hashForCheck = (id: string) => `#/check/${encodeURIComponent(id)}`;
 export const hashForIncident = (id: string) => `#/incident/${encodeURIComponent(id)}`;
 export const hashForGroup = (name: string) => `#/group/${encodeURIComponent(name)}`;
 export const hashForAdmin = (panel: string) => `#/admin/${panel}`;
+export const hashForFleet = (tab: FleetTab) => `#/admin/fleet/${tab}`;
 export const hashForCheckEditor = (id: string | null) =>
   `#/admin/checks/${id === null ? 'new' : encodeURIComponent(id)}`;
 export const hashForIncidentEditor = (id: string | null) =>

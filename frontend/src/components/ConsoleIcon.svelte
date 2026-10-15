@@ -9,6 +9,9 @@
     <path d="M2 12h5l3-8 4 16 3-8h5" />
   {:else if name === 'incidents' || name === 'alert'}
     <path d="m12 3 10 18H2Z" /><path d="M12 9v5m0 3v.1" />
+  {:else if name === 'fleet'}
+    <rect x="3" y="3" width="18" height="6" rx="2" /><rect x="3" y="10" width="18" height="5" rx="2" /><rect x="3" y="16" width="18" height="5" rx="2" />
+    <path d="M7 6h.01M7 12.5h.01M7 18.5h.01M12 6h6M12 12.5h6M12 18.5h6" />
   {:else if name === 'agents' || name === 'data'}
     <rect x="4" y="3" width="16" height="7" rx="2" /><rect x="4" y="14" width="16" height="7" rx="2" /><path d="M8 6.5h.01M8 17.5h.01M12 6.5h5M12 17.5h5" />
   {:else if name === 'cluster'}

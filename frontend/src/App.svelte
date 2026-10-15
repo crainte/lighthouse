@@ -28,7 +28,7 @@
   import type { WsStatus } from './lib/ws';
   import { applyStateChange, prependAlert, applyIncidentEvent } from './lib/live';
   import { formatDuration, worstStatus } from './lib/format';
-  import type { View } from './lib/router';
+  import type { View, FleetTab } from './lib/router';
   import {
     viewFromHash,
     hashForHome,
@@ -36,6 +36,7 @@
     hashForIncident,
     hashForGroup,
     hashForAdmin,
+    hashForFleet,
     hashForCheckEditor,
     hashForIncidentEditor,
   } from './lib/router';
@@ -66,13 +67,11 @@
   import ChecksAdmin from './components/ChecksAdmin.svelte';
   import CheckEditor from './components/CheckEditor.svelte';
   import SectionsAdmin from './components/SectionsAdmin.svelte';
-  import AgentsAdmin from './components/AgentsAdmin.svelte';
+  import FleetAdmin from './components/FleetAdmin.svelte';
   import AgentDisplayAdmin from './components/AgentDisplayAdmin.svelte';
   import NotifiersAdmin from './components/NotifiersAdmin.svelte';
-  import AgentCredentials from './components/AgentCredentials.svelte';
   import ProbeResultsAdmin from './components/ProbeResultsAdmin.svelte';
   import MaintenanceAdmin from './components/MaintenanceAdmin.svelte';
-  import ClusterAdmin from './components/ClusterAdmin.svelte';
   import RegionTreeAdmin from './components/RegionTreeAdmin.svelte';
   import DataAdmin from './components/DataAdmin.svelte';
   import { fetchSession, logout, type NodeMode } from './lib/admin';
@@ -104,18 +103,11 @@
       blurb: 'Active and historical outages, acknowledgements, and public updates.',
     },
     {
-      id: 'agents',
-      label: 'Agents',
+      id: 'fleet',
+      label: 'Fleet',
       group: 'Fleet',
-      title: 'Agents',
-      blurb: 'Probe fleet connectivity, placement, capabilities, and assignment health.',
-    },
-    {
-      id: 'credentials',
-      label: 'Credentials',
-      group: 'Fleet',
-      title: 'Credentials',
-      blurb: 'Zone-scoped agent credentials, minted in the region whose agents use them.',
+      title: 'Fleet',
+      blurb: 'Agents, regions, zones, credentials, and connectivity.',
     },
     {
       id: 'results',
@@ -123,13 +115,6 @@
       group: 'Fleet',
       title: 'Probe results',
       blurb: 'Individual probe attempts with outcome, location, latency, and error details.',
-    },
-    {
-      id: 'cluster',
-      label: 'Topology',
-      group: 'Fleet',
-      title: 'Topology',
-      blurb: 'Deployment structure, connectivity, and onboarding for regions and agents.',
     },
     {
       id: 'region-tree',
@@ -271,9 +256,16 @@
   }
 
   function openAdmin(panel: AdminPanel = ADMIN_PANELS[0].id) {
-    history.pushState(null, '', hashForAdmin(panel));
+    history.pushState(null, '', panel === 'fleet' ? hashForFleet('overview') : hashForAdmin(panel));
     pushedNav = true;
-    view = { name: 'admin', panel };
+    view = panel === 'fleet' ? { name: 'admin', panel, fleetTab: 'overview' } : { name: 'admin', panel };
+  }
+
+  function openFleetTab(tab: FleetTab) {
+    if (view.name === 'admin' && view.panel === 'fleet' && (view.fleetTab ?? 'overview') === tab) return;
+    history.pushState(null, '', hashForFleet(tab));
+    pushedNav = true;
+    view = { name: 'admin', panel: 'fleet', fleetTab: tab };
   }
 
   /** Opens the check editor page, by immutable id. `null` is a check that does
@@ -875,14 +867,10 @@
           {:else if panel === 'status'}
             <SectionsAdmin onchanged={load} onexpired={onExpired} />
             <AgentDisplayAdmin onchanged={load} onexpired={onExpired} />
-          {:else if panel === 'agents'}
-            <AgentsAdmin onopen={openCheckEditor} onexpired={onExpired} />
-          {:else if panel === 'credentials'}
-            <AgentCredentials onexpired={onExpired} />
+          {:else if panel === 'fleet'}
+            <FleetAdmin tab={view.fleetTab ?? 'overview'} onNavigate={openFleetTab} onexpired={onExpired} onopen={openCheckEditor} {nodeMode} />
           {:else if panel === 'results'}
             <ProbeResultsAdmin onopen={openCheckEditor} onexpired={onExpired} />
-          {:else if panel === 'cluster'}
-            <ClusterAdmin onexpired={onExpired} />
           {:else if panel === 'region-tree'}
             <RegionTreeAdmin onexpired={onExpired} />
           {:else if panel === 'alerts'}

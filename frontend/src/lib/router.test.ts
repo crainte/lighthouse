@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   hashForAdmin,
+  hashForFleet,
   hashForCheck,
   hashForCheckEditor,
   hashForGroup,
@@ -49,6 +50,36 @@ describe('viewFromHash', () => {
     expect(viewFromHash('#/admin/alerts', PANELS, 'checks')).toEqual({
       name: 'admin',
       panel: 'alerts',
+    });
+  });
+
+  it('keeps Fleet tabs addressable and old admin bookmarks compatible', () => {
+    const fleetPanels = ['overview', 'fleet', 'checks'] as const;
+    for (const tab of ['overview', 'agents', 'access'] as const) {
+      expect(viewFromHash(hashForFleet(tab), fleetPanels, 'overview')).toEqual({
+        name: 'admin', panel: 'fleet', fleetTab: tab,
+      });
+    }
+    expect(viewFromHash('#/admin/fleet', fleetPanels, 'overview')).toEqual({
+      name: 'admin', panel: 'fleet', fleetTab: 'overview',
+    });
+    expect(viewFromHash('#/admin/fleet/regions', fleetPanels, 'overview')).toEqual({
+      name: 'admin', panel: 'fleet', fleetTab: 'overview',
+    });
+    expect(viewFromHash('#/admin/fleet/credentials', fleetPanels, 'overview')).toEqual({
+      name: 'admin', panel: 'fleet', fleetTab: 'access',
+    });
+    expect(viewFromHash('#/admin/fleet/registration', fleetPanels, 'overview')).toEqual({
+      name: 'admin', panel: 'fleet', fleetTab: 'access',
+    });
+    expect(viewFromHash('#/admin/cluster', fleetPanels, 'overview')).toEqual({
+      name: 'admin', panel: 'fleet', fleetTab: 'overview',
+    });
+    expect(viewFromHash('#/admin/agents', fleetPanels, 'overview')).toEqual({
+      name: 'admin', panel: 'fleet', fleetTab: 'agents',
+    });
+    expect(viewFromHash('#/admin/credentials', fleetPanels, 'overview')).toEqual({
+      name: 'admin', panel: 'fleet', fleetTab: 'access',
     });
   });
 
