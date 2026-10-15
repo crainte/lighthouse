@@ -308,6 +308,9 @@
     try {
       const [r, checks] = await Promise.all([fetchAgents(), fetchAdminChecks()]);
       agents = r.agents;
+      // Start the operational inventory with a useful inspector instead of
+      // a blank side panel. Closing it does not reselect automatically.
+      if (inventory && !selectedAgentId && r.agents.length) selectedAgentId = r.agents[0].agent_id;
       orphaned = r.checks_with_no_live_agent;
       orphanedTotal = r.checks_with_no_live_agent_total;
       unrunnable = r.checks_no_agent_can_run;
