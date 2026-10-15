@@ -60,7 +60,7 @@ export function viewFromHash<Panel extends string>(
   const fleet = hash.match(/^#\/admin\/fleet(?:\/(overview|agents|regions|access|credentials|registration))?\/?$/);
   if (fleet) {
     const oldTab = fleet[1] === 'credentials' || fleet[1] === 'registration';
-    const tab: FleetTab = oldTab ? 'access' : fleet[1] === 'agents' ? 'agents' : 'overview';
+    const tab: FleetTab = oldTab || fleet[1] === 'access' ? 'access' : fleet[1] === 'agents' ? 'agents' : 'overview';
     return { name: 'admin', panel: 'fleet' as Panel, fleetTab: tab };
   }
 
