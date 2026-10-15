@@ -71,6 +71,10 @@ export interface ClusterResponse {
   links?: ClusterLink[];
   link_stale_after_ms?: number;
   regions?: RegionRoster[];
+  /** Global control-plane membership (self + global peers). Never regional report entries. */
+  global_peers?: ClusterMember[];
+  global_links?: ClusterLink[];
+  global_link_stale_after_ms?: number | null;
 }
 
 /** Lives outside `/admin/*`: cluster membership is coordinator state, not
