@@ -213,14 +213,14 @@ describe('component render smoke', () => {
     ), { headers: { 'content-type': 'application/json' } }));
     vi.stubGlobal('fetch', fetchMock);
     render(RegionsAdmin);
-    expect(await screen.findByText(/Waiting for first push/)).toBeInTheDocument();
-    await fireEvent.input(screen.getByPlaceholderText(/Region/), { target: { value: 'eu' } });
-    await fireEvent.click(screen.getByRole('button', { name: 'Register' }));
+    expect(await screen.findByText(/Awaiting first report/)).toBeInTheDocument();
+    await fireEvent.input(screen.getByRole('textbox', { name: 'Region' }), { target: { value: 'eu' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Register region' }));
     expect(await screen.findByText(/wac_2\.secret/)).toBeInTheDocument();
     await fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
     expect(screen.queryByText(/wac_2\.secret/)).not.toBeInTheDocument();
     await fireEvent.click(screen.getAllByRole('button', { name: 'Remove' })[0]);
-    await fireEvent.click(screen.getByRole('button', { name: 'Remove' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
     expect(fetchMock).toHaveBeenCalledWith('/api/v1/admin/regions/tw', expect.objectContaining({ method: 'DELETE' }));
   });
 
