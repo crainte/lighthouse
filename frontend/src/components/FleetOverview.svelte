@@ -7,9 +7,10 @@
   import { regionFlag } from '../lib/regionFlag';
   import type { FleetTab } from '../lib/router';
 
-  let { mode = 'overview', onNavigate, onexpired }: {
+  let { mode = 'overview', onNavigate, onFocusAgent, onexpired }: {
     mode?: 'overview' | 'regions';
     onNavigate: (tab: FleetTab) => void;
+    onFocusAgent?: (id: string) => void;
     onexpired?: () => void;
   } = $props();
 
@@ -147,7 +148,7 @@
           <h3>{mode === 'overview' ? 'Regions & zones' : 'Region and zone inventory'}</h3>
           <p>{mode === 'overview' ? 'Live placement, grouped by location.' : 'Explore regions, zones, and the agents reporting from each location.'}</p>
         </div>
-        {#if mode === 'overview'}<button class="quiet-link" onclick={() => onNavigate('regions')}>All regions <span aria-hidden="true">→</span></button>{/if}
+        {#if mode === 'overview'}<span class="location-count">{regions.length} {regions.length === 1 ? 'region' : 'regions'}</span>{/if}
       </div>
 
       <div class="region-list">
@@ -162,7 +163,10 @@
               <span class="expand-symbol" aria-hidden="true">···</span>
             </button>
             {#if !collapsed.has(region.name)}
-              {#if mode === 'regions' && region.roster?.members.length}
+              {#if region.roster && !region.roster.available}
+                <div class="coordinator-list"><small>Coordinator roster unavailable for this region</small></div>
+              {/if}
+              {#if region.roster?.members.length}
                 <div class="coordinator-list">
                   <small>Regional coordinators</small>
                   {#each region.roster.members as member (member.node_id)}
@@ -187,7 +191,7 @@
                         <span class="agent-state" class:warning={!isReporting(agent)}>{agent.retired ? 'Retired' : isReporting(agent) ? 'Reporting' : 'Silent'} · {formatRelativeTime(agent.last_seen)}</span>
                         <span class="agent-detail">Checks <strong>{agent.checks_reporting}</strong></span>
                         <span class="agent-detail">Poll RTT <strong>{agent.poll_rtt_ms === null ? '—' : agent.poll_rtt_ms + ' ms'}</strong></span>
-                        <button class="agent-drill" title={'View fleet agents including ' + agent.agent_id} aria-label={'View agent ' + agent.agent_id} onclick={() => onNavigate('agents')}>›</button>
+                        <button class="agent-drill" title={'Inspect agent ' + agent.agent_id} aria-label={'Inspect agent ' + agent.agent_id} onclick={() => onFocusAgent ? onFocusAgent(agent.agent_id) : onNavigate('agents')}>›</button>
                       </div>
                     {:else}
                       <p class="empty-zone">No agents have reported from this zone.</p>
@@ -283,6 +287,10 @@
   .agent-drill { display:grid;place-items:center;color:#89cce1;background:none;border:0;cursor:pointer;font-size:20px;padding:7px; }
   .coordinator-list { display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:10px 16px 12px; }
   .coordinator-list small { color:#8ea4b7; }
+  .location-count {font-size:11px;color:#94aec1;}
+  .coordinator-list {border-top:1px solid #253b4e;background:rgba(12,30,46,.45);}
+  .coordinator-pill {transition:background-color .15s ease;}
+  .coordinator-pill:hover {background:#193046;}
   .coordinator-pill { display:inline-flex;align-items:center;gap:6px;padding:6px 9px;background:#0d1e2e;border:1px solid #244057;border-radius:6px;font-size:11px; }
   .live-dot { flex:none;display:inline-block;width:7px;height:7px;background:#52cba5;border-radius:50%; }
   .live-dot.warn { background:#e5ac6c; }.live-dot.bad { background:#e27370; }.live-dot.neutral { background:#8a98a8; }
