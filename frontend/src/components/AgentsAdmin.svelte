@@ -8,10 +8,13 @@
   import FleetSummary from './agents-admin/FleetSummary.svelte';
   import AgentFilters from './agents-admin/AgentFilters.svelte';
   import AgentTable from './agents-admin/AgentTable.svelte';
+  import AgentInventoryTable from './AgentInventoryTable.svelte';
 
   // `onopen` is the check editor, keyed on the check's immutable id: the orphan
   // warning is only actionable if the named check is one click away.
-  let { onopen, onexpired }: { onopen: (id: string) => void; onexpired?: () => void } = $props();
+  let { onopen, onexpired, inventory = false, focusAgent = null }: { onopen: (id: string) => void; onexpired?: () => void; inventory?: boolean; focusAgent?: string | null } = $props();
+  let selectedAgentId = $state<string | null>(focusAgent);
+  $effect(() => { if (focusAgent) selectedAgentId = focusAgent; });
 
   /** Agent rows mounted before "show more". A fleet is hundreds of agents, not
    *  millions, so a cap holds where virtualisation would only add measured row
@@ -54,7 +57,7 @@
   let sortKey = $state<SortKey>('status');
   let sortDir = $state<1 | -1>(1);
 
-  let grouped = $state(true);
+  let grouped = $state(!inventory);
   /** Keyed by the group row's own key, so one record covers regions and zones. */
   let collapsed = $state<Record<string, boolean>>({});
 
@@ -178,7 +181,9 @@
         (query === '' ||
           a.agent_id.toLowerCase().includes(query) ||
           a.zone.toLowerCase().includes(query) ||
-          a.region.toLowerCase().includes(query)),
+          a.region.toLowerCase().includes(query) ||
+          (a.coordinator?.toLowerCase().includes(query) ?? false) ||
+          (a.version?.toLowerCase().includes(query) ?? false)),
     );
     rows.sort(
       grouped
@@ -401,7 +406,7 @@
         No agent has ever reported. Start one pointed at this coordinator and it will appear here.
       </p>
     {:else}
-      <FleetSummary agentCount={agents.length} {fleet} onFocusZone={focusZone} />
+      {#if !inventory}<FleetSummary agentCount={agents.length} {fleet} onFocusZone={focusZone} />{/if}
 
       <AgentFilters
         bind:search
@@ -410,6 +415,7 @@
         bind:zoneFilter
         bind:showRetired
         {grouped}
+        hideGrouping={inventory}
         onSetGrouped={setGrouped}
         {regionOptions}
         {zoneOptions}
@@ -421,25 +427,48 @@
         {purgeNote}
       />
 
-      <AgentTable
-        {rendered}
-        {grouped}
-        {sortKey}
-        {sortDir}
-        onToggleSort={toggleSort}
-        {ariaSort}
-        bind:collapsed
-        bind:pending
-        {purging}
-        {purgeError}
-        onArm={arm}
-        onConfirmPurge={confirmPurge}
-        {capped}
-        {shown}
-        pageSize={PAGE}
-        onShowMore={() => (limit += PAGE)}
-        onClearFilters={clearFilters}
-      />
+      {#if inventory}
+        <AgentInventoryTable
+          agents={matched.slice(0, limit)}
+          selectedId={selectedAgentId}
+          onSelect={(id) => { selectedAgentId = id; pending = null; purgeError = null; }}
+          {sortKey}
+          {sortDir}
+          onSort={toggleSort}
+          {pending}
+          {purging}
+          {purgeError}
+          onArm={arm}
+          onCancel={() => { pending = null; purgeError = null; }}
+          onConfirmPurge={confirmPurge}
+        />
+        {#if matched.length > limit}
+          <div class="inventory-more">
+            <button class="btn" onclick={() => (limit += PAGE)}>Show {Math.min(PAGE, matched.length - limit)} more agents</button>
+            <span class="admin-muted">{limit} of {matched.length} shown</span>
+          </div>
+        {/if}
+      {:else}
+        <AgentTable
+          {rendered}
+          {grouped}
+          {sortKey}
+          {sortDir}
+          onToggleSort={toggleSort}
+          {ariaSort}
+          bind:collapsed
+          bind:pending
+          {purging}
+          {purgeError}
+          onArm={arm}
+          onConfirmPurge={confirmPurge}
+          {capped}
+          {shown}
+          pageSize={PAGE}
+          onShowMore={() => (limit += PAGE)}
+          onClearFilters={clearFilters}
+        />
+      {/if}
 
       {#if fleet.unplaced > 0}
         <p class="admin-muted foot">
@@ -468,6 +497,7 @@
 {/if}
 
 <style>
+  .inventory-more {display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:14px;}
   .retry {
     margin-top: 0.7rem;
   }
