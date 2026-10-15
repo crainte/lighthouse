@@ -97,7 +97,7 @@
 {/snippet}
 
 <div class="console">
-  <aside class="sidebar" aria-label="Console navigation">
+  <aside class="sidebar" aria-label="Console navigation" style:--sidebar-art={`url(${lighthouseScene})`}>
     <div class="brand">
       <svg class="brand-mark" viewBox="0 0 32 40" fill="none" aria-hidden="true">
         <path d="m10 35 3-23h6l3 23M8 35h16M11 12h10M12 7h8l-4-5ZM13 7v5m6-5v5M2 9h6m16 0h6" stroke="currentColor" stroke-width="1.5" />
@@ -223,7 +223,7 @@
     bottom: 120px;
     height: min(44vh, 420px);
     background: linear-gradient(to bottom, var(--nav) 0%, transparent 26%, rgba(10,18,30,.15) 70%, var(--nav) 100%),
-      url(${lighthouseScene}) center 40% / cover no-repeat;
+      var(--sidebar-art) center 40% / cover no-repeat;
     opacity: .55;
   }
   .brand {
