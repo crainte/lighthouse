@@ -466,10 +466,14 @@ header.bar {
 .latency-graph {
   margin-top: 0.5rem;
 }
+/* Keep the latency scale in its own small gutter, wide enough for
+   ~1000ms without letting the last plot bar collide with the label. */
 .latency-plot {
+  --latency-scale-gutter: 52px;
   position: relative;
-  /* Right gutter for the scale label. */
-  padding-right: 3rem;
+  width: 100%;
+  box-sizing: border-box;
+  padding-right: var(--latency-scale-gutter);
 }
 .lat-inner {
   position: relative;
@@ -538,13 +542,15 @@ header.bar {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
-/* Max-latency scale marker in the right gutter, aligned to the baseline. */
+/* Scale is right-aligned inside the reserved gutter, not over the bars. */
 .lat-scale {
   position: absolute;
   right: 0;
   bottom: 0.9rem;
-  width: 3rem;
-  padding-left: 0.4rem;
+  width: var(--latency-scale-gutter);
+  box-sizing: border-box;
+  padding: 0 2px 0 4px;
+  text-align: right;
   font-size: 0.68rem;
   color: var(--text-dim);
   font-variant-numeric: tabular-nums;

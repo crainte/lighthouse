@@ -123,7 +123,13 @@
           </div>
         {/if}
         <div class="inc-foot">
-          <span class="when">started {formatRelativeTime(card.startedAt)}</span>
+          <span class="when">
+            {#if card.resolvedAt !== null}
+              Ended {formatRelativeTime(card.resolvedAt)} · Duration {formatDuration(card.resolvedAt - card.startedAt)}
+            {:else}
+              Started {formatRelativeTime(card.startedAt)}
+            {/if}
+          </span>
           {#if mergedChecks(card.members).length}
             <span class="mons">
               {#each mergedChecks(card.members) as c (c.check_id)}

@@ -310,7 +310,20 @@ pub(super) async fn relay_merge(
     match merge_responses(uri.path(), uri.query(), merged) {
         Ok(mut response) => {
             if matches!(uri.path(), "/api/v1/uptime" | "/api/v1/latency-points") {
-                filter_chart_page(node, uri, &mut response.0);
+                let paged_sections = match node.inner.store.list_sections().await {
+                    Ok(sections) => sections
+                        .into_iter()
+                        .filter(|s| s.display == crate::coordinator::storage::SectionDisplay::Page)
+                        .map(|s| s.name)
+                        .collect(),
+                    Err(_) => {
+                        return error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Could not load section metadata for chart selection",
+                        )
+                    }
+                };
+                filter_chart_page(node, uri, &mut response.0, &paged_sections);
             }
             if uri.path().ends_with("/incidents") {
                 attach_incident_groups(node, &mut response.0);

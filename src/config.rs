@@ -1495,14 +1495,41 @@ impl CheckConfig {
         Self::parse_cron(&self.cron)
     }
 
+    /// Older installations stored a 60-second/minute interval as `*/60`
+    /// inside a 0–59 cron field. Cron correctly rejects it and agents then
+    /// silently stop probing. At the unit boundary, stepping 60 is equivalent
+    /// to the zero position of the next unit: every minute/hour respectively.
+    /// Only those two exact legacy forms are repaired, never arbitrary invalid
+    /// expressions (e.g. `*/61`).
+    pub fn normalise_legacy_cron(expr: &str) -> String {
+        let mut fields: Vec<&str> = expr.split_whitespace().collect();
+        let minute = match fields.len() {
+            5 => Some(0),
+            6 => {
+                if fields[0] == "*/60" {
+                    fields[0] = "0";
+                }
+                Some(1)
+            }
+            _ => None,
+        };
+        if let Some(minute) = minute {
+            if fields[minute] == "*/60" {
+                fields[minute] = "0";
+            }
+        }
+        fields.join(" ")
+    }
+
     pub fn parse_cron(expr: &str) -> Result<cron::Schedule, String> {
         let trimmed = expr.trim();
         if trimmed.is_empty() {
             return Err("schedule is required".into());
         }
-        let padded = match trimmed.split_whitespace().count() {
-            5 => format!("0 {trimmed}"),
-            _ => trimmed.to_string(),
+        let repaired = Self::normalise_legacy_cron(trimmed);
+        let padded = match repaired.split_whitespace().count() {
+            5 => format!("0 {repaired}"),
+            _ => repaired,
         };
         use std::str::FromStr;
         cron::Schedule::from_str(&padded).map_err(|e| format!("invalid cron expression: {e}"))
@@ -1604,7 +1631,7 @@ impl CheckConfig {
         let blank_to_none = |s: Option<String>| s.filter(|v: &String| !v.trim().is_empty());
         self.name = self.name.trim().to_string();
         self.target = self.target.trim().to_string();
-        self.cron = self.cron.trim().to_string();
+        self.cron = Self::normalise_legacy_cron(&self.cron);
         self.group = blank_to_none(self.group);
         self.eval = blank_to_none(self.eval);
         self.description = blank_to_none(self.description);
@@ -2200,6 +2227,40 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn legacy_sixty_second_and_minute_steps_are_repaired_without_changing_cadence() {
+        assert_eq!(
+            CheckConfig::normalise_legacy_cron("*/60 * * * * *"),
+            "0 * * * * *"
+        );
+        assert_eq!(
+            CheckConfig::normalise_legacy_cron("0 */60 * * * *"),
+            "0 0 * * * *"
+        );
+        assert_eq!(
+            CheckConfig::normalise_legacy_cron("*/60 * * * *"),
+            "0 * * * *"
+        );
+        assert_eq!(
+            CheckConfig::normalise_legacy_cron("*/61 * * * * *"),
+            "*/61 * * * * *"
+        );
+        assert!(CheckConfig::parse_cron("*/61 * * * * *").is_err());
+        for (expression, seconds) in [("*/60 * * * * *", 60), ("0 */60 * * * *", 3600)] {
+            let schedule = CheckConfig::parse_cron(expression).unwrap();
+            let mut dates = schedule.upcoming(chrono::Utc);
+            let first = dates.next().unwrap();
+            let second = dates.next().unwrap();
+            assert_eq!((second - first).num_seconds(), seconds);
+        }
+        let repaired = CheckConfig {
+            cron: "0 */60 * * * *".to_string(),
+            ..CheckConfig::default()
+        }
+        .normalised();
+        assert_eq!(repaired.cron, "0 0 * * * *");
     }
 
     #[test]

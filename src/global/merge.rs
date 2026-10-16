@@ -5,7 +5,7 @@ use super::{cache, incidents, GlobalNode};
 use axum::http::Uri;
 use axum::Json;
 use percent_encoding::percent_decode_str;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Add a `"groups"` array alongside the merged `"incidents"` list: the same
 /// per-region rows, folded by same-check overlapping windows and attributed
@@ -86,35 +86,85 @@ pub(super) fn chart_relay_path(uri: &Uri) -> String {
             .filter(|pair| {
                 !matches!(
                     pair.split_once('=').map(|(key, _)| key),
-                    Some("page" | "limit" | "section")
+                    Some("page" | "limit" | "section" | "all")
                 )
             })
             .collect::<Vec<_>>()
             .join("&")
     });
+    // Global and regional public scopes differ when a section is displayed as
+    // a separate page. Since we deliberately strip region-local section and
+    // pagination selectors, the fan-out MUST explicitly ask each region for
+    // all visible checks. Otherwise a regional Primary scope discards paged
+    // section checks *before* the global merge can select them.
+    let mut query = query.unwrap_or_default();
+    if !query.is_empty() {
+        query.push('&');
+    }
+    query.push_str("all=true");
     // A global page is capped at 1,000 rows. Ask each region for that full
     // candidate set so a regional default page (100) cannot hide ids selected
     // by a later global page.
-    match query.as_deref() {
-        Some("") | None => format!("{}?limit=1000", uri.path()),
-        Some(query) => format!("{}?{query}&limit=1000", uri.path()),
+    if uri.path() == "/api/v1/latency-points"
+        && !(query_value(uri.query(), "from").is_some() && query_value(uri.query(), "to").is_some())
+    {
+        // Every region must bucket on *the same* clock boundaries. Asking with
+        // independent 'now' timestamps shifts each region's 24h grid a few ms
+        // and can erase or misalign the measurements in a merged chart.
+        let now = chrono::Utc::now().timestamp_millis();
+        let to = now.div_euclid(60_000) * 60_000;
+        let hours = query_usize(uri.query(), "hours")
+            .unwrap_or(24)
+            .clamp(1, 24 * 365);
+        if !query.is_empty() {
+            query.push('&');
+        }
+        query.push_str(&format!("from={}&to={}", to - hours as i64 * 3_600_000, to));
     }
+    if !query.is_empty() {
+        query.push('&');
+    }
+    query.push_str("limit=1000");
+    format!("{}?{query}", uri.path())
+}
+
+/// Global public and batched-chart reads must apply the same scope rules as
+/// coordinator SQL. In particular a paged section is a *tile*, not part of the
+/// primary page, while an admin request can explicitly include all checks.
+pub(super) fn scope_aggregate_checks(
+    checks: &mut Vec<cache::AggregatedCheck>,
+    section: Option<&str>,
+    all: bool,
+    paged_sections: &HashSet<String>,
+) {
+    if all {
+        return;
+    }
+    checks.retain(|check| match section {
+        Some(name) => check.group.as_deref() == Some(name),
+        None => check
+            .group
+            .as_ref()
+            .is_none_or(|name| !paged_sections.contains(name)),
+    });
 }
 
 /// Keep chart entries to precisely the ids rendered by the global status page.
-pub(super) fn filter_chart_page(node: &GlobalNode, uri: &Uri, response: &mut serde_json::Value) {
+pub(super) fn filter_chart_page(
+    node: &GlobalNode,
+    uri: &Uri,
+    response: &mut serde_json::Value,
+    paged_sections: &HashSet<String>,
+) {
     let page = query_usize(uri.query(), "page").unwrap_or(0);
     let limit = crate::page::bounded(query_usize(uri.query(), "limit"), 100);
     let section = query_value(uri.query(), "section");
+    let all = query_value(uri.query(), "all").as_deref() == Some("true");
     let mut checks = node
         .inner
         .cache
         .aggregate(chrono::Utc::now().timestamp_millis());
-    checks.retain(|check| {
-        section
-            .as_deref()
-            .is_none_or(|want| check.group.as_deref() == Some(want))
-    });
+    scope_aggregate_checks(&mut checks, section.as_deref(), all, paged_sections);
     checks.sort_by(|a, b| {
         a.position
             .cmp(&b.position)
@@ -488,6 +538,71 @@ fn latency_band_json(
 mod tests {
     use super::*;
 
+    fn scoped_check(group: Option<&str>) -> cache::AggregatedCheck {
+        cache::AggregatedCheck {
+            check_id: crate::models::new_check_id(),
+            name: group.unwrap_or("loose").to_string(),
+            state: crate::models::NodeState::Up,
+            per_region: HashMap::new(),
+            latency_ms: 1,
+            last_check: 1,
+            uptime_24h: Some(1.0),
+            status_code: None,
+            error: None,
+            kind: None,
+            group: group.map(str::to_owned),
+            latency_graph: true,
+            position: 0,
+        }
+    }
+
+    #[test]
+    fn global_scopes_do_not_lose_paged_groups_or_admin_checks() {
+        let all = vec![
+            scoped_check(None),
+            scoped_check(Some("inline")),
+            scoped_check(Some("remote")),
+        ];
+        let paged = HashSet::from(["remote".to_string()]);
+        let mut primary = all.clone();
+        scope_aggregate_checks(&mut primary, None, false, &paged);
+        assert_eq!(primary.len(), 2);
+        assert!(!primary.iter().any(|c| c.group.as_deref() == Some("remote")));
+
+        let mut remote = all.clone();
+        scope_aggregate_checks(&mut remote, Some("remote"), false, &paged);
+        assert_eq!(remote.len(), 1);
+        assert_eq!(remote[0].group.as_deref(), Some("remote"));
+
+        let mut admin = all;
+        scope_aggregate_checks(&mut admin, None, true, &paged);
+        assert_eq!(
+            admin.len(),
+            3,
+            "changing a public section must not hide admin monitors"
+        );
+    }
+
+    #[test]
+    fn global_latency_requests_share_one_exact_24_hour_window() {
+        let uri: Uri = "/api/v1/latency-points?hours=24&buckets=90&page=2&limit=25&section=remote"
+            .parse()
+            .unwrap();
+        let relay = chart_relay_path(&uri);
+        let query = relay.split_once('?').unwrap().1;
+        let from: i64 = query_value(Some(query), "from").unwrap().parse().unwrap();
+        let to: i64 = query_value(Some(query), "to").unwrap().parse().unwrap();
+        assert_eq!(to - from, 86_400_000);
+        assert_eq!(to % 60_000, 0, "regions must share minute-aligned buckets");
+        assert!(!relay.contains("page="));
+        assert!(!relay.contains("section="));
+        assert!(relay.contains("limit=1000"));
+        assert!(
+            relay.contains("all=true"),
+            "paged groups must survive region reads"
+        );
+    }
+
     /// A region can bake a raw check id into an incident title when it opens
     /// the incident before the check's name has reached its catalogue. The
     /// global tier holds every live region's name for the check, so it puts the
@@ -672,7 +787,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             chart_relay_path(&uri),
-            "/api/v1/uptime?days=30&buckets=90&limit=1000"
+            "/api/v1/uptime?days=30&buckets=90&all=true&limit=1000"
         );
     }
 

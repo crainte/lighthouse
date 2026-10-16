@@ -215,6 +215,26 @@
   // A screen-reader-only account of websocket state transitions. The visible
   // badges update too, but those are easy to miss while reading another row.
   let liveAnnouncement = $state('');
+  // Admin Overview is an all-monitor inventory. Public primary pages omit
+  // checks placed into standalone sections, but the operator must not.
+  let adminOverviewChecks = $state<Check[]>([]);
+  let adminOverviewTotal = $state(0);
+  let adminOverviewLoaded = $state(false);
+  $effect(() => {
+    if (view.name !== 'admin' || view.panel !== 'overview') return;
+    let active = true;
+    adminOverviewLoaded = false;
+    fetchStatus(null, 0, STATUS_PAGE_SIZE, true)
+      .then((response) => {
+        if (!active) return;
+        adminOverviewChecks = response.checks;
+        adminOverviewTotal = response.total_checks;
+        adminOverviewLoaded = true;
+      })
+      .catch(() => { /* The regular status/error panel still reports failures. */ });
+    return () => { active = false; };
+  });
+
   let wsStatus = $state<WsStatus>('connecting');
   // Bumped to tell an open CheckDetail page to refetch its own uptime, latency,
   // history and incidents — on a live state change for the check it's showing,
@@ -642,7 +662,7 @@
   const groupRollupBanner = $derived.by(() => {
     const rollup = groupPage?.rollup;
     if (!rollup) return null;
-    const tone = rollup.status === 'up' ? 'operational' : rollup.status === 'down' ? 'major' : 'degraded';
+    const tone = rollup.status === 'up' ? 'operational' : rollup.status === 'down' ? 'outage' : rollup.status === 'degraded' ? 'degraded' : 'unknown';
     const label =
       rollup.status === 'up'
         ? 'All monitors operational'
@@ -830,6 +850,10 @@
           if (view.name !== 'home') goHome();
           else document.getElementById('public-incidents')?.scrollIntoView({ behavior: 'smooth' });
         }}>History</button>
+        <span class="public-live" role="status" title={wsStatus === 'open' ? 'Live updates connected' : wsStatus === 'connecting' ? 'Connecting to live updates' : 'Live updates disconnected'}>
+          <span class="public-live-dot" class:connected={wsStatus === 'open'} class:connecting={wsStatus === 'connecting'} aria-hidden="true"></span>
+          <span class="public-live-label">{wsStatus === 'open' ? 'Live' : wsStatus === 'connecting' ? 'Connecting' : 'Offline'}</span>
+        </span>
         <button class="public-admin" onclick={() => (authenticated ? openAdmin() : (adminView = 'login'))}>Admin</button>
       </nav>
     </header>
@@ -839,6 +863,7 @@
       <div
         class="public-route-masthead"
         class:storm={publicRouteIncidentId !== null && activePublicIncidents.some((incident) => incident.id === publicRouteIncidentId)}
+        class:compact={view.name === 'detail'}
         style:--scene={'url("' + publicLighthouseScene + '")'}
         aria-hidden="true"
       ></div>
@@ -879,7 +904,7 @@
             </div>
           </div>
         {:else if panel === 'overview'}
-          <NightwatchOverview seasonalPreferences={seasonalPreferences} seasonalNow={seasonalNow} onSeasonalPreferencesChange={updateSeasonalPreferences} {checks} totalChecks={statusTotal} hasMore={statusHasMore || statusPage > 0} incidents={adminIncidents} groups={adminIncidentGroups} {alerts} {fleet} {maintenance} {loading} {error} {wsStatus} {nodeMode} onOpenCheck={openDetail} onOpenIncident={openIncidentEditor} onPanel={(id) => { const target = ADMIN_PANELS.find((p) => p.id === id); if (target) openAdmin(target.id); }} onAddCheck={() => openCheckEditor(null)} onRetry={load} onExpired={onExpired} />
+          <NightwatchOverview seasonalPreferences={seasonalPreferences} seasonalNow={seasonalNow} onSeasonalPreferencesChange={updateSeasonalPreferences} checks={adminOverviewLoaded ? adminOverviewChecks : checks} totalChecks={adminOverviewLoaded ? adminOverviewTotal : statusTotal} hasMore={adminOverviewLoaded ? adminOverviewTotal > STATUS_PAGE_SIZE : statusHasMore || statusPage > 0} incidents={adminIncidents} groups={adminIncidentGroups} {alerts} {fleet} {maintenance} {loading} {error} {wsStatus} {nodeMode} onOpenCheck={openDetail} onOpenIncident={openIncidentEditor} onPanel={(id) => { const target = ADMIN_PANELS.find((p) => p.id === id); if (target) openAdmin(target.id); }} onAddCheck={() => openCheckEditor(null)} onRetry={load} onExpired={onExpired} />
         {:else if panel === 'checks' && editing}
           <!-- Keyed so back/forward between two checks rebuilds the editor
                instead of leaving one check's draft under another's id. -->
@@ -969,22 +994,31 @@
       onback={goBack}
     /></div>
   {:else if view.name === 'group' && groupPage}
-    <button class="link" onclick={goBack}>← Back</button>
-    <section class="section">
-      {#if groupRollupBanner}
-        <div class="banner {groupRollupBanner.tone}">
-          <span class="banner-icon" aria-hidden="true">
-            {#if groupRollupBanner.status === 'up'}✓{:else}!{/if}
-          </span>
-          <span class="banner-text">
-            {groupRollupBanner.label} · {groupRollupBanner.checks} {groupRollupBanner.checks === 1 ? 'monitor' : 'monitors'}
-            {#if groupRollupBanner.down > 0} · {groupRollupBanner.down} down{/if}
-            {#if groupRollupBanner.degraded > 0} · {groupRollupBanner.degraded} degraded{/if}
-          </span>
+    <!-- Like the main status hero, the group leads with the service identity
+         and a calm state banner against the lighthouse scene. -->
+    <div class="public-group-intro">
+      <button class="link public-group-back" onclick={goBack}>← Back to status</button>
+      <div class="public-state-banner {groupRollupBanner?.tone ?? 'unknown'}" role="status">
+        <span class="public-state-symbol" aria-hidden="true">
+          {#if groupRollupBanner?.status === 'up'}✓{:else if groupRollupBanner?.status === 'unknown' || !groupRollupBanner}?{:else}!{/if}
+        </span>
+        <div class="public-state-copy">
+          <div class="public-state-heading"><h1>{groupPage.name}</h1></div>
+          {#if groupRollupBanner}
+            <p>
+              {groupRollupBanner.label} · {groupRollupBanner.checks} {groupRollupBanner.checks === 1 ? 'monitor' : 'monitors'}
+              {#if groupRollupBanner.down > 0} · {groupRollupBanner.down} down{/if}
+              {#if groupRollupBanner.degraded > 0} · {groupRollupBanner.degraded} degraded{/if}
+            </p>
+          {:else}
+            <p>Section status not yet available.</p>
+          {/if}
         </div>
-      {/if}
+      </div>
+    </div>
+    <section class="section public-group-services">
       <div class="section-bar">
-        <h2 class="section-title">{groupPage.name}</h2>
+        <h2 class="section-title">Services</h2>
         <div class="range-switch" role="group" aria-label="chart window">
           {#each RANGES as r (r.days)}
             <button class="range-btn" class:active={days === r.days} onclick={() => setDays(r.days)}>

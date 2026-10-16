@@ -2,6 +2,7 @@
   import type { Agent, HistoryPoint } from '../lib/api';
   import { fetchAgents, fetchHistory } from '../lib/api';
   import { failureReason, formatLatency, formatRelativeTime, statusColor } from '../lib/format';
+  import { cronInputError } from '../lib/cronValidation';
   import type { CheckPayload, Section } from '../lib/admin';
   import {
     AdminError,
@@ -21,6 +22,7 @@
     DEFAULT_STATUSES,
     blank,
     fromCheck,
+    normaliseLegacyCron,
     whole,
     validPolicy,
     policyValue,
@@ -167,6 +169,7 @@
   });
 
   const cronHint = $derived(describeCron(draft.cron));
+  const cronError = $derived(cronInputError(normaliseLegacyCron(draft.cron)));
   const retryIntervalHint = $derived(describeInterval(draft.retry_interval_secs));
   const downIntervalHint = $derived(describeInterval(draft.down_interval_secs));
 
@@ -395,6 +398,10 @@
     savedNote = null;
     const n = draft.name.trim();
     if (!n) return (saveError = 'Name is required.');
+    if (cronError) {
+      probeOpen = true;
+      return (saveError = `Invalid cron schedule: ${cronError}`);
+    }
     const k = draft.type;
     if (k !== 'heartbeat' && !(k === 'dns' && draft.dns.mode === 'dnssec') && !draft.target.trim())
       return (saveError = 'Target is required.');
@@ -446,7 +453,7 @@
       target: k === 'heartbeat' ? '' : k === 'dns' && draft.dns.mode === 'dnssec' ? '.' : draft.target.trim(),
       hosts: multiHost ? trimmed(draft.hosts) : [],
       host_match: draft.host_match,
-      cron: draft.cron.trim(),
+      cron: normaliseLegacyCron(draft.cron),
       // Nothing is probed for a heartbeat, so a timeout has no meaning — but the
       // server still requires one that fits inside the schedule gap, and the
       // field is deliberately not on screen for this type. 1s always fits.
@@ -709,8 +716,24 @@ per_zone: draft.placement.count ?? 1,
              how it is probed, not a separate concern. -->
         <label class="field wide">
           <span class="field-label">Cron</span>
-          <input class="mono" bind:value={draft.cron} placeholder="*/30 * * * * *" />
-          <span class="field-note"><code>{draft.cron.trim() || '(empty)'}</code> — {cronHint}</span>
+          <input
+            class="mono cron-input"
+            class:invalid={cronError !== null}
+            bind:value={draft.cron}
+            placeholder="*/30 * * * * *"
+            aria-invalid={cronError !== null}
+            aria-describedby="check-cron-feedback"
+          />
+          <span id="check-cron-feedback" class:cron-error={cronError !== null} class="field-note" aria-live="polite">
+            {#if cronError}
+              {cronError}
+            {:else}
+              <code>{draft.cron.trim() || '(empty)'}</code> — {cronHint}
+            {/if}
+          </span>
+          {#if draft.cron.trim() !== normaliseLegacyCron(draft.cron)}
+            <span class="field-note">The legacy 60-unit cron step will be saved as <code>{normaliseLegacyCron(draft.cron)}</code>, which runs at the start of each minute/hour.</span>
+          {/if}
         </label>
 
         {#if kind !== 'heartbeat'}
@@ -1202,6 +1225,14 @@ per_zone: draft.placement.count ?? 1,
   .field code {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     color: var(--text);
+  }
+  :global(.admin-app) .cron-input.invalid {
+    border-color: var(--down, #e58a87);
+    box-shadow: 0 0 0 1px rgba(229, 138, 135, .15);
+  }
+  .field-note.cron-error {
+    color: var(--down, #e58a87);
+    font-weight: 550;
   }
 
   /* A check nothing probes must not read as fine when the panel is shut. */

@@ -116,7 +116,7 @@
       {#if authenticated}{@render navigation(false)}{/if}
     </nav>
     <div class="nav-footer">
-      <div class="connection"><span class="dot {liveTone}"></span><span>{liveLabel}</span></div>
+
       <div class="connection"><span class="mono-text">{nodeId ?? nodeMode}</span><span class="quiet">· {modeLabel}</span></div>
       <button class="nav-item" onclick={onHome}><ConsoleIcon name="arrow" />Public status page</button>
       {#if authenticated}
@@ -137,7 +137,10 @@
         <span class="muted context">Workspace</span><span class="slash">/</span><strong>{title}</strong>
       </div>
       <div class="top-actions">
-        <span class="freshness tiny muted">{modeLabel} view · {wsStatus === 'open' ? 'Live' : liveLabel}</span>
+        <span class="freshness tiny muted">{nodeId ?? modeLabel} · {modeLabel} view</span>
+        <span class="connection header-live" role="status" title={liveLabel}>
+          <span class="dot {liveTone}" aria-hidden="true"></span><span>{wsStatus === 'open' ? 'Live' : wsStatus === 'connecting' ? 'Connecting' : 'Disconnected'}</span>
+        </span>
       </div>
     </header>
     <main class="content" class:page={!overview} id="main" tabindex="-1">
