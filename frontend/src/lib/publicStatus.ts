@@ -1,6 +1,6 @@
 import type { Check, Incident, SectionRollup } from './api';
 
-export type PublicStatusTone = 'operational' | 'degraded' | 'outage' | 'unknown';
+export type PublicStatusTone = 'operational' | 'degraded' | 'outage' | 'incident' | 'unknown';
 export interface PublicStatusSummary {
   tone: PublicStatusTone;
   title: string;
@@ -30,7 +30,7 @@ export function summarizePublicStatus(
   const sectionsUnknown = sections.some((section) => section.status === 'unknown');
   if (current) {
     return {
-      tone: checks.some((check) => check.status === 'down') || sectionsDown ? 'outage' : 'degraded',
+      tone: checks.some((check) => check.status === 'down') || sectionsDown ? 'outage' : 'incident',
       title: current.title,
       detail: active.length === 1
         ? 'Active incident · See the latest published updates below.'
