@@ -60,10 +60,10 @@ body:has(.public-app) { background: #071321; }
   border: 1px solid #236e65; background: rgba(7,36,37,.94);
   box-shadow: 0 12px 32px rgba(0,0,0,.16);
 }
-.public-state-banner.outage { background: rgba(40,18,25,.97); border-color: #9c4449; }
+.public-state-banner.outage, .public-state-banner.incident { background: rgba(40,18,25,.97); border-color: #9c4449; }
 .public-state-banner.degraded, .public-state-banner.unknown { background: rgba(42,32,23,.97); border-color: #89653d; }
 .public-state-symbol { display: grid; place-items: center; flex: none; width: 49px; height: 49px; border-radius: 50%; background: #17be94; color: white; font-size: 28px; font-weight: 650; }
-.public-state-banner.outage .public-state-symbol { background: #f15c50; }
+.public-state-banner.outage .public-state-symbol, .public-state-banner.incident .public-state-symbol { background: #f15c50; }
 .public-state-banner.degraded .public-state-symbol, .public-state-banner.unknown .public-state-symbol { background: #c48c43; }
 .public-state-copy { min-width: 0; }
 .public-state-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
