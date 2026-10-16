@@ -597,7 +597,10 @@ mod tests {
         assert!(!relay.contains("page="));
         assert!(!relay.contains("section="));
         assert!(relay.contains("limit=1000"));
-        assert!(relay.contains("all=true"), "paged groups must survive region reads");
+        assert!(
+            relay.contains("all=true"),
+            "paged groups must survive region reads"
+        );
     }
 
     /// A region can bake a raw check id into an incident title when it opens
