@@ -28,6 +28,7 @@ describe('public status lighthouse hero', () => {
     render(PublicStatusHero, { props: { checks: [check('dns', 'up')], incidents: [incident] } });
     const region = screen.getByRole('region', { name: 'Current service status' });
     expect(region).toHaveClass('storm');
+    expect(region).toHaveAttribute('data-health', 'incident');
     expect(region).toHaveTextContent('DNS service disruption');
     expect(region).toHaveTextContent('investigating');
   });
