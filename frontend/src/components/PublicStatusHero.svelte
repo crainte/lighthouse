@@ -11,7 +11,7 @@
 
 <section
   class="public-status-hero"
-  class:storm={summary.tone === 'outage' || summary.tone === 'degraded'}
+  class:storm={summary.tone === 'outage' || summary.tone === 'degraded' || summary.tone === 'incident'}
   data-health={summary.tone}
   style:--scene={'url("' + scenicLighthouse + '")'}
   aria-label="Current service status"
