@@ -18,6 +18,7 @@
     incident,
     onselect,
     onbarclick,
+    compact = false,
   }: {
     check: Check;
     uptime: UptimeResponse | undefined;
@@ -28,6 +29,7 @@
     incident?: Incident | null;
     onselect: (id: string) => void;
     onbarclick?: (id: string, b: UptimeBucket) => void;
+    compact?: boolean;
   } = $props();
 
   const placeholders = Array.from({ length: 90 }, (_, i) => i);
@@ -112,6 +114,34 @@
   }
 </script>
 
+{#if compact}
+  <button class="public-service-row" data-status={check.status} onclick={() => onselect(check.check_id)}>
+    <span class="public-service-name">
+      <span class="public-service-dot" style:background={statusColor(check.status)} aria-hidden="true"></span>
+      <span><strong>{check.name}</strong><small>{check.group ?? check.type?.toUpperCase() ?? 'Service monitor'}</small></span>
+    </span>
+    <span class="public-service-history">
+      <span class="ubars" role="presentation" onmousemove={onStripMove} onmouseleave={() => (tip = null)} onclick={stripClicked}>
+        {#if uptime}
+          {#each uptime.buckets as b (b.start)}
+            <span class="ubar {barColor(b)}" class:hovered={tip?.b === b} role="presentation"></span>
+          {/each}
+        {:else}
+          {#each placeholders as i (i)}
+            <span class="ubar nodata" role="presentation"></span>
+          {/each}
+        {/if}
+      </span>
+      {#if reason}<small class="public-service-reason" title={reason}>{reason}</small>{/if}
+      {#if incident}<small class="public-service-incident">Incident: {incident.title}</small>{/if}
+    </span>
+    <span class="public-service-stats">
+      <strong>{formatUptime(uptime?.overall_uptime ?? null)}</strong>
+      <small>{statusLabel} · {formatLatency(check.latency_ms)}</small>
+    </span>
+    <span class="public-service-chevron" aria-hidden="true">›</span>
+  </button>
+{:else}
 <button class="component" onclick={() => onselect(check.check_id)}>
   <div class="component-head">
     <span class="component-name">
@@ -164,6 +194,7 @@
     <LatencyChart points={sparkline} label="latency over the selected window" />
   {/if}
 </button>
+{/if}
 
 {#if tip}
   <div class="bar-tooltip" style="left:{tip.x}px; top:{tip.y}px">
