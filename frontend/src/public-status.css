@@ -7,7 +7,7 @@
   --public-panel: #0e1a28;
   --public-line: #263c50;
   --public-dim: #a2b8c7;
-  --public-success: #71bfa6;
+  --public-success: var(--lk-health-green);
   --public-warning: #dab176;
   --public-danger: #e58a87;
   --public-empty: #3e5367;
