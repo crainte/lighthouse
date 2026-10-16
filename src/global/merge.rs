@@ -529,6 +529,63 @@ fn latency_band_json(
 mod tests {
     use super::*;
 
+    fn scoped_check(group: Option<&str>) -> cache::AggregatedCheck {
+        cache::AggregatedCheck {
+            check_id: crate::models::new_check_id(),
+            name: group.unwrap_or("loose").to_string(),
+            state: crate::models::NodeState::Up,
+            per_region: HashMap::new(),
+            latency_ms: 1,
+            last_check: 1,
+            uptime_24h: Some(1.0),
+            status_code: None,
+            error: None,
+            kind: None,
+            group: group.map(str::to_owned),
+            latency_graph: true,
+            position: 0,
+        }
+    }
+
+    #[test]
+    fn global_scopes_do_not_lose_paged_groups_or_admin_checks() {
+        let all = vec![
+            scoped_check(None),
+            scoped_check(Some("inline")),
+            scoped_check(Some("remote")),
+        ];
+        let paged = HashSet::from(["remote".to_string()]);
+        let mut primary = all.clone();
+        scope_aggregate_checks(&mut primary, None, false, &paged);
+        assert_eq!(primary.len(), 2);
+        assert!(!primary.iter().any(|c| c.group.as_deref() == Some("remote")));
+
+        let mut remote = all.clone();
+        scope_aggregate_checks(&mut remote, Some("remote"), false, &paged);
+        assert_eq!(remote.len(), 1);
+        assert_eq!(remote[0].group.as_deref(), Some("remote"));
+
+        let mut admin = all;
+        scope_aggregate_checks(&mut admin, None, true, &paged);
+        assert_eq!(admin.len(), 3, "changing a public section must not hide admin monitors");
+    }
+
+    #[test]
+    fn global_latency_requests_share_one_exact_24_hour_window() {
+        let uri: Uri = "/api/v1/latency-points?hours=24&buckets=90&page=2&limit=25&section=remote"
+            .parse()
+            .unwrap();
+        let relay = chart_relay_path(&uri);
+        let query = relay.split_once('?').unwrap().1;
+        let from: i64 = query_value(Some(query), "from").unwrap().parse().unwrap();
+        let to: i64 = query_value(Some(query), "to").unwrap().parse().unwrap();
+        assert_eq!(to - from, 86_400_000);
+        assert_eq!(to % 60_000, 0, "regions must share minute-aligned buckets");
+        assert!(!relay.contains("page="));
+        assert!(!relay.contains("section="));
+        assert!(relay.contains("limit=1000"));
+    }
+
     /// A region can bake a raw check id into an incident title when it opens
     /// the incident before the check's name has reached its catalogue. The
     /// global tier holds every live region's name for the check, so it puts the
