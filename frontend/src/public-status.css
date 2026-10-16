@@ -137,6 +137,24 @@ body:has(.public-app) { background: #071321; }
 .public-state-label { font-size: 11px; text-transform: capitalize; color: #fd9b8d; border: 1px solid #8b4248; background: #441b28; border-radius: 18px; padding: 3px 10px; }
 .public-state-copy p { color: #b4c9d5; margin: 6px 0 0; font-size: 12px; line-height: 1.55; }
 .public-state-copy p.public-state-time { color: #829fae; font-size: 11px; }
+/* A section page shares the home hero's status card rather than the older
+   saturated banner component. Pull it into the coastal masthead foreground. */
+.public-group-intro {
+  display: grid;
+  gap: 14px;
+  position: relative;
+  z-index: 1;
+  margin: -62px 0 27px;
+}
+.public-group-back {
+  justify-self: start;
+  color: #aad7e7;
+  cursor: pointer;
+}
+.public-group-intro .public-state-banner {
+  min-height: 110px;
+}
+.public-group-services .section-bar { margin-bottom: 16px; }
 .public-app .section { margin-bottom: 28px; }
 .public-app .section-title { color: #e3edf4; font-size: 17px; font-weight: 550; margin: 0; }
 .public-app .section-bar { align-items: center; margin-bottom: 13px; }
@@ -328,6 +346,8 @@ body:has(.public-app) { background: #071321; }
   .public-nav button { font-size: 11px; padding: 5px 6px; }
   .public-route-masthead { margin: -95px -15px 10px; height: 192px; background-position: center, 67% 46%; }
   .public-route-masthead.compact { height: 118px; margin-bottom: 3px; }
+  .public-group-intro { margin-top: -45px; gap: 11px; }
+  .public-group-intro .public-state-banner { min-height: 90px; }
   .public-live-label { display: none; }
   .public-status-hero { margin: -95px -15px 23px; padding: 198px 15px 0; min-height: 338px; }
   .public-hero-scene { background-position: 68% 46%; }
