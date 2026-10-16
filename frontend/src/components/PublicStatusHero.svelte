@@ -1,11 +1,11 @@
 <script lang="ts">
-  import type { Check, Incident } from '../lib/api';
+  import type { Check, Incident, SectionRollup } from '../lib/api';
   import { formatRelativeTime } from '../lib/format';
   import { summarizePublicStatus } from '../lib/publicStatus';
   import scenicLighthouse from '../assets/lighthouse-fall.png';
 
-  let { checks, incidents }: { checks: Check[]; incidents: Incident[] } = $props();
-  const summary = $derived(summarizePublicStatus(checks, incidents));
+  let { checks, incidents, sections = [] }: { checks: Check[]; incidents: Incident[]; sections?: SectionRollup[] } = $props();
+  const summary = $derived(summarizePublicStatus(checks, incidents, sections));
   const observedAt = $derived(Math.max(0, ...checks.map((check) => check.last_check ?? 0)));
 </script>
 
