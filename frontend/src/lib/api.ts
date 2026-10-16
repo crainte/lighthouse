@@ -529,9 +529,10 @@ export function fetchUptimeStrips(
   section: string | null = null,
   page = 0,
   limit = 100,
+  all = false,
 ): Promise<UptimeStripsResponse> {
   return getJson<UptimeStripsResponse>(
-    `/api/v1/uptime?days=${days}&buckets=${buckets}&page=${page}&limit=${limit}${sectionParam(section)}`,
+    `/api/v1/uptime?days=${days}&buckets=${buckets}&page=${page}&limit=${limit}${sectionParam(section)}${all ? "&all=true" : ""}`,
   );
 }
 
