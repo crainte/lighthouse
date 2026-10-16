@@ -2231,15 +2231,24 @@ mod tests {
 
     #[test]
     fn legacy_sixty_second_and_minute_steps_are_repaired_without_changing_cadence() {
-        assert_eq!(CheckConfig::normalise_legacy_cron("*/60 * * * * *"), "0 * * * * *");
-        assert_eq!(CheckConfig::normalise_legacy_cron("0 */60 * * * *"), "0 0 * * * *");
-        assert_eq!(CheckConfig::normalise_legacy_cron("*/60 * * * *"), "0 * * * *");
-        assert_eq!(CheckConfig::normalise_legacy_cron("*/61 * * * * *"), "*/61 * * * * *");
+        assert_eq!(
+            CheckConfig::normalise_legacy_cron("*/60 * * * * *"),
+            "0 * * * * *"
+        );
+        assert_eq!(
+            CheckConfig::normalise_legacy_cron("0 */60 * * * *"),
+            "0 0 * * * *"
+        );
+        assert_eq!(
+            CheckConfig::normalise_legacy_cron("*/60 * * * *"),
+            "0 * * * *"
+        );
+        assert_eq!(
+            CheckConfig::normalise_legacy_cron("*/61 * * * * *"),
+            "*/61 * * * * *"
+        );
         assert!(CheckConfig::parse_cron("*/61 * * * * *").is_err());
-        for (expression, seconds) in [
-            ("*/60 * * * * *", 60),
-            ("0 */60 * * * *", 3600),
-        ] {
+        for (expression, seconds) in [("*/60 * * * * *", 60), ("0 */60 * * * *", 3600)] {
             let schedule = CheckConfig::parse_cron(expression).unwrap();
             let mut dates = schedule.upcoming(chrono::Utc);
             let first = dates.next().unwrap();
@@ -2249,7 +2258,8 @@ mod tests {
         let repaired = CheckConfig {
             cron: "0 */60 * * * *".to_string(),
             ..CheckConfig::default()
-        }.normalised();
+        }
+        .normalised();
         assert_eq!(repaired.cron, "0 0 * * * *");
     }
 
