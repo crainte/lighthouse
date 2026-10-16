@@ -230,6 +230,9 @@ pub(in crate::coordinator) struct ResultsQuery {
 pub(in crate::coordinator) struct StatusQuery {
     /// A named section, or omitted for the primary page (loose + inline checks).
     section: Option<String>,
+    /// Include every visible check, regardless of section display mode. The
+    /// admin Overview needs all monitors, not only the primary public scope.
+    all: Option<bool>,
     /// Zero-based page within the selected scope.
     page: Option<usize>,
     limit: Option<usize>,
@@ -243,6 +246,7 @@ pub(in crate::coordinator) struct DaysQuery {
     buckets: Option<usize>,
     /// Scope the request to one section. See [`storage::StatusScope`].
     section: Option<String>,
+    all: Option<bool>,
     /// Must match the status request's bounded page.
     page: Option<usize>,
     limit: Option<usize>,
@@ -363,6 +367,7 @@ pub(in crate::coordinator) struct HoursQuery {
     to: Option<i64>,
     /// Scope the request to one section. See [`storage::StatusScope`].
     section: Option<String>,
+    all: Option<bool>,
     /// Must match the status request's bounded page.
     page: Option<usize>,
     limit: Option<usize>,
@@ -400,7 +405,11 @@ pub(in crate::coordinator) async fn status_handler(
     // The status page is public; raw probe errors name resolved addresses and
     // expected values, so only an admin sees them verbatim.
     let detailed = is_admin(&coord, &headers);
-    let scope = storage::StatusScope::from_section(q.section);
+    let scope = if q.all.unwrap_or(false) {
+        storage::StatusScope::All
+    } else {
+        storage::StatusScope::from_section(q.section)
+    };
     let (page, limit) = (q.page.unwrap_or(0), crate::page::bounded(q.limit, 100));
     let reader = coord.clone();
     let (statuses, total_checks, section_states) = match coord
@@ -772,7 +781,11 @@ pub(in crate::coordinator) async fn uptime_strips_handler(
     let days = q.days.unwrap_or(90).clamp(1, 365);
     let buckets = q.buckets.unwrap_or(90).clamp(1, 500);
     let now = chrono::Utc::now().timestamp_millis();
-    let scope = storage::StatusScope::from_section(q.section);
+    let scope = if q.all.unwrap_or(false) {
+        storage::StatusScope::All
+    } else {
+        storage::StatusScope::from_section(q.section)
+    };
     let page = q.page.unwrap_or(0);
     let limit = crate::page::bounded(q.limit, 100);
     let reader = coord.clone();
@@ -828,7 +841,11 @@ pub(in crate::coordinator) async fn latency_points_handler(
             (now - hours * 3_600_000, now)
         }
     };
-    let scope = storage::StatusScope::from_section(q.section);
+    let scope = if q.all.unwrap_or(false) {
+        storage::StatusScope::All
+    } else {
+        storage::StatusScope::from_section(q.section)
+    };
     let page = q.page.unwrap_or(0);
     let limit = crate::page::bounded(q.limit, 100);
     match coord
