@@ -497,7 +497,7 @@
               </div>
             {/each}
           </div>
-          <div class="region-foot"><span>Line = reporting relationship, not physical topology</span><span>{regionTree ? 'Region tree · refreshed every minute' : 'Region health unavailable'}</span></div>
+          <div class="region-foot"><span>Regions report independently to global · no inter-region connection</span><span>{regionTree ? 'Region tree · refreshed every minute' : 'Region health unavailable'}</span></div>
         {:else}
           <div class="empty">Regional stations appear once agents report from a region.</div>
         {/if}
@@ -935,15 +935,8 @@
     gap: 16px;
     position: relative;
   }
-  .stations:before {
-    content: '';
-    position: absolute;
-    top: 31px;
-    left: 35px;
-    right: 35px;
-    height: 1px;
-    background: #304454;
-  }
+  /* Regions are siblings reporting to global, not peers in a network chain.
+     Never draw a line through unrelated regional station nodes. */
   .station {
     min-width: 0;
     position: relative;
