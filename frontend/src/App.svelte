@@ -664,6 +664,7 @@
     publicIncidents.filter((incident) => incident.state !== 'resolved').sort((a, b) => b.started_at - a.started_at),
   );
   const leadPublicIncident = $derived(activePublicIncidents[0] ?? null);
+  const publicRouteIncidentId = $derived(view.name === 'incident' ? view.incidentId : null);
 
   // Section URLs remain deep-linkable; changing scope always starts at page one
   // and requests matching charts with the exact same scope/page tuple.
@@ -835,7 +836,7 @@
            health verdict shown on the status homepage. Decorative only. -->
       <div
         class="public-route-masthead"
-        class:storm={view.name === 'incident' && activePublicIncidents.some((incident) => incident.id === view.incidentId)}
+        class:storm={publicRouteIncidentId !== null && activePublicIncidents.some((incident) => incident.id === publicRouteIncidentId)}
         style:--scene={'url("' + publicLighthouseScene + '")'}
         aria-hidden="true"
       ></div>
