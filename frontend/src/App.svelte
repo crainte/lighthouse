@@ -215,6 +215,26 @@
   // A screen-reader-only account of websocket state transitions. The visible
   // badges update too, but those are easy to miss while reading another row.
   let liveAnnouncement = $state('');
+  // Admin Overview is an all-monitor inventory. Public primary pages omit
+  // checks placed into standalone sections, but the operator must not.
+  let adminOverviewChecks = $state<Check[]>([]);
+  let adminOverviewTotal = $state(0);
+  let adminOverviewLoaded = $state(false);
+  $effect(() => {
+    if (view.name !== 'admin' || view.panel !== 'overview') return;
+    let active = true;
+    adminOverviewLoaded = false;
+    fetchStatus(null, 0, STATUS_PAGE_SIZE, true)
+      .then((response) => {
+        if (!active) return;
+        adminOverviewChecks = response.checks;
+        adminOverviewTotal = response.total_checks;
+        adminOverviewLoaded = true;
+      })
+      .catch(() => { /* The regular status/error panel still reports failures. */ });
+    return () => { active = false; };
+  });
+
   let wsStatus = $state<WsStatus>('connecting');
   // Bumped to tell an open CheckDetail page to refetch its own uptime, latency,
   // history and incidents — on a live state change for the check it's showing,
@@ -843,6 +863,7 @@
       <div
         class="public-route-masthead"
         class:storm={publicRouteIncidentId !== null && activePublicIncidents.some((incident) => incident.id === publicRouteIncidentId)}
+        class:compact={view.name === 'detail'}
         style:--scene={'url("' + publicLighthouseScene + '")'}
         aria-hidden="true"
       ></div>
@@ -883,7 +904,7 @@
             </div>
           </div>
         {:else if panel === 'overview'}
-          <NightwatchOverview seasonalPreferences={seasonalPreferences} seasonalNow={seasonalNow} onSeasonalPreferencesChange={updateSeasonalPreferences} {checks} totalChecks={statusTotal} hasMore={statusHasMore || statusPage > 0} incidents={adminIncidents} groups={adminIncidentGroups} {alerts} {fleet} {maintenance} {loading} {error} {wsStatus} {nodeMode} onOpenCheck={openDetail} onOpenIncident={openIncidentEditor} onPanel={(id) => { const target = ADMIN_PANELS.find((p) => p.id === id); if (target) openAdmin(target.id); }} onAddCheck={() => openCheckEditor(null)} onRetry={load} onExpired={onExpired} />
+          <NightwatchOverview seasonalPreferences={seasonalPreferences} seasonalNow={seasonalNow} onSeasonalPreferencesChange={updateSeasonalPreferences} checks={adminOverviewLoaded ? adminOverviewChecks : checks} totalChecks={adminOverviewLoaded ? adminOverviewTotal : statusTotal} hasMore={adminOverviewLoaded ? adminOverviewTotal > STATUS_PAGE_SIZE : statusHasMore || statusPage > 0} incidents={adminIncidents} groups={adminIncidentGroups} {alerts} {fleet} {maintenance} {loading} {error} {wsStatus} {nodeMode} onOpenCheck={openDetail} onOpenIncident={openIncidentEditor} onPanel={(id) => { const target = ADMIN_PANELS.find((p) => p.id === id); if (target) openAdmin(target.id); }} onAddCheck={() => openCheckEditor(null)} onRetry={load} onExpired={onExpired} />
         {:else if panel === 'checks' && editing}
           <!-- Keyed so back/forward between two checks rebuilds the editor
                instead of leaving one check's draft under another's id. -->
