@@ -97,19 +97,24 @@ pub(super) fn chart_relay_path(uri: &Uri) -> String {
     // by a later global page.
     let mut query = query.unwrap_or_default();
     if uri.path() == "/api/v1/latency-points"
-        && !(query_value(uri.query(), "from").is_some()
-            && query_value(uri.query(), "to").is_some())
+        && !(query_value(uri.query(), "from").is_some() && query_value(uri.query(), "to").is_some())
     {
         // Every region must bucket on *the same* clock boundaries. Asking with
         // independent 'now' timestamps shifts each region's 24h grid a few ms
         // and can erase or misalign the measurements in a merged chart.
         let now = chrono::Utc::now().timestamp_millis();
         let to = now.div_euclid(60_000) * 60_000;
-        let hours = query_usize(uri.query(), "hours").unwrap_or(24).clamp(1, 24 * 365);
-        if !query.is_empty() { query.push('&'); }
+        let hours = query_usize(uri.query(), "hours")
+            .unwrap_or(24)
+            .clamp(1, 24 * 365);
+        if !query.is_empty() {
+            query.push('&');
+        }
         query.push_str(&format!("from={}&to={}", to - hours as i64 * 3_600_000, to));
     }
-    if !query.is_empty() { query.push('&'); }
+    if !query.is_empty() {
+        query.push('&');
+    }
     query.push_str("limit=1000");
     format!("{}?{query}", uri.path())
 }
@@ -123,10 +128,15 @@ pub(super) fn scope_aggregate_checks(
     all: bool,
     paged_sections: &HashSet<String>,
 ) {
-    if all { return; }
+    if all {
+        return;
+    }
     checks.retain(|check| match section {
         Some(name) => check.group.as_deref() == Some(name),
-        None => check.group.as_ref().is_none_or(|name| !paged_sections.contains(name)),
+        None => check
+            .group
+            .as_ref()
+            .is_none_or(|name| !paged_sections.contains(name)),
     });
 }
 
@@ -141,7 +151,10 @@ pub(super) fn filter_chart_page(
     let limit = crate::page::bounded(query_usize(uri.query(), "limit"), 100);
     let section = query_value(uri.query(), "section");
     let all = query_value(uri.query(), "all").as_deref() == Some("true");
-    let mut checks = node.inner.cache.aggregate(chrono::Utc::now().timestamp_millis());
+    let mut checks = node
+        .inner
+        .cache
+        .aggregate(chrono::Utc::now().timestamp_millis());
     scope_aggregate_checks(&mut checks, section.as_deref(), all, paged_sections);
     checks.sort_by(|a, b| {
         a.position
