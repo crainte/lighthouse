@@ -466,11 +466,13 @@ header.bar {
 .latency-graph {
   margin-top: 0.5rem;
 }
-/* Keep the entire latency timeline as wide as the uptime strip above it.
-   The old 3rem right gutter shortened the plot and right-most tick. */
+/* A small shared plot inset leaves room for the latency scale value at
+   the right edge, without the old oversized gutter truncating the chart. */
 .latency-plot {
   position: relative;
   width: 100%;
+  box-sizing: border-box;
+  padding-right: 28px;
 }
 .lat-inner {
   position: relative;
