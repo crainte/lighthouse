@@ -5,7 +5,7 @@ use super::{cache, incidents, GlobalNode};
 use axum::http::Uri;
 use axum::Json;
 use percent_encoding::percent_decode_str;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Add a `"groups"` array alongside the merged `"incidents"` list: the same
 /// per-region rows, folded by same-check overlapping windows and attributed
@@ -101,20 +101,35 @@ pub(super) fn chart_relay_path(uri: &Uri) -> String {
     }
 }
 
+/// Global public and batched-chart reads must apply the same scope rules as
+/// coordinator SQL. In particular a paged section is a *tile*, not part of the
+/// primary page, while an admin request can explicitly include all checks.
+pub(super) fn scope_aggregate_checks(
+    checks: &mut Vec<cache::AggregatedCheck>,
+    section: Option<&str>,
+    all: bool,
+    paged_sections: &HashSet<String>,
+) {
+    if all { return; }
+    checks.retain(|check| match section {
+        Some(name) => check.group.as_deref() == Some(name),
+        None => check.group.as_ref().is_none_or(|name| !paged_sections.contains(name)),
+    });
+}
+
 /// Keep chart entries to precisely the ids rendered by the global status page.
-pub(super) fn filter_chart_page(node: &GlobalNode, uri: &Uri, response: &mut serde_json::Value) {
+pub(super) fn filter_chart_page(
+    node: &GlobalNode,
+    uri: &Uri,
+    response: &mut serde_json::Value,
+    paged_sections: &HashSet<String>,
+) {
     let page = query_usize(uri.query(), "page").unwrap_or(0);
     let limit = crate::page::bounded(query_usize(uri.query(), "limit"), 100);
     let section = query_value(uri.query(), "section");
-    let mut checks = node
-        .inner
-        .cache
-        .aggregate(chrono::Utc::now().timestamp_millis());
-    checks.retain(|check| {
-        section
-            .as_deref()
-            .is_none_or(|want| check.group.as_deref() == Some(want))
-    });
+    let all = query_value(uri.query(), "all").as_deref() == Some("true");
+    let mut checks = node.inner.cache.aggregate(chrono::Utc::now().timestamp_millis());
+    scope_aggregate_checks(&mut checks, section.as_deref(), all, paged_sections);
     checks.sort_by(|a, b| {
         a.position
             .cmp(&b.position)
