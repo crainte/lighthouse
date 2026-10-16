@@ -289,6 +289,8 @@
       {/if}
     </div>
 
+    <details class="public-technical">
+      <summary>Technical details — per-agent results and recent probes</summary>
     {#if series && series.agents.length}
       <div class="detail-panel">
         <div class="panel-title">By agent</div>
@@ -351,6 +353,7 @@
         <p class="dim">No attempts recorded.</p>
       {/if}
     </div>
+    </details>
   </div>
 {/if}
 
