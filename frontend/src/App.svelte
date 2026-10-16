@@ -27,7 +27,7 @@
   import { connectWs } from './lib/ws';
   import type { WsStatus } from './lib/ws';
   import { applyStateChange, prependAlert, applyIncidentEvent } from './lib/live';
-  import { formatDuration, worstStatus } from './lib/format';
+  import { worstStatus } from './lib/format';
   import type { View, FleetTab } from './lib/router';
   import {
     viewFromHash,
@@ -53,7 +53,6 @@
   import {
     formatAbsolute,
     openIncidentForCheck,
-    stateTone,
   } from './lib/incident';
   import NightwatchOverview from './components/NightwatchOverview.svelte';
   import ConsoleIcon from './components/ConsoleIcon.svelte';
@@ -1010,7 +1009,7 @@
        {/if}
      </section>
    {:else}
-     <PublicStatusHero {checks} incidents={publicIncidents} />
+     <PublicStatusHero {checks} incidents={publicIncidents} sections={sectionRollups} />
      {#if leadPublicIncident}
        <PublicIncidentSpotlight incident={leadPublicIncident} {checks} onOpen={openIncident} />
        {#if activePublicIncidents.length > 1}
