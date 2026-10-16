@@ -466,10 +466,11 @@ header.bar {
 .latency-graph {
   margin-top: 0.5rem;
 }
+/* Keep the entire latency timeline as wide as the uptime strip above it.
+   The old 3rem right gutter shortened the plot and right-most tick. */
 .latency-plot {
   position: relative;
-  /* Right gutter for the scale label. */
-  padding-right: 3rem;
+  width: 100%;
 }
 .lat-inner {
   position: relative;
@@ -538,13 +539,14 @@ header.bar {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
-/* Max-latency scale marker in the right gutter, aligned to the baseline. */
+/* Max-latency scale marker overlaid at the right edge of the full-width plot. */
 .lat-scale {
   position: absolute;
   right: 0;
   bottom: 0.9rem;
-  width: 3rem;
-  padding-left: 0.4rem;
+  width: auto;
+  padding: 0 0 0 0.4rem;
+  text-align: right;
   font-size: 0.68rem;
   color: var(--text-dim);
   font-variant-numeric: tabular-nums;
