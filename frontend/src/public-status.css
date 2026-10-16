@@ -54,6 +54,10 @@ body:has(.public-app) { background: #071321; }
 .public-nav button.active { color: #e9f6fa; border-bottom: 1px solid #a9daed; border-radius: 0; }
 .public-nav button:focus-visible, .public-app button:focus-visible { outline: 2px solid #7dddea; outline-offset: 2px; }
 .public-nav .public-admin { border: 1px solid #30485b; font-size: 11px; border-radius: 6px; padding: 6px 10px; }
+.public-live { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: #b6c9d6; padding: 4px 7px; }
+.public-live-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--down); }
+.public-live-dot.connecting { background: var(--amber); }
+.public-live-dot.connected { background: var(--up); }
 .public-route-masthead {
   position: relative;
   z-index: 0;
@@ -63,6 +67,11 @@ body:has(.public-app) { background: #071321; }
   background:
     linear-gradient(to bottom, rgba(5,16,27,.4) 0%, rgba(5,16,27,.08) 38%, rgba(7,19,33,.65) 75%, #071321 100%),
     var(--scene) center 46% / cover no-repeat;
+}
+.public-route-masthead.compact {
+  height: 130px;
+  margin-bottom: 4px;
+  background-position: center, 66% 42%;
 }
 .public-route-masthead.storm {
   background:
@@ -318,6 +327,8 @@ body:has(.public-app) { background: #071321; }
   .public-nav { gap: 1px; }
   .public-nav button { font-size: 11px; padding: 5px 6px; }
   .public-route-masthead { margin: -95px -15px 10px; height: 192px; background-position: center, 67% 46%; }
+  .public-route-masthead.compact { height: 118px; margin-bottom: 3px; }
+  .public-live-label { display: none; }
   .public-status-hero { margin: -95px -15px 23px; padding: 198px 15px 0; min-height: 338px; }
   .public-hero-scene { background-position: 68% 46%; }
   .public-state-banner { padding: 16px; gap: 12px; }
