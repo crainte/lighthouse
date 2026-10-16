@@ -241,10 +241,46 @@
   .strategy-fieldset, .scope-fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
   .strategy-fieldset legend, .scope-fieldset legend { margin-bottom: 9px; }
   .strategy-choices { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
-  .strategy-option { display: flex; gap: 12px; align-items: flex-start; min-width: 0; padding: 15px; border: 1px solid var(--border); border-radius: 9px; background: #0d1b2b; cursor: pointer; }
+  /* Force radio + copy into fixed/elastic grid columns. Some inherited form
+     styles otherwise allow the radio to stretch and shove its text beyond
+     the right edge of the selection card. */
+  .strategy-option {
+    display: grid;
+    grid-template-columns: 16px minmax(0, 1fr);
+    grid-template-rows: auto;
+    gap: 12px;
+    align-items: start;
+    min-width: 0;
+    min-height: 82px;
+    padding: 15px;
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    background: #0d1b2b;
+    cursor: pointer;
+  }
   .strategy-option.active { background: #102538; border-color: #32718b; box-shadow: inset 0 0 0 1px rgba(91, 208, 230, .06); }
-  .strategy-option input { flex: none; margin-top: 3px; accent-color: var(--cyan, #6bbbd5); }
-  .option-copy { display: grid; gap: 5px; min-width: 0; }
+  .strategy-option input[type='radio'] {
+    grid-column: 1;
+    grid-row: 1;
+    width: 16px;
+    height: 16px;
+    min-width: 16px;
+    margin: 1px 0 0;
+    padding: 0;
+    justify-self: start;
+    accent-color: var(--cyan, #6bbbd5);
+  }
+  .strategy-option .option-copy {
+    grid-column: 2;
+    grid-row: 1;
+    display: grid;
+    align-content: start;
+    gap: 5px;
+    min-width: 0;
+    max-width: 100%;
+    overflow-wrap: break-word;
+    text-align: left;
+  }
   .option-copy strong { font-size: 13px; font-weight: 600; }
   .option-copy small { font-size: 11px; line-height: 1.5; color: var(--text-dim); }
   .placement-settings { display: grid; gap: 14px; }
