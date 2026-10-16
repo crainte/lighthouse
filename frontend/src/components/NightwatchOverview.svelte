@@ -367,7 +367,7 @@
     }
     const request = ++stripsRequest;
     try {
-      const response = await fetchUptimeStrips(1, BUCKETS, null, 0, 100);
+      const response = await fetchUptimeStrips(1, BUCKETS, null, 0, 100, true);
       if (request === stripsRequest) strips = Object.fromEntries(response.checks.map((strip) => [strip.check_id, strip]));
     } catch (failure) {
       if (isUnauthorized(failure)) onExpired();
