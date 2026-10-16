@@ -160,7 +160,7 @@
             y={bar.y}
             width={bar.w}
             height={bar.h}
-            fill={bar.i === hoverIndex ? 'var(--text, #e6edf3)' : 'var(--accent, #56d4e4)'}
+            fill={bar.i === hoverIndex ? 'var(--latency-hover, var(--text, #e6edf3))' : 'var(--latency-color, var(--accent, #56d4e4))'}
           />
         {/each}
       </svg>

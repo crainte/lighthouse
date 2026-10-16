@@ -107,7 +107,7 @@
     <div class="sidebar-art" aria-hidden="true" style:background-image={`url("${sidebarScene}")`}></div>
     <div class="brand">
       <svg class="brand-mark" viewBox="0 0 32 40" fill="none" aria-hidden="true">
-        <path d="m10 35 3-23h6l3 23M8 35h16M11 12h10M12 7h8l-4-5ZM13 7v5m6-5v5M2 9h6m16 0h6" stroke="currentColor" stroke-width="1.5" />
+        <path d="m10 35 3-23h6l3 23M8 35h16M11 12h10M12 7h8l-4-5ZM13 7v5m6-5v5" stroke="currentColor" stroke-width="1.5" />
         <path d="m15 16-1 15h4l-1-15" fill="currentColor" opacity=".3" />
       </svg>
       <div><strong>Lightkeeper</strong><small>LIGHTHOUSE CONSOLE</small></div>

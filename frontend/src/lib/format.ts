@@ -3,11 +3,14 @@ import type { Status, Health, Check, UptimeBucket } from './api';
 
 // Degraded checks and partially healthy fleet rows share the same amber used
 // by partial-outage history bars.
+// CSS semantic tokens are scoped to public/admin. Hard-coded hex colors here
+// drifted from the palette, leaving status dots and probe grids mismatched
+// with their neighboring uptime bars.
 const STATUS_COLORS: Record<Status | Health, string> = {
-  up: '#3fb950',
-  down: '#f85149',
-  unknown: '#8b949e',
-  degraded: '#d29922',
+  up: 'var(--up)',
+  down: 'var(--down)',
+  unknown: 'var(--unknown)',
+  degraded: 'var(--amber)',
 };
 
 export function statusColor(status: Status | Health): string {

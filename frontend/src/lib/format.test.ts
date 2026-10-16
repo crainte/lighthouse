@@ -12,10 +12,10 @@ import {
 
 describe('statusColor', () => {
   it('maps each status to a distinct color', () => {
-    expect(statusColor('up')).toBe('#3fb950');
-    expect(statusColor('down')).toBe('#f85149');
-    expect(statusColor('unknown')).toBe('#8b949e');
-    expect(statusColor('degraded')).toBe('#d29922');
+    expect(statusColor('up')).toBe('var(--up)');
+    expect(statusColor('down')).toBe('var(--down)');
+    expect(statusColor('unknown')).toBe('var(--unknown)');
+    expect(statusColor('degraded')).toBe('var(--amber)');
   });
 });
 
