@@ -71,7 +71,7 @@
   import DayDetailModal from './components/DayDetailModal.svelte';
   import CollapsibleGroup from './components/CollapsibleGroup.svelte';
   import SectionTile from './components/SectionTile.svelte';
-  import ServerRow from './components/ServerRow.svelte';
+  import PublicMonitoringCoverage from './components/PublicMonitoringCoverage.svelte';
   import LoginModal from './components/LoginModal.svelte';
   import ChecksAdmin from './components/ChecksAdmin.svelte';
   import CheckEditor from './components/CheckEditor.svelte';
@@ -1120,25 +1120,7 @@
       </section>
 
       {#if fleet.length}
-        <details class="section public-coverage" aria-label="Monitoring coverage">
-          <summary class="public-coverage-toggle">
-            <span class="public-coverage-heading">
-              <strong>Monitoring coverage</strong>
-              <span>Connectivity of the monitoring fleet, not the health of the services it checks.</span>
-            </span>
-            <span class="public-coverage-count">
-              {fleet.filter((row) => row.kind === 'region').length || fleet.length} reported locations
-              <span class="public-coverage-action">· <span class="public-coverage-action-label">View observers</span></span>
-              <span class="public-coverage-chevron" aria-hidden="true">⌄</span>
-            </span>
-          </summary>
-          <div class="public-coverage-observers" aria-label="Reporting locations">
-            {#each fleet as row (row.kind + ':' + row.name)}
-              <ServerRow name={row.name} status={row.status}
-                detail={row.kind === 'region' ? row.healthy + '/' + row.total + ' agents reporting' : undefined} />
-            {/each}
-          </div>
-        </details>
+        <PublicMonitoringCoverage {fleet} />
       {/if}
 
   {/if}
