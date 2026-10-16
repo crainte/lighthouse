@@ -662,7 +662,7 @@
   const groupRollupBanner = $derived.by(() => {
     const rollup = groupPage?.rollup;
     if (!rollup) return null;
-    const tone = rollup.status === 'up' ? 'operational' : rollup.status === 'down' ? 'major' : 'degraded';
+    const tone = rollup.status === 'up' ? 'operational' : rollup.status === 'down' ? 'outage' : rollup.status === 'degraded' ? 'degraded' : 'unknown';
     const label =
       rollup.status === 'up'
         ? 'All monitors operational'
@@ -994,22 +994,31 @@
       onback={goBack}
     /></div>
   {:else if view.name === 'group' && groupPage}
-    <button class="link" onclick={goBack}>← Back</button>
-    <section class="section">
-      {#if groupRollupBanner}
-        <div class="banner {groupRollupBanner.tone}">
-          <span class="banner-icon" aria-hidden="true">
-            {#if groupRollupBanner.status === 'up'}✓{:else}!{/if}
-          </span>
-          <span class="banner-text">
-            {groupRollupBanner.label} · {groupRollupBanner.checks} {groupRollupBanner.checks === 1 ? 'monitor' : 'monitors'}
-            {#if groupRollupBanner.down > 0} · {groupRollupBanner.down} down{/if}
-            {#if groupRollupBanner.degraded > 0} · {groupRollupBanner.degraded} degraded{/if}
-          </span>
+    <!-- Like the main status hero, the group leads with the service identity
+         and a calm state banner against the lighthouse scene. -->
+    <div class="public-group-intro">
+      <button class="link public-group-back" onclick={goBack}>← Back to status</button>
+      <div class="public-state-banner {groupRollupBanner?.tone ?? 'unknown'}" role="status">
+        <span class="public-state-symbol" aria-hidden="true">
+          {#if groupRollupBanner?.status === 'up'}✓{:else if groupRollupBanner?.status === 'unknown' || !groupRollupBanner}?{:else}!{/if}
+        </span>
+        <div class="public-state-copy">
+          <div class="public-state-heading"><h1>{groupPage.name}</h1></div>
+          {#if groupRollupBanner}
+            <p>
+              {groupRollupBanner.label} · {groupRollupBanner.checks} {groupRollupBanner.checks === 1 ? 'monitor' : 'monitors'}
+              {#if groupRollupBanner.down > 0} · {groupRollupBanner.down} down{/if}
+              {#if groupRollupBanner.degraded > 0} · {groupRollupBanner.degraded} degraded{/if}
+            </p>
+          {:else}
+            <p>Section status not yet available.</p>
+          {/if}
         </div>
-      {/if}
+      </div>
+    </div>
+    <section class="section public-group-services">
       <div class="section-bar">
-        <h2 class="section-title">{groupPage.name}</h2>
+        <h2 class="section-title">Services</h2>
         <div class="range-switch" role="group" aria-label="chart window">
           {#each RANGES as r (r.days)}
             <button class="range-btn" class:active={days === r.days} onclick={() => setDays(r.days)}>
