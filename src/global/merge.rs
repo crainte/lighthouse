@@ -567,7 +567,11 @@ mod tests {
 
         let mut admin = all;
         scope_aggregate_checks(&mut admin, None, true, &paged);
-        assert_eq!(admin.len(), 3, "changing a public section must not hide admin monitors");
+        assert_eq!(
+            admin.len(),
+            3,
+            "changing a public section must not hide admin monitors"
+        );
     }
 
     #[test]
