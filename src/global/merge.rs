@@ -95,10 +95,23 @@ pub(super) fn chart_relay_path(uri: &Uri) -> String {
     // A global page is capped at 1,000 rows. Ask each region for that full
     // candidate set so a regional default page (100) cannot hide ids selected
     // by a later global page.
-    match query.as_deref() {
-        Some("") | None => format!("{}?limit=1000", uri.path()),
-        Some(query) => format!("{}?{query}&limit=1000", uri.path()),
+    let mut query = query.unwrap_or_default();
+    if uri.path() == "/api/v1/latency-points"
+        && !(query_value(uri.query(), "from").is_some()
+            && query_value(uri.query(), "to").is_some())
+    {
+        // Every region must bucket on *the same* clock boundaries. Asking with
+        // independent 'now' timestamps shifts each region's 24h grid a few ms
+        // and can erase or misalign the measurements in a merged chart.
+        let now = chrono::Utc::now().timestamp_millis();
+        let to = now.div_euclid(60_000) * 60_000;
+        let hours = query_usize(uri.query(), "hours").unwrap_or(24).clamp(1, 24 * 365);
+        if !query.is_empty() { query.push('&'); }
+        query.push_str(&format!("from={}&to={}", to - hours as i64 * 3_600_000, to));
     }
+    if !query.is_empty() { query.push('&'); }
+    query.push_str("limit=1000");
+    format!("{}?{query}", uri.path())
 }
 
 /// Global public and batched-chart reads must apply the same scope rules as
