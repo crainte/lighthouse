@@ -42,6 +42,27 @@ describe('compact public service rows', () => {
     expect(container.querySelector('.public-service-latency')).toBeInTheDocument();
   });
 
+  it('does not show a redundant chart heading when latency is enabled', () => {
+    mount(true);
+    expect(screen.getByRole('img', { name: 'Latency history for DNS' })).toBeInTheDocument();
+    expect(screen.queryByText('Latency over selected window')).not.toBeInTheDocument();
+  });
+
+  it('preserves no-data buckets as unknown rather than labeling them failures', () => {
+    const check = mkCheck(false);
+    render(ComponentRow, {
+      props: {
+        compact: true, check,
+        uptime: { ...uptime, buckets: [{ start: 1000, end: 2000, uptime: null, up: 0, total: 0 }] },
+        sparkline: null,
+        onselect: vi.fn(),
+      },
+    });
+    const noDataBar = document.querySelector('.public-service-history .ubar.nodata');
+    expect(noDataBar).toBeInTheDocument();
+    expect(document.querySelector('.public-service-history .ubar.down')).not.toBeInTheDocument();
+  });
+
   it('keeps latency hidden when disabled, even when sparkline samples exist', () => {
     mount(false);
     expect(screen.queryByRole('img', { name: /Latency history/ })).not.toBeInTheDocument();
