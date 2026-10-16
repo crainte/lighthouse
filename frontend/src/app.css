@@ -11,7 +11,9 @@
   --ad-dim: #7d8590;
   --ad-faint: #5a636c;
   --ad-cyan: #56d4e4;
-  --ad-green: #3fb950;
+  /* Shared semantic success color for public and admin pages. */
+  --lk-health-green: #56c9a1;
+  --ad-green: var(--lk-health-green);
   --ad-amber: #d29922;
   --ad-red: #f85149;
   --ad-violet: #8b8bf5;
@@ -1438,7 +1440,7 @@ button.link:hover {
   --ad-dim: #a0afc0;
   --ad-faint: #8a9aad;
   --ad-cyan: #83b8ce;
-  --ad-green: #56c9a1;
+  --ad-green: var(--lk-health-green);
   --ad-amber: #e7b66b;
   --ad-red: #ee8389;
   --bg: var(--ad-bg);
