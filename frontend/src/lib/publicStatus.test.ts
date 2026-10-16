@@ -31,7 +31,7 @@ describe('public status summary', () => {
   it('gives actual open incidents priority and does not fabricate an ETA', () => {
     const summary = summarizePublicStatus([{ status: 'up' }], [incident()]);
     expect(summary.title).toBe('DNS service disruption');
-    expect(summary.tone).toBe('degraded');
+    expect(summary.tone).toBe('incident');
     expect(summary.incident?.state).toBe('investigating');
     expect(summary.detail).not.toMatch(/ETA|resolved by|estimated recovery/i);
   });
