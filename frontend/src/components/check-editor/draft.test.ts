@@ -1,5 +1,22 @@
+describe('legacy cron compatibility', () => {
+  it('repairs exactly the invalid 60-second and 60-minute increments', () => {
+    expect(normaliseLegacyCron('*/60 * * * * *')).toBe('0 * * * * *');
+    expect(normaliseLegacyCron('0 */60 * * * *')).toBe('0 0 * * * *');
+    expect(normaliseLegacyCron('*/60 * * * *')).toBe('0 * * * *');
+    expect(normaliseLegacyCron('*/61 * * * * *')).toBe('*/61 * * * * *');
+  });
+
+  it('repairs legacy saved checks on edit without modifying other cron schedules', () => {
+    const existing = check({ mode: 'standard', record: 'A', match_type: 'all', expected: [] });
+    existing.cron = '0 */60 * * * *';
+    expect(fromCheck(existing).cron).toBe('0 0 * * * *');
+    existing.cron = '*/30 * * * * *';
+    expect(fromCheck(existing).cron).toBe('*/30 * * * * *');
+  });
+});
+
 import { describe, expect, it } from 'vitest';
-import { blank, fromCheck } from './draft';
+import { blank, fromCheck, normaliseLegacyCron } from './draft';
 import type { AdminCheck } from '../../lib/admin';
 
 function check(dns: AdminCheck['dns']): AdminCheck {
