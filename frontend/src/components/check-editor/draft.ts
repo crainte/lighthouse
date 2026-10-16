@@ -169,7 +169,7 @@ export function fromCheck(c: AdminCheck): Draft {
     target: c.target ?? '',
     hosts: [...(c.hosts ?? [])],
     host_match: c.host_match ?? d.host_match,
-    cron: c.cron ?? d.cron,
+    cron: normaliseLegacyCron(c.cron ?? d.cron),
     timeout_secs: c.timeout_secs ?? d.timeout_secs,
     group: c.group ?? '',
     latency_graph: c.latency_graph ?? false,
