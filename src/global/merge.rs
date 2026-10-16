@@ -92,10 +92,21 @@ pub(super) fn chart_relay_path(uri: &Uri) -> String {
             .collect::<Vec<_>>()
             .join("&")
     });
+    // Global and regional public scopes differ when a section is displayed as
+    // a separate page. Since we deliberately strip region-local section and
+    // pagination selectors, the fan-out MUST explicitly ask each region for
+    // all visible checks. Otherwise a regional Primary scope discards paged
+    // section checks *before* the global merge can select them.
+    let mut query = query.unwrap_or_default();
+    if query_value(Some(&query), "all").is_none() {
+        if !query.is_empty() {
+            query.push('&');
+        }
+        query.push_str("all=true");
+    }
     // A global page is capped at 1,000 rows. Ask each region for that full
     // candidate set so a regional default page (100) cannot hide ids selected
     // by a later global page.
-    let mut query = query.unwrap_or_default();
     if uri.path() == "/api/v1/latency-points"
         && !(query_value(uri.query(), "from").is_some() && query_value(uri.query(), "to").is_some())
     {
@@ -588,6 +599,7 @@ mod tests {
         assert!(!relay.contains("page="));
         assert!(!relay.contains("section="));
         assert!(relay.contains("limit=1000"));
+        assert!(relay.contains("all=true"), "paged groups must survive region reads");
     }
 
     /// A region can bake a raw check id into an incident title when it opens
