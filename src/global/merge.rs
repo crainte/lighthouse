@@ -786,7 +786,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             chart_relay_path(&uri),
-            "/api/v1/uptime?days=30&buckets=90&limit=1000"
+            "/api/v1/uptime?days=30&buckets=90&all=true&limit=1000"
         );
     }
 
