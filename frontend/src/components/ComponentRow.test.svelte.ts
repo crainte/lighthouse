@@ -56,7 +56,13 @@ describe('compact public service rows', () => {
     const { onselect, onbarclick, container } = mount(true);
     await fireEvent.click(screen.getByRole('button', { name: /DNS/ }));
     expect(onselect).toHaveBeenCalledWith('dns');
-    await fireEvent.click(container.querySelector('.public-service-history .ubars')!);
+    const bar = container.querySelector('.public-service-history .ubars')!;
+    const bounds = vi.spyOn(bar, 'getBoundingClientRect').mockReturnValue({
+      left: 0, right: 100, top: 0, bottom: 20, width: 100, height: 20,
+      x: 0, y: 0, toJSON: () => ({}),
+    } as DOMRect);
+    await fireEvent.click(bar, { clientX: 25 });
     expect(onbarclick).toHaveBeenCalledWith('dns', expect.objectContaining({ uptime: 1 }));
+    bounds.mockRestore();
   });
 });
