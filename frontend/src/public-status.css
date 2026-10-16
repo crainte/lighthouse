@@ -222,10 +222,84 @@ body:has(.public-app) { background: #071321; }
 .public-timeline-body small { font-size: 10px; color: #7899b0; }
 .public-app .public-incidents-empty { display: flex; gap: 12px; align-items: center; padding: 16px 18px; background: #0d202b; border: 1px solid #274455; border-radius: 8px; color: #b8d5ce; font-size: 12px; }
 .public-app .public-incidents-empty .empty-mark { display: grid; place-items: center; width: 31px; height: 31px; border-radius: 50%; background: #0e453b; color: #2bdaab; }
-.public-app .public-coverage { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 13px; background: #0e1a28; border: 1px solid #263d52; padding: 16px 18px; border-radius: 8px; }
-.public-app .public-coverage h2 { margin: 0 0 4px; font-size: 13px; }
-.public-app .public-coverage p { margin: 0; font-size: 11px; color: #a0b3c4; }
-.public-app .public-coverage-count { font-size: 12px; color: #a8d7e0; }
+/* The disclosure owns the entire card: no narrow right-hand column when
+   observers are expanded. Both mouse and keyboard users can open it. */
+.public-app .public-coverage {
+  display: block;
+  min-width: 0;
+  padding: 0;
+  background: #0e1a28;
+  border: 1px solid #263d52;
+  border-radius: 8px;
+}
+.public-app .public-coverage-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px 22px;
+  padding: 17px 19px;
+  cursor: pointer;
+  list-style: none;
+  border-radius: 8px;
+}
+.public-app .public-coverage-toggle::-webkit-details-marker { display: none; }
+.public-app .public-coverage-toggle::marker { content: ''; }
+.public-app .public-coverage-toggle:hover { background: #162d3f; }
+.public-app .public-coverage-toggle:focus-visible {
+  outline: 2px solid #96d1df;
+  outline-offset: -3px;
+}
+.public-app .public-coverage-heading { display: grid; gap: 4px; min-width: 0; }
+.public-app .public-coverage-heading strong { font-size: 13px; font-weight: 600; color: #e5eff5; }
+.public-app .public-coverage-heading > span { font-size: 11px; color: #a0b3c4; }
+.public-app .public-coverage-count {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  font-size: 12px;
+  color: #a8d7e0;
+}
+.public-app .public-coverage-action-label { text-decoration: underline; text-underline-offset: 3px; }
+.public-app .public-coverage-chevron {
+  display: inline-block;
+  font-size: 17px;
+  margin-left: 5px;
+  transition: transform .15s ease;
+}
+.public-app .public-coverage[open] .public-coverage-chevron { transform: rotate(180deg); }
+.public-app .public-coverage-observers {
+  display: grid;
+  min-width: 0;
+  margin: 0 19px 14px;
+  border-top: 1px solid #2d4558;
+}
+.public-app .public-coverage-observers .server-row {
+  min-width: 0;
+  gap: 12px;
+  padding: 13px 2px;
+  border-bottom: 1px solid #22394c;
+}
+.public-app .public-coverage-observers .server-row:last-child { border-bottom: 0; }
+.public-app .public-coverage-observers .server-name {
+  min-width: 0;
+  flex-wrap: wrap;
+  font-size: 12px;
+  font-weight: 600;
+}
+.public-app .public-coverage-observers .server-detail {
+  color: #a0b3c4;
+  font-size: 11px;
+  font-weight: 400;
+}
+.public-app .public-coverage-observers .server-status {
+  flex: none;
+  color: var(--up);
+  font-size: 11px;
+}
+.public-app .public-coverage-observers .server-status.degraded { color: var(--amber); }
+.public-app .public-coverage-observers .server-status.down { color: var(--down); }
 .public-app .public-footer { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; border-top: 1px solid #223548; margin-top: 24px; padding-top: 14px; color: #91a7ba; font-size: 11px; }
 .public-app .public-footer strong { color: #c8d7e5; font-weight: 500; }
 .public-app .public-status-detail { padding-top: 12px; }
@@ -254,6 +328,8 @@ body:has(.public-app) { background: #071321; }
   .public-service-stats small { font-size: 9px; }
   .public-service-name strong { font-size: 12px; }
   .public-incident-head { flex-direction: column; }
+  .public-app .public-coverage-toggle { align-items: flex-start; }
+  .public-app .public-coverage-count { width: 100%; }
 }
 @media (max-width: 430px) {
   .public-service-row { grid-template-columns: minmax(0,1fr) max-content; column-gap: 6px; row-gap: 9px; }
