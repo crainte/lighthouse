@@ -316,10 +316,12 @@ pub(super) async fn relay_merge(
                         .filter(|s| s.display == crate::coordinator::storage::SectionDisplay::Page)
                         .map(|s| s.name)
                         .collect(),
-                    Err(_) => return error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Could not load section metadata for chart selection",
-                    ),
+                    Err(_) => {
+                        return error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Could not load section metadata for chart selection",
+                        )
+                    }
                 };
                 filter_chart_page(node, uri, &mut response.0, &paged_sections);
             }
