@@ -141,10 +141,10 @@
     </span>
     <span class="public-service-chevron" aria-hidden="true">›</span>
     {#if check.latency_graph && sparkline && sparkline.length > 1}
-      <span class="public-service-latency">
+      <div class="public-service-latency">
         <span class="public-latency-label">Latency over selected window</span>
         <LatencyChart points={sparkline} label={`Latency history for ${check.name}`} />
-      </span>
+      </div>
     {/if}
   </button>
 {:else}
