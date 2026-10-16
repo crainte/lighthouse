@@ -58,6 +58,7 @@
   import ConsoleIcon from './components/ConsoleIcon.svelte';
   import ConsoleShell from './components/ConsoleShell.svelte';
   import PublicStatusHero from './components/PublicStatusHero.svelte';
+  import publicLighthouseScene from './assets/lighthouse-fall.png';
   import PublicIncidentSpotlight from './components/PublicIncidentSpotlight.svelte';
   import './public-status.css';
   import ComponentRow from './components/ComponentRow.svelte';
@@ -829,6 +830,16 @@
         <button class="public-admin" onclick={() => (authenticated ? openAdmin() : (adminView = 'login'))}>Admin</button>
       </nav>
     </header>
+    {#if view.name !== 'home'}
+      <!-- The public routes retain the lighthouse identity even without the
+           health verdict shown on the status homepage. Decorative only. -->
+      <div
+        class="public-route-masthead"
+        class:storm={view.name === 'incident' && activePublicIncidents.some((incident) => incident.id === view.incidentId)}
+        style:--scene={'url("' + publicLighthouseScene + '")'}
+        aria-hidden="true"
+      ></div>
+    {/if}
   {/if}
 
   {#if view.name === 'admin'}
@@ -980,7 +991,7 @@
         </div>
       </div>
       {#if groupPage.checks.length}
-        <div class="components">
+        <div class="components public-services">
           {#each groupPage.checks as c (c.check_id)}
             <ComponentRow
               compact
