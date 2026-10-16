@@ -2,7 +2,8 @@
 //! (as opposed to `relay`, which proxies to regions, and `merge`, which
 //! folds their answers together).
 
-use super::merge::{query_usize, query_value};
+use super::merge::{query_usize, query_value, scope_aggregate_checks};
+use crate::coordinator::storage::SectionDisplay;
 use super::wire::{PushAck, RegionStatePush};
 use super::GlobalNode;
 use super::{admin, cluster, relay};
@@ -317,16 +318,48 @@ async fn status_handler(State(node): State<GlobalNode>, uri: Uri) -> Response {
     let page = query_usize(uri.query(), "page").unwrap_or(0);
     let limit = crate::page::bounded(query_usize(uri.query(), "limit"), 100);
     let section = query_value(uri.query(), "section");
-    let mut checks = node
-        .inner
-        .cache
-        .aggregate(now)
-        .into_iter()
-        .filter(|check| {
-            section
-                .as_deref()
-                .is_none_or(|want| check.group.as_deref() == Some(want))
+    let all = query_value(uri.query(), "all").as_deref() == Some("true");
+    // Global owns the section catalogue. A region's cached check metadata does
+    // not know if its group is presented inline or as a separate page.
+    let defined_sections = match node.inner.store.list_sections().await {
+        Ok(sections) => sections,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Could not load section metadata").into_response(),
+    };
+    let paged_sections: std::collections::HashSet<String> = defined_sections
+        .iter()
+        .filter(|s| s.display == SectionDisplay::Page)
+        .map(|s| s.name.clone())
+        .collect();
+    let mut all_checks = node.inner.cache.aggregate(now);
+    // Section rollups cover *all* reporting checks, not merely the bounded
+    // public page. A paged section must not become "0 checks" or "unknown".
+    let mut grouped = std::collections::BTreeMap::<String, Vec<NodeState>>::new();
+    for check in &all_checks {
+        if let Some(name) = &check.group {
+            grouped.entry(name.clone()).or_default().push(check.state);
+        }
+    }
+    let section_rollups: Vec<serde_json::Value> = defined_sections
+        .iter()
+        .filter_map(|section| {
+            let states = grouped.get(&section.name)?;
+            let counts = states.iter().copied().map(|state| (state, 1usize));
+            let status = crate::rollup::rollup_counts(
+                &crate::rollup::RollupPolicy::CHECK_DEFAULT,
+                counts,
+            );
+            Some(serde_json::json!({
+                "name": section.name,
+                "status": status,
+                "checks": states.len(),
+                "down": states.iter().filter(|&&s| s == NodeState::Down).count(),
+                "degraded": states.iter().filter(|&&s| s == NodeState::Degraded).count(),
+            }))
         })
+        .collect();
+    scope_aggregate_checks(&mut all_checks, section.as_deref(), all, &paged_sections);
+    let mut checks = all_checks
+        .into_iter()
         .map(|c| CheckStatusDto {
             check_id: c.check_id,
             name: c.name,
@@ -385,7 +418,7 @@ async fn status_handler(State(node): State<GlobalNode>, uri: Uri) -> Response {
         has_more,
         agents,
         maintenance: Vec::new(),
-        sections: Vec::new(),
+        sections: section_rollups,
     })
     .into_response()
 }
