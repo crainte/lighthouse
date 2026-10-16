@@ -52,14 +52,15 @@
   import { debounce, debounceByKey } from './lib/debounce';
   import {
     formatAbsolute,
-    openGlobalIncidents,
     openIncidentForCheck,
     stateTone,
   } from './lib/incident';
   import NightwatchOverview from './components/NightwatchOverview.svelte';
   import ConsoleIcon from './components/ConsoleIcon.svelte';
   import ConsoleShell from './components/ConsoleShell.svelte';
-  import OverallBanner from './components/OverallBanner.svelte';
+  import PublicStatusHero from './components/PublicStatusHero.svelte';
+  import PublicIncidentSpotlight from './components/PublicIncidentSpotlight.svelte';
+  import './public-status.css';
   import ComponentRow from './components/ComponentRow.svelte';
   import AlertsList from './components/AlertsList.svelte';
   import IncidentsList from './components/IncidentsList.svelte';
@@ -659,7 +660,10 @@
 
   // The page-wide live surface is derived from the windowed public list, which
   // always includes open incidents even when their start predates the window.
-  const openGlobals = $derived(openGlobalIncidents(publicIncidents));
+  const activePublicIncidents = $derived(
+    publicIncidents.filter((incident) => incident.state !== 'resolved').sort((a, b) => b.started_at - a.started_at),
+  );
+  const leadPublicIncident = $derived(activePublicIncidents[0] ?? null);
 
   // Section URLs remain deep-linkable; changing scope always starts at page one
   // and requests matching charts with the exact same scope/page tuple.
@@ -797,7 +801,7 @@
   });
 </script>
 
-<div class="app" class:wide={view.name === 'admin'} class:admin-app={view.name === 'admin'}>
+<div class="app" class:wide={view.name === 'admin'} class:admin-app={view.name === 'admin'} class:public-app={view.name !== 'admin'}>
   <div
     aria-live="polite"
     aria-atomic="true"
@@ -808,24 +812,23 @@
   <!-- The console owns the whole viewport, brand included, so the status page
        header is suppressed there rather than stacked above a second brand. -->
   {#if view.name !== 'admin'}
-    <header class="bar">
-      <div class="brand">
-        <h1>Lightkeeper</h1>
-        <p class="subtitle">Service Status</p>
+    <header class="public-topbar" aria-label="Public status navigation">
+      <div class="public-brand">
+        <svg class="public-brand-icon" viewBox="0 0 48 60" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+          <path d="M19 10h10l-3 12 6 30H16l6-30z" stroke-linejoin="round"/>
+          <path d="M17 21h14M18 53h13M22 5h4v5M14 16l-9 5M34 16l9 5M13 27H3M35 27h10"/>
+          <path d="M22 29h4v7h-4z" fill="currentColor" stroke="none"/>
+        </svg>
+        <div class="public-brand-text"><h1>Lightkeeper</h1><p class="subtitle">Service status</p></div>
       </div>
-      <div class="bar-right">
-        <span class="ws-dot {wsStatus}" title="live updates: {wsStatus}">
-          <span class="dot"></span>{wsStatus}
-        </span>
-        <div class="range-switch" role="group" aria-label="admin">
-          <button
-            class="range-btn"
-            onclick={() => (authenticated ? openAdmin() : (adminView = 'login'))}
-          >
-            Admin
-          </button>
-        </div>
-      </div>
+      <nav class="public-nav" aria-label="Public pages">
+        <button class:active={view.name === 'home'} onclick={goHome}>Status</button>
+        <button onclick={() => {
+          if (view.name !== 'home') goHome();
+          else document.getElementById('public-incidents')?.scrollIntoView({ behavior: 'smooth' });
+        }}>History</button>
+        <button class="public-admin" onclick={() => (authenticated ? openAdmin() : (adminView = 'login'))}>Admin</button>
+      </nav>
     </header>
   {/if}
 
@@ -942,16 +945,16 @@
     </div>
   {:else if view.name === 'incident'}
     {@const id = view.incidentId}
-    <IncidentPage incidentId={id} {checks} onBack={goBack} />
+    <div class="public-status-detail"><IncidentPage incidentId={id} {checks} onBack={goBack} /></div>
   {:else if view.name === 'detail'}
     <!-- Bound once: the narrowing on `view` doesn't survive into the callback below. -->
     {@const id = view.checkId}
-    <CheckDetail
+    <div class="public-status-detail"><CheckDetail
       checkId={id}
       check={checks.find((c) => c.check_id === id)}
       refreshKey={detailRefresh}
       onback={goBack}
-    />
+    /></div>
   {:else if view.name === 'group' && groupPage}
     <button class="link" onclick={goBack}>← Back</button>
     <section class="section">
@@ -981,6 +984,7 @@
         <div class="components">
           {#each groupPage.checks as c (c.check_id)}
             <ComponentRow
+              compact
               check={c}
               uptime={uptime[c.check_id]}
               sparkline={sparkline[c.check_id] ?? null}
@@ -1006,7 +1010,13 @@
        {/if}
      </section>
    {:else}
-     <OverallBanner {checks} />
+     <PublicStatusHero {checks} incidents={publicIncidents} />
+     {#if leadPublicIncident}
+       <PublicIncidentSpotlight incident={leadPublicIncident} {checks} onOpen={openIncident} />
+       {#if activePublicIncidents.length > 1}
+         <p class="public-muted">{activePublicIncidents.length - 1} additional active {activePublicIncidents.length === 2 ? 'incident' : 'incidents'} listed in incident history below.</p>
+       {/if}
+     {/if}
 
     {#if maintenance.length}
       <div class="mbanners">
@@ -1020,21 +1030,9 @@
       </div>
     {/if}
 
-    {#if openGlobals.length}
-      <div class="gbanners">
-        {#each openGlobals as i (i.id)}
-          <button class="gbanner" onclick={() => openIncident(i.id)}>
-            <span class="opill {stateTone(i.state)}">{i.state}</span>
-            <span class="gb-title">{i.title}</span>
-            <span class="gb-meta">{formatDuration(i.duration_ms)} · read updates →</span>
-          </button>
-        {/each}
-      </div>
-    {/if}
-
     <section class="section">
       <div class="section-bar">
-        <h2 class="section-title">Monitors</h2>
+        <h2 class="section-title">Services</h2>
         <div class="range-switch" role="group" aria-label="chart window">
           {#each RANGES as r (r.days)}
             <button
@@ -1047,9 +1045,10 @@
           {/each}
         </div>
       </div>
-      <div class="components">
+      <div class="components public-services">
         {#each generalChecks as c (c.check_id)}
           <ComponentRow
+            compact
             check={c}
             uptime={uptime[c.check_id]}
             sparkline={sparkline[c.check_id] ?? null}
@@ -1077,6 +1076,7 @@
           >
             {#each g.checks as c (c.check_id)}
               <ComponentRow
+                compact
                 check={c}
                 uptime={uptime[c.check_id]}
                 sparkline={sparkline[c.check_id] ?? null}
@@ -1097,32 +1097,41 @@
        {/if}
       </section>
 
-      {#if fleet.length}
-      <section class="section">
-        <h2 class="section-title">Monitoring Agents</h2>
-        <div class="components">
-          {#each fleet as row (row.kind + ':' + row.name)}
-            <ServerRow
-              name={row.name}
-              status={row.status}
-              detail={row.kind === 'region'
-                ? `${row.healthy}/${row.total} ${row.total === 1 ? 'agent' : 'agents'} healthy`
-                : undefined}
-            />
-          {/each}
-        </div>
+      <section class="section" id="public-incidents" aria-label="Incident history">
+        <div class="section-bar"><h2 class="section-title">Recent incidents</h2></div>
+        {#if publicIncidents.length === 0}
+          <div class="public-incidents-empty"><span class="empty-mark" aria-hidden="true">✓</span><span>No incidents recorded in the current history window.</span></div>
+        {:else}
+          <PastIncidents incidents={publicIncidents} groups={publicIncidentGroups} {checks} onOpen={openIncident} />
+        {/if}
       </section>
-    {/if}
 
-    <section class="section">
-      <h2 class="section-title">Past Incidents</h2>
-       <PastIncidents
-         incidents={publicIncidents}
-         groups={publicIncidentGroups}
-         {checks}
-         onOpen={openIncident}
-       />
-    </section>
+      {#if fleet.length}
+        <section class="section public-coverage" aria-label="Monitoring coverage">
+          <div>
+            <h2>Monitoring coverage</h2>
+            <p>Connectivity of the monitoring fleet, not the health of the services it checks.</p>
+          </div>
+          <details>
+            <summary class="public-coverage-count">
+              {fleet.filter((row) => row.kind === 'region').length || fleet.length} reported locations · View observers
+            </summary>
+            <div class="components">
+              {#each fleet as row (row.kind + ':' + row.name)}
+                <ServerRow name={row.name} status={row.status}
+                  detail={row.kind === 'region' ? row.healthy + '/' + row.total + ' agents reporting' : undefined} />
+              {/each}
+            </div>
+          </details>
+        </section>
+      {/if}
+
+  {/if}
+  {#if view.name !== 'admin'}
+    <footer class="public-footer">
+      <span><strong>Lightkeeper</strong>　│　Calm in the storm.</span>
+      <span>Status reflects published observations. Times shown in your local timezone.</span>
+    </footer>
   {/if}
 </div>
 
