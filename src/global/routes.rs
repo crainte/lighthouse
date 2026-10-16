@@ -3,10 +3,10 @@
 //! folds their answers together).
 
 use super::merge::{query_usize, query_value, scope_aggregate_checks};
-use crate::coordinator::storage::SectionDisplay;
 use super::wire::{PushAck, RegionStatePush};
 use super::GlobalNode;
 use super::{admin, cluster, relay};
+use crate::coordinator::storage::SectionDisplay;
 use crate::models::{CheckId, NodeState};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, State};
@@ -323,7 +323,13 @@ async fn status_handler(State(node): State<GlobalNode>, uri: Uri) -> Response {
     // not know if its group is presented inline or as a separate page.
     let defined_sections = match node.inner.store.list_sections().await {
         Ok(sections) => sections,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Could not load section metadata").into_response(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not load section metadata",
+            )
+                .into_response()
+        }
     };
     let paged_sections: std::collections::HashSet<String> = defined_sections
         .iter()
@@ -344,10 +350,8 @@ async fn status_handler(State(node): State<GlobalNode>, uri: Uri) -> Response {
         .filter_map(|section| {
             let states = grouped.get(&section.name)?;
             let counts = states.iter().copied().map(|state| (state, 1usize));
-            let status = crate::rollup::rollup_counts(
-                &crate::rollup::RollupPolicy::CHECK_DEFAULT,
-                counts,
-            );
+            let status =
+                crate::rollup::rollup_counts(&crate::rollup::RollupPolicy::CHECK_DEFAULT, counts);
             Some(serde_json::json!({
                 "name": section.name,
                 "status": status,
