@@ -815,10 +815,12 @@
   {#if view.name !== 'admin'}
     <header class="public-topbar" aria-label="Public status navigation">
       <div class="public-brand">
-        <svg class="public-brand-icon" viewBox="0 0 48 60" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-          <path d="M19 10h10l-3 12 6 30H16l6-30z" stroke-linejoin="round"/>
-          <path d="M17 21h14M18 53h13M22 5h4v5M14 16l-9 5M34 16l9 5M13 27H3M35 27h10"/>
-          <path d="M22 29h4v7h-4z" fill="currentColor" stroke="none"/>
+        <!-- Match the admin console's lighthouse silhouette without the
+             horizontal beacon marks so the public identity stays restrained. -->
+        <svg class="public-brand-icon" viewBox="0 0 32 40" fill="none" aria-hidden="true">
+          <path d="m10 35 3-23h6l3 23M8 35h16M11 12h10M12 7h8l-4-5ZM13 7v5m6-5v5"
+            stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+          <path d="m15 16-1 15h4l-1-15" fill="currentColor" opacity=".3" />
         </svg>
         <div class="public-brand-text"><h1>Lightkeeper</h1><p class="subtitle">Service status</p></div>
       </div>
