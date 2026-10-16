@@ -22,6 +22,12 @@ describe('public status summary', () => {
     expect(summarizePublicStatus([{ status: 'down' }, { status: 'down' }], []).title).toBe('Major service outage');
   });
 
+  it('includes server-published sections hidden behind their own pages', () => {
+    expect(summarizePublicStatus([{ status: 'up' }], [], [{ status: 'down' }]).tone).toBe('outage');
+    expect(summarizePublicStatus([{ status: 'up' }], [], [{ status: 'degraded' }]).tone).toBe('degraded');
+    expect(summarizePublicStatus([{ status: 'up' }], [], [{ status: 'unknown' }]).tone).toBe('unknown');
+  });
+
   it('gives actual open incidents priority and does not fabricate an ETA', () => {
     const summary = summarizePublicStatus([{ status: 'up' }], [incident()]);
     expect(summary.title).toBe('DNS service disruption');
