@@ -1120,23 +1120,25 @@
       </section>
 
       {#if fleet.length}
-        <section class="section public-coverage" aria-label="Monitoring coverage">
-          <div>
-            <h2>Monitoring coverage</h2>
-            <p>Connectivity of the monitoring fleet, not the health of the services it checks.</p>
+        <details class="section public-coverage" aria-label="Monitoring coverage">
+          <summary class="public-coverage-toggle">
+            <span class="public-coverage-heading">
+              <strong>Monitoring coverage</strong>
+              <span>Connectivity of the monitoring fleet, not the health of the services it checks.</span>
+            </span>
+            <span class="public-coverage-count">
+              {fleet.filter((row) => row.kind === 'region').length || fleet.length} reported locations
+              <span class="public-coverage-action">· <span class="public-coverage-action-label">View observers</span></span>
+              <span class="public-coverage-chevron" aria-hidden="true">⌄</span>
+            </span>
+          </summary>
+          <div class="public-coverage-observers" aria-label="Reporting locations">
+            {#each fleet as row (row.kind + ':' + row.name)}
+              <ServerRow name={row.name} status={row.status}
+                detail={row.kind === 'region' ? row.healthy + '/' + row.total + ' agents reporting' : undefined} />
+            {/each}
           </div>
-          <details>
-            <summary class="public-coverage-count">
-              {fleet.filter((row) => row.kind === 'region').length || fleet.length} reported locations · View observers
-            </summary>
-            <div class="components">
-              {#each fleet as row (row.kind + ':' + row.name)}
-                <ServerRow name={row.name} status={row.status}
-                  detail={row.kind === 'region' ? row.healthy + '/' + row.total + ' agents reporting' : undefined} />
-              {/each}
-            </div>
-          </details>
-        </section>
+        </details>
       {/if}
 
   {/if}
