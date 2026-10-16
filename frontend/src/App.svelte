@@ -830,6 +830,10 @@
           if (view.name !== 'home') goHome();
           else document.getElementById('public-incidents')?.scrollIntoView({ behavior: 'smooth' });
         }}>History</button>
+        <span class="public-live" role="status" title={wsStatus === 'open' ? 'Live updates connected' : wsStatus === 'connecting' ? 'Connecting to live updates' : 'Live updates disconnected'}>
+          <span class="public-live-dot" class:connected={wsStatus === 'open'} class:connecting={wsStatus === 'connecting'} aria-hidden="true"></span>
+          <span class="public-live-label">{wsStatus === 'open' ? 'Live' : wsStatus === 'connecting' ? 'Connecting' : 'Offline'}</span>
+        </span>
         <button class="public-admin" onclick={() => (authenticated ? openAdmin() : (adminView = 'login'))}>Admin</button>
       </nav>
     </header>
