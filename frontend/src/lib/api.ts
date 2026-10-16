@@ -267,9 +267,10 @@ export function fetchStatus(
   section: string | null = null,
   page = 0,
   limit = 100,
+  all = false,
 ): Promise<StatusResponse> {
   return getJson<StatusResponse>(
-    `/api/v1/status?page=${page}&limit=${limit}${sectionParam(section)}`,
+    `/api/v1/status?page=${page}&limit=${limit}${sectionParam(section)}${all ? "&all=true" : ""}`,
   );
 }
 
