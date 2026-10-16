@@ -226,6 +226,19 @@ export function fromCheck(c: AdminCheck): Draft {
 /** These map to unsigned integers server-side. A negative or fractional value
  *  can be typed past the `min` attribute and would fail JSON deserialization,
  *  surfacing a framework message instead of Lighthouse's own. */
+/** Repair only the legacy one-unit-boundary cron forms. A step of sixty in
+ * seconds/minutes is a start-of-next-unit schedule, never a valid cron step.
+ * Match the server's narrow compatibility rule; reject other bad syntax there.
+ */
+export function normaliseLegacyCron(expr: string): string {
+  const fields = expr.trim().split(/\s+/).filter(Boolean);
+  const minute = fields.length === 5 ? 0 : fields.length === 6 ? 1 : -1;
+  if (minute === -1) return expr.trim();
+  if (fields.length === 6 && fields[0] === '*/60') fields[0] = '0';
+  if (fields[minute] === '*/60') fields[minute] = '0';
+  return fields.join(' ');
+}
+
 export function whole(v: number | null, min: number): boolean {
   return v !== null && Number.isInteger(v) && v >= min;
 }
