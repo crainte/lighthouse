@@ -1088,7 +1088,7 @@
            <span><span class="public-awaiting-dot ready" aria-hidden="true"></span> Global control plane <strong>Online</strong></span>
            <span><span class="public-awaiting-dot pending" aria-hidden="true"></span> Regional reporting <strong>Awaiting data</strong></span>
          </div>
-         <button class="public-awaiting-link" onclick={() => (authenticated ? openAdmin('fleet') : (adminView = 'login'))}>
+         <button class="public-awaiting-link" onclick={() => openAdmin('fleet')}>
            Configure Fleet <span aria-hidden="true">→</span>
          </button>
        </section>
