@@ -9,10 +9,11 @@
   import AgentFilters from './agents-admin/AgentFilters.svelte';
   import AgentTable from './agents-admin/AgentTable.svelte';
   import AgentInventoryTable from './AgentInventoryTable.svelte';
+  import type { FleetTab } from '../lib/router';
 
   // `onopen` is the check editor, keyed on the check's immutable id: the orphan
   // warning is only actionable if the named check is one click away.
-  let { onopen, onexpired, inventory = false, focusAgent = null }: { onopen: (id: string) => void; onexpired?: () => void; inventory?: boolean; focusAgent?: string | null } = $props();
+  let { onopen, onexpired, inventory = false, focusAgent = null, nodeMode = 'coordinator', onNavigate }: { onopen: (id: string) => void; onexpired?: () => void; inventory?: boolean; focusAgent?: string | null; nodeMode?: string; onNavigate?: (tab: FleetTab) => void } = $props();
   let selectedAgentId = $state<string | null>(focusAgent);
   $effect(() => { if (focusAgent) selectedAgentId = focusAgent; });
 
@@ -405,9 +406,17 @@
         <button class="btn" onclick={refresh}>Retry</button>
       </div>
     {:else if agents.length === 0}
-      <p class="admin-muted">
-        No agent has ever reported. Start one pointed at this coordinator and it will appear here.
-      </p>
+      <div class="empty-fleet-enrollment">
+        <strong>No probe agents reporting yet</strong>
+        <p class="admin-muted">
+          {nodeMode === 'global'
+            ? 'Register a region, start its coordinator, then issue zone-scoped credentials and enroll agents.'
+            : 'Issue agent credentials and start an agent pointed at this coordinator. Its report will appear here.'}
+        </p>
+        {#if onNavigate}
+          <button class="btn primary" onclick={() => onNavigate('access')}>Open access &amp; enrollment →</button>
+        {/if}
+      </div>
     {:else}
       {#if !inventory}<FleetSummary agentCount={agents.length} {fleet} onFocusZone={focusZone} />{/if}
 
