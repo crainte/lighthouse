@@ -1033,6 +1033,20 @@ async fn alerts_handler(State(node): State<GlobalNode>, uri: Uri) -> Response {
     // This is a valid *empty* feed, not a relay failure. Once a region has
     // reported, relay_merge still fails closed if that region stops answering.
     if regions.is_empty() {
+        // A previously reporting region with no readable endpoint is an
+        // outage, not a fresh-cluster empty feed.
+        if node
+            .inner
+            .cache
+            .roster(chrono::Utc::now().timestamp_millis())
+            .iter()
+            .any(|region| region.age_ms >= 0)
+        {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "previously reporting regions are no longer available",
+            );
+        }
         return Json(serde_json::json!({ "alerts": [] })).into_response();
     }
     relay::relay_merge(&node, &Method::GET, &uri, &Bytes::new(), &regions, false).await
@@ -1044,6 +1058,18 @@ async fn incidents_handler(State(node): State<GlobalNode>, uri: Uri) -> Response
         .cache
         .region_endpoints(chrono::Utc::now().timestamp_millis());
     if regions.is_empty() {
+        if node
+            .inner
+            .cache
+            .roster(chrono::Utc::now().timestamp_millis())
+            .iter()
+            .any(|region| region.age_ms >= 0)
+        {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "previously reporting regions are no longer available",
+            );
+        }
         return Json(serde_json::json!({ "incidents": [], "groups": [] })).into_response();
     }
     relay::relay_merge(&node, &Method::GET, &uri, &Bytes::new(), &regions, false).await
