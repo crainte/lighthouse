@@ -131,6 +131,69 @@ body:has(.public-app) { background: #071321; }
 .public-state-banner.degraded .public-state-symbol, .public-state-banner.unknown .public-state-symbol {
   color: #e3c393; background: rgba(217,168,103,.1); border-color: #9b7a54;
 }
+/* An empty global-only deployment is a neutral setup/availability state,
+   never green "operational" or amber "degraded". */
+.public-status-hero.awaiting .public-state-banner {
+  border-color: #35546a;
+  border-left-color: #80b9d4;
+  background: linear-gradient(105deg, rgba(15,34,50,.97), rgba(13,27,43,.97));
+}
+.public-status-hero.awaiting .public-state-symbol {
+  border-color: #466c83;
+  background: rgba(106,177,207,.1);
+  color: #acd8e8;
+  font-size: 28px;
+}
+.public-awaiting-card {
+  border: 1px solid #294257;
+  border-radius: 10px;
+  background: linear-gradient(125deg, #101f30, #0c192a);
+  padding: 26px 28px;
+  margin-bottom: 30px;
+}
+.public-awaiting-heading { display: flex; align-items: center; gap: 17px; }
+.public-awaiting-mark {
+  display: grid; place-items: center; flex: none;
+  width: 42px; height: 42px;
+  border-radius: 9px;
+  border: 1px solid #355d74;
+  background: #123047;
+  color: #8bd3e5;
+  font-size: 24px;
+}
+.public-awaiting-kicker {
+  display: block; color: #8bb5cc; font-size: 10px;
+  letter-spacing: .11em; text-transform: uppercase; margin-bottom: 7px;
+}
+.public-awaiting-card h2 {
+  margin: 0; color: #e0edf4; font-size: 17px; line-height: 1.35; font-weight: 600;
+}
+.public-awaiting-card > p {
+  color: #a3b9c9; font-size: 12px; line-height: 1.7;
+  max-width: 67ch; margin: 16px 0 20px;
+}
+.public-awaiting-states {
+  display: flex; align-items: center; flex-wrap: wrap;
+  gap: 12px 30px;
+  padding: 14px 0; border-top: 1px solid #283e51;
+  color: #acbecc; font-size: 11px;
+}
+.public-awaiting-states > span { display: inline-flex; align-items: center; gap: 7px; }
+.public-awaiting-states strong { color: #d1e2eb; font-weight: 550; }
+.public-awaiting-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  display: inline-block; flex: none;
+}
+.public-awaiting-dot.ready { background: var(--public-success); }
+.public-awaiting-dot.pending { background: #90a6b7; }
+.public-awaiting-link {
+  display: inline-flex; gap: 10px; align-items: center;
+  margin-top: 11px; padding: 8px 12px;
+  border: 1px solid #40647c; border-radius: 6px;
+  background: #122d42; color: #a9deef;
+  font-size: 12px; cursor: pointer;
+}
+.public-awaiting-link:hover { background: #1c4058; border-color: #6ca2be; }
 .public-state-copy { min-width: 0; }
 .public-state-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
 .public-state-heading h1 { font-family: Georgia, 'Times New Roman', serif; color: #f0f5f7; font-size: clamp(20px, 2.4vw, 29px); font-weight: 500; line-height: 1.25; margin: 0; overflow-wrap: anywhere; }
@@ -349,6 +412,11 @@ body:has(.public-app) { background: #071321; }
   .public-group-intro { margin-top: -45px; gap: 11px; }
   .public-group-intro .public-state-banner { min-height: 90px; }
   .public-live-label { display: none; }
+  .public-awaiting-card { padding: 20px 18px; }
+  .public-awaiting-heading { align-items: flex-start; gap: 12px; }
+  .public-awaiting-mark { width: 36px; height: 36px; }
+  .public-awaiting-card h2 { font-size: 15px; }
+
   .public-status-hero { margin: -95px -15px 23px; padding: 198px 15px 0; min-height: 338px; }
   .public-hero-scene { background-position: 68% 46%; }
   .public-state-banner { padding: 16px; gap: 12px; }
