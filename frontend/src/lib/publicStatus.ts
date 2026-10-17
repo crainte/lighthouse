@@ -16,7 +16,18 @@ export function summarizePublicStatus(
   checks: Pick<Check, 'status'>[],
   incidents: Incident[],
   sections: Pick<SectionRollup, 'status'>[] = [],
+  waitingForRegions = false,
 ): PublicStatusSummary {
+  // No region has published an observation. Even a healthy global control
+  // plane cannot assert that monitored services are operational in this state.
+  if (waitingForRegions) {
+    return {
+      tone: 'unknown',
+      title: 'Waiting for regional reports',
+      detail: 'The global control plane is online, but no regional coordinators are reporting yet. Service health is not available until a region connects.',
+      incident: null,
+    };
+  }
   const active = incidents
     .filter((incident) => incident.state !== 'resolved')
     .sort((a, b) => b.started_at - a.started_at);
