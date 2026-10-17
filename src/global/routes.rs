@@ -274,6 +274,9 @@ struct StatusResponse {
     agents: Vec<FleetRowDto>,
     maintenance: Vec<serde_json::Value>,
     sections: Vec<serde_json::Value>,
+    /// Global-only: reports may not exist even when a region has been
+    /// registered. Unlike the region list, this describes observed data.
+    region_reports_seen: bool,
 }
 
 /// Matches the coordinator's public `CheckStatusDto` field-for-field, so the
@@ -423,6 +426,12 @@ async fn status_handler(State(node): State<GlobalNode>, uri: Uri) -> Response {
         agents,
         maintenance: Vec::new(),
         sections: section_rollups,
+        region_reports_seen: node
+            .inner
+            .cache
+            .roster(now)
+            .iter()
+            .any(|region| region.age_ms >= 0),
     })
     .into_response()
 }
