@@ -195,6 +195,7 @@
   // agents. Deliberately not `/api/v1/agents` — that needs a session, and this
   // page is anonymous, so fetching it here failed the whole load with a 401.
   let fleet = $state<FleetRow[]>([]);
+  let regionReportsSeen = $state<boolean | null>(null);
   // Announced maintenance running right now. Public, and deliberately separate
   // from incidents: this one was planned.
   let maintenance = $state<MaintenanceNotice[]>([]);
@@ -453,6 +454,7 @@
     statusHasMore = s.has_more;
     sectionRollups = s.sections;
     fleet = s.agents;
+    regionReportsSeen = s.region_reports_seen ?? null;
     maintenance = s.maintenance;
   }
 
@@ -534,6 +536,7 @@
       publicIncidentGroups = publicInc.groups ?? [];
       adminIncidentGroups = adminInc.groups ?? [];
       fleet = s.agents;
+      regionReportsSeen = s.region_reports_seen ?? null;
       maintenance = s.maintenance;
     } catch {
       // Keep the optimistic in-memory state; a later event or reconnect retries.
@@ -566,6 +569,7 @@
       publicIncidentGroups = publicInc.groups ?? [];
       adminIncidentGroups = adminInc.groups ?? [];
       fleet = s.agents;
+      regionReportsSeen = s.region_reports_seen ?? null;
       maintenance = s.maintenance;
       sectionRollups = s.sections;
       await loadCharts(days, chartScope);
@@ -687,10 +691,7 @@
   // No live region means the global tier cannot infer service health from an
   // empty result set, regardless of how healthy its own WebSocket connection is.
   const waitingForRegions = $derived(
-    nodeMode === 'global' &&
-    fleet.length === 0 &&
-    checks.length === 0 &&
-    sectionRollups.length === 0,
+    nodeMode === 'global' && regionReportsSeen === false,
   );
   const publicRouteIncidentId = $derived(view.name === 'incident' ? view.incidentId : null);
 
@@ -728,6 +729,7 @@
       publicIncidentGroups = publicInc.groups ?? [];
       adminIncidentGroups = adminInc.groups ?? [];
       fleet = s.agents;
+      regionReportsSeen = s.region_reports_seen ?? null;
       maintenance = s.maintenance;
       sections = sec;
       sectionRollups = s.sections;
