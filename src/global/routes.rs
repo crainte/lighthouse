@@ -970,33 +970,28 @@ async fn create_incident_handler(
 /// empty envelopes so the SPA's incident and alert panels load cleanly rather
 /// than erroring on a 404.
 async fn alerts_handler(State(node): State<GlobalNode>, uri: Uri) -> Response {
-    relay::relay_merge(
-        &node,
-        &Method::GET,
-        &uri,
-        &Bytes::new(),
-        &node
-            .inner
-            .cache
-            .region_endpoints(chrono::Utc::now().timestamp_millis()),
-        false,
-    )
-    .await
+    let regions = node
+        .inner
+        .cache
+        .region_endpoints(chrono::Utc::now().timestamp_millis());
+    // A newly started global control plane has no regional data source yet.
+    // This is a valid *empty* feed, not a relay failure. Once a region has
+    // reported, relay_merge still fails closed if that region stops answering.
+    if regions.is_empty() {
+        return Json(serde_json::json!({ "alerts": [] })).into_response();
+    }
+    relay::relay_merge(&node, &Method::GET, &uri, &Bytes::new(), &regions, false).await
 }
 
 async fn incidents_handler(State(node): State<GlobalNode>, uri: Uri) -> Response {
-    relay::relay_merge(
-        &node,
-        &Method::GET,
-        &uri,
-        &Bytes::new(),
-        &node
-            .inner
-            .cache
-            .region_endpoints(chrono::Utc::now().timestamp_millis()),
-        false,
-    )
-    .await
+    let regions = node
+        .inner
+        .cache
+        .region_endpoints(chrono::Utc::now().timestamp_millis());
+    if regions.is_empty() {
+        return Json(serde_json::json!({ "incidents": [], "groups": [] })).into_response();
+    }
+    relay::relay_merge(&node, &Method::GET, &uri, &Bytes::new(), &regions, false).await
 }
 
 // ---- Auth -------------------------------------------------------------------
