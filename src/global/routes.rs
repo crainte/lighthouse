@@ -399,9 +399,9 @@ async fn status_handler(State(node): State<GlobalNode>, uri: Uri) -> Response {
         .map(|r| FleetRowDto {
             kind: "region",
             name: r.region,
-            // The public fleet row is three-state (up/degraded/down). A dark or
-            // never-seen region has no "unknown" to show there, so it reads as
-            // down — which is what a region that has stopped answering is.
+            // The public fleet row currently has no unknown state. A
+            // never-reporting region remains visible as down in fleet health;
+            // the console distinguishes its registered/pending membership.
             status: match r.health {
                 NodeState::Up => "up",
                 NodeState::Degraded => "degraded",
@@ -684,7 +684,15 @@ async fn region_tree_handler(
     // The region tree has no leaves until a regional coordinator has sent
     // data. A registered region without a reporting coordinator is not a
     // server failure. If known coordinator endpoints fail, keep the error.
-    if gathered.answers.is_empty() && !gathered.unavailable.is_empty() {
+    if gathered.answers.is_empty()
+        && (!gathered.unavailable.is_empty()
+            || node
+                .inner
+                .cache
+                .roster(chrono::Utc::now().timestamp_millis())
+                .iter()
+                .any(|r| r.age_ms >= 0))
+    {
         return error_response(
             StatusCode::BAD_GATEWAY,
             "no region coordinator answered the region-tree query",
@@ -780,7 +788,15 @@ async fn agents_handler(
     _admin: crate::http::AdminSession,
 ) -> Response {
     let gathered = relay::gather_regions(&node, "/api/v1/agents").await;
-    if gathered.answers.is_empty() && !gathered.unavailable.is_empty() {
+    if gathered.answers.is_empty()
+        && (!gathered.unavailable.is_empty()
+            || node
+                .inner
+                .cache
+                .roster(chrono::Utc::now().timestamp_millis())
+                .iter()
+                .any(|r| r.age_ms >= 0))
+    {
         return error_response(
             StatusCode::BAD_GATEWAY,
             "no region coordinator answered the agent inventory query",
@@ -842,7 +858,15 @@ async fn list_credentials_handler(
     _admin: crate::http::AdminSession,
 ) -> Response {
     let gathered = relay::gather_regions(&node, "/api/v1/admin/agent-credentials").await;
-    if gathered.answers.is_empty() && !gathered.unavailable.is_empty() {
+    if gathered.answers.is_empty()
+        && (!gathered.unavailable.is_empty()
+            || node
+                .inner
+                .cache
+                .roster(chrono::Utc::now().timestamp_millis())
+                .iter()
+                .any(|r| r.age_ms >= 0))
+    {
         return error_response(
             StatusCode::BAD_GATEWAY,
             "no region coordinator answered the credentials query",
