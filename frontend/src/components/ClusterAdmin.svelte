@@ -146,6 +146,7 @@
         return 'amber';
       case 'dead':
         return 'red';
+      case 'pending':
       case 'removed':
         return '';
     }

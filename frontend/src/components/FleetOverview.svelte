@@ -158,7 +158,7 @@
               <span class="chev" class:closed={collapsed.has(region.name)}>⌄</span>
               <span class="region-mark" class:warning={regionStatus(region) === 'silent'} class:flagged={!!regionFlag(region.name)} aria-hidden="true">{regionFlag(region.name) ?? '◎'}</span>
               <strong>{label(region.name)}</strong>
-              <span class="state-chip" class:warning={regionStatus(region) !== 'connected' && regionStatus(region) !== 'reporting'}>{regionStatus(region)}</span>
+              <span class="state-chip" class:pending={regionStatus(region) === 'pending'} class:warning={regionStatus(region) !== 'connected' && regionStatus(region) !== 'reporting' && regionStatus(region) !== 'pending'}>{regionStatus(region)}</span>
               <span class="region-summary">{region.zones.length} {region.zones.length === 1 ? 'zone' : 'zones'} · {region.agents.length} {region.agents.length === 1 ? 'agent' : 'agents'}</span>
               <span class="expand-symbol" aria-hidden="true">···</span>
             </button>
@@ -217,7 +217,7 @@
       <aside class="fleet-aside" aria-label="Fleet health and recent agent reports">
         <section class="aside-panel">
           <div class="aside-heading"><h3>Fleet connectivity</h3><span>Live</span></div>
-          <div class="fleet-health"><strong>{fleetError ? '—' : reportingPct + '%'}</strong><span>of active agents reporting</span></div>
+          <div class="fleet-health"><strong>{fleetError || activeCount === 0 ? '—' : reportingPct + '%'}</strong><span>{activeCount === 0 && !fleetError ? 'No agents enrolled yet' : 'of active agents reporting'}</span></div>
           <div class="health-track"><div style={'width:' + reportingPct + '%'}></div></div>
           <div class="health-lines"><span><i class="live-dot"></i>{reporting.length} reporting</span><span><i class="live-dot warn"></i>{silent.length} silent</span><span><i class="live-dot neutral"></i>{retired.length} retired</span></div>
           <p class="aside-foot">Connectivity only; monitored check health is tracked separately.</p>
@@ -274,6 +274,7 @@
   .region-toggle strong { font-size:15px; }.region-summary { font-size:11px;color:#9db1c3; }
   .state-chip { font-size:10px;color:#51cfa8;background:#0b302b;border:1px solid #245c49;border-radius:14px;padding:4px 8px;white-space:nowrap; }
   .state-chip.warning { color:#e9b06f;background:#2d231c;border-color:#705237; }
+  .state-chip.pending { color:#92c3dc;background:#142a3b;border-color:#33586f; }
   .expand-symbol { margin-left:auto;letter-spacing:2px;color:#91abc1; }
   .zone-card { margin:0 14px 10px 32px;background:#0d1928;border:1px solid #253d52;border-radius:8px;overflow:hidden; }
   .zone-toggle { min-height:46px;padding:8px 12px; }.zone-toggle strong {font-size:12px;overflow-wrap:anywhere;min-width:0;}

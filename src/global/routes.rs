@@ -274,6 +274,9 @@ struct StatusResponse {
     agents: Vec<FleetRowDto>,
     maintenance: Vec<serde_json::Value>,
     sections: Vec<serde_json::Value>,
+    /// Global-only: reports may not exist even when a region has been
+    /// registered. Unlike the region list, this describes observed data.
+    region_reports_seen: bool,
 }
 
 /// Matches the coordinator's public `CheckStatusDto` field-for-field, so the
@@ -399,9 +402,9 @@ async fn status_handler(State(node): State<GlobalNode>, uri: Uri) -> Response {
         .map(|r| FleetRowDto {
             kind: "region",
             name: r.region,
-            // The public fleet row is three-state (up/degraded/down). A dark or
-            // never-seen region has no "unknown" to show there, so it reads as
-            // down — which is what a region that has stopped answering is.
+            // The public fleet row currently has no unknown state. A
+            // never-reporting region remains visible as down in fleet health;
+            // the console distinguishes its registered/pending membership.
             status: match r.health {
                 NodeState::Up => "up",
                 NodeState::Degraded => "degraded",
@@ -423,6 +426,12 @@ async fn status_handler(State(node): State<GlobalNode>, uri: Uri) -> Response {
         agents,
         maintenance: Vec::new(),
         sections: section_rollups,
+        region_reports_seen: node
+            .inner
+            .cache
+            .roster(now)
+            .iter()
+            .any(|region| region.age_ms >= 0),
     })
     .into_response()
 }
@@ -569,7 +578,13 @@ async fn cluster_handler(
                 url: r.endpoints.first().cloned().unwrap_or_default(),
                 generation: 0,
                 last_seen: if r.age_ms < 0 { now } else { now - r.age_ms },
-                state: if r.stale { "dead" } else { "alive" },
+                state: if r.age_ms < 0 {
+                    "pending"
+                } else if r.stale {
+                    "dead"
+                } else {
+                    "alive"
+                },
                 build: origin.as_deref().and_then(|origin| {
                     regions
                         .iter()
@@ -674,10 +689,24 @@ async fn region_tree_handler(
     State(node): State<GlobalNode>,
     _admin: crate::http::AdminSession,
 ) -> Response {
-    let gathered = match relay::gather_some(&node, "/api/v1/admin/region-tree").await {
-        Ok(gathered) => gathered,
-        Err(response) => return response,
-    };
+    let gathered = relay::gather_regions(&node, "/api/v1/admin/region-tree").await;
+    // The region tree has no leaves until a regional coordinator has sent
+    // data. A registered region without a reporting coordinator is not a
+    // server failure. If known coordinator endpoints fail, keep the error.
+    if gathered.answers.is_empty()
+        && (!gathered.unavailable.is_empty()
+            || node
+                .inner
+                .cache
+                .roster(chrono::Utc::now().timestamp_millis())
+                .iter()
+                .any(|r| r.age_ms >= 0))
+    {
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            "no region coordinator answered the region-tree query",
+        );
+    }
     let now = chrono::Utc::now().timestamp_millis();
     Json(merge_region_tree(node.inner.cache.aggregate(now), gathered)).into_response()
 }
@@ -767,10 +796,24 @@ async fn agents_handler(
     State(node): State<GlobalNode>,
     _admin: crate::http::AdminSession,
 ) -> Response {
-    match relay::gather_some(&node, "/api/v1/agents").await {
-        Ok(gathered) => Json(merge_agents(gathered)).into_response(),
-        Err(response) => response,
+    let gathered = relay::gather_regions(&node, "/api/v1/agents").await;
+    if gathered.answers.is_empty()
+        && (!gathered.unavailable.is_empty()
+            || node
+                .inner
+                .cache
+                .roster(chrono::Utc::now().timestamp_millis())
+                .iter()
+                .any(|r| r.age_ms >= 0))
+    {
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            "no region coordinator answered the agent inventory query",
+        );
     }
+    // An empty inventory is a valid first-deployment state. merge_agents
+    // retains every expected counter and diagnostic field with zero values.
+    Json(merge_agents(gathered)).into_response()
 }
 
 /// The two fleet-health lists each region reports: a bounded sample of names
@@ -823,10 +866,22 @@ async fn list_credentials_handler(
     State(node): State<GlobalNode>,
     _admin: crate::http::AdminSession,
 ) -> Response {
-    match relay::gather_some(&node, "/api/v1/admin/agent-credentials").await {
-        Ok(gathered) => Json(merge_credentials(gathered)).into_response(),
-        Err(response) => response,
+    let gathered = relay::gather_regions(&node, "/api/v1/admin/agent-credentials").await;
+    if gathered.answers.is_empty()
+        && (!gathered.unavailable.is_empty()
+            || node
+                .inner
+                .cache
+                .roster(chrono::Utc::now().timestamp_millis())
+                .iter()
+                .any(|r| r.age_ms >= 0))
+    {
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            "no region coordinator answered the credentials query",
+        );
     }
+    Json(merge_credentials(gathered)).into_response()
 }
 
 fn merge_credentials(gathered: relay::Gathered) -> serde_json::Value {
@@ -970,33 +1025,54 @@ async fn create_incident_handler(
 /// empty envelopes so the SPA's incident and alert panels load cleanly rather
 /// than erroring on a 404.
 async fn alerts_handler(State(node): State<GlobalNode>, uri: Uri) -> Response {
-    relay::relay_merge(
-        &node,
-        &Method::GET,
-        &uri,
-        &Bytes::new(),
-        &node
+    let regions = node
+        .inner
+        .cache
+        .region_endpoints(chrono::Utc::now().timestamp_millis());
+    // A newly started global control plane has no regional data source yet.
+    // This is a valid *empty* feed, not a relay failure. Once a region has
+    // reported, relay_merge still fails closed if that region stops answering.
+    if regions.is_empty() {
+        // A previously reporting region with no readable endpoint is an
+        // outage, not a fresh-cluster empty feed.
+        if node
             .inner
             .cache
-            .region_endpoints(chrono::Utc::now().timestamp_millis()),
-        false,
-    )
-    .await
+            .roster(chrono::Utc::now().timestamp_millis())
+            .iter()
+            .any(|region| region.age_ms >= 0)
+        {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "previously reporting regions are no longer available",
+            );
+        }
+        return Json(serde_json::json!({ "alerts": [] })).into_response();
+    }
+    relay::relay_merge(&node, &Method::GET, &uri, &Bytes::new(), &regions, false).await
 }
 
 async fn incidents_handler(State(node): State<GlobalNode>, uri: Uri) -> Response {
-    relay::relay_merge(
-        &node,
-        &Method::GET,
-        &uri,
-        &Bytes::new(),
-        &node
+    let regions = node
+        .inner
+        .cache
+        .region_endpoints(chrono::Utc::now().timestamp_millis());
+    if regions.is_empty() {
+        if node
             .inner
             .cache
-            .region_endpoints(chrono::Utc::now().timestamp_millis()),
-        false,
-    )
-    .await
+            .roster(chrono::Utc::now().timestamp_millis())
+            .iter()
+            .any(|region| region.age_ms >= 0)
+        {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "previously reporting regions are no longer available",
+            );
+        }
+        return Json(serde_json::json!({ "incidents": [], "groups": [] })).into_response();
+    }
+    relay::relay_merge(&node, &Method::GET, &uri, &Bytes::new(), &regions, false).await
 }
 
 // ---- Auth -------------------------------------------------------------------

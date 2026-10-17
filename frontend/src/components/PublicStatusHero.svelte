@@ -4,14 +4,22 @@
   import { summarizePublicStatus } from '../lib/publicStatus';
   import scenicLighthouse from '../assets/lighthouse-fall.png';
 
-  let { checks, incidents, sections = [] }: { checks: Check[]; incidents: Incident[]; sections?: SectionRollup[] } = $props();
-  const summary = $derived(summarizePublicStatus(checks, incidents, sections));
+  let {
+    checks, incidents, sections = [], waitingForRegions = false,
+  }: {
+    checks: Check[];
+    incidents: Incident[];
+    sections?: SectionRollup[];
+    waitingForRegions?: boolean;
+  } = $props();
+  const summary = $derived(summarizePublicStatus(checks, incidents, sections, waitingForRegions));
   const observedAt = $derived(Math.max(0, ...checks.map((check) => check.last_check ?? 0)));
 </script>
 
 <section
   class="public-status-hero"
   class:storm={summary.tone === 'outage' || summary.tone === 'degraded' || summary.tone === 'incident'}
+  class:awaiting={waitingForRegions}
   data-health={summary.tone}
   style:--scene={'url("' + scenicLighthouse + '")'}
   aria-label="Current service status"
@@ -20,7 +28,7 @@
   <div class="public-hero-content">
     <div class="public-state-banner {summary.tone}" role="status">
       <div class="public-state-symbol" aria-hidden="true">
-        {#if summary.tone === 'operational'}✓{:else if summary.tone === 'unknown'}?{:else}!{/if}
+        {#if waitingForRegions}…{:else if summary.tone === 'operational'}✓{:else if summary.tone === 'unknown'}?{:else}!{/if}
       </div>
       <div class="public-state-copy">
         <div class="public-state-heading">

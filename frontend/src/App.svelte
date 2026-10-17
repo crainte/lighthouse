@@ -195,6 +195,7 @@
   // agents. Deliberately not `/api/v1/agents` — that needs a session, and this
   // page is anonymous, so fetching it here failed the whole load with a 401.
   let fleet = $state<FleetRow[]>([]);
+  let regionReportsSeen = $state<boolean | null>(null);
   // Announced maintenance running right now. Public, and deliberately separate
   // from incidents: this one was planned.
   let maintenance = $state<MaintenanceNotice[]>([]);
@@ -453,6 +454,7 @@
     statusHasMore = s.has_more;
     sectionRollups = s.sections;
     fleet = s.agents;
+    regionReportsSeen = s.region_reports_seen ?? null;
     maintenance = s.maintenance;
   }
 
@@ -534,6 +536,7 @@
       publicIncidentGroups = publicInc.groups ?? [];
       adminIncidentGroups = adminInc.groups ?? [];
       fleet = s.agents;
+      regionReportsSeen = s.region_reports_seen ?? null;
       maintenance = s.maintenance;
     } catch {
       // Keep the optimistic in-memory state; a later event or reconnect retries.
@@ -566,6 +569,7 @@
       publicIncidentGroups = publicInc.groups ?? [];
       adminIncidentGroups = adminInc.groups ?? [];
       fleet = s.agents;
+      regionReportsSeen = s.region_reports_seen ?? null;
       maintenance = s.maintenance;
       sectionRollups = s.sections;
       await loadCharts(days, chartScope);
@@ -684,6 +688,11 @@
     publicIncidents.filter((incident) => incident.state !== 'resolved').sort((a, b) => b.started_at - a.started_at),
   );
   const leadPublicIncident = $derived(activePublicIncidents[0] ?? null);
+  // No live region means the global tier cannot infer service health from an
+  // empty result set, regardless of how healthy its own WebSocket connection is.
+  const waitingForRegions = $derived(
+    nodeMode === 'global' && regionReportsSeen === false,
+  );
   const publicRouteIncidentId = $derived(view.name === 'incident' ? view.incidentId : null);
 
   // Section URLs remain deep-linkable; changing scope always starts at page one
@@ -720,6 +729,7 @@
       publicIncidentGroups = publicInc.groups ?? [];
       adminIncidentGroups = adminInc.groups ?? [];
       fleet = s.agents;
+      regionReportsSeen = s.region_reports_seen ?? null;
       maintenance = s.maintenance;
       sections = sec;
       sectionRollups = s.sections;
@@ -771,6 +781,12 @@
     window.addEventListener('storage', syncFromStorage);
     document.addEventListener('visibilitychange', refreshDate);
     load();
+    // A global-only deployment has no regional state-change events to trigger
+    // updates. Recheck quietly until the first region reports, without making
+    // the page flash "Loading" every 30 seconds.
+    const bootstrapPoll = window.setInterval(() => {
+      if (view.name === 'home' && !loading && waitingForRegions) void resync();
+    }, 30_000);
     // Cookie-only: the server is the sole authority on whether we're signed in.
     void checkSession();
     const conn = connectWs({
@@ -812,6 +828,7 @@
     window.addEventListener('popstate', onPop);
     return () => {
       window.clearInterval(dateInterval);
+      window.clearInterval(bootstrapPoll);
       window.removeEventListener('storage', syncFromStorage);
       document.removeEventListener('visibilitychange', refreshDate);
       conn.close();
@@ -1057,7 +1074,27 @@
        {/if}
      </section>
    {:else}
-     <PublicStatusHero {checks} incidents={publicIncidents} sections={sectionRollups} />
+     <PublicStatusHero {checks} incidents={publicIncidents} sections={sectionRollups} {waitingForRegions} />
+     {#if waitingForRegions}
+       <section class="public-awaiting-card" id="public-incidents" aria-label="Waiting for monitoring deployment">
+         <div class="public-awaiting-heading">
+           <span class="public-awaiting-mark" aria-hidden="true">◇</span>
+           <div>
+             <span class="public-awaiting-kicker">Deployment in progress</span>
+             <h2>Global is ready. Monitoring is waiting for its regions.</h2>
+           </div>
+         </div>
+         <p>Connect a regional coordinator and enroll agents to start publishing service health.
+           No probe results or incident history are available yet.</p>
+         <div class="public-awaiting-states">
+           <span><span class="public-awaiting-dot ready" aria-hidden="true"></span> Global control plane <strong>Online</strong></span>
+           <span><span class="public-awaiting-dot pending" aria-hidden="true"></span> Regional reporting <strong>Awaiting data</strong></span>
+         </div>
+         <button class="public-awaiting-link" onclick={() => openAdmin('fleet')}>
+           Configure Fleet <span aria-hidden="true">→</span>
+         </button>
+       </section>
+     {:else}
      {#if leadPublicIncident}
        <PublicIncidentSpotlight incident={leadPublicIncident} {checks} onOpen={openIncident} />
        {#if activePublicIncidents.length > 1}
@@ -1156,6 +1193,7 @@
       {#if fleet.length}
         <PublicMonitoringCoverage {fleet} />
       {/if}
+     {/if}
 
   {/if}
   {#if view.name !== 'admin'}

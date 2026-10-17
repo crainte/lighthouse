@@ -10,6 +10,18 @@ const incident = (overrides: Partial<Incident> = {}): Incident => ({
 });
 
 describe('public status summary', () => {
+  it('never calls an empty global-only deployment healthy or an outage', () => {
+    const waiting = summarizePublicStatus([], [], [], true);
+    expect(waiting).toEqual({
+      tone: 'unknown',
+      title: 'Waiting for regional reports',
+      detail: expect.stringContaining('no regional coordinators are reporting'),
+      incident: null,
+    });
+    // Regular coordinators with no checks have a distinct, generic no-data state.
+    expect(summarizePublicStatus([], []).title).toBe('No status data available');
+  });
+
   it('reports healthy services only when every observation is healthy', () => {
     expect(summarizePublicStatus([{ status: 'up' }, { status: 'up' }], []).tone).toBe('operational');
     expect(summarizePublicStatus([{ status: 'up' }, { status: 'unknown' }], []).tone).toBe('unknown');
