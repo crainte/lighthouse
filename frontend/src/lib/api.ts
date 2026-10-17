@@ -135,6 +135,9 @@ export interface StatusResponse {
    *  rule lives there so a section tile and a zone row cannot disagree; do not
    *  recompute a state from `checks` here. */
   sections: SectionRollup[];
+  /** Global only: false while the cluster has registered regions but no
+   * coordinator has ever published an observation to this global node. */
+  region_reports_seen?: boolean;
 }
 
 export interface SectionRollup {
