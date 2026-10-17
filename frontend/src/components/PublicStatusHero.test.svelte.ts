@@ -16,6 +16,15 @@ const incident: Incident = {
 };
 
 describe('public status lighthouse hero', () => {
+  it('keeps the lighthouse and neutral waiting message when global has no regions', () => {
+    render(PublicStatusHero, { props: { checks: [], incidents: [], waitingForRegions: true } });
+    const region = screen.getByRole('region', { name: 'Current service status' });
+    expect(region).toHaveClass('awaiting');
+    expect(region).toHaveAttribute('data-health', 'unknown');
+    expect(region).toHaveTextContent('Waiting for regional reports');
+    expect(region).not.toHaveTextContent('All systems operational');
+  });
+
   it('renders the calm scene and an honest all-clear from healthy observations', () => {
     render(PublicStatusHero, { props: { checks: [check('dns', 'up')], incidents: [] } });
     const region = screen.getByRole('region', { name: 'Current service status' });
