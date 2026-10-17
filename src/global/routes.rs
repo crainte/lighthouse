@@ -569,7 +569,13 @@ async fn cluster_handler(
                 url: r.endpoints.first().cloned().unwrap_or_default(),
                 generation: 0,
                 last_seen: if r.age_ms < 0 { now } else { now - r.age_ms },
-                state: if r.stale { "dead" } else { "alive" },
+                state: if r.age_ms < 0 {
+                    "pending"
+                } else if r.stale {
+                    "dead"
+                } else {
+                    "alive"
+                },
                 build: origin.as_deref().and_then(|origin| {
                     regions
                         .iter()
@@ -674,10 +680,16 @@ async fn region_tree_handler(
     State(node): State<GlobalNode>,
     _admin: crate::http::AdminSession,
 ) -> Response {
-    let gathered = match relay::gather_some(&node, "/api/v1/admin/region-tree").await {
-        Ok(gathered) => gathered,
-        Err(response) => return response,
-    };
+    let gathered = relay::gather_regions(&node, "/api/v1/admin/region-tree").await;
+    // The region tree has no leaves until a regional coordinator has sent
+    // data. A registered region without a reporting coordinator is not a
+    // server failure. If known coordinator endpoints fail, keep the error.
+    if gathered.answers.is_empty() && !gathered.unavailable.is_empty() {
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            "no region coordinator answered the region-tree query",
+        );
+    }
     let now = chrono::Utc::now().timestamp_millis();
     Json(merge_region_tree(node.inner.cache.aggregate(now), gathered)).into_response()
 }
@@ -767,10 +779,16 @@ async fn agents_handler(
     State(node): State<GlobalNode>,
     _admin: crate::http::AdminSession,
 ) -> Response {
-    match relay::gather_some(&node, "/api/v1/agents").await {
-        Ok(gathered) => Json(merge_agents(gathered)).into_response(),
-        Err(response) => response,
+    let gathered = relay::gather_regions(&node, "/api/v1/agents").await;
+    if gathered.answers.is_empty() && !gathered.unavailable.is_empty() {
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            "no region coordinator answered the agent inventory query",
+        );
     }
+    // An empty inventory is a valid first-deployment state. merge_agents
+    // retains every expected counter and diagnostic field with zero values.
+    Json(merge_agents(gathered)).into_response()
 }
 
 /// The two fleet-health lists each region reports: a bounded sample of names
@@ -823,10 +841,14 @@ async fn list_credentials_handler(
     State(node): State<GlobalNode>,
     _admin: crate::http::AdminSession,
 ) -> Response {
-    match relay::gather_some(&node, "/api/v1/admin/agent-credentials").await {
-        Ok(gathered) => Json(merge_credentials(gathered)).into_response(),
-        Err(response) => response,
+    let gathered = relay::gather_regions(&node, "/api/v1/admin/agent-credentials").await;
+    if gathered.answers.is_empty() && !gathered.unavailable.is_empty() {
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            "no region coordinator answered the credentials query",
+        );
     }
+    Json(merge_credentials(gathered)).into_response()
 }
 
 fn merge_credentials(gathered: relay::Gathered) -> serde_json::Value {
