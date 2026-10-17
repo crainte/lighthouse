@@ -457,26 +457,6 @@ pub(super) async fn gather_regions(node: &GlobalNode, pq: &str) -> Gathered {
     gathered
 }
 
-/// `gather_regions` for a view that has nothing to show without at least one
-/// region: 503 when none is known, 502 when none answered.
-pub(super) async fn gather_some(node: &GlobalNode, pq: &str) -> Result<Gathered, Response> {
-    let gathered = gather_regions(node, pq).await;
-    if gathered.answers.is_empty() {
-        return Err(if gathered.unavailable.is_empty() {
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no region is available to serve this query yet",
-            )
-        } else {
-            error_response(
-                StatusCode::BAD_GATEWAY,
-                "no region coordinator answered the query",
-            )
-        });
-    }
-    Ok(gathered)
-}
-
 async fn fetch_region_json(
     node: &GlobalNode,
     method: &Method,
