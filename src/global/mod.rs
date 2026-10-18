@@ -960,7 +960,13 @@ mod tests {
             .await
             .ok()
             .unwrap();
+        // DuckDB closes on the worker thread after the last handle drops;
+        // reopening before that finishes races its checkpoint and WAL removal.
+        let closed = node.inner.store.database().closed();
         drop(node);
+        tokio::time::timeout(std::time::Duration::from_secs(30), closed)
+            .await
+            .expect("the first node's database closes once dropped");
 
         let reopened = GlobalNode::new(&cfg).await.unwrap();
         let (checks, total, _) = reopened.inner.store.list_checks(0, 10).await.unwrap();

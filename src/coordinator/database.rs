@@ -105,6 +105,9 @@ pub struct Database {
     timings: Arc<Timings>,
     metrics: Arc<Metrics>,
     database_path: Arc<std::path::PathBuf>,
+    /// Flips to `true` once the worker thread has closed DuckDB, which it
+    /// does on its own after the last handle drops. See `closed`.
+    closed: tokio::sync::watch::Receiver<bool>,
 }
 
 impl Database {
@@ -118,6 +121,7 @@ impl Database {
         });
         let metrics = Arc::new(Metrics::default());
         let database_path = Arc::new(std::path::PathBuf::from(&path));
+        let (closed_tx, closed) = tokio::sync::watch::channel(false);
         std::thread::Builder::new()
             .name("lighthouse-database".to_string())
             .spawn(move || {
@@ -143,6 +147,10 @@ impl Database {
                 while let Some(job) = rx.blocking_recv() {
                     job(&storage);
                 }
+                // Closing checkpoints and removes the WAL; only report closed
+                // once that has finished, so a reopen cannot race it.
+                drop(storage);
+                let _ = closed_tx.send(true);
             })?;
         ready_rx
             .await
@@ -152,7 +160,19 @@ impl Database {
             timings,
             metrics,
             database_path,
+            closed,
         })
+    }
+
+    /// A future that resolves once the worker has closed the database file.
+    /// The worker closes it only after every `Database` handle is dropped,
+    /// asynchronously, so anything reopening the same path in-process (a
+    /// restart test) must take this first, drop its handles, then await it.
+    pub fn closed(&self) -> impl Future<Output = ()> + Send + 'static {
+        let mut closed = self.closed.clone();
+        async move {
+            let _ = closed.wait_for(|done| *done).await;
+        }
     }
 
     /// `#[track_caller]` so a slow job names the call site that submitted it:
