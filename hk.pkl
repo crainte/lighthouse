@@ -67,7 +67,8 @@ local slow = new Mapping<String, Step> {
   }
   ["docker-build"] {
     profiles = List("slow")
-    check = "docker build --build-arg GIT_SHA=$(git rev-parse --short=12 HEAD) -t lighthouse:gate ."
+    // DOCKER_BUILD_FLAGS is empty locally; CI sets it to the shared gha cache.
+    check = "docker buildx build ${DOCKER_BUILD_FLAGS:-} --build-arg GIT_SHA=$(git rev-parse --short=12 HEAD) -t lighthouse:gate ."
   }
   ["actionlint"] {
     profiles = List("slow")
