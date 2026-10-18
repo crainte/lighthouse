@@ -177,8 +177,11 @@ Releases are two steps:
 1. Run the **Release PR** workflow. git-cliff derives the next version from the
    conventional commits (or you pick one), the workflow bumps `Cargo.toml`,
    `Cargo.lock` and `frontend/package.json`, regenerates `CHANGELOG.md`, and opens a PR.
-2. Merge it. The **Release** workflow sees a changelog entry with no tag, runs CI,
-   creates the GitHub release and publishes the image to GHCR.
+2. Merge it. The **Release** workflow sees a changelog entry with no tag or no
+   GHCR image, runs CI (skipping `docker-build`, since publishing is that build),
+   creates the GitHub release if it is missing and publishes the image if it is
+   missing. Either step that failed can be retried by running **Release** again
+   with workflow_dispatch.
 
 ### Layout
 

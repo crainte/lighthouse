@@ -11,23 +11,35 @@ RUN --mount=type=cache,id=lighthouse-bun-cache,target=/root/.bun/install/cache \
     bun run build
 
 # --- Stage 2: build the Rust binary (embeds the built dashboard) ---
-FROM rust:1-bookworm AS builder
+# cargo-chef splits dependencies into their own layer, keyed on a recipe that
+# ignores this crate's version and sources. Release version bumps and code
+# changes then reuse the cached dependency build (notably bundled DuckDB)
+# from the layer cache. No cache mounts here: their contents are not exported
+# to CI layer caches, and a target mount would hide the cooked dependencies.
+FROM lukemathwalker/cargo-chef:0.1.78-rust-1-bookworm AS chef
 WORKDIR /app
-# .dockerignore excludes .git, so build.rs has no repository to ask for the
-# commit and takes it from here instead:
-#   docker build --build-arg GIT_SHA=$(git rev-parse --short=12 HEAD) .
-# Omitting it stamps "unknown", which builds fine but makes a deployed image
-# untraceable to a commit.
-ARG GIT_SHA=""
-ENV GIT_SHA=$GIT_SHA
+
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY src ./src
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --bin lighthouse --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
 # rust-embed reads frontend/dist at compile time
 COPY --from=frontend /app/frontend/dist ./frontend/dist
-RUN --mount=type=cache,id=lighthouse-cargo-registry,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=lighthouse-cargo-git,target=/usr/local/cargo/git \
-    --mount=type=cache,id=lighthouse-target,target=/app/target \
-    cargo build --release --bin lighthouse && \
+# .dockerignore excludes .git, so build.rs has no repository to ask for the
+# commit and takes it from here instead:
+#   docker build --build-arg GIT_SHA=$(git rev-parse --short=12 HEAD) .
+# Omitting it stamps "unknown", which builds fine but makes a deployed image
+# untraceable to a commit. Declared after `cook` so a new sha only rebuilds
+# this crate.
+ARG GIT_SHA=""
+ENV GIT_SHA=$GIT_SHA
+RUN cargo build --release --bin lighthouse && \
     cp /app/target/release/lighthouse /app/lighthouse
 
 # --- Stage 3: minimal runtime ---

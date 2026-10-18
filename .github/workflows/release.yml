@@ -1,9 +1,12 @@
 name: Release
 
-# Step 2 of a release. Runs on every push to main, and releases only when the
-# version declared in Cargo.toml has a CHANGELOG.md entry but no tag yet,
-# i.e. right after a release PR merges. That rule is idempotent, so a failed
-# release can be retried with workflow_dispatch.
+# Step 2 of a release. Runs on every push to main and always runs CI (ci.yml
+# has no push trigger of its own, so each main commit gets one CI run).
+# A version declared in Cargo.toml with a CHANGELOG.md entry is pending when
+# its git tag or its GHCR image is missing, i.e. right after a release PR
+# merges. The GitHub release and the image publish are each skipped once
+# done, so a failed release or publish can be retried with workflow_dispatch.
+# While a release is pending CI skips docker-build: publish is that build.
 on:
   push:
     branches: [main]
@@ -21,39 +24,84 @@ jobs:
     name: Pending release?
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     outputs:
-      release: ${{ steps.check.outputs.release }}
+      release_needed: ${{ steps.check.outputs.release_needed }}
+      publish_needed: ${{ steps.check.outputs.publish_needed }}
+      pending: ${{ steps.check.outputs.pending }}
       version: ${{ steps.check.outputs.version }}
       tag: ${{ steps.check.outputs.tag }}
+      sha: ${{ steps.check.outputs.sha }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
       - id: check
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
           tag="v$version"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-            echo "$tag already released"
-            echo "release=false" >> "$GITHUB_OUTPUT"
-          elif grep -qF "## [$version]" CHANGELOG.md 2>/dev/null; then
-            echo "Releasing $tag"
-            echo "release=true" >> "$GITHUB_OUTPUT"
-          else
+
+          release_needed=false
+          publish_needed=false
+          if ! grep -qF "## [$version]" CHANGELOG.md 2>/dev/null; then
             echo "$version has no CHANGELOG.md entry; nothing to release"
-            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+              echo "$tag already released"
+            else
+              echo "Releasing $tag"
+              release_needed=true
+            fi
+            # Only "not found" means unpublished; any other failure (auth,
+            # network) fails the job rather than overwriting a published image.
+            if out="$(docker buildx imagetools inspect "$image" 2>&1)"; then
+              echo "$image already published"
+            elif grep -qi 'not found' <<<"$out"; then
+              echo "Publishing $image"
+              publish_needed=true
+            else
+              echo "::error::Could not inspect $image: $out"
+              exit 1
+            fi
           fi
+
+          # A retry from a later main commit must still build the release commit.
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            sha="$(git rev-list -n1 "$tag")"
+          else
+            sha="$GITHUB_SHA"
+          fi
+          pending=false
+          if [ "$release_needed" = true ] || [ "$publish_needed" = true ]; then
+            pending=true
+          fi
+          {
+            echo "release_needed=$release_needed"
+            echo "publish_needed=$publish_needed"
+            echo "pending=$pending"
+            echo "sha=$sha"
+          } >> "$GITHUB_OUTPUT"
 
   ci:
     needs: check
-    if: needs.check.outputs.release == 'true'
     uses: ./.github/workflows/ci.yml
+    with:
+      docker: ${{ needs.check.outputs.pending != 'true' }}
 
   release:
     name: GitHub release
     needs: [check, ci]
+    if: needs.check.outputs.release_needed == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -66,14 +114,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.check.outputs.tag }}
+          SHA: ${{ needs.check.outputs.sha }}
         run: |
           RELEASE_NOTES=1 git cliff --tag "$TAG" --unreleased --strip all > "$RUNNER_TEMP/notes.md"
           cat "$RUNNER_TEMP/notes.md"
-          gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" --target "${{ needs.check.outputs.sha }}" --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
 
   publish:
     name: Publish image
-    needs: [check, release]
+    needs: [check, ci, release]
+    # Runs after a fresh GitHub release, or alone when only the image is missing.
+    if: >-
+      always()
+      && needs.check.outputs.publish_needed == 'true'
+      && needs.ci.result == 'success'
+      && (needs.release.result == 'success' || needs.release.result == 'skipped')
     runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
     permissions:
       contents: read
@@ -82,6 +137,11 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.check.outputs.tag }}
+      # Same 12-character form hk.pkl's docker-build stamps.
+      - id: sha
+        env:
+          SHA: ${{ needs.check.outputs.sha }}
+        run: echo "short=${SHA::12}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:
@@ -105,10 +165,10 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64
           push: true
-          build-args: GIT_SHA=${{ github.sha }}
+          build-args: GIT_SHA=${{ steps.sha.outputs.short }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=lighthouse
+          cache-to: type=gha,mode=max,scope=lighthouse
           provenance: true
           sbom: true
