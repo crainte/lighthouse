@@ -243,6 +243,34 @@ impl GlobalCache {
         PushOutcome::Applied
     }
 
+    /// The region's cached state as a complete snapshot push carrying the
+    /// same chain position (origin, epoch, seq, pushed_at) it was built from,
+    /// so a peer global node that applies it accepts the origin's next delta.
+    /// `None` for an unknown region or one that has never pushed.
+    pub fn export_region(&self, region: &str) -> Option<RegionStatePush> {
+        let guard = self.regions.read();
+        let s = guard.get(region)?;
+        if s.received_at == 0 {
+            return None;
+        }
+        let mut checks: Vec<CheckSummary> = s.checks.values().cloned().collect();
+        checks.sort_by_key(|c| c.check_id);
+        Some(RegionStatePush {
+            region: region.to_string(),
+            origin: s.origin.clone(),
+            advertise_url: s.endpoints.first().cloned(),
+            pushed_at: s.pushed_at,
+            region_health: s.health,
+            agents_healthy: s.agents_healthy,
+            agents_total: s.agents_total,
+            checks,
+            epoch: s.epoch,
+            seq: s.seq,
+            delta_base: None,
+            removed: Vec::new(),
+        })
+    }
+
     fn state_from_push(push: RegionStatePush, endpoints: Vec<String>, now: i64) -> RegionState {
         let checks = push.checks.into_iter().map(|c| (c.check_id, c)).collect();
         RegionState {
@@ -765,5 +793,31 @@ mod tests {
         );
         let eps = cache.owner_endpoints(id("dns"), 1000);
         assert_eq!(eps, vec!["http://t:8080".to_string()]);
+    }
+
+    /// What a peer global node is repaired with carries the origin's chain
+    /// position, so the origin's next delta applies on the peer as well.
+    #[test]
+    fn an_exported_region_resumes_the_origins_chain_on_a_peer() {
+        let here = GlobalCache::new(20);
+        assert!(here.export_region("us").is_none());
+        here.seed("us", &[]);
+        assert!(here.export_region("us").is_none(), "never pushed");
+        let mut first = push("us", "a", 1, NodeState::Up, &[("api", NodeState::Up)]);
+        first.seq = 7;
+        here.apply_push(first, 1000);
+
+        let peer = GlobalCache::new(20);
+        let snapshot = here.export_region("us").unwrap();
+        assert_eq!((snapshot.seq, snapshot.delta_base), (7, None));
+        assert_eq!(peer.apply_push(snapshot, 1000), PushOutcome::Applied);
+
+        let mut delta = push("us", "a", 2, NodeState::Up, &[("db", NodeState::Down)]);
+        delta.seq = 8;
+        delta.delta_base = Some(7);
+        assert_eq!(peer.apply_push(delta.clone(), 1001), PushOutcome::Applied);
+        assert_eq!(peer.aggregate(1001).len(), 2);
+        // Replaying the same delta is a gap, not a silent double-apply.
+        assert_eq!(peer.apply_push(delta, 1002), PushOutcome::Resync);
     }
 }

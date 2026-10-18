@@ -386,6 +386,35 @@ impl GlobalStore {
             .map(|t| t.is_some())
     }
 
+    // ---- Global alert state (see `global::alert`) ----
+
+    /// Every condition currently recorded as firing: `(key, record JSON)`.
+    pub async fn firing_alerts(&self) -> Result<Vec<(String, String)>> {
+        self.db(|storage| storage.settings_with_prefix(super::alert::KEY_PREFIX))
+            .await
+    }
+
+    /// Whether `key` is currently recorded as firing.
+    pub async fn alert_firing(&self, key: &str) -> Result<bool> {
+        let key = key.to_string();
+        self.db(move |storage| {
+            Ok(storage
+                .config_entry(ConfigKind::Setting, &key)?
+                .is_some_and(|e| !e.is_tombstone()))
+        })
+        .await
+    }
+
+    pub async fn put_alert(&self, key: &str, record: &str) -> Result<ConfigEntry> {
+        let document = serde_json::to_string(record)?;
+        self.write_config(ConfigKind::Setting, key, Some(document))
+            .await
+    }
+
+    pub async fn clear_alert(&self, key: &str) -> Result<ConfigEntry> {
+        self.write_config(ConfigKind::Setting, key, None).await
+    }
+
     /// Drop `region` from every check's placement, disabling a check it was
     /// the only region for — an empty placement means "every region".
     /// Returns the rewritten checks' entries to distribute.

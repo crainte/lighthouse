@@ -112,6 +112,18 @@ pub struct Member {
     /// which is read as "the protocol before this field existed".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<u32>,
+    /// Whether that node considers itself in sync with the cluster and fit
+    /// to own single-sender duties. A node that has not caught up is alive
+    /// but must not be handed them (`is_lowest_ready`). Defaults to `true`
+    /// so a peer on a build that predates the field is not treated as
+    /// permanently unready during a rolling upgrade. Coordinators always
+    /// report `true`; only the global tier gates on it today.
+    #[serde(default = "ready_by_default")]
+    pub ready: bool,
+}
+
+fn ready_by_default() -> bool {
+    true
 }
 
 /// Sender identity plus its whole member view. Both directions of
@@ -182,6 +194,9 @@ pub struct Cluster {
     /// Set once a peer answers 410: this node was decommissioned. It stops
     /// pinging and replicating instead of retrying a cluster that refuses it.
     fenced: std::sync::atomic::AtomicBool,
+    /// This node's own readiness, advertised in every ping. See
+    /// `Member::ready`.
+    ready: std::sync::atomic::AtomicBool,
 }
 
 impl Cluster {
@@ -209,7 +224,17 @@ impl Cluster {
             transitions_to_suspect: AtomicU64::new(0),
             transitions_to_dead: AtomicU64::new(0),
             fenced: std::sync::atomic::AtomicBool::new(false),
+            ready: std::sync::atomic::AtomicBool::new(true),
         }
+    }
+
+    /// Set what this node advertises as its own readiness.
+    pub fn set_ready(&self, ready: bool) {
+        self.ready.store(ready, Ordering::Relaxed);
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Relaxed)
     }
 
     fn is_fenced(&self) -> bool {
@@ -322,6 +347,7 @@ impl Cluster {
             state: MemberState::Alive,
             build: said.and_then(|m| m.build.clone()),
             protocol: said.and_then(|m| m.protocol),
+            ready: said.is_none_or(|m| m.ready),
         };
         Self::merge_one(&mut guard, sender, &self.self_id);
 
@@ -457,6 +483,7 @@ impl Cluster {
             state: MemberState::Alive,
             build: Some(crate::version::current().to_string()),
             protocol: Some(PROTOCOL_VERSION),
+            ready: self.is_ready(),
         }
     }
 
@@ -633,6 +660,65 @@ impl Cluster {
             .values()
             .filter(|m| m.state == MemberState::Alive && m.node_id != self.self_id)
             .all(|m| m.node_id > self.self_id)
+    }
+
+    /// Whether no *ready* live peer has a lower id than this node, ignoring
+    /// this node's own readiness: "would own single-sender duties once
+    /// ready". Used to notice promotion before readiness is re-earned.
+    pub fn is_lowest_among_ready_peers(&self) -> bool {
+        self.members
+            .read()
+            .values()
+            .filter(|m| m.state == MemberState::Alive && m.ready && m.node_id != self.self_id)
+            .all(|m| m.node_id > self.self_id)
+    }
+
+    /// `is_lowest_live`, restricted to members that report themselves in
+    /// sync, and only when this node is itself ready. A lower-id node that has
+    /// just restarted does not take a duty over until it has caught up; until
+    /// then the next ready node keeps it.
+    pub fn is_lowest_ready(&self) -> bool {
+        self.is_ready() && self.is_lowest_among_ready_peers()
+    }
+
+    /// Whether any live peer is known (ready or not).
+    pub fn has_live_peers(&self) -> bool {
+        !self.live_urls().is_empty()
+    }
+
+    /// Where to send data a peer must not miss even while membership is
+    /// still forming: every member not known dead or removed (suspect ones
+    /// included), plus configured seeds no known member answers for yet.
+    /// Excludes this node. Unlike `live_urls`, ignores whether a peer is
+    /// ready, so an unsynced peer is still fed what it needs to catch up.
+    pub fn forward_targets(&self) -> Vec<String> {
+        if self.is_fenced() {
+            return Vec::new();
+        }
+        let norm = |u: &str| u.trim_end_matches('/').to_string();
+        let me = norm(&self.self_url);
+        let guard = self.members.read();
+        let mut out: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(me.clone());
+        for m in guard.values() {
+            if m.node_id == self.self_id {
+                continue;
+            }
+            if matches!(m.state, MemberState::Alive | MemberState::Suspect)
+                && seen.insert(norm(&m.url))
+            {
+                out.push(m.url.clone());
+            }
+        }
+        for seed in &self.seeds {
+            let known = guard.values().any(|m| norm(&m.url) == norm(seed));
+            if !known && seen.insert(norm(seed)) {
+                out.push(seed.clone());
+            }
+        }
+        out.sort();
+        out
     }
 
     /// The full member view, for persistence or the admin API.
@@ -812,6 +898,7 @@ mod tests {
             // string never participates in either.
             build: None,
             protocol: None,
+            ready: true,
         }
     }
 
@@ -1400,5 +1487,76 @@ mod tests {
         // rather than silently reading it as something else.
         let err = serde_json::from_str::<MemberState>(r#""zombie""#);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn readiness_travels_with_pings_and_defaults_to_ready_for_old_builds() {
+        let a = cluster("a", "http://a", 1);
+        let b = cluster("b", "http://b", 1);
+        b.set_ready(false);
+        a.merge(&b.ping_body(100), 100);
+        assert!(
+            !a.snapshot()
+                .iter()
+                .find(|m| m.node_id == "b")
+                .unwrap()
+                .ready
+        );
+        b.set_ready(true);
+        a.merge(&b.ping_body(200), 200);
+        assert!(
+            a.snapshot()
+                .iter()
+                .find(|m| m.node_id == "b")
+                .unwrap()
+                .ready
+        );
+
+        let old: Member = serde_json::from_str(
+            r#"{"node_id":"c","url":"http://c","generation":1,"last_seen":1,"state":"alive"}"#,
+        )
+        .unwrap();
+        assert!(old.ready, "a pre-readiness build must not read as unready");
+    }
+
+    #[test]
+    fn duties_pass_only_to_a_ready_lower_id() {
+        let b = cluster("b", "http://b", 1);
+        let a = cluster("a", "http://a", 1);
+        a.set_ready(false);
+        b.merge(&a.ping_body(100), 100);
+        assert!(!b.is_lowest_live(), "a is alive and lower");
+        assert!(
+            b.is_lowest_ready(),
+            "but a has not caught up, so b keeps it"
+        );
+        a.set_ready(true);
+        b.merge(&a.ping_body(200), 200);
+        assert!(!b.is_lowest_ready());
+        // An unready node never owns a duty, even as the lowest id.
+        a.set_ready(false);
+        assert!(!a.is_lowest_ready());
+        assert!(a.is_lowest_among_ready_peers());
+    }
+
+    #[test]
+    fn forward_targets_include_suspects_and_unknown_seeds_but_not_self_or_dead() {
+        let c = Cluster::new(
+            "a",
+            "http://a/",
+            1,
+            vec!["http://a".into(), "http://b".into(), "http://s".into()],
+            None,
+            15,
+        );
+        c.restore(vec![
+            member("b", "http://b", 1, 0, MemberState::Suspect),
+            member("d", "http://d", 1, 0, MemberState::Dead),
+            member("e", "http://e", 1, 0, MemberState::Alive),
+        ]);
+        assert_eq!(
+            c.forward_targets(),
+            vec!["http://b".to_string(), "http://e".into(), "http://s".into()]
+        );
     }
 }

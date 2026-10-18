@@ -1035,6 +1035,7 @@ pub(in crate::coordinator) async fn cluster_view_handler(
                 // where an operator looks for it.
                 build: Some(crate::version::current().to_string()),
                 protocol: Some(cluster::PROTOCOL_VERSION),
+                ready: true,
             },
             Vec::new(),
             Vec::new(),
