@@ -3,7 +3,7 @@ import { request, send } from "./client";
 /** Gossip failure-detector state for one coordinator, as another node currently
  *  believes it — the same shape for `self` and for every peer, so the panel
  *  needs no special case to show where it is standing. */
-export type ClusterState = "alive" | "suspect" | "dead" | "removed";
+export type ClusterState = "alive" | "suspect" | "dead" | "removed" | "pending";
 export type ClusterMode = "coordinator" | "global";
 export type ClusterLinkOutcome = "connected" | "failed";
 
@@ -34,6 +34,8 @@ export interface ClusterMember {
    *  `ClusterResponse.now`, not the browser's clock, to read it as an age. */
   last_seen: number;
   state: ClusterState;
+  /** A seeded region with no initial push is pending, not a dead peer.
+   *  This state is only emitted for regional members on global nodes. */
   /** What that node reported it is running. Absent for a peer on a build that
    *  predates reporting one, or for an entry restored from disk that no ping
    *  has refreshed yet — builds are deliberately not persisted, since a stored

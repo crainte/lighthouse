@@ -131,6 +131,24 @@ pub(super) async fn relay_handler(
         return relay_merge(&node, &method, &uri, &body, &region_endpoints, operator).await;
     }
 
+    // A global control plane with no reporting region has no regional results
+    // or stored rollup overrides to read. These are empty inventories during
+    // initial enrollment, not failed requests. Keep admin authorization above,
+    // and NEVER synthesize empty results after a region has reported: that
+    // would conceal a genuine data-plane outage or an unreachable coordinator.
+    if method == Method::GET
+        && node
+            .inner
+            .cache
+            .roster(now)
+            .iter()
+            .all(|region| region.age_ms < 0)
+    {
+        if let Some(empty) = bootstrap_empty_read(path) {
+            return axum::Json(empty).into_response();
+        }
+    }
+
     // Config and other singleton reads are identical in every region.
     relay_single(
         &node,
@@ -142,6 +160,17 @@ pub(super) async fn relay_handler(
     )
     .await
 }
+/// Well-defined read-only envelopes that a region would serve if it existed,
+/// before the first reporting region joins this global tier. Never use for
+/// writes, unknown APIs, or genuine outages after a region has reported.
+fn bootstrap_empty_read(path: &str) -> Option<serde_json::Value> {
+    match path {
+        "api/v1/admin/results" => Some(serde_json::json!({ "results": [] })),
+        "api/v1/admin/rollup-policies" => Some(serde_json::json!({ "policies": [] })),
+        _ => None,
+    }
+}
+
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS.add(b'/').add(b'%').add(b'?').add(b'#');
 
 fn decode_path_segment(segment: &str) -> Option<String> {
@@ -426,26 +455,6 @@ pub(super) async fn gather_regions(node: &GlobalNode, pq: &str) -> Gathered {
         }
     }
     gathered
-}
-
-/// `gather_regions` for a view that has nothing to show without at least one
-/// region: 503 when none is known, 502 when none answered.
-pub(super) async fn gather_some(node: &GlobalNode, pq: &str) -> Result<Gathered, Response> {
-    let gathered = gather_regions(node, pq).await;
-    if gathered.answers.is_empty() {
-        return Err(if gathered.unavailable.is_empty() {
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no region is available to serve this query yet",
-            )
-        } else {
-            error_response(
-                StatusCode::BAD_GATEWAY,
-                "no region coordinator answered the query",
-            )
-        });
-    }
-    Ok(gathered)
 }
 
 async fn fetch_region_json(
@@ -734,6 +743,21 @@ async fn passthrough(resp: reqwest::Response) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_region_bootstrap_only_synthesizes_known_read_only_envelopes() {
+        assert_eq!(
+            bootstrap_empty_read("api/v1/admin/results"),
+            Some(serde_json::json!({"results": []}))
+        );
+        assert_eq!(
+            bootstrap_empty_read("api/v1/admin/rollup-policies"),
+            Some(serde_json::json!({"policies": []}))
+        );
+        assert_eq!(bootstrap_empty_read("api/v1/admin/regions"), None);
+        assert_eq!(bootstrap_empty_read("api/v1/admin/results/purge"), None);
+        assert_eq!(bootstrap_empty_read("api/v1/checks/123/history"), None);
+    }
 
     #[test]
     fn encoded_path_ids_are_decoded_for_routing_and_reencoded_for_relay() {
