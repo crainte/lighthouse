@@ -1234,9 +1234,181 @@ mod tests {
         );
     }
 
+    /// A region of two coordinators, attached at both, for the fan-out tests
+    /// below. Intra-region replication is deliberately absent: what these
+    /// tests assert is that the global tier reaches every coordinator itself
+    /// rather than leaving the rest of the region to anti-entropy.
+    async fn two_coordinator_region(extra: &[&str]) -> (GlobalNode, Coordinator, Coordinator) {
+        let mk = || async {
+            Coordinator::new(&CoordinatorConfig {
+                db_path: ":memory:".into(),
+                region: "us".into(),
+                global: push_config("http://ignored.invalid", US_KEY, 3600),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+        };
+        let (a, b) = (mk().await, mk().await);
+        let a_addr = serve_router(a.clone().router()).await;
+        let b_addr = serve_router(b.clone().router()).await;
+        let node = GlobalNode::new(&GlobalConfig {
+            db_path: ":memory:".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let mut endpoints: Vec<String> = extra.iter().map(|e| e.to_string()).collect();
+        endpoints.push(format!("http://{a_addr}"));
+        endpoints.push(format!("http://{b_addr}"));
+        node.attach_for_test("us", US_KEY, &endpoints);
+        (node, a, b)
+    }
+
+    async fn sweep_all(node: &GlobalNode) {
+        let now = chrono::Utc::now().timestamp_millis();
+        for (region, endpoints) in node.inner.cache.region_endpoints(now) {
+            reconcile::reconcile_region(node, &region, &endpoints).await;
+        }
+    }
+
+    /// The sweep used to compare digests against the first coordinator that
+    /// answered and stop: that one converged, the sweep called the region
+    /// converged, and the others waited on anti-entropy indefinitely.
+    #[tokio::test]
+    async fn the_sweep_converges_every_coordinator_in_a_region() {
+        let (node, a, b) = two_coordinator_region(&[]).await;
+        node.inner
+            .store
+            .create_check(serde_json::json!({
+                "name": "scoped", "type": "http", "target": "https://example.com",
+                "placement": {"mode": "region", "regions": ["us"], "zones": [], "count": 1},
+            }))
+            .await
+            .ok()
+            .unwrap();
+        sweep_all(&node).await;
+        assert_eq!(a.list_checks_for_test().await.len(), 1);
+        assert_eq!(
+            b.list_checks_for_test().await.len(),
+            1,
+            "every coordinator in the region converges, not just the first to answer"
+        );
+    }
+
+    /// The optimistic push after a write has the same obligation as the
+    /// sweep: a write that reached one coordinator has not reached the region.
+    #[tokio::test]
+    async fn push_now_reaches_every_coordinator_in_a_region() {
+        let (node, a, b) = two_coordinator_region(&[]).await;
+        let (_, entry) = node
+            .inner
+            .store
+            .create_check(serde_json::json!({
+                "name": "web", "type": "http", "target": "https://example.com",
+            }))
+            .await
+            .ok()
+            .unwrap();
+        reconcile::push_now(&node, vec![entry]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let held = (
+                a.list_checks_for_test().await.len(),
+                b.list_checks_for_test().await.len(),
+            );
+            if held == (1, 1) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "push_now must reach every coordinator, held {held:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Unplace is a local delete with no tombstone, so any coordinator it
+    /// skips keeps the check and hands it back to the rest through
+    /// anti-entropy. It only sticks if every coordinator is unplaced.
+    #[tokio::test]
+    async fn unplace_reaches_every_coordinator_in_a_region() {
+        let (node, a, b) = two_coordinator_region(&[]).await;
+        let (_, entry) = node
+            .inner
+            .store
+            .create_check(serde_json::json!({
+                "name": "dns", "type": "http", "target": "https://example.com",
+            }))
+            .await
+            .ok()
+            .unwrap();
+        let check_id: crate::models::CheckId = entry.id.parse().unwrap();
+        sweep_all(&node).await;
+        assert_eq!(
+            (
+                a.list_checks_for_test().await.len(),
+                b.list_checks_for_test().await.len()
+            ),
+            (1, 1)
+        );
+
+        node.inner
+            .store
+            .update_check(
+                check_id,
+                serde_json::json!({
+                    "name": "dns", "type": "http", "target": "https://example.com",
+                    "placement": {"regions": ["tw"]},
+                }),
+            )
+            .await
+            .ok()
+            .unwrap();
+        sweep_all(&node).await;
+        assert!(a.list_checks_for_test().await.is_empty());
+        assert!(
+            b.list_checks_for_test().await.is_empty(),
+            "a coordinator left holding an unplaced check would re-replicate it"
+        );
+    }
+
+    /// A coordinator that does not answer must not stop the rest of the
+    /// region converging, nor, while others answer, count as the region
+    /// being unreachable: the endpoint list only grows, so one scaled away
+    /// would otherwise count against a healthy region forever.
+    #[tokio::test]
+    async fn an_unreachable_coordinator_does_not_hold_back_the_rest_of_its_region() {
+        let (node, a, b) = two_coordinator_region(&["http://127.0.0.1:1"]).await;
+        node.inner
+            .store
+            .create_check(serde_json::json!({
+                "name": "web", "type": "http", "target": "https://example.com",
+            }))
+            .await
+            .ok()
+            .unwrap();
+        sweep_all(&node).await;
+        assert_eq!(
+            (
+                a.list_checks_for_test().await.len(),
+                b.list_checks_for_test().await.len()
+            ),
+            (1, 1)
+        );
+        assert_eq!(
+            reconciliation_metric(
+                &node,
+                "lighthouse_global_reconciliation_failures_total",
+                "region"
+            ),
+            0.0
+        );
+    }
+
     /// Once a region has converged, a further sweep must cost exactly one
-    /// digest comparison — no full-table push, no id-set diff, no unplace
-    /// call. A placement-scoped digest that still amplified would defeat the
+    /// digest comparison per coordinator — no full-table push, no id-set
+    /// diff, no unplace call. A placement-scoped digest that still amplified would defeat the
     /// whole point of Phase 2, the same way a whole-catalogue digest against
     /// a subset region already did before this change.
     #[tokio::test]

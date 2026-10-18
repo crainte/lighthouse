@@ -30,6 +30,20 @@
 //! avoid, for a kind two orders of magnitude smaller than checks and (since
 //! Phase 0) carrying no secret either way. Sections stay on the old
 //! whole-kind push.
+//!
+//! **Both paths address every coordinator in a region, not the first that
+//! answers.** A coordinator applies `/internal/global/config` locally and
+//! does not forward it to its regional peers, so delivering to one left the
+//! rest of the region to intra-region anti-entropy — which has no bound (a
+//! peer pinned to a long repair walk never samples the one holding the new
+//! entry), and which the sweep could not see, because it compared digests
+//! against that same one coordinator and called the region converged. It
+//! also made unplace unable to stick: unplace is a local delete with no
+//! tombstone, so the coordinators it skipped handed the check straight
+//! back. Repeat delivery is safe: every entry carries the HLC this node
+//! stamped once, and a coordinator ignores anything not strictly newer than
+//! what it holds, so the same entry arriving three times, or again through
+//! anti-entropy, is a no-op.
 
 use super::GlobalNode;
 use crate::configplane::{self, ConfigBatch, ConfigDigestDto};
@@ -66,9 +80,9 @@ pub fn push_now(node: &GlobalNode, entries: Vec<ConfigEntry>) {
                 // round trip.
                 continue;
             }
-            if let Err(e) = push_batch(&node, &region, &endpoints, scoped).await {
+            for (endpoint, e) in push_batch(&node, &region, &endpoints, scoped).await {
                 tracing::warn!(
-                    %region, error = %e,
+                    %region, %endpoint, error = %e,
                     "global: optimistic config push failed, the reconciliation sweep will retry"
                 );
             }
@@ -113,40 +127,49 @@ fn check_admits(entry: &ConfigEntry, region: &str) -> bool {
     }
 }
 
-/// POST a batch to the first endpoint in `endpoints` that answers — the same
-/// try-in-order failover every other region call in this crate uses.
+/// POST a batch to every endpoint in `endpoints`, concurrently, and return
+/// the ones that did not accept it. Not the try-in-order failover the
+/// region's read paths use: a read needs one answer, but a write that reaches
+/// one coordinator has not reached the region — see the module doc.
 async fn push_batch(
     node: &GlobalNode,
     region: &str,
     endpoints: &[String],
     entries: Vec<ConfigEntry>,
-) -> anyhow::Result<()> {
+) -> Vec<(String, anyhow::Error)> {
     let Some(token) = node.inner.regions.relay_token(region) else {
-        anyhow::bail!("region has not attached yet");
+        return vec![(
+            region.to_string(),
+            anyhow::anyhow!("region has not attached yet"),
+        )];
     };
     let token = token.as_str();
     let batch = ConfigBatch {
         origin: node.inner.store.node_id().to_string(),
         entries,
     };
-    let mut last_err = anyhow::anyhow!("no reachable coordinator");
-    for base in endpoints {
+    let batch = &batch;
+    futures_util::future::join_all(endpoints.iter().map(|base| async move {
         let url = format!("{}/internal/global/config", base.trim_end_matches('/'));
-        match node
+        let error = match node
             .inner
             .client
             .post(&url)
             .bearer_auth(token)
-            .zstd_json(&batch)
+            .zstd_json(batch)
             .send()
             .await
         {
-            Ok(r) if r.status().is_success() => return Ok(()),
-            Ok(r) => last_err = anyhow::anyhow!("HTTP {}", r.status()),
-            Err(e) => last_err = e.into(),
-        }
-    }
-    Err(last_err)
+            Ok(r) if r.status().is_success() => return None,
+            Ok(r) => anyhow::anyhow!("HTTP {}", r.status()),
+            Err(e) => e.into(),
+        };
+        Some((base.clone(), error))
+    }))
+    .await
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// Starts the periodic reconciliation sweep. A no-op loop when no region is
@@ -185,57 +208,89 @@ pub(super) async fn reconcile_region(node: &GlobalNode, region: &str, endpoints:
             return;
         }
     };
-    for base in endpoints {
-        let url = format!(
-            "{}/internal/global/config-digest",
-            base.trim_end_matches('/')
-        );
-        let resp = node.inner.client.get(&url).bearer_auth(token).send().await;
-        let their: Vec<ConfigDigestDto> = match resp {
-            Ok(r) if r.status().is_success() => match r.json::<Vec<ConfigDigestDto>>().await {
-                Ok(d) => scoped(&d),
-                Err(e) => {
-                    tracing::warn!(%region, %base, error = %e, "global: malformed config-digest response");
-                    continue;
-                }
-            },
-            Ok(r) => {
-                tracing::warn!(%region, %base, status = %r.status(), "global: config-digest request rejected");
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!(%region, %base, error = %e, "global: config-digest request failed");
-                continue;
-            }
-        };
-        // `our` is `their` from `kinds_behind`'s point of view: it answers
-        // "which of the first argument's kinds are ahead of the second's",
-        // and here the region is the one that might be behind.
-        let kinds_behind = configplane::kinds_behind(&our, &their);
-        node.inner.region_reconcile_last_success_ms.store(
-            chrono::Utc::now().timestamp_millis(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        for kind in kinds_behind {
-            let result = match kind {
-                // Checks converge by id-set diff against a placement-scoped
-                // desired set, never a whole-table repush — see
-                // `reconcile_checks`'s doc for why.
-                ConfigKind::Check => reconcile_checks(node, region, base, token).await,
-                _ => push_kind(node, region, base, kind).await,
-            };
-            if result.is_err() {
-                node.inner
-                    .region_reconcile_repair_failures
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return;
-            }
-        }
-        return;
+    // Every coordinator is compared and repaired on its own — see the module
+    // doc — and concurrently, so all of them are unplaced within the same
+    // instant and none is left holding a check to hand back to the others.
+    let outcomes = futures_util::future::join_all(
+        endpoints
+            .iter()
+            .map(|base| reconcile_endpoint(node, region, base, token, &our)),
+    )
+    .await;
+    // `failures` means the region could not be reached at all, as before:
+    // the endpoint list only ever grows, so a coordinator since scaled away
+    // would otherwise count against a healthy region on every sweep. A
+    // coordinator that answered but could not be repaired is counted per
+    // coordinator in `repair_failures` instead.
+    if outcomes.iter().all(|o| *o == EndpointOutcome::Unreachable) {
+        node.inner
+            .region_reconcile_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    node.inner
-        .region_reconcile_failures
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum EndpointOutcome {
+    Unreachable,
+    Converged,
+    RepairFailed,
+}
+
+/// One coordinator's digest comparison and repair — what `reconcile_region`
+/// did for the first endpoint that answered, now done for each.
+async fn reconcile_endpoint(
+    node: &GlobalNode,
+    region: &str,
+    base: &str,
+    token: &str,
+    our: &[ConfigDigestDto],
+) -> EndpointOutcome {
+    let url = format!(
+        "{}/internal/global/config-digest",
+        base.trim_end_matches('/')
+    );
+    let resp = node.inner.client.get(&url).bearer_auth(token).send().await;
+    let their: Vec<ConfigDigestDto> = match resp {
+        Ok(r) if r.status().is_success() => match r.json::<Vec<ConfigDigestDto>>().await {
+            Ok(d) => scoped(&d),
+            Err(e) => {
+                tracing::warn!(%region, %base, error = %e, "global: malformed config-digest response");
+                return EndpointOutcome::Unreachable;
+            }
+        },
+        Ok(r) => {
+            tracing::warn!(%region, %base, status = %r.status(), "global: config-digest request rejected");
+            return EndpointOutcome::Unreachable;
+        }
+        Err(e) => {
+            tracing::warn!(%region, %base, error = %e, "global: config-digest request failed");
+            return EndpointOutcome::Unreachable;
+        }
+    };
+    // `our` is `their` from `kinds_behind`'s point of view: it answers
+    // "which of the first argument's kinds are ahead of the second's",
+    // and here the region is the one that might be behind.
+    let kinds_behind = configplane::kinds_behind(our, &their);
+    node.inner.region_reconcile_last_success_ms.store(
+        chrono::Utc::now().timestamp_millis(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    for kind in kinds_behind {
+        let result = match kind {
+            // Checks converge by id-set diff against a placement-scoped
+            // desired set, never a whole-table repush — see
+            // `reconcile_checks`'s doc for why.
+            ConfigKind::Check => reconcile_checks(node, region, base, token).await,
+            _ => push_kind(node, region, base, kind).await,
+        };
+        if result.is_err() {
+            node.inner
+                .region_reconcile_repair_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return EndpointOutcome::RepairFailed;
+        }
+    }
+    EndpointOutcome::Converged
 }
 
 /// This node's digest as compared against `region`: every other
