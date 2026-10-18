@@ -225,7 +225,7 @@
                 <span class="node-dot {tone(m.state)}"></span>
                 <strong>{m.node_id}</strong>
                 {#if m.node_id === cluster.self.node_id}<span class="current-tag">This node</span>{/if}
-                <small>{cluster.mode === 'global' ? 'Global coordinator' : 'Regional coordinator'} · {m.state}</small>
+                <small>{cluster.mode === 'global' ? 'Global coordinator' : 'Regional coordinator'} · {m.state}{m.ready === false ? ' · syncing' : ''}</small>
               </button>
             {/each}
           </div>
@@ -335,7 +335,7 @@
         <dl><div><dt>Connectivity</dt><dd><span class="opill {agentSelection.status === 'up' ? 'green' : 'amber'}">{agentSelection.status === 'up' ? 'reporting' : 'silent'}</span></dd></div><div><dt>Location</dt><dd>{agentSelection.region} / {agentSelection.zone}</dd></div><div><dt>Last seen</dt><dd>{formatRelativeTime(agentSelection.last_seen)}</dd></div><div><dt>Checks reporting</dt><dd>{agentSelection.checks_reporting}</dd></div><div><dt>Reported build</dt><dd>{agentSelection.version ?? 'Not reported'}</dd></div><div><dt>Polls coordinator</dt><dd>{agentSelection.coordinator ?? 'Not reported'}</dd></div></dl>
       {:else if selected}
         <span class="topology-tier">{selected.node_id === cluster.self.node_id ? 'Current node' : isRegion(selected) ? 'Selected region' : 'Selected coordinator'}</span><h3>{selected.node_id}</h3>
-        <dl><div><dt>Membership state</dt><dd><span class="opill {tone(selected.state)}">{selected.state}</span></dd></div><div><dt>Endpoint</dt><dd>{selected.url || 'Not reported'}</dd></div><div><dt>Last observed</dt><dd title={formatAbsolute(selected.last_seen)}>{formatRelativeTime(selected.last_seen, cluster.now)}</dd></div><div><dt>Build</dt><dd>{reportedBuild(selected.build) ?? 'Not reported'}</dd></div>
+        <dl><div><dt>Membership state</dt><dd><span class="opill {tone(selected.state)}">{selected.state}</span></dd></div><div><dt>Endpoint</dt><dd>{selected.url || 'Not reported'}</dd></div><div><dt>Last observed</dt><dd title={formatAbsolute(selected.last_seen)}>{formatRelativeTime(selected.last_seen, cluster.now)}</dd></div><div><dt>Build</dt><dd>{reportedBuild(selected.build) ?? 'Not reported'}</dd></div>{#if selected.ready !== undefined && selected.ready !== null}<div><dt>Sync</dt><dd><span class="opill {selected.ready ? 'green' : 'amber'}">{selected.ready ? 'in sync' : selected.node_id === cluster.self.node_id && cluster.global_sync ? 'waiting on ' + (['membership', 'config', 'state'] as const).filter((k) => !cluster!.global_sync![k]).join(', ') : 'syncing'}</span></dd></div>{/if}
         {#if selected.origin}<div><dt>Reporting origin</dt><dd>{selected.origin}</dd></div>{/if}
         {#if cluster.mode !== 'global' || coordinators.some((c) => c.node_id === selected!.node_id)}<div><dt>Generation</dt><dd>{selected.generation}</dd></div><div><dt>Agents polling</dt><dd>{polling(selected.node_id)}</dd></div>{/if}
         </dl>

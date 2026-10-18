@@ -12,20 +12,20 @@
 # The us region is a 3-node coordinator cluster (seed chain a -> b -> c -> a);
 # tw is a single coordinator. The global tier is likewise three nodes
 # (SCALING.md "Placement-scoped configuration", Phase 4), seeded a -> b -> c
-# -> a the same way. Regions push their state summary to global-a only in
-# this fixture — see `global::reconcile`'s module doc: that push is ephemeral
-# per-region *data*, not the catalogue, and only the receiving node's cache
-# holds it. What all three global nodes agree on is the *catalogue* (checks
-# and sections), which global-a distributes to every region
-# (`global::store`/`global::reconcile`) and replicates to global-b and
-# global-c over their own peer cluster (`global::cluster`) — durably, in
-# `/data/lighthouse.duckdb` on each, so any one of the three can restart, or the
-# operator's browser can point at any one of the three, without losing or
-# disagreeing about the catalogue. A production deployment would put a load
-# balancer in front of all three and every region's `[coordinator.global]`
-# behind it; this fixture dials each region straight at global-a to keep the
-# compose file's environment small, which is enough to demonstrate the
-# catalogue converging across the three without one.
+# -> a the same way. The us region pushes its state summary to global-a and
+# the tw region to global-b, on purpose: a region's push is ephemeral
+# per-region *data* held in the receiving node's memory, and the receiver
+# forwards each push it applied to its peer global nodes
+# (`global::state_fanout`), so all three serve the same dashboard whichever
+# node a region dialled. The *catalogue* (checks and sections) is durable,
+# in `/data/lighthouse.duckdb` on each, distributed to every region
+# (`global::store`/`global::reconcile`) and replicated between the three over
+# their own peer cluster (`global::cluster`). The durable global alert firing
+# set rides the same plane, and a global node only serves as ready
+# (`/readyz`) and owns alerting once it is in sync with its peers
+# (`global::sync`). A production deployment puts a load balancer that honours
+# `/readyz` in front of all three for the browser, and points every region's
+# `[coordinator.global]` at an address that reaches any node, ready or not.
 #
 # Regions are not declared on the global tier. Each holds its own
 # registration key (`wac_<id>.<secret>`, bound to its region name); the global
@@ -44,7 +44,7 @@
 #   LIGHTHOUSE_ADMIN_PASSWORD    optional; the admin UI is read-only without it
 #
 # Preview: open http://localhost:9005 for the global dashboard once the stack
-# is up (cold start ~55s); :9006 and :9007 serve the same catalogue. The
+# is up (cold start ~55s); :9006 and :9007 serve the same dashboard. The
 # regional dashboards remain on :9001-:9004.
 
 name: lighthouse-global
@@ -329,7 +329,8 @@ configs:
       min_incident_secs = 60
 
       [coordinator.global]
-      url = "http://global-a:8080"
+      # global-b, not global-a: exercises global-to-global state forwarding.
+      url = "http://global-b:8080"
       token_env = "LIGHTHOUSE_REGION_KEY"
       push_secs = 5
 
@@ -344,8 +345,9 @@ configs:
   # ---- Global tier: 3 nodes, seeded a -> b -> c -> a like the us
   #      coordinators. Each holds the whole catalogue durably and reconciles
   #      it with the other two (Phase 4) and with every region (Phase 1); none
-  #      of the three holds raw results. Only global-a is listed in every
-  #      region's [coordinator.global] in this fixture — see the file header. ----
+  #      of the three holds raw results. Regions push to global-a (us) and
+  #      global-b (tw); received state is forwarded to the others — see the
+  #      file header. ----
   global-a-toml:
     content: |
       [global]

@@ -24,7 +24,9 @@ pub mod reconcile;
 pub mod regions;
 mod relay;
 mod routes;
+mod state_fanout;
 pub mod store;
+pub mod sync;
 pub mod wire;
 
 use crate::config::GlobalConfig;
@@ -97,6 +99,11 @@ struct Inner {
     region_reconcile_failures: AtomicU64,
     region_reconcile_repair_failures: AtomicU64,
     region_reconcile_last_success_ms: AtomicI64,
+    /// Forwards applied region pushes to peer global nodes. See
+    /// `state_fanout`.
+    fanout: state_fanout::StateFanout,
+    /// Readiness bookkeeping. See `sync`.
+    sync: sync::SyncState,
 }
 impl GlobalNode {
     /// Opens the durable catalogue and, when `global.peers` is configured,
@@ -140,6 +147,11 @@ impl GlobalNode {
             }
             _ => None,
         };
+        // Unready until the first sync tick says otherwise, so no peer hands
+        // this node a duty on the strength of an early ping.
+        if let Some(cluster) = &cluster {
+            cluster.set_ready(false);
+        }
         let peer_token = cfg.resolved_peer_token();
         let (events, _) = broadcast::channel(256);
         let node = Self {
@@ -172,6 +184,8 @@ impl GlobalNode {
                 region_reconcile_failures: AtomicU64::new(0),
                 region_reconcile_repair_failures: AtomicU64::new(0),
                 region_reconcile_last_success_ms: AtomicI64::new(0),
+                fanout: state_fanout::StateFanout::default(),
+                sync: sync::SyncState::new(chrono::Utc::now().timestamp_millis()),
             }),
         };
         node.load_regions().await?;
@@ -181,6 +195,18 @@ impl GlobalNode {
     pub fn spawn_background(&self) {
         cluster::spawn(self);
         reconcile::spawn_region_reconciler(self.clone());
+        self.spawn_sync_loop();
+    }
+
+    /// Hand a region push this node just applied to every peer global node.
+    /// A no-op without global clustering.
+    pub(crate) fn forward_state(&self, push: wire::RegionStatePush) {
+        let Some(cluster) = &self.inner.cluster else {
+            return;
+        };
+        self.inner
+            .fanout
+            .forward(&self.inner, cluster.forward_targets(), push);
     }
 
     pub fn router(self) -> Router {
@@ -298,6 +324,27 @@ impl GlobalNode {
                 },
             ),
         ]);
+        samples.push(crate::openmetrics::MetricSample::new(
+            "lighthouse_global_ready",
+            vec![],
+            if self.sync_status(now).ready() {
+                1.0
+            } else {
+                0.0
+            },
+        ));
+        for (peer, failures, resyncs) in self.inner.fanout.stats() {
+            samples.push(crate::openmetrics::MetricSample::new(
+                "lighthouse_global_state_forward_failures_total",
+                vec![("peer".into(), peer.clone())],
+                failures as f64,
+            ));
+            samples.push(crate::openmetrics::MetricSample::new(
+                "lighthouse_global_state_forward_resyncs_total",
+                vec![("peer".into(), peer)],
+                resyncs as f64,
+            ));
+        }
         if let Some(cluster) = &self.inner.cluster {
             samples.extend(cluster.metrics());
         }
@@ -913,7 +960,13 @@ mod tests {
             .await
             .ok()
             .unwrap();
+        // DuckDB closes on the worker thread after the last handle drops;
+        // reopening before that finishes races its checkpoint and WAL removal.
+        let closed = node.inner.store.database().closed();
         drop(node);
+        tokio::time::timeout(std::time::Duration::from_secs(30), closed)
+            .await
+            .expect("the first node's database closes once dropped");
 
         let reopened = GlobalNode::new(&cfg).await.unwrap();
         let (checks, total, _) = reopened.inner.store.list_checks(0, 10).await.unwrap();
@@ -1597,5 +1650,305 @@ mod tests {
         assert!(
             crate::openmetrics::select(&metrics, "lighthouse_database_queue_depth", &[]).is_ok()
         );
+    }
+
+    // ---- Global-to-global region state, readiness and durable alerts ----
+
+    const GLOBAL_PEER_TOKEN: &str = "global-peer-token";
+
+    fn summary(name: &str, state: crate::models::NodeState) -> wire::CheckSummary {
+        wire::CheckSummary {
+            check_id: crate::models::CheckId::new_v5(
+                &crate::models::CheckId::NAMESPACE_OID,
+                name.as_bytes(),
+            ),
+            name: name.into(),
+            state,
+            latency_ms: 1,
+            last_check: chrono::Utc::now().timestamp_millis(),
+            uptime_24h: None,
+            status_code: None,
+            error: None,
+            kind: None,
+            group: None,
+            latency_graph: false,
+            position: 0,
+            depends_on: Vec::new(),
+        }
+    }
+
+    fn peer_cfg(id: &str, peers: Vec<String>) -> GlobalConfig {
+        GlobalConfig {
+            db_path: ":memory:".into(),
+            node_id: Some(id.into()),
+            peer_token: Some(GLOBAL_PEER_TOKEN.into()),
+            advertise_url: Some(format!("http://{id}.invalid")),
+            peers,
+            provision: vec![provision("us", US_KEY)],
+            peer_timeout_secs: 0,
+            gossip_interval_secs: 1,
+            region_staleness_secs: 3600,
+            // Never answers; pages are observed through `alerter.sent`.
+            notifiers: vec![crate::notify::Notifier {
+                name: "test".into(),
+                kind: crate::notify::NotifierKind::Webhook {
+                    url: "http://127.0.0.1:1/".into(),
+                },
+                default: true,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A clustered global node serving on a real port it also advertises,
+    /// so peers that learn it through membership can reach it.
+    async fn serve_peer(id: &str, peers: Vec<String>) -> (GlobalNode, std::net::SocketAddr) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut cfg = peer_cfg(id, peers);
+        cfg.advertise_url = Some(format!("http://{addr}"));
+        let node = GlobalNode::new(&cfg).await.unwrap();
+        let router = node.clone().router();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (node, addr)
+    }
+
+    async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
+        for _ in 0..100 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    fn cached_checks(node: &GlobalNode) -> usize {
+        node.inner
+            .cache
+            .aggregate(chrono::Utc::now().timestamp_millis())
+            .len()
+    }
+
+    /// The production bug: a region publishes to one global node, and every
+    /// other node served an empty dashboard. The receiver now forwards what it
+    /// applied, deltas included, and a peer that lost the chain (restarted)
+    /// is repaired with a snapshot that keeps the origin's chain position.
+    #[tokio::test]
+    async fn region_state_replicates_to_peer_global_nodes() {
+        use crate::models::NodeState::{Down, Up};
+        let (b, addr_b) = serve_peer("global-b", vec![]).await;
+        let (_a, addr_a) = serve_peer("global-a", vec![format!("http://{addr_b}")]).await;
+        let client = reqwest::Client::new();
+        let push_to_a = |push: wire::RegionStatePush| {
+            client
+                .post(format!("http://{addr_a}/internal/global/state"))
+                .bearer_auth(US_KEY)
+                .json(&push)
+                .send()
+        };
+
+        let mut snapshot = bare_push("us");
+        snapshot.checks = vec![summary("one", Down)];
+        assert_eq!(push_to_a(snapshot).await.unwrap().status(), StatusCode::OK);
+        // B is not ready (no sync loop runs here) and still receives it.
+        eventually("snapshot reaches B", || cached_checks(&b) == 1).await;
+
+        let mut delta = bare_push("us");
+        delta.seq = 2;
+        delta.delta_base = Some(1);
+        delta.checks = vec![summary("two", Up)];
+        assert_eq!(push_to_a(delta).await.unwrap().status(), StatusCode::OK);
+        eventually("delta reaches B", || cached_checks(&b) == 2).await;
+
+        // B "restarts": its cache forgets the region. A's next delta cannot
+        // apply there, so A answers B's resync with a snapshot.
+        b.inner.cache.retain_regions(|_| false);
+        b.inner.cache.seed("us", &[]);
+        let mut delta = bare_push("us");
+        delta.seq = 3;
+        delta.delta_base = Some(2);
+        delta.checks = vec![summary("three", Up)];
+        assert_eq!(push_to_a(delta).await.unwrap().status(), StatusCode::OK);
+        eventually("resync snapshot reaches B", || cached_checks(&b) == 3).await;
+
+        // And B accepts the origin's next delta directly: same chain.
+        let mut delta = bare_push("us");
+        delta.seq = 4;
+        delta.delta_base = Some(3);
+        let ack: wire::PushAck = client
+            .post(format!("http://{addr_b}/internal/global/state"))
+            .bearer_auth(US_KEY)
+            .json(&delta)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(ack.accepted && !ack.resync, "{ack:?}");
+
+        // The peer route is peer-only: no bearer, or a region key, is refused;
+        // an unknown region is not created by a peer.
+        let peer_route = format!("http://{addr_b}/internal/global/peer-state");
+        let none = client.post(&peer_route).json(&bare_push("us")).send().await;
+        assert_eq!(none.unwrap().status(), StatusCode::UNAUTHORIZED);
+        let region_key = client
+            .post(&peer_route)
+            .bearer_auth(US_KEY)
+            .json(&bare_push("us"))
+            .send()
+            .await;
+        assert_eq!(region_key.unwrap().status(), StatusCode::UNAUTHORIZED);
+        let unknown = client
+            .post(&peer_route)
+            .bearer_auth(GLOBAL_PEER_TOKEN)
+            .json(&bare_push("zz"))
+            .send()
+            .await;
+        assert_eq!(unknown.unwrap().status(), StatusCode::CONFLICT);
+    }
+
+    /// A node that is not in sync neither serves as ready nor pages; once in
+    /// sync it inherits the firing set from its peer, so an ongoing condition
+    /// is not paged again, a recovery pages exactly once, and a fresh alerter
+    /// over the same store (a restart) does not repeat anything.
+    #[tokio::test]
+    async fn alerting_waits_for_sync_and_never_repeats() {
+        use crate::models::NodeState::{Down, Up};
+        let check = summary("web", Down);
+        let key = alert::Condition::CheckDownEverywhere(check.check_id).key();
+
+        let (b, addr_b) = serve_peer("global-b", vec![]).await;
+        // B already paged for this check before A existed.
+        b.inner
+            .store
+            .put_alert(
+                &key,
+                r#"{"opened_at":1,"title":"check web is down in every region"}"#,
+            )
+            .await
+            .unwrap();
+
+        let (a, addr_a) = serve_peer("global-a", vec![format!("http://{addr_b}")]).await;
+        let client = reqwest::Client::new();
+        let push = |checks: Vec<wire::CheckSummary>, seq: u64| {
+            let mut p = bare_push("us");
+            p.checks = checks;
+            p.seq = seq;
+            client
+                .post(format!("http://{addr_a}/internal/global/state"))
+                .bearer_auth(US_KEY)
+                .json(&p)
+                .send()
+        };
+        push(vec![check.clone()], 1).await.unwrap();
+
+        // Membership has not formed: unready, and nothing pages.
+        let readyz = client
+            .get(format!("http://{addr_a}/readyz"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(readyz.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value = readyz.json().await.unwrap();
+        assert_eq!(body["membership"], false);
+        assert!(a.inner.alerter.sent.lock().is_empty());
+
+        // Membership forms; config has not synced yet: still not ready.
+        let cluster_a = a.inner.cluster.clone().unwrap();
+        cluster_a
+            .retry_discovery(chrono::Utc::now().timestamp_millis())
+            .await;
+        a.mark_discovery_round();
+        let status = a.sync_status(chrono::Utc::now().timestamp_millis());
+        assert!(status.membership && !status.config, "{status:?}");
+        assert!(!a.owns_alerting(chrono::Utc::now().timestamp_millis()));
+
+        // One tick reconciles with B (pulling B's firing record) and becomes
+        // ready, but does not take alerting over inside the handoff delay.
+        a.sync_tick().await;
+        assert!(a.sync_status(chrono::Utc::now().timestamp_millis()).ready());
+        assert!(a.inner.store.alert_firing(&key).await.unwrap());
+        assert!(cluster_a.is_ready());
+        assert!(!a.owns_alerting(chrono::Utc::now().timestamp_millis()));
+        let readyz = client
+            .get(format!("http://{addr_a}/readyz"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(readyz.status(), StatusCode::OK);
+
+        a.backdate_ready_for_test(60_000);
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!(a.owns_alerting(now));
+        a.evaluate_alerts(now).await;
+        assert!(
+            a.inner.alerter.sent.lock().is_empty(),
+            "already firing on B: must not page again"
+        );
+
+        // Recovery pages once, and only once.
+        let mut up = check.clone();
+        up.state = Up;
+        push(vec![up], 2).await.unwrap();
+        a.evaluate_alerts(chrono::Utc::now().timestamp_millis())
+            .await;
+        assert_eq!(*a.inner.alerter.sent.lock(), vec![(key.clone(), Up)]);
+        assert!(!a.inner.store.alert_firing(&key).await.unwrap());
+
+        // Down again pages once; a restarted alerter over the same store
+        // sees it as already firing.
+        push(vec![check.clone()], 3).await.unwrap();
+        a.evaluate_alerts(chrono::Utc::now().timestamp_millis())
+            .await;
+        assert_eq!(
+            *a.inner.alerter.sent.lock(),
+            vec![(key.clone(), Up), (key.clone(), Down)]
+        );
+        let restarted = GlobalAlerter::new(peer_cfg("x", vec![]).notifiers);
+        restarted
+            .evaluate(
+                &a.inner.cache,
+                &a.inner.store,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await;
+        assert!(restarted.sent.lock().is_empty());
+
+        // A rename of the down check is not a new condition.
+        let mut renamed = check.clone();
+        renamed.name = "web-renamed".into();
+        push(vec![renamed], 4).await.unwrap();
+        a.evaluate_alerts(chrono::Utc::now().timestamp_millis())
+            .await;
+        assert_eq!(a.inner.alerter.sent.lock().len(), 2);
+    }
+
+    /// A node restarted while a region is dark has an empty cache. Until it
+    /// has heard from every region (or the staleness window passes) it is not
+    /// in sync, so it cannot read "never pushed" as "recovered".
+    #[tokio::test]
+    async fn a_restart_during_a_dark_region_sends_no_false_recovery() {
+        let node = GlobalNode::new(&GlobalConfig {
+            node_id: Some("solo".into()),
+            peer_token: None,
+            advertise_url: None,
+            ..peer_cfg("solo", vec![])
+        })
+        .await
+        .unwrap();
+        let key = alert::Condition::RegionDark("us".into()).key();
+        node.inner
+            .store
+            .put_alert(&key, r#"{"opened_at":1,"title":"region us has gone dark"}"#)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let status = node.sync_status(now);
+        assert!(!status.state, "{status:?}");
+        node.evaluate_alerts(now).await;
+        assert!(node.inner.alerter.sent.lock().is_empty());
+        assert!(node.inner.store.alert_firing(&key).await.unwrap());
     }
 }

@@ -1,0 +1,74 @@
+services:
+  - name: lighthouse-coordinator-headless
+    target: lighthouse-coordinator
+    clusterIP: None
+    publishNotReadyAddresses: true
+    ports:
+      - name: http
+        port: 8080
+        targetPort: http
+  - name: lighthouse-coordinator
+    target: lighthouse-coordinator
+    ports:
+      - name: http
+        port: 8080
+        targetPort: http
+  - name: lighthouse-global-headless
+    target: lighthouse-global
+    clusterIP: None
+    publishNotReadyAddresses: true
+    ports:
+      - name: http
+        port: 8080
+        targetPort: http
+  - name: lighthouse-global
+    target: lighthouse-global
+    ports:
+      - name: http
+        port: 80
+        targetPort: http
+
+certificates:
+  - name: lighthouse
+    spec:
+      secretName: lighthouse-tls
+      dnsNames:
+        - $ref: inputs.hostname
+      issuerRef:
+        name:
+          $ref: inputs.clusterIssuer
+        kind: ClusterIssuer
+        group: cert-manager.io
+
+ingresses:
+  - name: lighthouse
+    metadata:
+      annotations:
+        ingress.cilium.io/loadbalancer-mode: shared
+        ingress.cilium.io/force-https: enabled
+    spec:
+      ingressClassName: cilium
+      rules:
+        - host:
+            $ref: inputs.hostname
+          http:
+            paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: lighthouse-global
+                    port:
+                      name: http
+      tls:
+        - hosts:
+            - $ref: inputs.hostname
+          secretName: lighthouse-tls
+
+pod-disruption-budgets:
+  - name: lighthouse-coordinator
+    target: lighthouse-coordinator
+    minAvailable: 2
+  - name: lighthouse-global
+    target: lighthouse-global
+    minAvailable: 2

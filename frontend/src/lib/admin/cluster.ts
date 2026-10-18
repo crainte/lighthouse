@@ -45,6 +45,16 @@ export interface ClusterMember {
   /** Global node only: the regional coordinator whose push this region entry
    *  was last built from. Its build is the region's `build`. */
   origin?: string | null;
+  /** Global peers only: whether that node reports itself in sync with its
+   *  peers. An unsynced node serves no dashboard traffic and owns no alerts. */
+  ready?: boolean | null;
+}
+
+/** Global node only: which sync conditions this node currently meets. */
+export interface GlobalSyncStatus {
+  membership: boolean;
+  config: boolean;
+  state: boolean;
 }
 
 /** Global node only: one region's own coordinator cluster, as that region
@@ -75,6 +85,7 @@ export interface ClusterResponse {
   global_peers?: ClusterMember[];
   global_links?: ClusterLink[];
   global_link_stale_after_ms?: number | null;
+  global_sync?: GlobalSyncStatus | null;
 }
 
 /** Lives outside `/admin/*`: cluster membership is coordinator state, not

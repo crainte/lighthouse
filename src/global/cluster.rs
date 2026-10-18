@@ -28,7 +28,7 @@ use std::time::Duration;
 /// Mirrors `coordinator::routes::peer::require_peer`: a global node's own
 /// peers authenticate with `global.peer_token`, never the cross-region trust
 /// token `global::admin` and `reconcile` use to talk to a coordinator.
-fn require_peer(node: &GlobalNode, headers: &HeaderMap) -> Option<Response> {
+pub(super) fn require_peer(node: &GlobalNode, headers: &HeaderMap) -> Option<Response> {
     use subtle::ConstantTimeEq;
     let bearer = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -147,6 +147,7 @@ pub(super) fn spawn(node: &GlobalNode) {
     });
 
     let retry_cluster = cluster.clone();
+    let retry_node = node.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(
             gossip_interval.saturating_mul(3).max(1),
@@ -156,6 +157,9 @@ pub(super) fn spawn(node: &GlobalNode) {
             retry_cluster
                 .retry_discovery(chrono::Utc::now().timestamp_millis())
                 .await;
+            // One full round of seed and dead-member pings has completed:
+            // membership is no longer "whatever was on disk at boot".
+            retry_node.mark_discovery_round();
         }
     });
 
@@ -191,7 +195,7 @@ async fn anti_entropy_sweep(node: &GlobalNode) {
 
 /// `pub(super)`: exercised directly by tests in `global::mod::tests` to drive
 /// one anti-entropy pass without waiting on the timer.
-pub(super) async fn reconcile_with_peer(node: &GlobalNode, peer: &str) {
+pub(super) async fn reconcile_with_peer(node: &GlobalNode, peer: &str) -> bool {
     let our = match node.inner.store.config_digest().await {
         Ok(d) => d.iter().map(ConfigDigestDto::from).collect::<Vec<_>>(),
         Err(e) => {
@@ -199,7 +203,7 @@ pub(super) async fn reconcile_with_peer(node: &GlobalNode, peer: &str) {
             node.inner
                 .peer_reconcile_failures
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return;
+            return false;
         }
     };
     let url = Cluster::endpoint(peer, "/internal/digest");
@@ -218,7 +222,7 @@ pub(super) async fn reconcile_with_peer(node: &GlobalNode, peer: &str) {
                 node.inner
                     .peer_reconcile_failures
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return;
+                return false;
             }
         },
         Ok(r) => {
@@ -226,14 +230,14 @@ pub(super) async fn reconcile_with_peer(node: &GlobalNode, peer: &str) {
             node.inner
                 .peer_reconcile_failures
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return;
+            return false;
         }
         Err(e) => {
             tracing::warn!(%peer, error = %e, "global cluster: digest request failed");
             node.inner
                 .peer_reconcile_failures
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return;
+            return false;
         }
     };
     let kinds_behind = configplane::kinds_behind(&their, &our);
@@ -262,8 +266,9 @@ pub(super) async fn reconcile_with_peer(node: &GlobalNode, peer: &str) {
                 node.inner
                     .peer_reconcile_repair_failures
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return;
+                return false;
             }
         }
     }
+    true
 }

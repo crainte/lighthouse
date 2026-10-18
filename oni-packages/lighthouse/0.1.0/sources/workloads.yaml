@@ -1,0 +1,255 @@
+stateful-sets:
+  - name: lighthouse-coordinator
+    dependsOn:
+      - external-secrets/lighthouse-coordinator-credentials
+    serviceName: lighthouse-coordinator-headless
+    replicas:
+      $ref: inputs.coordinatorReplicas
+    podManagementPolicy: Parallel
+    podSecurity:
+      runAsNonRoot: true
+      runAsUser: 65534
+      runAsGroup: 65534
+      fsGroup: 65534
+      seccompProfile:
+        type: RuntimeDefault
+    storage:
+      - name: data
+        path: /data
+        size:
+          $ref: inputs.coordinatorStorageSize
+    containers:
+      - name: lighthouse
+        image: ghcr.io/crainte/lighthouse:0.1.0
+        imagePullPolicy: IfNotPresent
+        args: [coordinator, --config, /etc/lighthouse/lighthouse.toml]
+        ports:
+          - name: http
+            port: 8080
+        env:
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+          - name: LIGHTHOUSE_NODE_ID
+            value: $(POD_NAME)
+          - name: LIGHTHOUSE_ADVERTISE_URL
+            value: http://$(POD_NAME).lighthouse-coordinator-headless.$(POD_NAMESPACE).svc.cluster.local:8080
+          - name: LIGHTHOUSE_ADMIN_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: lighthouse-admin-credentials
+                key: LIGHTHOUSE_ADMIN_PASSWORD
+                optional: true
+          - name: LIGHTHOUSE_PEER_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: lighthouse-coordinator-credentials
+                key: LIGHTHOUSE_PEER_TOKEN
+          - name: LIGHTHOUSE_REGION_KEY
+            valueFrom:
+              secretKeyRef:
+                name: lighthouse-coordinator-credentials
+                key: LIGHTHOUSE_REGION_KEY
+        mounts:
+          - configMap: lighthouse-coordinator-config
+            key: lighthouse.toml
+            path: /etc/lighthouse/lighthouse.toml
+            readOnly: true
+        security:
+          allowPrivilegeEscalation: false
+          dropCapabilities: [ALL]
+        startupProbe:
+          httpGet:
+            path: /api/v1/status
+            port: http
+          periodSeconds: 5
+          failureThreshold: 24
+        livenessProbe:
+          httpGet:
+            path: /api/v1/status
+            port: http
+          periodSeconds: 15
+          timeoutSeconds: 3
+          failureThreshold: 4
+        readinessProbe:
+          httpGet:
+            path: /api/v1/status
+            port: http
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+    spec:
+      selector:
+        matchLabels:
+          app.kubernetes.io/name: lighthouse
+          app.kubernetes.io/component: coordinator
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: lighthouse
+            app.kubernetes.io/component: coordinator
+        spec:
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/name: lighthouse
+                      app.kubernetes.io/component: coordinator
+                  topologyKey: kubernetes.io/hostname
+      persistentVolumeClaimRetentionPolicy:
+        whenDeleted: Retain
+        whenScaled: Retain
+
+  - name: lighthouse-global
+    dependsOn:
+      - external-secrets/lighthouse-global-credentials
+    serviceName: lighthouse-global-headless
+    replicas:
+      $ref: inputs.globalReplicas
+    podManagementPolicy: Parallel
+    podSecurity:
+      runAsNonRoot: true
+      runAsUser: 65534
+      runAsGroup: 65534
+      fsGroup: 65534
+      seccompProfile:
+        type: RuntimeDefault
+    storage:
+      - name: data
+        path: /data
+        size:
+          $ref: inputs.globalStorageSize
+    containers:
+      - name: lighthouse
+        image: ghcr.io/crainte/lighthouse:0.1.0
+        imagePullPolicy: IfNotPresent
+        args: [global, --config, /etc/lighthouse/lighthouse.toml]
+        ports:
+          - name: http
+            port: 8080
+        env:
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+          - name: LIGHTHOUSE_NODE_ID
+            value: $(POD_NAME)
+          - name: LIGHTHOUSE_ADVERTISE_URL
+            value: http://$(POD_NAME).lighthouse-global-headless.$(POD_NAMESPACE).svc.cluster.local:8080
+          - name: LIGHTHOUSE_ADMIN_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: lighthouse-admin-credentials
+                key: LIGHTHOUSE_ADMIN_PASSWORD
+                optional: true
+          - name: LIGHTHOUSE_PEER_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: lighthouse-global-credentials
+                key: LIGHTHOUSE_PEER_TOKEN
+        mounts:
+          - configMap: lighthouse-global-config
+            key: lighthouse.toml
+            path: /etc/lighthouse/lighthouse.toml
+            readOnly: true
+        security:
+          allowPrivilegeEscalation: false
+          dropCapabilities: [ALL]
+        startupProbe:
+          httpGet:
+            path: /api/v1/status
+            port: http
+          periodSeconds: 5
+          failureThreshold: 24
+        livenessProbe:
+          httpGet:
+            path: /api/v1/status
+            port: http
+          periodSeconds: 15
+          timeoutSeconds: 3
+          failureThreshold: 4
+        readinessProbe:
+          httpGet:
+            path: /api/v1/status
+            port: http
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+    spec:
+      selector:
+        matchLabels:
+          app.kubernetes.io/name: lighthouse
+          app.kubernetes.io/component: global
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: lighthouse
+            app.kubernetes.io/component: global
+        spec:
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/name: lighthouse
+                      app.kubernetes.io/component: global
+                  topologyKey: kubernetes.io/hostname
+      persistentVolumeClaimRetentionPolicy:
+        whenDeleted: Retain
+        whenScaled: Retain
+
+deployments:
+  - name: lighthouse-agent
+    dependsOn:
+      - external-secrets/lighthouse-agent-credentials
+    replicas: 1
+    containers:
+      - name: lighthouse
+        image: ghcr.io/crainte/lighthouse:0.1.0
+        imagePullPolicy: IfNotPresent
+        args: [agent, --config, /etc/lighthouse/lighthouse.toml]
+        env:
+          - name: LIGHTHOUSE_AGENT_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: lighthouse-agent-credentials
+                key: LIGHTHOUSE_AGENT_TOKEN
+        mounts:
+          - configMap: lighthouse-agent-config
+            key: lighthouse.toml
+            path: /etc/lighthouse/lighthouse.toml
+            readOnly: true
+    spec:
+      selector:
+        matchLabels:
+          app.kubernetes.io/name: lighthouse
+          app.kubernetes.io/component: agent
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: lighthouse
+            app.kubernetes.io/component: agent
+        spec:
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: lighthouse
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]

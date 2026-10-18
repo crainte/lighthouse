@@ -340,6 +340,7 @@ impl Storage {
                     // ping after boot fills this in.
                     build: None,
                     protocol: None,
+                    ready: true,
                 })
             })?
             .collect::<std::result::Result<_, _>>()?;

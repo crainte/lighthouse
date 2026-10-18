@@ -35,6 +35,9 @@ pub(super) fn router(node: GlobalNode) -> Router {
             }),
         )
         .route("/api/v1/status", get(status_handler))
+        // Readiness: 200 only once this node is in sync with its peers.
+        // Liveness stays on `/api/v1/status`.
+        .route("/readyz", get(super::sync::readyz_handler))
         .route("/api/v1/cluster", get(cluster_handler))
         .route("/api/v1/admin/region-tree", get(region_tree_handler))
         .route("/api/v1/alerts", get(alerts_handler))
@@ -128,6 +131,12 @@ pub(super) fn router(node: GlobalNode) -> Router {
         // Global-to-global config plane (Phase 4): the same shape a
         // coordinator's own `/internal/config`/`/internal/digest` are,
         // peer-gated by `global.peer_token` rather than a region's.
+        // Region state forwarded by a peer global node that received it
+        // (see `state_fanout`). Peer-gated, never a region key.
+        .route(
+            super::state_fanout::PEER_STATE_PATH,
+            post(peer_state_handler).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
         .route(
             "/internal/config",
             post(cluster::config_handler)
@@ -191,6 +200,23 @@ async fn push_handler(
             )
         }
     }
+    // Only a node with peers needs the copy, to forward once applied.
+    let forward = node.inner.cluster.as_ref().map(|_| push.clone());
+    let outcome = apply_state(&node, push).await;
+    if outcome == super::cache::PushOutcome::Applied {
+        if let Some(push) = forward {
+            node.forward_state(push);
+        }
+    }
+    Json(PushAck {
+        accepted: outcome == super::cache::PushOutcome::Applied,
+        resync: outcome == super::cache::PushOutcome::Resync,
+    })
+    .into_response()
+}
+
+/// Apply a region push, from the region itself or forwarded by a peer.
+async fn apply_state(node: &GlobalNode, push: RegionStatePush) -> super::cache::PushOutcome {
     let now = chrono::Utc::now().timestamp_millis();
     // Diff the cross-region rollup around the push so a dashboard socket sees a
     // `state_change` the instant a check flips *globally* — a region reporting
@@ -200,11 +226,29 @@ async fn push_handler(
     let before = node.inner.cache.state_snapshot(now);
     let outcome = node.inner.cache.apply_push(push, now);
     let after = node.inner.cache.state_snapshot(now);
-    broadcast_state_changes(&node, &before, &after, now);
-    // Re-evaluate global alerts on every push: it is the only thing that
-    // changes cached state, and staleness is checked here too so a region that
-    // stops pushing is still noticed on the next surviving region's push.
-    node.inner.alerter.evaluate(&node.inner.cache, now).await;
+    broadcast_state_changes(node, &before, &after, now);
+    // Re-evaluate global alerts on every push as well as on the sync tick, so
+    // a flip pages without waiting for the tick. Only the owner evaluates.
+    node.evaluate_alerts(now).await;
+    outcome
+}
+
+/// Region state forwarded by the peer global node that received it. Applied
+/// exactly as the region's own push would be, never forwarded again.
+async fn peer_state_handler(
+    State(node): State<GlobalNode>,
+    headers: HeaderMap,
+    Json(push): Json<RegionStatePush>,
+) -> Response {
+    if let Some(denied) = cluster::require_peer(&node, &headers) {
+        return denied;
+    }
+    // A region removed here (or not yet known here) is not resurrected by a
+    // peer that has not caught up; the peer retries with a snapshot later.
+    if node.inner.regions.get(&push.region).is_none() {
+        return error_response(StatusCode::CONFLICT, "region is not registered here");
+    }
+    let outcome = apply_state(&node, push).await;
     Json(PushAck {
         accepted: outcome == super::cache::PushOutcome::Applied,
         resync: outcome == super::cache::PushOutcome::Resync,
@@ -443,6 +487,9 @@ struct ClusterMemberDto {
     /// The regional coordinator whose push this entry was last built from.
     #[serde(skip_serializing_if = "Option::is_none")]
     origin: Option<String>,
+    /// Global peers only: whether the member reports itself in sync.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ready: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -460,6 +507,8 @@ struct ClusterResponse {
     /// Observed links between global control-plane peers.
     global_links: Vec<crate::coordinator::cluster::LinkObservation>,
     global_link_stale_after_ms: Option<i64>,
+    /// This node's own sync status, broken down by reason.
+    global_sync: super::sync::SyncStatus,
 }
 
 /// One region's own coordinator cluster, exactly as that region's
@@ -538,6 +587,7 @@ fn global_member_dto(member: crate::coordinator::cluster::Member) -> ClusterMemb
         build: member.build,
         protocol: member.protocol,
         origin: None,
+        ready: Some(member.ready),
     }
 }
 
@@ -578,6 +628,7 @@ async fn cluster_handler(
                 }),
                 protocol: None,
                 origin,
+                ready: None,
             }
         })
         .collect();
@@ -621,6 +672,7 @@ async fn cluster_handler(
                 build: Some(crate::version::current().to_string()),
                 protocol: None,
                 origin: None,
+                ready: None,
             };
             (me.clone(), vec![me], vec![], None)
         };
@@ -644,6 +696,7 @@ async fn cluster_handler(
         global_peers,
         global_links,
         global_link_stale_after_ms,
+        global_sync: node.sync_status(now),
     })
     .into_response()
 }

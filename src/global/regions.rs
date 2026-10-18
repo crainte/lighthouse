@@ -301,7 +301,7 @@ impl GlobalNode {
 
     /// Best-effort immediate push to peer global nodes; anti-entropy is the
     /// backstop for any that miss it.
-    fn broadcast_to_peers(&self, entries: Vec<ConfigEntry>) {
+    pub(super) fn broadcast_to_peers(&self, entries: Vec<ConfigEntry>) {
         let Some(cluster) = self.inner.cluster.clone() else {
             return;
         };
