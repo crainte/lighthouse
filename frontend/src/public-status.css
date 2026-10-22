@@ -225,19 +225,19 @@ body:has(.public-app) { background: #071321; }
 .public-app .range-btn { color: #9fb7c8; padding: 6px 12px; }
 .public-app .range-btn.active { color: #9be0f0; background: #173e59; }
 .public-app .components { gap: 0; }
-.public-services { overflow: hidden; background: var(--public-panel); border: 1px solid var(--public-line); border-radius: 9px; }
-.public-services .service-spacer { height: 2.25rem; position: relative; }
-.public-services .service-spacer::after { content: ''; position: absolute; top: 50%; left: 1.25rem; right: 1.25rem; border-top: 1px solid var(--public-line); }
+.public-services { overflow: visible; background: transparent; border: 0; border-radius: 0; }
+.public-services .service-spacer { height: 8px; position: relative; }
+.public-services .service-spacer::after { content: none; }
 .public-service-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) max-content 14px;
   grid-template-rows: auto auto auto;
   align-items: center; column-gap: 12px; row-gap: 12px;
   width: 100%; min-width: 0;
-  background: transparent; border: 0; border-bottom: 1px solid #24394c; color: #e8f0f6;
+  background: var(--public-panel); border: 1px solid var(--public-line); border-radius: 8px; color: #e8f0f6;
   text-align: left; font: inherit; cursor: pointer; padding: 15px 18px;
 }
-.public-service-row:last-of-type { border-bottom: 0; }
+.public-service-row:last-of-type { border-bottom: 1px solid var(--public-line); }
 .public-service-row:hover { background: #162d41; }
 .public-service-name { display: flex; align-items: center; gap: 10px; min-width: 0; grid-column: 1; grid-row: 1; }
 .public-service-name>span:last-child { min-width: 0; display: grid; gap: 4px; }
@@ -280,6 +280,7 @@ body:has(.public-app) { background: #071321; }
 .public-app .group-name { font-size: 13px; }
 .public-app .group-body .public-service-row { border-radius: 0; padding-left: 26px; border: 0; border-top: 1px solid #24394c; }
 .public-app .group-head:hover, .public-app .group-body .public-service-row:hover { background: #172b3d; }
+.public-services > .group { background: var(--public-panel); border: 1px solid var(--public-line); border-radius: 8px; overflow: hidden; }
 .public-app #public-incidents .components { gap: 8px; }
 .public-app #public-incidents .component {
   background: #101d2b;
