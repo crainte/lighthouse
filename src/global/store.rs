@@ -346,6 +346,25 @@ impl GlobalStore {
 
     // ---- Regions (see `global::regions`) ----
 
+    pub async fn homepage_spacers(&self) -> Result<crate::homepage::Spacers> {
+        let value = self
+            .db(|storage| storage.get_setting(crate::homepage::KEY))
+            .await?;
+        Ok(match value {
+            Some(value) => serde_json::from_str(&value)?,
+            None => crate::homepage::Spacers::default(),
+        })
+    }
+
+    pub async fn put_homepage_spacers(
+        &self,
+        spacers: &crate::homepage::Spacers,
+    ) -> Result<ConfigEntry> {
+        let document = serde_json::to_string(&serde_json::to_string(spacers)?)?;
+        self.write_config(ConfigKind::Setting, crate::homepage::KEY, Some(document))
+            .await
+    }
+
     pub async fn regions(&self) -> Result<Vec<super::regions::RegionRecord>> {
         let rows = self
             .db(|storage| storage.settings_with_prefix(super::regions::KEY_PREFIX))

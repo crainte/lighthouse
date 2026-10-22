@@ -605,3 +605,12 @@ export function fetchPublicSections(): Promise<PublicSection[]> {
     (r) => r.sections,
   );
 }
+
+import type { HomepageSpacer } from "./homepageSpacers";
+export type { HomepageSpacer } from "./homepageSpacers";
+
+export function fetchHomepageSpacers(): Promise<HomepageSpacer[]> {
+  return getJson<{ spacers: HomepageSpacer[] }>("/api/v1/homepage/spacers").then(
+    (r) => r.spacers,
+  );
+}

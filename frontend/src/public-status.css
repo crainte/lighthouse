@@ -226,6 +226,8 @@ body:has(.public-app) { background: #071321; }
 .public-app .range-btn.active { color: #9be0f0; background: #173e59; }
 .public-app .components { gap: 0; }
 .public-services { overflow: hidden; background: var(--public-panel); border: 1px solid var(--public-line); border-radius: 9px; }
+.public-services .service-spacer { height: 2.25rem; position: relative; }
+.public-services .service-spacer::after { content: ''; position: absolute; top: 50%; left: 1.25rem; right: 1.25rem; border-top: 1px solid var(--public-line); }
 .public-service-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) max-content 14px;
