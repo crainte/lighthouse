@@ -23,6 +23,53 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+async fn spacers_response(coord: &Coordinator) -> Response {
+    match coord
+        .db(|storage| storage.get_setting(crate::homepage::KEY))
+        .await
+    {
+        Ok(Some(value)) => match serde_json::from_str::<crate::homepage::Spacers>(&value) {
+            Ok(spacers) => Json(spacers).into_response(),
+            Err(e) => internal_error(e.into()),
+        },
+        Ok(None) => Json(crate::homepage::Spacers::default()).into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+pub(in crate::coordinator) async fn public_spacers_handler(
+    State(coord): State<Coordinator>,
+) -> Response {
+    spacers_response(&coord).await
+}
+
+pub(in crate::coordinator) async fn update_spacers_handler(
+    State(coord): State<Coordinator>,
+    AdminJson(body): AdminJson<crate::homepage::Spacers>,
+) -> Response {
+    if let Err(reason) = body.validate() {
+        return error_response(StatusCode::BAD_REQUEST, reason);
+    }
+    let value = match serde_json::to_string(&body) {
+        Ok(value) => value,
+        Err(e) => return internal_error(e.into()),
+    };
+    match coord
+        .write_config(
+            storage::ConfigKind::Setting,
+            crate::homepage::KEY,
+            Some(value),
+        )
+        .await
+    {
+        Ok(entry) => {
+            coord.replicate_config(vec![entry]);
+            Json(body).into_response()
+        }
+        Err(e) => internal_error(e),
+    }
+}
+
 #[derive(Serialize)]
 struct SectionsResponse {
     sections: Vec<storage::Section>,

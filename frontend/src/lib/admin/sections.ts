@@ -1,4 +1,5 @@
 import { send, request } from "./client";
+import type { HomepageSpacer } from "../homepageSpacers";
 
 /** A named, ordered group on the status page. Exists independently of checks,
  *  so an empty section can be created before anything is put in it. */
@@ -55,4 +56,11 @@ export async function reorderSections(order: string[]): Promise<Section[]> {
     { order },
   );
   return r.sections;
+}
+
+export async function saveHomepageSpacers(spacers: HomepageSpacer[]): Promise<HomepageSpacer[]> {
+  const r = await send<{ spacers: HomepageSpacer[] }>(
+    "PUT", "/api/v1/admin/homepage/spacers", { spacers },
+  );
+  return r.spacers;
 }

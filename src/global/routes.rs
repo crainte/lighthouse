@@ -95,6 +95,14 @@ pub(super) fn router(node: GlobalNode) -> Router {
             put(admin::rename_section_handler).delete(admin::delete_section_handler),
         )
         .route("/api/v1/sections", get(admin::public_sections_handler))
+        .route(
+            "/api/v1/homepage/spacers",
+            get(admin::public_spacers_handler),
+        )
+        .route(
+            "/api/v1/admin/homepage/spacers",
+            put(admin::update_spacers_handler),
+        )
         // Region registration and removal, and decommissioning a peer
         // global node. See `regions`.
         .route(

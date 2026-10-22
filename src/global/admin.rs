@@ -161,6 +161,29 @@ pub(super) async fn reorder_checks_handler(
 
 // ---- Sections ----
 
+pub(super) async fn public_spacers_handler(State(node): State<GlobalNode>) -> Response {
+    match node.inner.store.homepage_spacers().await {
+        Ok(spacers) => Json(spacers).into_response(),
+        Err(e) => admin_error(AdminError::Internal(e)),
+    }
+}
+
+pub(super) async fn update_spacers_handler(
+    State(node): State<GlobalNode>,
+    AdminJson(body): AdminJson<crate::homepage::Spacers>,
+) -> Response {
+    if let Err(reason) = body.validate() {
+        return error_response(StatusCode::BAD_REQUEST, reason);
+    }
+    match node.inner.store.put_homepage_spacers(&body).await {
+        Ok(entry) => {
+            reconcile::push_now(&node, vec![entry]);
+            Json(body).into_response()
+        }
+        Err(e) => admin_error(AdminError::Internal(e)),
+    }
+}
+
 #[derive(Serialize)]
 struct SectionsResponse {
     sections: Vec<Section>,

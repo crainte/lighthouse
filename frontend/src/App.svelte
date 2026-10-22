@@ -10,6 +10,7 @@
     fetchUptimeStrips,
     fetchLatencyPoints,
     fetchPublicSections,
+    fetchHomepageSpacers,
   } from './lib/api';
   import type {
     Check,
@@ -23,6 +24,7 @@
     LatencyPoint,
     PublicSection,
     SectionRollup,
+    HomepageSpacer,
   } from './lib/api';
   import { connectWs } from './lib/ws';
   import type { WsStatus } from './lib/ws';
@@ -50,6 +52,7 @@
     type SeasonalPreferences,
   } from './lib/seasonalAtmosphere';
   import { debounce, debounceByKey } from './lib/debounce';
+  import { placeSpacers } from './lib/homepageSpacers';
   import {
     formatAbsolute,
     openIncidentForCheck,
@@ -202,6 +205,7 @@
   // Only carries the headings' metadata — /api/v1/status has none, and the
   // collapsed flag decides how a group first renders.
   let sections = $state<PublicSection[]>([]);
+  let homepageSpacers = $state<HomepageSpacer[]>([]);
   // Per-section states, rolled up by the coordinator under the same policy the
   // zone and region rows use. Never recomputed here: a tile and a zone row
   // disagreeing about what "degraded" means is the bug this avoids.
@@ -646,7 +650,7 @@
   const pagedGroups = $derived(
     sections
       .filter((section) => section.display === 'page')
-      .map((section) => ({ name: section.name, checks: [] as Check[], collapsed: section.collapsed })),
+      .map((section) => ({ name: section.name, checks: [] as Check[], collapsed: section.collapsed, display: 'page' as const })),
   );
 
   // The section whose own page is open, resolved against the status list. An
@@ -681,6 +685,12 @@
   // Everything without a group is listed loose, so a check can never be hidden
   // by a config typo.
   const generalChecks = $derived(ordered.filter((c) => !c.group));
+  const serviceBlocks = $derived([
+    ...generalChecks.map((check) => ({ key: `check:${check.check_id}`, kind: 'check' as const, check })),
+    ...pagedGroups.map((group) => ({ key: `section:${group.name}`, kind: 'section' as const, group })),
+    ...inlineGroups.map((group) => ({ key: `section:${group.name}`, kind: 'section' as const, group })),
+  ]);
+  const serviceItems = $derived(placeSpacers(serviceBlocks, homepageSpacers));
 
   // The page-wide live surface is derived from the windowed public list, which
   // always includes open incidents even when their start predates the window.
@@ -712,12 +722,13 @@
     loading = true;
     error = null;
     try {
-      const [s, a, publicInc, adminInc, sec] = await Promise.all([
+      const [s, a, publicInc, adminInc, sec, spacers] = await Promise.all([
         fetchStatus(statusScope, statusPage, STATUS_PAGE_SIZE),
         fetchAlerts(),
         fetchIncidents(50, Date.now() - days * 24 * 60 * 60 * 1000),
         fetchIncidents(),
         fetchPublicSections(),
+        fetchHomepageSpacers(),
       ]);
       checks = s.checks;
       statusPage = s.page;
@@ -732,6 +743,7 @@
       regionReportsSeen = s.region_reports_seen ?? null;
       maintenance = s.maintenance;
       sections = sec;
+      homepageSpacers = spacers;
       sectionRollups = s.sections;
       // Charts are not awaited here. They are driven by `chartScope`/`days`,
       // and that request runs in parallel with this one rather than after it.
@@ -1130,46 +1142,49 @@
         </div>
       </div>
       <div class="components public-services">
-        {#each generalChecks as c (c.check_id)}
-          <ComponentRow
-            compact
-            check={c}
-            uptime={uptime[c.check_id]}
-            sparkline={sparkline[c.check_id] ?? null}
-            incident={openIncidentForCheck(publicIncidents, c.check_id)}
-            onselect={openDetail}
-            onbarclick={(id, b) => (dayModal = { checkId: id, bucket: b })}
-          />
-        {/each}
-
-        {#each pagedGroups as g (g.name)}
-          <SectionTile
-            name={g.name}
-            rollup={sectionRollups.find((r) => r.name === g.name)}
-            count={sectionRollups.find((r) => r.name === g.name)?.checks ?? 0}
-            onopen={openGroup}
-          />
-        {/each}
-
-        {#each inlineGroups as g (g.name)}
-          <CollapsibleGroup
-            name={g.name}
-            status={worstStatus(g.checks)}
-            count={g.checks.length}
-            collapsed={g.collapsed}
-          >
-            {#each g.checks as c (c.check_id)}
-              <ComponentRow
-                compact
-                check={c}
-                uptime={uptime[c.check_id]}
-                sparkline={sparkline[c.check_id] ?? null}
-                incident={openIncidentForCheck(publicIncidents, c.check_id)}
-                onselect={openDetail}
-                onbarclick={(id, b) => (dayModal = { checkId: id, bucket: b })}
-              />
-            {/each}
-          </CollapsibleGroup>
+        {#each serviceItems as item (item.key)}
+          {#if item.kind === 'spacer'}
+            <div class="service-spacer" aria-hidden="true"></div>
+          {:else if item.block.kind === 'check'}
+            {@const c = item.block.check}
+            <ComponentRow
+              compact
+              check={c}
+              uptime={uptime[c.check_id]}
+              sparkline={sparkline[c.check_id] ?? null}
+              incident={openIncidentForCheck(publicIncidents, c.check_id)}
+              onselect={openDetail}
+              onbarclick={(id, b) => (dayModal = { checkId: id, bucket: b })}
+            />
+          {:else if item.block.group.display === 'page'}
+            {@const g = item.block.group}
+            <SectionTile
+              name={g.name}
+              rollup={sectionRollups.find((r) => r.name === g.name)}
+              count={sectionRollups.find((r) => r.name === g.name)?.checks ?? 0}
+              onopen={openGroup}
+            />
+          {:else}
+            {@const g = item.block.group}
+            <CollapsibleGroup
+              name={g.name}
+              status={worstStatus(g.checks)}
+              count={g.checks.length}
+              collapsed={g.collapsed}
+            >
+              {#each g.checks as c (c.check_id)}
+                <ComponentRow
+                  compact
+                  check={c}
+                  uptime={uptime[c.check_id]}
+                  sparkline={sparkline[c.check_id] ?? null}
+                  incident={openIncidentForCheck(publicIncidents, c.check_id)}
+                  onselect={openDetail}
+                  onbarclick={(id, b) => (dayModal = { checkId: id, bucket: b })}
+                />
+              {/each}
+            </CollapsibleGroup>
+          {/if}
         {/each}
        </div>
        {#if statusTotal > STATUS_PAGE_SIZE}

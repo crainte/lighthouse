@@ -39,7 +39,8 @@ use routes::public::{
 };
 use routes::sections::{
     create_section_handler, delete_section_handler, list_sections_handler, public_sections_handler,
-    rename_section_handler, reorder_sections_handler,
+    public_spacers_handler, rename_section_handler, reorder_sections_handler,
+    update_spacers_handler,
 };
 use routes::session::{login_handler, logout_handler, session_handler};
 use routes::settings::{
@@ -284,6 +285,11 @@ impl Coordinator {
             .route(
                 "/api/v1/admin/sections/{name}",
                 put(rename_section_handler).delete(delete_section_handler),
+            )
+            .route("/api/v1/homepage/spacers", get(public_spacers_handler))
+            .route(
+                "/api/v1/admin/homepage/spacers",
+                put(update_spacers_handler),
             )
             // Which agents the public page names, and how. Admin-only in both
             // directions: `pinned` is a list of agent ids.
