@@ -54,16 +54,20 @@ pub(in crate::coordinator) async fn update_spacers_handler(
         Ok(value) => value,
         Err(e) => return internal_error(e.into()),
     };
-    if let Err(e) = coord
-        .db(move |storage| storage.put_setting(crate::homepage::KEY, &value))
+    match coord
+        .write_config(
+            storage::ConfigKind::Setting,
+            crate::homepage::KEY,
+            Some(value),
+        )
         .await
     {
-        return internal_error(e);
+        Ok(entry) => {
+            coord.replicate_config(vec![entry]);
+            Json(body).into_response()
+        }
+        Err(e) => internal_error(e),
     }
-    coord
-        .restamp_and_push(storage::ConfigKind::Setting, crate::homepage::KEY)
-        .await;
-    Json(body).into_response()
 }
 
 #[derive(Serialize)]

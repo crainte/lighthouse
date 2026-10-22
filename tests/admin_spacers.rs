@@ -32,14 +32,14 @@ async fn homepage_spacers_are_persistent_public_and_admin_gated() {
         .await
         .unwrap();
     assert_eq!(saved.status(), 200);
-    let public: Value = client
-        .get(&path)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let public_response = client.get(&path).send().await.unwrap();
+    let public_status = public_response.status();
+    let public_body = public_response.text().await.unwrap();
+    assert!(
+        public_status.is_success(),
+        "public spacer request returned {public_status}: {public_body}"
+    );
+    let public: Value = serde_json::from_str(&public_body).unwrap();
     assert_eq!(
         public["spacers"],
         json!([
