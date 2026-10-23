@@ -249,7 +249,7 @@
              matches and the browser refuses it instead of reassigning. -->
         {@const list = `check:${g.key}`}
         <div class="ogroup">
-          <div class="olabel"
+          <div class="olabel" role="group"
             ondragover={(e) => { if (draggingSpacer) e.preventDefault(); }}
             ondrop={(e) => { if (g.key) dropSpacerAfter(e, `section:${g.key}`); }}
           >{g.label}</div>
