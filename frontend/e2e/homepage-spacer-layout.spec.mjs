@@ -53,7 +53,7 @@ async function readServiceLayout(page) {
   });
 }
 
-test('without spacers adjacent service rows form one flush panel', async ({ page }) => {
+test('without spacers adjacent service rows form one flush panel', async ({ page }, testInfo) => {
   await mockStatusApi(page, []);
   await page.goto('/');
   await expect(page.getByRole('heading', { name: 'Services' })).toBeVisible();
@@ -65,9 +65,10 @@ test('without spacers adjacent service rows form one flush panel', async ({ page
   expect(layout.secondTopRadius).toBe('0px');
   expect(layout.secondTopBorder).toBe('0px');
   expect(layout.firstBottomBorder).toBe('1px');
+  await page.locator('.public-services').screenshot({ path: testInfo.outputPath('flush-services.png') });
 });
 
-test('only an explicit spacer creates a dark gap and rounded panel boundaries', async ({ page }) => {
+test('only an explicit spacer creates a dark gap and rounded panel boundaries', async ({ page }, testInfo) => {
   await mockStatusApi(page);
   await page.goto('/');
   await expect(page.getByRole('heading', { name: 'Services' })).toBeVisible();
@@ -80,6 +81,7 @@ test('only an explicit spacer creates a dark gap and rounded panel boundaries', 
   expect(layout.secondTopRadius).toBe('8px');
   expect(layout.spacerBackground).toBe('rgba(0, 0, 0, 0)');
   expect(layout.secondTopBorder).toBe('1px');
+  await page.locator('.public-services').screenshot({ path: testInfo.outputPath('spaced-services.png') });
 });
 
 test('a paged section and a loose check are flush until an explicit spacer separates them', async ({ page }) => {
