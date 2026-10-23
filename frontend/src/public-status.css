@@ -288,6 +288,11 @@ body:has(.public-app) { background: #071321; }
   border-radius: 0;
   overflow: hidden;
 }
+/* Override the generic final-group border suppression: a public Services
+   panel must retain its bottom edge whether or not spacers are present. */
+.public-services > .group:last-child {
+  border-bottom: 1px solid var(--public-line);
+}
 /* Adjacent loose checks and section tiles are one flush container. */
 .public-services > :is(.public-service-row, .group) + :is(.public-service-row, .group) {
   border-top: 0;
