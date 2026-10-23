@@ -5,7 +5,6 @@
   import type { HomepageSpacer } from '../lib/homepageSpacers';
   import SectionsList from './sections-admin/SectionsList.svelte';
   import CheckOrderList from './sections-admin/CheckOrderList.svelte';
-  import HomepageSpacersAdmin from './HomepageSpacersAdmin.svelte';
 
   let { onchanged, onexpired }: { onchanged: () => void; onexpired: () => void } = $props();
 
@@ -63,8 +62,7 @@
   </div>
 {:else}
   <SectionsList bind:sections {checks} {onchanged} onexpired={markExpired} refreshAll={refresh} />
-  <CheckOrderList bind:checks {sections} {onchanged} onexpired={markExpired} />
-  <HomepageSpacersAdmin {checks} {sections} bind:spacers {onchanged} onexpired={markExpired} />
+  <CheckOrderList bind:checks bind:spacers {sections} {onchanged} onexpired={markExpired} />
 {/if}
 
 <style>

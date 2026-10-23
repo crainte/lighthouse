@@ -226,7 +226,9 @@ body:has(.public-app) { background: #071321; }
 .public-app .range-btn.active { color: #9be0f0; background: #173e59; }
 .public-app .components { gap: 0; }
 .public-services { overflow: visible; background: transparent; border: 0; border-radius: 0; }
-.public-services .service-spacer { height: 8px; position: relative; }
+/* Cards touch in one continuous service list. Only an explicit spacer creates
+   a visible gap; a spacer closes one panel and starts the next. */
+.public-services .service-spacer { height: 8px; position: relative; background: transparent; }
 .public-services .service-spacer::after { content: none; }
 .public-service-row {
   display: grid;
@@ -234,7 +236,7 @@ body:has(.public-app) { background: #071321; }
   grid-template-rows: auto auto auto;
   align-items: center; column-gap: 12px; row-gap: 12px;
   width: 100%; min-width: 0;
-  background: var(--public-panel); border: 1px solid var(--public-line); border-radius: 8px; color: #e8f0f6;
+  background: var(--public-panel); border: 1px solid var(--public-line); border-radius: 0; color: #e8f0f6;
   text-align: left; font: inherit; cursor: pointer; padding: 15px 18px;
 }
 .public-service-row:last-of-type { border-bottom: 1px solid var(--public-line); }
@@ -280,7 +282,38 @@ body:has(.public-app) { background: #071321; }
 .public-app .group-name { font-size: 13px; }
 .public-app .group-body .public-service-row { border-radius: 0; padding-left: 26px; border: 0; border-top: 1px solid #24394c; }
 .public-app .group-head:hover, .public-app .group-body .public-service-row:hover { background: #172b3d; }
-.public-services > .group { background: var(--public-panel); border: 1px solid var(--public-line); border-radius: 8px; overflow: hidden; }
+.public-services > .group {
+  background: var(--public-panel);
+  border: 1px solid var(--public-line);
+  border-radius: 0;
+  overflow: hidden;
+}
+/* Override the generic final-group border suppression: a public Services
+   panel must retain its bottom edge whether or not spacers are present. */
+.public-services > .group:last-child {
+  border-bottom: 1px solid var(--public-line);
+}
+/* Adjacent loose checks and section tiles are one flush container. */
+.public-services > :is(.public-service-row, .group) + :is(.public-service-row, .group) {
+  border-top: 0;
+}
+/* The start and end of each contiguous run get the rounded corners. */
+.public-services > :is(.public-service-row, .group):first-child,
+.public-services > .service-spacer + :is(.public-service-row, .group) {
+  border-top: 1px solid var(--public-line);
+  border-radius: 8px 8px 0 0;
+}
+.public-services > :is(.public-service-row, .group):last-child,
+.public-services > :is(.public-service-row, .group):has(+ .service-spacer) {
+  border-radius: 0 0 8px 8px;
+}
+/* Single-card runs round all four corners. */
+.public-services > :is(.public-service-row, .group):first-child:last-child,
+.public-services > :is(.public-service-row, .group):first-child:has(+ .service-spacer),
+.public-services > .service-spacer + :is(.public-service-row, .group):last-child,
+.public-services > .service-spacer + :is(.public-service-row, .group):has(+ .service-spacer) {
+  border-radius: 8px;
+}
 .public-app #public-incidents .components { gap: 8px; }
 .public-app #public-incidents .component {
   background: #101d2b;
