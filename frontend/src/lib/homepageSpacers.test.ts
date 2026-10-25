@@ -52,4 +52,17 @@ describe('homepage spacers', () => {
     expect(placeSpacers(blocks, [{ id: 'lost', after: 'section:old' }]).at(-1)?.key)
       .toBe('spacer:lost');
   });
+
+  it('renders many spacers on one anchor and moves each independently', () => {
+    const many = Array.from({ length: 5 }, (_, n) => ({ id: `s${n}`, after: 'check:a' as string | null }));
+    expect(placeSpacers(blocks, many).map((item) => item.key)).toEqual([
+      'check:a', 'spacer:s0', 'spacer:s1', 'spacer:s2', 'spacer:s3', 'spacer:s4', 'check:b', 'section:API',
+    ]);
+    const moved = moveSpacer(blocks, many, 's4', -1);
+    expect(moved.map((s) => s.id)).toEqual(['s0', 's1', 's2', 's4', 's3']);
+    expect(moved.every((s) => s.after === 'check:a')).toBe(true);
+    const across = moveSpacer(blocks, many, 's4', 1);
+    expect(across.find((s) => s.id === 's4')?.after).toBe('check:b');
+    expect(across.filter((s) => s.id !== 's4').every((s) => s.after === 'check:a')).toBe(true);
+  });
 });

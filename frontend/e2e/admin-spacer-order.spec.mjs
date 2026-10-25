@@ -83,3 +83,66 @@ test('dragging a spacer onto a section changes only its layout anchor', async ({
   await expect(panel.locator('.ogroup').filter({ hasText: 'Core' }).locator('.spacer-row')).toHaveCount(1);
   expect(state.writes.every(({ spacers }) => spacers.length === 1)).toBe(true);
 });
+
+test('adds several independent spacers, moves one with arrows, and removes one', async ({ page }) => {
+  // Plain-HTTP consoles have no crypto.randomUUID; adding must still work.
+  await page.addInitScript(() => { Object.defineProperty(crypto, 'randomUUID', { value: undefined }); });
+  const state = await mockAdmin(page);
+  await page.goto('/#/admin/status');
+  const panel = page.locator('.admin-panel').filter({ hasText: 'Check order' });
+  const add = panel.getByRole('button', { name: '+ Add spacer' });
+  const rows = panel.locator('.spacer-row');
+  const settled = () => expect(panel.getByText('Saving layout…')).toHaveCount(0);
+  // Click without waiting between presses: queued saves must all land.
+  await add.click();
+  await add.click();
+  await add.click();
+  await expect(rows).toHaveCount(3);
+  await expect.poll(() => state.getSpacers().length).toBe(3);
+  await settled();
+  const ids = state.getSpacers().map((spacer) => spacer.id);
+  expect(new Set(ids).size).toBe(3);
+  expect(state.getSpacers().every((spacer) => spacer.after === 'section:Core')).toBe(true);
+
+  // Spacer rows match check rows: same chrome, grip, and arrow SVGs.
+  const chrome = (row) => row.evaluate((el) => {
+    const css = getComputedStyle(el);
+    return {
+      padding: css.padding, margin: css.margin, borderStyle: css.borderBottomStyle,
+      radius: css.borderRadius, background: css.backgroundColor, fontSize: css.fontSize,
+    };
+  });
+  const checkRow = panel.locator('.orow').filter({ has: page.locator('.oname', { hasText: 'Public API' }) });
+  const spacerChrome = await chrome(rows.nth(0));
+  const checkChrome = await chrome(checkRow);
+  expect(spacerChrome).toEqual(checkChrome);
+  await expect(rows.nth(0).locator('.movers .reorder-step svg')).toHaveCount(2);
+  await expect(rows.nth(0).locator('.movers path').first()).toHaveAttribute('d', 'm6 14 6-6 6 6');
+  await expect(rows.nth(0).locator('.movers path').nth(1)).toHaveAttribute('d', 'm6 10 6 6 6-6');
+  await expect(rows.nth(0).locator('.grip')).toBeVisible();
+
+  const order = () => state.getSpacers().map((s) => s.id);
+  // Move the last spacer up past its sibling; the others keep ids and anchors.
+  await settled();
+  await rows.nth(2).getByRole('button', { name: 'Move spacer up' }).click();
+  await expect.poll(order).toEqual([ids[0], ids[2], ids[1]]);
+  await settled();
+  await rows.nth(0).getByRole('button', { name: 'Move spacer down' }).click();
+  await expect.poll(order).toEqual([ids[2], ids[0], ids[1]]);
+  await expect(rows).toHaveCount(3);
+
+  // The arrow crosses the section boundary for that spacer only.
+  await settled();
+  await rows.nth(0).getByRole('button', { name: 'Move spacer up' }).click();
+  await expect.poll(() => state.getSpacers().find((s) => s.id === ids[2]).after).toBe('check:db');
+  expect(state.getSpacers().filter((s) => s.id !== ids[2]).every((s) => s.after === 'section:Core')).toBe(true);
+  await expect(rows).toHaveCount(3);
+
+  // Remove one; the other two are untouched.
+  await settled();
+  await rows.nth(1).getByRole('button', { name: 'Remove spacer' }).click();
+  await expect.poll(() => state.getSpacers().length).toBe(2);
+  await expect(rows).toHaveCount(2);
+  expect(order()).toEqual([ids[2], ids[1]]);
+  expect(state.getSpacers().map((s) => s.after)).toEqual(['check:db', 'section:Core']);
+});
