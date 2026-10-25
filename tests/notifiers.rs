@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 
 use lighthouse::config::{CheckConfig, CoordinatorConfig};
 use lighthouse::coordinator::Coordinator;
-use lighthouse::models::{CheckId, CheckKind, CheckResult};
+use lighthouse::models::{CheckId, CheckKind, CheckResult, NodeState};
 use uuid::Uuid;
 
 const PASSWORD: &str = "correct horse battery staple";
@@ -383,6 +383,201 @@ async fn a_test_send_reports_a_refusal_instead_of_claiming_success() {
         .await
         .unwrap();
     assert_eq!(res.status(), 400);
+}
+
+/// Templates are per ntfy channel. Test-send must exercise the same rendering
+/// as a real transition, without publishing to a public topic.
+#[tokio::test]
+async fn ntfy_templates_apply_to_test_and_real_transitions() {
+    let captured: Sink = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route(
+            "/alerts",
+            post(|State(sink): State<Sink>, headers: axum::http::HeaderMap, body: String| async move {
+                sink.lock().push(json!({
+                    "title": headers.get("Title").unwrap().to_str().unwrap(),
+                    "body": body,
+                }));
+                StatusCode::OK
+            }),
+        )
+        .with_state(captured.clone());
+    let ntfy_addr = serve(app).await;
+    let coord = coordinator().await;
+    let coord_addr = serve(coord.clone().router()).await;
+    let base = format!("http://{coord_addr}");
+    let session = login(&base).await;
+    let notifier = json!({
+        "name": "phone", "type": "ntfy", "topic": "alerts",
+        "base_url": format!("http://{ntfy_addr}"),
+        "title_template": "Alert: {name} is {to}",
+        "message_template": "{name}: {from} -> {to}"
+    });
+    let (code, saved) = put_notifiers(&base, &session, json!([notifier.clone()])).await;
+    assert_eq!(code, 200, "{saved}");
+    assert_eq!(
+        saved["notifiers"][0]["title_template"],
+        "Alert: {name} is {to}"
+    );
+    assert_eq!(
+        saved["notifiers"][0]["message_template"],
+        "{name}: {from} -> {to}"
+    );
+
+    let test = reqwest::Client::new()
+        .post(format!("{base}/api/v1/admin/notifiers/test"))
+        .header(reqwest::header::COOKIE, &session)
+        .json(&notifier)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(test.status(), 200, "{}", test.text().await.unwrap());
+    assert_eq!(
+        captured.lock().clone(),
+        [json!({
+            "title": "Alert: Lighthouse test is up",
+            "body": "Lighthouse test: unknown -> up"
+        })]
+    );
+
+    take_down(&coord, LOUD).await;
+    settle().await;
+    assert_eq!(
+        captured.lock()[1],
+        json!({
+            "title": "Alert: payments-api is down",
+            "body": "payments-api: up -> down"
+        })
+    );
+}
+
+#[tokio::test]
+async fn ntfy_without_templates_keeps_the_original_alert() {
+    let captured: Sink = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route(
+            "/alerts",
+            post(
+                |State(sink): State<Sink>, headers: axum::http::HeaderMap, body: String| async move {
+                    sink.lock().push(json!({
+                        "title": String::from_utf8(headers.get("Title").unwrap().as_bytes().to_vec()).unwrap(),
+                        "body": body,
+                    }));
+                    StatusCode::OK
+                },
+            ),
+        )
+        .with_state(captured.clone());
+    let ntfy_addr = serve(app).await;
+    let addr = serve(coordinator().await.router()).await;
+    let base = format!("http://{addr}");
+    let session = login(&base).await;
+    let notifier = json!({
+        "name": "phone", "type": "ntfy", "topic": "alerts",
+        "base_url": format!("http://{ntfy_addr}")
+    });
+    let (code, saved) = put_notifiers(&base, &session, json!([notifier.clone()])).await;
+    assert_eq!(code, 200, "{saved}");
+    let result = reqwest::Client::new()
+        .post(format!("{base}/api/v1/admin/notifiers/test"))
+        .header(reqwest::header::COOKIE, &session)
+        .json(&notifier)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(result.status(), 200);
+    assert_eq!(result.json::<Value>().await.unwrap()["delivered"], true);
+    assert_eq!(
+        captured.lock().clone(),
+        [json!({
+            "title": "Check Lighthouse test → up",
+            "body": "Status changed from unknown to up"
+        })]
+    );
+}
+
+#[tokio::test]
+async fn ntfy_delivers_a_long_check_name_without_losing_the_alert_status() {
+    let captured: Sink = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route(
+            "/alerts",
+            post(
+                |State(sink): State<Sink>, headers: axum::http::HeaderMap, body: String| async move {
+                    sink.lock().push(json!({
+                        "title": String::from_utf8(headers.get("Title").unwrap().as_bytes().to_vec()).unwrap(),
+                        "body": body,
+                    }));
+                    StatusCode::OK
+                },
+            ),
+        )
+        .with_state(captured.clone());
+    let ntfy_addr = serve(app).await;
+    let notifier: lighthouse::notify::Notifier = serde_json::from_value(json!({
+        "name": "phone", "type": "ntfy", "topic": "alerts",
+        "base_url": format!("http://{ntfy_addr}"),
+        "title_template": "Alert: {name} is {to}",
+        "message_template": "{name}: {from} -> {to}"
+    }))
+    .unwrap();
+    notifier.validate().unwrap();
+    let t = lighthouse::coordinator::state::Transition {
+        check_id: cid(LOUD),
+        from: NodeState::Up,
+        to: NodeState::Down,
+    };
+    lighthouse::notify::send(&reqwest::Client::new(), &notifier, &t, &"x".repeat(5000))
+        .await
+        .unwrap();
+    let got = captured.lock().clone();
+    let title = got[0]["title"].as_str().unwrap();
+    assert!(title.len() <= 1024, "ntfy rejects larger titles");
+    assert!(title.ends_with(" is down"), "{title}");
+    assert!(got[0]["body"].as_str().unwrap().len() <= 4096);
+}
+
+#[tokio::test]
+async fn empty_templates_from_config_use_the_original_wording() {
+    let captured: Sink = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route(
+            "/alerts",
+            post(
+                |State(sink): State<Sink>, headers: axum::http::HeaderMap, body: String| async move {
+                    sink.lock().push(json!({
+                        "title": String::from_utf8(headers.get("Title").unwrap().as_bytes().to_vec()).unwrap(),
+                        "body": body,
+                    }));
+                    StatusCode::OK
+                },
+            ),
+        )
+        .with_state(captured.clone());
+    let ntfy_addr = serve(app).await;
+    // Deserialized startup configuration is not passed through the admin form's
+    // blank-field sanitizer. An explicit "" should still mean use the default.
+    let notifier: lighthouse::notify::Notifier = serde_json::from_value(json!({
+        "name": "phone", "type": "ntfy", "topic": "alerts",
+        "base_url": format!("http://{ntfy_addr}"),
+        "title_template": "", "message_template": ""
+    }))
+    .unwrap();
+    let t = lighthouse::coordinator::state::Transition {
+        check_id: cid(LOUD),
+        from: NodeState::Up,
+        to: NodeState::Down,
+    };
+    lighthouse::notify::send(&reqwest::Client::new(), &notifier, &t, LOUD)
+        .await
+        .unwrap();
+    assert_eq!(
+        captured.lock().clone(),
+        [json!({
+            "title": "Check payments-api → down",
+            "body": "Status changed from up to down"
+        })]
+    );
 }
 
 #[tokio::test]

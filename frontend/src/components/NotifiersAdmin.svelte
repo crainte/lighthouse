@@ -2,6 +2,7 @@
   import type { Notifier, NotifiersResponse, Undelivered } from '../lib/admin';
   import { AdminError, fetchNotifiers, saveNotifiers, testNotifier } from '../lib/admin';
   import NumberField from './NumberField.svelte';
+  import { DEFAULT_NTFY_MESSAGE, DEFAULT_NTFY_TITLE, ntfyPreview } from '../lib/ntfyTemplate';
 
   let { onexpired }: { onexpired: () => void } = $props();
 
@@ -76,7 +77,7 @@
       case 'webhook':
         return { ...base, type, url: '' };
       case 'ntfy':
-        return { ...base, type, topic: '', base_url: '' };
+        return { ...base, type, topic: '', base_url: '', title_template: '', message_template: '' };
       case 'slack':
         return { ...base, type, webhook_url: '' };
       case 'pagerduty':
@@ -336,6 +337,7 @@
               />
               </label>
             {:else}
+              {@const preview = ntfyPreview(row.notifier.title_template ?? '', row.notifier.message_template ?? '')}
               <label class="channel-field"><span>Topic</span>
               <input
                 class="topic"
@@ -356,6 +358,41 @@
                 }}
               />
               </label>
+              <label class="channel-field"><span>Title template</span>
+              <input
+                class="grow"
+                placeholder={DEFAULT_NTFY_TITLE}
+                value={row.notifier.title_template ?? ''}
+                oninput={(e) => {
+                  if (row.notifier.type === 'ntfy')
+                    row.notifier.title_template = e.currentTarget.value;
+                  touched(row.key);
+                }}
+              />
+              </label>
+              <label class="channel-field"><span>Message template</span>
+              <textarea
+                class="grow"
+                rows="2"
+                placeholder={DEFAULT_NTFY_MESSAGE}
+                value={row.notifier.message_template ?? ''}
+                oninput={(e) => {
+                  if (row.notifier.type === 'ntfy')
+                    row.notifier.message_template = e.currentTarget.value;
+                  touched(row.key);
+                }}
+              ></textarea>
+              </label>
+              <div class="ntfy-preview" aria-label="Example outage notification">
+                <span>Preview · example outage (API: up → down)</span>
+                {#if preview.error}
+                  <span class="preview-error">{preview.error}</span>
+                {:else}
+                  <strong>{preview.title}</strong>
+                  <span>{preview.message}</span>
+                {/if}
+                <small>Use {'{name}'}, {'{from}'}, {'{to}'}. Leave blank for the default. Test sends a separate example recovery.</small>
+              </div>
             {/if}
             </div>
             <div class="channel-actions">
@@ -443,6 +480,10 @@
     min-width: 4.2rem;
   }
   .grow, .topic, .tls { width: 100%; min-width: 0; }
+  .ntfy-preview { grid-column: 1 / -1; display: grid; gap: 4px; padding: 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px; color: var(--text-dim); overflow-wrap: anywhere; }
+  .ntfy-preview strong { font-size: 13px; color: var(--text); }
+  .ntfy-preview .preview-error { color: var(--down); }
+  .ntfy-preview small { margin-top: 4px; color: var(--text-dim); }
   .deflt {
     display: inline-flex;
     align-items: center;

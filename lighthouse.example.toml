@@ -67,6 +67,9 @@ degraded_is_downtime = false
 # type = "ntfy"
 # topic = "lighthouse"
 # base_url = "https://ntfy.sh"  # optional
+# title_template = "Check {name} → {to}"                 # optional; this is the default
+# message_template = "Status changed from {from} to {to}" # optional; this is the default
+# The admin editor shows an example outage; Test sends a separate example recovery.
 #
 # type = "pagerduty"          # Events API v2. The check id is the dedup key, so
 # routing_key = "..."         # a recovery resolves the incident it opened.

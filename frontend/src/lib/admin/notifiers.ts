@@ -9,7 +9,14 @@ export type Notifier = {
   default: boolean;
 } & (
   | { type: "webhook"; url: string }
-  | { type: "ntfy"; topic: string; base_url?: string | null }
+  | {
+      type: "ntfy";
+      topic: string;
+      base_url?: string | null;
+      /** Empty or absent fields preserve Lighthouse's original wording. */
+      title_template?: string | null;
+      message_template?: string | null;
+    }
   /** Slack wants `text` and rejects anything else, which is why it is not the
    *  generic webhook pointed at a Slack URL. */
   | { type: "slack"; webhook_url: string }
