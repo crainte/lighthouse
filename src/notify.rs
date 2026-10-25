@@ -72,6 +72,10 @@ pub enum NotifierKind {
         topic: String,
         #[serde(default)]
         base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title_template: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_template: Option<String>,
     },
     /// Slack incoming webhook. Deliberately a separate kind from `Webhook`:
     /// Slack does not accept arbitrary JSON, it wants a `text` field, so
@@ -135,9 +139,16 @@ impl Notifier {
                 NotifierKind::Webhook { url } => NotifierKind::Webhook {
                     url: url.trim().to_string(),
                 },
-                NotifierKind::Ntfy { topic, base_url } => NotifierKind::Ntfy {
+                NotifierKind::Ntfy {
+                    topic,
+                    base_url,
+                    title_template,
+                    message_template,
+                } => NotifierKind::Ntfy {
                     topic: topic.trim().to_string(),
                     base_url: trimmed(base_url),
+                    title_template: trimmed(title_template),
+                    message_template: trimmed(message_template),
                 },
                 NotifierKind::Slack { webhook_url } => NotifierKind::Slack {
                     webhook_url: webhook_url.trim().to_string(),
@@ -168,9 +179,16 @@ impl Notifier {
             NotifierKind::Webhook { url } => NotifierKind::Webhook {
                 url: redacted_secret(url),
             },
-            NotifierKind::Ntfy { topic, base_url } => NotifierKind::Ntfy {
+            NotifierKind::Ntfy {
+                topic,
+                base_url,
+                title_template,
+                message_template,
+            } => NotifierKind::Ntfy {
                 topic: topic.clone(),
                 base_url: base_url.as_deref().map(redacted_secret),
+                title_template: title_template.clone(),
+                message_template: message_template.clone(),
             },
             NotifierKind::Slack { webhook_url } => NotifierKind::Slack {
                 webhook_url: redacted_secret(webhook_url),
@@ -237,7 +255,12 @@ impl Notifier {
                     return Err("a webhook URL has to start with http:// or https://".into());
                 }
             }
-            NotifierKind::Ntfy { topic, base_url } => {
+            NotifierKind::Ntfy {
+                topic,
+                base_url,
+                title_template,
+                message_template,
+            } => {
                 if topic.is_empty() {
                     return Err(format!("{} needs an ntfy topic", self.name));
                 }
@@ -251,6 +274,16 @@ impl Notifier {
                         return Err(
                             "the ntfy server URL has to start with http:// or https://".into()
                         );
+                    }
+                }
+                for (label, template) in [
+                    ("title", title_template.as_deref()),
+                    ("message", message_template.as_deref()),
+                ] {
+                    if let Some(template) = template.filter(|s| !s.trim().is_empty()) {
+                        let rendered = render_ntfy_template(template, "API", "up", "down")
+                            .map_err(|e| format!("ntfy {label} template: {e}"))?;
+                        check_ntfy_content(label, &rendered)?;
                     }
                 }
             }
@@ -308,6 +341,87 @@ pub fn targets<'a>(all: &'a [Notifier], routed_to: &[String]) -> Vec<&'a Notifie
 
 const NTFY_DEFAULT: &str = "https://ntfy.sh";
 
+/// Expand only the source template, never text inserted from a check name.
+/// Unknown tokens are errors rather than silent literal text in a sent alert.
+fn render_ntfy_template(
+    template: &str,
+    name: &str,
+    from: &str,
+    to: &str,
+) -> Result<String, String> {
+    let mut output = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        if rest[..start].contains('}') {
+            return Err("a closing brace has no opening brace".into());
+        }
+        output.push_str(&rest[..start]);
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('}') else {
+            return Err("an opening brace has no closing brace".into());
+        };
+        let token = &rest[..end];
+        output.push_str(match token {
+            "name" => name,
+            "from" => from,
+            "to" => to,
+            _ => {
+                return Err(format!(
+                    "unknown placeholder {{{token}}}; use {{name}}, {{from}}, or {{to}}"
+                ))
+            }
+        });
+        rest = &rest[end + 1..];
+    }
+    if rest.contains('}') {
+        return Err("a closing brace has no opening brace".into());
+    }
+    output.push_str(rest);
+    Ok(output)
+}
+
+fn check_ntfy_content(label: &str, content: &str) -> Result<(), String> {
+    if label == "title" && content.chars().any(|c| c.is_control()) {
+        return Err("ntfy title cannot contain newlines or control characters".into());
+    }
+    let max = if label == "title" { 1024 } else { 4096 };
+    if content.is_empty() || content.len() > max {
+        return Err(format!("ntfy {label} must be 1–{max} bytes"));
+    }
+    Ok(())
+}
+
+/// Reserve space for static text and the state before shortening an unusually
+/// long check name. This keeps the status suffix visible and avoids ntfy's
+/// title/message byte limits without dropping an otherwise valid alert.
+fn render_ntfy_bounded(
+    template: &str,
+    name: &str,
+    from: &str,
+    to: &str,
+    max_bytes: usize,
+) -> Result<String, String> {
+    let fixed = render_ntfy_template(template, "", from, to)?;
+    let count = template.matches("{name}").count();
+    let budget = max_bytes.saturating_sub(fixed.len());
+    let name_budget = budget.checked_div(count).unwrap_or(0);
+    if count == 0 || name.len() <= name_budget {
+        return render_ntfy_template(template, name, from, to);
+    }
+    let prefix_budget = name_budget.saturating_sub(3);
+    let mut shortened = String::new();
+    for ch in name.chars() {
+        if shortened.len() + ch.len_utf8() > prefix_budget {
+            break;
+        }
+        shortened.push(ch);
+    }
+    if name_budget >= 3 {
+        shortened.push('…');
+    }
+    render_ntfy_template(template, &shortened, from, to)
+}
+
 /// Send a transition notification via the given notifier.
 ///
 /// Best-effort at the dispatcher, which logs the error and moves on — but the
@@ -322,8 +436,22 @@ pub async fn send(
 ) -> Result<(), String> {
     match &notifier.kind {
         NotifierKind::Webhook { url } => send_webhook(client, url, t, name).await,
-        NotifierKind::Ntfy { topic, base_url } => {
-            send_ntfy(client, base_url.as_deref(), topic, t, name).await
+        NotifierKind::Ntfy {
+            topic,
+            base_url,
+            title_template,
+            message_template,
+        } => {
+            send_ntfy(
+                client,
+                base_url.as_deref(),
+                topic,
+                title_template.as_deref(),
+                message_template.as_deref(),
+                t,
+                name,
+            )
+            .await
         }
         NotifierKind::Slack { webhook_url } => send_slack(client, webhook_url, t, name).await,
         NotifierKind::Pagerduty { routing_key } => {
@@ -364,15 +492,31 @@ async fn send_ntfy(
     client: &Client,
     base_url: Option<&str>,
     topic: &str,
+    title_template: Option<&str>,
+    message_template: Option<&str>,
     t: &Transition,
     name: &str,
 ) -> Result<(), String> {
-    let title = format!("Check {name} → {}", t.to.as_str());
-    let body = format!(
-        "Status changed from {} to {}",
+    let title = render_ntfy_bounded(
+        title_template
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("Check {name} → {to}"),
+        name,
         t.from.as_str(),
-        t.to.as_str()
-    );
+        t.to.as_str(),
+        1024,
+    )?;
+    let body = render_ntfy_bounded(
+        message_template
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("Status changed from {from} to {to}"),
+        name,
+        t.from.as_str(),
+        t.to.as_str(),
+        4096,
+    )?;
+    check_ntfy_content("title", &title)?;
+    check_ntfy_content("message", &body)?;
     delivered(
         client
             .post(ntfy_url(base_url, topic))
@@ -522,6 +666,29 @@ mod tests {
             ntfy_url(Some("https://notify.example.com/"), "my-topic"),
             "https://notify.example.com/my-topic"
         );
+    }
+
+    #[test]
+    fn ntfy_rejects_unknown_template_tokens_before_saving() {
+        let n: Notifier = serde_json::from_str(
+            r#"{"name":"phone","type":"ntfy","topic":"alerts", "title_template":"{status} is {to}"}"#,
+        )
+        .unwrap();
+        assert!(n.validate().unwrap_err().contains("{status}"));
+    }
+
+    #[test]
+    fn ntfy_rejects_a_multiline_title_before_saving() {
+        let n: Notifier = serde_json::from_str(
+            r#"{"name":"phone","type":"ntfy","topic":"alerts", "title_template":"Alert\nInjected: value"}"#,
+        )
+        .unwrap();
+        assert!(n.validate().unwrap_err().contains("title"));
+    }
+
+    #[test]
+    fn ntfy_rejects_a_stray_closing_brace_before_a_valid_token() {
+        assert!(render_ntfy_template("bad } {name}", "API", "up", "down").is_err());
     }
 
     fn cid() -> crate::models::CheckId {
