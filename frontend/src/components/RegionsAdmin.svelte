@@ -84,13 +84,13 @@
     </label>
     <button class="btn primary" type="submit" disabled={busy}>{busy ? 'Registering…' : 'Register region'}</button>
   </form>
-  <p class="note">A region key authorizes a coordinator to report to the global tier. Set it as <code>[coordinator.global] token</code>. Rotating the key disconnects the region until the coordinator has been updated.</p>
+  <p class="note">A region key authorizes a coordinator to report to the global tier. Use the full token (including the part after the dot) as <code>[coordinator.global] token</code>; the credential ID alone is not a key. Rotating the key disconnects the region until the coordinator has been updated.</p>
   {#if formError}<p class="admin-error">{formError}</p>{/if}
 
   {#if minted}
     <div class="minted" role="alert">
-      <strong>Copy the new key for {minted.region} now. This is the only time the secret is shown.</strong>
-      <p>Credential ID: <code>{minted.credentialId}</code></p>
+      <strong>Copy the full key for {minted.region} now. This is the only time the secret is shown.</strong>
+      <p>Credential ID (for identification only, not deployment): <code>{minted.credentialId}</code></p>
       <pre>[coordinator.global]{'\n'}token = "{minted.token}"</pre>
       <div class="minted-actions">
         <button class="btn primary" onclick={copyToken}>{copied ? 'Copied' : 'Copy secret token'}</button>
@@ -100,7 +100,7 @@
   {/if}
 
   <div class="table-title">
-    <div><h5>Registered regions</h5><p>Identifiers are shown below; existing secret keys cannot be recovered.</p></div>
+    <div><h5>Registered regions</h5><p>Credential IDs below are identifiers, not usable keys. Existing secret keys cannot be recovered; rotate a key if it was lost.</p></div>
     <span>{regions.length} {regions.length === 1 ? 'region' : 'regions'}</span>
   </div>
   {#if loadError}
