@@ -27,7 +27,14 @@
 
   let drag = $state<DragState | null>(null);
   let draggingSpacer = $state<string | null>(null);
-  let busySpacer = $state(false);
+  /** Spacer saves in flight or queued; only drives the status text. */
+  let pendingSpacerSaves = $state(0);
+  const busySpacer = $derived(pendingSpacerSaves > 0);
+  /** Spacer writes run one after another, each built from the latest saved
+   *  list, so rapid "+ Add spacer" clicks queue up instead of being dropped or
+   *  overwriting each other from a stale copy. Row controls stay disabled
+   *  while a save is pending, so they never act on a row the list has moved. */
+  let spacerQueue: Promise<void> = Promise.resolve();
   let spacerError = $state<string | null>(null);
 
   function startDrag(e: DragEvent, list: string, from: number) {
@@ -123,35 +130,45 @@
     commitChecks(checkOrderWith(groupIndex, d.from, index));
   }
 
-  async function persistSpacers(next: HomepageSpacer[]) {
-    if (busySpacer || busyOrder) return;
-    busySpacer = true;
-    spacerError = null;
-    try {
-      spacers = await saveHomepageSpacers(next);
-      onchanged();
-    } catch (e) {
-      spacerError = fail(e);
-    } finally {
-      busySpacer = false;
-    }
+  function newSpacerId(): string {
+    // randomUUID only exists in secure contexts; consoles served over plain
+    // HTTP would otherwise throw on every add.
+    if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  function persistSpacers(build: (current: HomepageSpacer[]) => HomepageSpacer[]) {
+    pendingSpacerSaves += 1;
+    spacerQueue = spacerQueue.then(async () => {
+      spacerError = null;
+      try {
+        const next = build(spacers);
+        if (next === spacers) return;
+        spacers = await saveHomepageSpacers(next);
+        onchanged();
+      } catch (e) {
+        spacerError = fail(e);
+      } finally {
+        pendingSpacerSaves -= 1;
+      }
+    });
   }
 
   function addSpacer() {
-    const after = publicBlocks.at(-1)?.key ?? null;
-    void persistSpacers([...spacers, { id: crypto.randomUUID(), after }]);
+    const id = newSpacerId();
+    persistSpacers((current) => [...current, { id, after: publicBlocks.at(-1)?.key ?? null }]);
   }
 
   function stepSpacer(id: string, delta: number) {
-    void persistSpacers(moveSpacer(publicBlocks, spacers, id, delta));
+    persistSpacers((current) => moveSpacer(publicBlocks, current, id, delta));
   }
 
   function removeSpacer(id: string) {
-    void persistSpacers(spacers.filter((spacer) => spacer.id !== id));
+    persistSpacers((current) => current.filter((spacer) => spacer.id !== id));
   }
 
   function startSpacerDrag(e: DragEvent, id: string) {
-    if (busySpacer) return;
     e.dataTransfer?.setData('text/plain', id);
     if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
     draggingSpacer = id;
@@ -164,12 +181,11 @@
     const id = draggingSpacer;
     draggingSpacer = null;
     if (!id || !anchors.has(after)) return;
-    const current = spacers.find((spacer) => spacer.id === id);
-    if (!current || current.after === after) return;
-    void persistSpacers([
-      ...spacers.filter((spacer) => spacer.id !== id),
-      { id, after },
-    ]);
+    persistSpacers((current) => {
+      const moving = current.find((spacer) => spacer.id === id);
+      if (!moving || moving.after === after) return current;
+      return [...current.filter((spacer) => spacer.id !== id), { id, after }];
+    });
   }
 
   function dropOnSpacer(e: DragEvent, destinationId: string) {
@@ -203,7 +219,7 @@
 <div class="admin-panel">
   <div class="order-toolbar">
     <div class="panel-title">Check order</div>
-    <button class="btn" onclick={addSpacer} disabled={busySpacer || busyOrder}>+ Add spacer</button>
+    <button class="btn" onclick={addSpacer} disabled={busyOrder}>+ Add spacer</button>
   </div>
   <p class="admin-muted lead">
     Drag checks or use their arrows to reorder within a section. Select a different section
@@ -218,7 +234,7 @@
 
   {#snippet spacerRow(spacer: HomepageSpacer)}
     {@const index = spacerItems.findIndex((item) => item.kind === 'spacer' && item.spacer.id === spacer.id)}
-    <div class="orow spacer-row" role="listitem"
+    <div class="orow spacer-row" role="listitem" data-spacer-id={spacer.id}
       ondragover={(e) => { if (draggingSpacer) e.preventDefault(); }}
       ondrop={(e) => dropOnSpacer(e, spacer.id)}>
       <span class="grip" draggable={!busySpacer} aria-hidden="true"
@@ -227,12 +243,12 @@
         ondragend={() => (draggingSpacer = null)}>⠿</span>
       <div class="movers">
         <button class="reorder-step" onclick={() => stepSpacer(spacer.id, -1)}
-          disabled={busySpacer || index <= 0} aria-label="Move spacer up">↑</button>
+          disabled={busySpacer || index <= 0} aria-label="Move spacer up"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 14 6-6 6 6" /></svg></button>
         <button class="reorder-step" onclick={() => stepSpacer(spacer.id, 1)}
-          disabled={busySpacer || index >= spacerItems.length - 1} aria-label="Move spacer down">↓</button>
+          disabled={busySpacer || index >= spacerItems.length - 1} aria-label="Move spacer down"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 10 6 6 6-6" /></svg></button>
       </div>
-      <span class="spacer-label">Spacer <small>— visual gap on the status page</small></span>
-      <button class="btn remove-spacer" onclick={() => removeSpacer(spacer.id)}
+      <span class="oname">Spacer <span class="spacer-hint">— visual gap on the status page</span></span>
+      <button class="btn ospacer-remove" onclick={() => removeSpacer(spacer.id)}
         disabled={busySpacer} aria-label="Remove spacer">Remove</button>
     </div>
   {/snippet}
@@ -380,17 +396,9 @@
     line-height: 1.5;
   }
   .order-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
-  .spacer-row {
-    margin: 1px 0;
-    padding: 0.45rem 0.5rem;
-    background: rgba(96, 165, 190, 0.07);
-    border: 1px dashed var(--border);
-    border-radius: 4px;
-  }
-  .spacer-label { color: var(--text); font-size: 0.8rem; }
-  .spacer-label small { color: var(--text-dim); font-size: 0.7rem; }
-  .remove-spacer { margin-left: auto; font-size: 0.72rem; }
-
+  .spacer-hint { color: var(--text-dim); font-size: 0.7rem; }
+  /* Trailing edge, like the check rows' section select. */
+  .ospacer-remove { margin-left: auto; flex: none; font-size: 0.75rem; }
 
   .movers {
     display: flex;
