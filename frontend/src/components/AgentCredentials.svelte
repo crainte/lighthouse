@@ -200,7 +200,7 @@
         recovered afterwards.
       </p>
     {:else}
-      <div class="list-heading"><strong>Issued agent credentials</strong><span>{ordered.length} credential{ordered.length === 1 ? '' : 's'} · IDs only, not recoverable secrets</span></div>
+      <div class="list-heading"><strong>Issued agent credentials</strong><span>{ordered.length} credential{ordered.length === 1 ? '' : 's'} · IDs for identification only, not usable tokens</span></div>
       <div class="admin-rows">
         <div class="row head">
           <span>Region</span>

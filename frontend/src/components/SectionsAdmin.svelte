@@ -1,6 +1,8 @@
 <script lang="ts">
   import type { AdminCheck, Section } from '../lib/admin';
   import { AdminError, fetchAdminChecks, fetchSections } from '../lib/admin';
+  import { fetchHomepageSpacers } from '../lib/api';
+  import type { HomepageSpacer } from '../lib/homepageSpacers';
   import SectionsList from './sections-admin/SectionsList.svelte';
   import CheckOrderList from './sections-admin/CheckOrderList.svelte';
 
@@ -8,6 +10,7 @@
 
   let sections = $state<Section[]>([]);
   let checks = $state<AdminCheck[]>([]);
+  let spacers = $state<HomepageSpacer[]>([]);
   let loading = $state(true);
   let loadError = $state<string | null>(null);
   let expired = $state(false);
@@ -24,7 +27,7 @@
     loading = true;
     loadError = null;
     try {
-      [sections, checks] = await Promise.all([fetchSections(), fetchAdminChecks()]);
+      [sections, checks, spacers] = await Promise.all([fetchSections(), fetchAdminChecks(), fetchHomepageSpacers()]);
     } catch (e) {
       loadError = fail(e);
     } finally {
@@ -59,7 +62,7 @@
   </div>
 {:else}
   <SectionsList bind:sections {checks} {onchanged} onexpired={markExpired} refreshAll={refresh} />
-  <CheckOrderList bind:checks {sections} {onchanged} onexpired={markExpired} />
+  <CheckOrderList bind:checks bind:spacers {sections} {onchanged} onexpired={markExpired} />
 {/if}
 
 <style>

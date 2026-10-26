@@ -15,6 +15,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { render, cleanup, screen, fireEvent } from '@testing-library/svelte';
 import ClusterAdmin from './ClusterAdmin.svelte';
 import RegionsAdmin from './RegionsAdmin.svelte';
+import AgentCredentials from './AgentCredentials.svelte';
 import RegionTreeAdmin from './RegionTreeAdmin.svelte';
 import ProbeResultsAdmin from './ProbeResultsAdmin.svelte';
 import type { Incident, IncidentGroup } from '../lib/api';
@@ -204,24 +205,55 @@ describe('component render smoke', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/v1/admin/cluster/members/b', expect.objectContaining({ method: 'DELETE' }));
   });
 
-  it('shows a minted region key once and confirms removal', async () => {
+  it('copies the full region key once, never the credential ID, and confirms removal', async () => {
     const region = { name: 'tw', credential_id: 'wac_1', created_at: 0, endpoints: [], attached: false, stale: true, age_ms: -1, check_count: 0 };
     const fetchMock = vi.fn(async (url: string, init?: RequestInit) => new Response(JSON.stringify(
       init?.method === 'POST' ? { region: 'eu', credential_id: 'wac_2', token: 'wac_2.secret' }
         : init?.method === 'DELETE' ? { removed: 'tw', checks_updated: 1 }
         : { regions: [region] },
     ), { headers: { 'content-type': 'application/json' } }));
+    const writeText = vi.fn(async () => {});
+    vi.stubGlobal('navigator', { clipboard: { writeText } });
     vi.stubGlobal('fetch', fetchMock);
     render(RegionsAdmin);
     expect(await screen.findByText(/Awaiting first report/)).toBeInTheDocument();
+    expect(screen.getByText('wac_1')).toHaveAttribute('title', expect.stringContaining('not a usable token'));
+    expect(screen.queryByRole('button', { name: /Copy.*ID/i })).not.toBeInTheDocument();
     await fireEvent.input(screen.getByRole('textbox', { name: 'Region' }), { target: { value: 'eu' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Register region' }));
-    expect(await screen.findByText(/wac_2\.secret/)).toBeInTheDocument();
+    expect(await screen.findByText(/wac_2\.secret/)).toHaveTextContent('token = "wac_2.secret"');
+    await fireEvent.click(screen.getByRole('button', { name: 'Copy secret token' }));
+    expect(writeText).toHaveBeenCalledExactlyOnceWith('wac_2.secret');
     await fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
     expect(screen.queryByText(/wac_2\.secret/)).not.toBeInTheDocument();
+    expect(screen.getByText('wac_1')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Copy.*ID/i })).not.toBeInTheDocument();
     await fireEvent.click(screen.getAllByRole('button', { name: 'Remove' })[0]);
     await fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
     expect(fetchMock).toHaveBeenCalledWith('/api/v1/admin/regions/tw', expect.objectContaining({ method: 'DELETE' }));
+  });
+
+  it('keeps agent credential IDs visible but copies only the issued token', async () => {
+    const credential = { id: 'wac_3', region: 'eu', zone: 'eu-1a', created_at: 0, revoked: false };
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => new Response(JSON.stringify(
+      init?.method === 'POST' ? { credential, token: 'wac_3.secret' } : { credentials: [credential] },
+    ), { headers: { 'content-type': 'application/json' } }));
+    const writeText = vi.fn(async () => {});
+    vi.stubGlobal('navigator', { clipboard: { writeText } });
+    vi.stubGlobal('fetch', fetchMock);
+    render(AgentCredentials, { props: { nodeMode: 'coordinator' } });
+    expect(await screen.findByText('wac_3')).toHaveAttribute('title', expect.stringContaining('not a usable token'));
+    expect(screen.queryByRole('button', { name: /Copy.*ID/i })).not.toBeInTheDocument();
+    await fireEvent.input(screen.getByRole('combobox', { name: 'Region' }), { target: { value: 'eu' } });
+    await fireEvent.input(screen.getByRole('textbox', { name: 'Zone' }), { target: { value: 'eu-1a' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Issue agent token' }));
+    expect(await screen.findByText(/wac_3\.secret/)).toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('button', { name: 'Copy token' }));
+    expect(writeText).toHaveBeenCalledExactlyOnceWith('wac_3.secret');
+    await fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+    expect(screen.queryByText(/wac_3\.secret/)).not.toBeInTheDocument();
+    expect(screen.getByText('wac_3')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Copy.*ID/i })).not.toBeInTheDocument();
   });
 
   it('renders probe results as a ledger with inspectable errors', async () => {

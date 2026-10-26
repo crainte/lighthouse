@@ -55,6 +55,7 @@ jobs:
         with:
           version: v1.2.2
           cache-c-cpp: true
+          # Keep the read-only CI permissions; cache stats belong in logs/job summary.
           pr-comment: false
       - uses: jdx/mise-action@v4
       # rust-embed needs frontend/dist at compile time.
@@ -77,6 +78,7 @@ jobs:
         with:
           version: v1.2.2
           cache-c-cpp: true
+          # Keep the read-only CI permissions; cache stats belong in logs/job summary.
           pr-comment: false
       - uses: jdx/mise-action@v4
       # rust-embed needs frontend/dist at compile time.

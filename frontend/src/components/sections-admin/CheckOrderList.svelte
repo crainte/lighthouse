@@ -1,16 +1,20 @@
 <script lang="ts">
   import type { AdminCheck, Section } from '../../lib/admin';
-  import { AdminError, reorderChecks, updateCheck } from '../../lib/admin';
+  import { AdminError, reorderChecks, updateCheck, saveHomepageSpacers } from '../../lib/admin';
+  import type { HomepageSpacer } from '../../lib/homepageSpacers';
+  import { moveSpacer, placeSpacers, serviceBlocks } from '../../lib/homepageSpacers';
   import type { DragState } from './dragReorder';
   import { dropEdge, reorder } from './dragReorder';
 
   let {
     checks = $bindable(),
+    spacers = $bindable(),
     sections,
     onchanged,
     onexpired,
   }: {
     checks: AdminCheck[];
+    spacers: HomepageSpacer[];
     sections: Section[];
     onchanged: () => void;
     onexpired: (message: string) => void;
@@ -22,6 +26,16 @@
   let busyCell = $state<string | null>(null);
 
   let drag = $state<DragState | null>(null);
+  let draggingSpacer = $state<string | null>(null);
+  /** Spacer saves in flight or queued; only drives the status text. */
+  let pendingSpacerSaves = $state(0);
+  const busySpacer = $derived(pendingSpacerSaves > 0);
+  /** Spacer writes run one after another, each built from the latest saved
+   *  list, so rapid "+ Add spacer" clicks queue up instead of being dropped or
+   *  overwriting each other from a stale copy. Row controls stay disabled
+   *  while a save is pending, so they never act on a row the list has moved. */
+  let spacerQueue: Promise<void> = Promise.resolve();
+  let spacerError = $state<string | null>(null);
 
   function startDrag(e: DragEvent, list: string, from: number) {
     e.dataTransfer?.setData('text/plain', String(from));
@@ -38,26 +52,37 @@
 
   const ordered = $derived([...sections].sort((a, b) => a.position - b.position));
 
-  // Mirrors the public page: loose checks above every section, sections in their
-  // own order, checks inside each by position. A check parked in a section the
-  // list doesn't know about still gets a group of its own — otherwise it would
-  // be invisible here and unorderable. Empty sections are dropped: nothing to
-  // order. Keys stay unique because the group names are Set-deduped and '' can
-  // never be a section name.
+  // Public services use loose checks, paged sections, then inline sections.
+  // Use the *same* pure layout helper for spacer anchors, so placement in this
+  // editor agrees with what the visitor sees, including orphan sections.
+  const publicBlocks = $derived(serviceBlocks(
+    checks.filter((c) => c.visible),
+    sections,
+    (c) => c.id,
+  ));
+  const spacerItems = $derived(placeSpacers(publicBlocks, spacers));
+  const anchors = $derived(new Set(publicBlocks.map((block) => block.key)));
+
+  // Keep hidden checks editable but never allow them to become spacer anchors:
+  // unpublished checks have no row on the public page to anchor to.
   const orderGroups = $derived.by(() => {
     const byPosition = (a: AdminCheck, b: AdminCheck) =>
       (a.position ?? 0) - (b.position ?? 0) || a.name.localeCompare(b.name);
-    const known = ordered.map((s) => s.name);
-    const assigned = [...new Set(checks.map((c) => c.group).filter((g) => Boolean(g)))] as string[];
-    const names = [...known, ...assigned.filter((n) => !known.includes(n))];
+    const sortedChecks = [...checks].sort(byPosition);
+    const assigned = [...new Set(sortedChecks.map((c) => c.group).filter((g) => Boolean(g)))] as string[];
+    const paged = ordered.filter((section) => section.display === 'page').map((section) => section.name);
+    const inline = assigned.filter((name) => !paged.includes(name));
+    const names = [...paged, ...inline];
     return [
-      { key: '', label: '(listed loose)', rows: checks.filter((c) => !c.group).sort(byPosition) },
-      ...names.map((n) => ({
-        key: n,
-        label: n,
-        rows: checks.filter((c) => c.group === n).sort(byPosition),
+      { key: '', label: '(listed loose)', rows: sortedChecks.filter((c) => !c.group) },
+      ...names.map((name) => ({
+        key: name,
+        label: name,
+        rows: sortedChecks.filter((c) => c.group === name),
       })),
-    ].filter((g) => g.rows.length > 0);
+    ].filter((group) =>
+      group.rows.length > 0 || (group.key !== '' && anchors.has(`section:${group.key}`)),
+    );
   });
 
   function fail(e: unknown): string {
@@ -105,6 +130,74 @@
     commitChecks(checkOrderWith(groupIndex, d.from, index));
   }
 
+  function newSpacerId(): string {
+    // randomUUID only exists in secure contexts; consoles served over plain
+    // HTTP would otherwise throw on every add.
+    if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  function persistSpacers(build: (current: HomepageSpacer[]) => HomepageSpacer[]) {
+    pendingSpacerSaves += 1;
+    spacerQueue = spacerQueue.then(async () => {
+      spacerError = null;
+      try {
+        const next = build(spacers);
+        if (next === spacers) return;
+        spacers = await saveHomepageSpacers(next);
+        onchanged();
+      } catch (e) {
+        spacerError = fail(e);
+      } finally {
+        pendingSpacerSaves -= 1;
+      }
+    });
+  }
+
+  function addSpacer() {
+    const id = newSpacerId();
+    persistSpacers((current) => [...current, { id, after: publicBlocks.at(-1)?.key ?? null }]);
+  }
+
+  function stepSpacer(id: string, delta: number) {
+    persistSpacers((current) => moveSpacer(publicBlocks, current, id, delta));
+  }
+
+  function removeSpacer(id: string) {
+    persistSpacers((current) => current.filter((spacer) => spacer.id !== id));
+  }
+
+  function startSpacerDrag(e: DragEvent, id: string) {
+    e.dataTransfer?.setData('text/plain', id);
+    if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
+    draggingSpacer = id;
+  }
+
+  /** Dropping on a check or section places the spacer *after* that public row.
+   *  A drag never modifies the check's group, order, or configuration. */
+  function dropSpacerAfter(e: DragEvent, after: string) {
+    e.preventDefault();
+    const id = draggingSpacer;
+    draggingSpacer = null;
+    if (!id || !anchors.has(after)) return;
+    persistSpacers((current) => {
+      const moving = current.find((spacer) => spacer.id === id);
+      if (!moving || moving.after === after) return current;
+      return [...current.filter((spacer) => spacer.id !== id), { id, after }];
+    });
+  }
+
+  function dropOnSpacer(e: DragEvent, destinationId: string) {
+    e.preventDefault();
+    const id = draggingSpacer;
+    draggingSpacer = null;
+    if (!id || id === destinationId) return;
+    const from = spacerItems.findIndex((item) => item.kind === 'spacer' && item.spacer.id === id);
+    const to = spacerItems.findIndex((item) => item.kind === 'spacer' && item.spacer.id === destinationId);
+    if (from >= 0 && to >= 0) stepSpacer(id, to - from);
+  }
+
   /** Writes a check's section back through the normal check update, so the
    *  server sees the same payload the editor would send. */
   async function patch(c: AdminCheck, next: AdminCheck, cell: string) {
@@ -124,27 +217,58 @@
 </script>
 
 <div class="admin-panel">
-  <div class="panel-title">Check order</div>
+  <div class="order-toolbar">
+    <div class="panel-title">Check order</div>
+    <button class="btn" onclick={addSpacer} disabled={busyOrder}>+ Add spacer</button>
+  </div>
   <p class="admin-muted lead">
-    The order checks appear in on the public page, within their own section. Loose checks render
-    above every section. Drag a row by its handle, or use the arrows — those only move a check
-    inside the section it is already in. To put it in a different one, use the select on its row.
-    Everything else about a check lives in its own editor.
+    Drag checks or use their arrows to reorder within a section. Select a different section
+    to move a check there. Add a spacer here, then drag it onto a check or section to insert
+    a visual gap after it, or use its arrows to move one position at a time.
+    Spacers affect only the public page layout, never monitoring.
   </p>
 
-  {#if orderError}<p class="admin-error">{orderError}</p>{/if}
-  {#if busyOrder}<p class="admin-muted">Saving order…</p>{/if}
+  {#if orderError}<p class="admin-error" role="alert">{orderError}</p>{/if}
+  {#if spacerError}<p class="admin-error" role="alert">{spacerError}</p>{/if}
+  {#if busyOrder || busySpacer}<p class="admin-muted">Saving layout…</p>{/if}
 
-  {#if orderGroups.length === 0}
-    <p class="admin-muted">No checks configured yet.</p>
+  {#snippet spacerRow(spacer: HomepageSpacer)}
+    {@const index = spacerItems.findIndex((item) => item.kind === 'spacer' && item.spacer.id === spacer.id)}
+    <div class="orow spacer-row" role="listitem" data-spacer-id={spacer.id}
+      ondragover={(e) => { if (draggingSpacer) e.preventDefault(); }}
+      ondrop={(e) => dropOnSpacer(e, spacer.id)}>
+      <span class="grip" draggable={!busySpacer} aria-hidden="true"
+        title="Drag spacer after a check or section"
+        ondragstart={(e) => startSpacerDrag(e, spacer.id)}
+        ondragend={() => (draggingSpacer = null)}>⠿</span>
+      <div class="movers">
+        <button class="reorder-step" onclick={() => stepSpacer(spacer.id, -1)}
+          disabled={busySpacer || index <= 0} aria-label="Move spacer up"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 14 6-6 6 6" /></svg></button>
+        <button class="reorder-step" onclick={() => stepSpacer(spacer.id, 1)}
+          disabled={busySpacer || index >= spacerItems.length - 1} aria-label="Move spacer down"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 10 6 6 6-6" /></svg></button>
+      </div>
+      <span class="oname">Spacer <span class="spacer-hint">— visual gap on the status page</span></span>
+      <button class="btn ospacer-remove" onclick={() => removeSpacer(spacer.id)}
+        disabled={busySpacer} aria-label="Remove spacer">Remove</button>
+    </div>
+  {/snippet}
+
+  {#if orderGroups.length === 0 && spacers.length === 0}
+    <p class="admin-muted">No checks configured yet. You can still add a spacer.</p>
   {:else}
     <div class="admin-rows">
+      {#each spacers.filter((spacer) => spacer.after === null) as spacer (spacer.id)}
+        {@render spacerRow(spacer)}
+      {/each}
       {#each orderGroups as g, gi (g.key)}
         <!-- One drag list per group, so a drop on another group's row never
              matches and the browser refuses it instead of reassigning. -->
         {@const list = `check:${g.key}`}
         <div class="ogroup">
-          <div class="olabel">{g.label}</div>
+          <div class="olabel" role="group"
+            ondragover={(e) => { if (draggingSpacer) e.preventDefault(); }}
+            ondrop={(e) => { if (g.key) dropSpacerAfter(e, `section:${g.key}`); }}
+          >{g.label}</div>
           <div role="list">
           {#each g.rows as c, i (c.id)}
             <div
@@ -153,8 +277,14 @@
               class:dragging={drag?.list === list && drag.from === i}
               class:drop-above={dropEdge(drag, list, i) === 'above'}
               class:drop-below={dropEdge(drag, list, i) === 'below'}
-              ondragover={(e) => dragOver(e, list, i)}
-              ondrop={(e) => (e.preventDefault(), dropCheck(list, gi, i))}
+              ondragover={(e) => {
+                if (draggingSpacer) e.preventDefault();
+                else dragOver(e, list, i);
+              }}
+              ondrop={(e) => {
+                if (draggingSpacer) dropSpacerAfter(e, g.key ? `section:${g.key}` : `check:${c.id}`);
+                else { e.preventDefault(); dropCheck(list, gi, i); }
+              }}
             >
               <span
                 class="grip"
@@ -210,9 +340,22 @@
                 {/if}
               </select>
             </div>
+            {#if !g.key}
+              {#each spacers.filter((spacer) => spacer.after === `check:${c.id}`) as spacer (spacer.id)}
+                {@render spacerRow(spacer)}
+              {/each}
+            {/if}
           {/each}
           </div>
+          {#if g.key}
+            {#each spacers.filter((spacer) => spacer.after === `section:${g.key}`) as spacer (spacer.id)}
+              {@render spacerRow(spacer)}
+            {/each}
+          {/if}
         </div>
+      {/each}
+      {#each spacers.filter((spacer) => spacer.after !== null && !anchors.has(spacer.after)) as spacer (spacer.id)}
+        {@render spacerRow(spacer)}
       {/each}
     </div>
   {/if}
@@ -249,9 +392,13 @@
   }
 
   .lead {
-    margin: -0.35rem 0 0.8rem;
+    margin: 0.25rem 0 0.8rem;
     line-height: 1.5;
   }
+  .order-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+  .spacer-hint { color: var(--text-dim); font-size: 0.7rem; }
+  /* Trailing edge, like the check rows' section select. */
+  .ospacer-remove { margin-left: auto; flex: none; font-size: 0.75rem; }
 
   .movers {
     display: flex;

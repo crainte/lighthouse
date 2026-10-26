@@ -8,7 +8,7 @@ const COUNTRY_CODES = new Set([
 ]);
 
 export function regionFlag(region: string): string | null {
-  const code = region.trim().toLowerCase();
+  const code = region.trim().toLowerCase().split('-', 1)[0];
   // UK is a common nickname; ISO 3166-1 actually uses GB.
   const normalized = code === 'uk' ? 'gb' : code;
   if (!COUNTRY_CODES.has(code)) return null;

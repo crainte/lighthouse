@@ -1,6 +1,6 @@
 [package]
 name = "lighthouse"
-version = "0.1.2"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
@@ -60,4 +60,4 @@ uuid = { version = "1", features = ["v7", "v5", "serde"] }
 futures-util = "0.3"
 
 [dev-dependencies]
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.29"

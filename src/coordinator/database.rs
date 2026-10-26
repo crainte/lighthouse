@@ -201,11 +201,12 @@ impl Database {
     }
 
     pub fn observe_removed_logical_rows(&self, removed: u64) {
-        let _ = self.metrics.logical_rows.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |current| Some(current.saturating_sub(removed)),
-        );
+        let _ =
+            self.metrics
+                .logical_rows
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_sub(removed))
+                });
     }
 
     /// Reading process-maintained counters and filesystem metadata is bounded;
