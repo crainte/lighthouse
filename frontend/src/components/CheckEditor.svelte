@@ -32,6 +32,7 @@
   import IcmpFields from './check-editor/IcmpFields.svelte';
   import DnsFields from './check-editor/DnsFields.svelte';
   import SslFields from './check-editor/SslFields.svelte';
+  import NtpFields from './check-editor/NtpFields.svelte';
   import OpenMetricsFields from './check-editor/OpenMetricsFields.svelte';
   import HeartbeatFields from './check-editor/HeartbeatFields.svelte';
   import PlacementEditor from './check-editor/PlacementEditor.svelte';
@@ -706,6 +707,8 @@ per_zone: draft.placement.count ?? 1,
           <DnsFields {draft} />
         {:else if kind === 'ssl'}
           <SslFields {draft} />
+        {:else if kind === 'ntp'}
+          <NtpFields {draft} />
         {:else if kind === 'openmetrics'}
           <OpenMetricsFields {draft} />
         {:else}

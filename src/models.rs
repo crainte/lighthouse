@@ -27,6 +27,7 @@ pub enum CheckKind {
     #[default]
     Http,
     Tcp,
+    Ntp,
     Dns,
     Icmp,
     /// TLS certificate validity and expiry for a host.
@@ -51,9 +52,10 @@ impl CheckKind {
     /// Every kind this binary knows. An agent declares its subset of these to
     /// the coordinator, so exhaustiveness matters: a kind missing here is a
     /// kind no agent ever claims to run.
-    pub const ALL: [CheckKind; 7] = [
+    pub const ALL: [CheckKind; 8] = [
         CheckKind::Http,
         CheckKind::Tcp,
+        CheckKind::Ntp,
         CheckKind::Dns,
         CheckKind::Icmp,
         CheckKind::Ssl,
@@ -65,6 +67,7 @@ impl CheckKind {
         match self {
             CheckKind::Http => "http",
             CheckKind::Tcp => "tcp",
+            CheckKind::Ntp => "ntp",
             CheckKind::Dns => "dns",
             CheckKind::Icmp => "icmp",
             CheckKind::Ssl => "ssl",
@@ -81,6 +84,7 @@ impl CheckKind {
         Some(match s {
             "http" => CheckKind::Http,
             "tcp" => CheckKind::Tcp,
+            "ntp" => CheckKind::Ntp,
             "dns" => CheckKind::Dns,
             "icmp" => CheckKind::Icmp,
             "ssl" => CheckKind::Ssl,
@@ -296,6 +300,7 @@ pub fn eval(result: &CheckResult, expect_status: Option<u16>) -> Status {
         // means the probe did what it was asked. A heartbeat never comes from an
         // agent at all — the coordinator synthesises its result.
         CheckKind::Tcp
+        | CheckKind::Ntp
         | CheckKind::Dns
         | CheckKind::Icmp
         | CheckKind::Ssl

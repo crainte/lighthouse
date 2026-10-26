@@ -104,7 +104,7 @@ export interface AdminCheck {
    *  and never orphans history, alerts or incidents. */
   name: string;
   type: CheckKind;
-  /** HTTP: a URL. TCP: "host:port". DNS/ICMP/SSL: a hostname. Heartbeat: unused. */
+  /** HTTP: a URL. TCP/NTP: "host:port". DNS/ICMP/SSL: a hostname. Heartbeat: unused. */
   target: string;
   /** Extra targets probed by the same check, alongside `target`. */
   hosts: string[];

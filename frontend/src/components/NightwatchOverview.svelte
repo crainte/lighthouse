@@ -65,6 +65,7 @@
     dns: 'DNS',
     icmp: 'ICMP',
     ssl: 'SSL / TLS',
+    ntp: 'NTP',
     heartbeat: 'Heartbeat',
     openmetrics: 'OpenMetrics',
   };

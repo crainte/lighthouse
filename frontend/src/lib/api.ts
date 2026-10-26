@@ -10,7 +10,7 @@ export type ProbeStatus = "up" | "down" | "unknown";
 export type Status = ProbeStatus | "degraded";
 
 export type CheckKind =
-  "http" | "tcp" | "dns" | "icmp" | "ssl" | "heartbeat" | "openmetrics";
+  "http" | "tcp" | "dns" | "icmp" | "ssl" | "ntp" | "heartbeat" | "openmetrics";
 
 export interface Check {
   /** Immutable identity. Every route, key and lookup uses this — never `name`. */
