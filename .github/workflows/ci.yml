@@ -51,8 +51,10 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends build-essential
       - run: rustup toolchain install
-      - uses: kunobi-ninja/kache-action@v1
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
+          version: v1.2.2
+          cache-c-cpp: true
           # Keep the read-only CI permissions; cache stats belong in logs/job summary.
           pr-comment: false
       - uses: jdx/mise-action@v4
@@ -72,8 +74,10 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends build-essential
       - run: rustup toolchain install
-      - uses: kunobi-ninja/kache-action@v1
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
+          version: v1.2.2
+          cache-c-cpp: true
           # Keep the read-only CI permissions; cache stats belong in logs/job summary.
           pr-comment: false
       - uses: jdx/mise-action@v4
