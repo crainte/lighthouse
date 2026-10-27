@@ -1746,6 +1746,11 @@ impl CheckConfig {
                     Some((host, port)) if !host.is_empty() && port.parse::<u16>().is_ok() => {}
                     _ => return Err("TCP target must be host:port".into()),
                 },
+                CheckKind::Ntp => match target.rsplit_once(':') {
+                    Some((host, port))
+                        if !host.is_empty() && matches!(port.parse::<u16>(), Ok(1..=u16::MAX)) => {}
+                    _ => return Err("NTP target must be host:port with a valid port".into()),
+                },
                 CheckKind::Dns | CheckKind::Icmp | CheckKind::Ssl => {
                     if target.contains("://") || target.contains('/') {
                         return Err("target must be a hostname or IP, not a URL".into());
@@ -1977,6 +1982,26 @@ mod tests {
         assert_eq!(dns_nameserver("192.0.2.1:5353").unwrap().port(), 5353);
         assert_eq!(dns_nameserver("[2001:db8::1]:5353").unwrap().port(), 5353);
         assert!(dns_nameserver("resolver.example").is_err());
+    }
+
+    #[test]
+    fn ntp_targets_require_a_host_and_nonzero_port() {
+        let mut check = CheckConfig {
+            name: "clock".into(),
+            kind: CheckKind::Ntp,
+            target: "time.example:123".into(),
+            ..Default::default()
+        };
+        check.validate().expect("NTP host and port are valid");
+        for target in [
+            "time.example",
+            "time.example:0",
+            ":123",
+            "time.example:not-a-port",
+        ] {
+            check.target = target.into();
+            assert!(check.validate().is_err(), "{target} must be rejected");
+        }
     }
 
     #[test]

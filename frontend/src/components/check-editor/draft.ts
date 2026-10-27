@@ -76,7 +76,7 @@ export type Draft = Omit<
   placement: { mode: 'zone' | 'region'; zones: string[]; regions: string[]; count: number | null };
 };
 
-export const KINDS: CheckKind[] = ['http', 'tcp', 'dns', 'icmp', 'ssl', 'heartbeat', 'openmetrics'];
+export const KINDS: CheckKind[] = ['http', 'tcp', 'dns', 'icmp', 'ssl', 'ntp', 'heartbeat', 'openmetrics'];
 export const MATCH_MODES: MatchMode[] = ['any', 'all'];
 export const DEFAULT_STATUSES: DefaultStatus[] = ['up', 'down', 'unknown'];
 export const DNS_RECORDS = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS'];

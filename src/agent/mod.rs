@@ -1,6 +1,7 @@
 mod dns;
 mod http;
 mod icmp;
+mod ntp;
 mod openmetrics;
 mod ssl;
 mod tcp;
@@ -164,6 +165,7 @@ async fn probe_one(probes: &Probes, check: &CheckConfig, target: &str) -> Observ
     match check.kind {
         CheckKind::Http => http::probe_http(&probes.http, check, target).await,
         CheckKind::Tcp => tcp::probe_tcp(check, target).await,
+        CheckKind::Ntp => ntp::probe_ntp(check, target).await,
         CheckKind::Dns => {
             dns::probe_dns(&probes.resolver, &probes.system_nameservers, check, target).await
         }

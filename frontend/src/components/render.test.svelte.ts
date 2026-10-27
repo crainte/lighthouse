@@ -315,6 +315,9 @@ describe('component render smoke', () => {
       // branch a fresh editor shows.
       const target = await screen.findByPlaceholderText(/example\.com\/health/);
       expect(target).toBeInTheDocument();
+      await fireEvent.change(screen.getAllByRole('combobox')[0], { target: { value: 'ntp' } });
+      expect(screen.getByPlaceholderText('time.example.com:123')).toBeInTheDocument();
+      expect(screen.getByText(/NTP server host:port/)).toBeInTheDocument();
       expect(errors).toEqual([]);
     } finally {
       window.removeEventListener('error', onError);
