@@ -256,7 +256,7 @@
   {#if orderGroups.length === 0 && spacers.length === 0}
     <p class="admin-muted">No checks configured yet. You can still add a spacer.</p>
   {:else}
-    <div class="admin-rows">
+    <div class="admin-rows inset-rail">
       {#each spacers.filter((spacer) => spacer.after === null) as spacer (spacer.id)}
         {@render spacerRow(spacer)}
       {/each}
