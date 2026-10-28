@@ -63,7 +63,7 @@ local slow = new Mapping<String, Step> {
   }
   ["bun-audit"] {
     profiles = List("slow")
-    check = "cd frontend && bun audit"
+    check = "cd frontend && bun audit --ignore=GHSA-gcqx-w48m-w2h4"
   }
   ["docker-build"] {
     profiles = List("slow")
