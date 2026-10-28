@@ -5,7 +5,7 @@ use crate::config::CheckConfig;
 /// with a bounded set of series, but a misconfigured or hostile target could
 /// stream indefinitely; without a cap a single check would let it hold memory
 /// and bandwidth open for as long as the exporter cared to keep writing.
-const MAX_METRICS_BODY_BYTES: usize = 1_048_576;
+const MAX_METRICS_BODY_BYTES: usize = 4_194_304;
 
 /// Scrape a Prometheus/OpenMetrics exporter and select one sample.
 ///
@@ -54,26 +54,40 @@ pub(super) async fn probe_openmetrics(
         );
     }
     let status_code = Some(status.as_u16());
-    let body = match resp.text().await {
-        Ok(b) => b,
-        Err(e) => {
-            return Observation {
-                status_code,
-                error: Some(format!("reading body: {e}")),
-                failure: Some(crate::models::FailureKind::ConnectionFailed),
-                ..Default::default()
+    let mut resp = resp;
+    let mut body = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if chunk.len() > MAX_METRICS_BODY_BYTES - body.len() {
+                    return Observation::failed(
+                        crate::models::FailureKind::Other,
+                        format!("exporter body exceeded {MAX_METRICS_BODY_BYTES} bytes"),
+                    );
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                return Observation {
+                    status_code,
+                    error: Some(format!("reading body: {e}")),
+                    failure: Some(crate::models::FailureKind::ConnectionFailed),
+                    ..Default::default()
+                }
             }
         }
-    };
-    // A dishonest or absent `Content-Length` still gets caught here, after the
-    // read but before anything downstream sees the text.
-    if body.len() > MAX_METRICS_BODY_BYTES {
-        return Observation::failed(
-            crate::models::FailureKind::Other,
-            format!("exporter body exceeded {MAX_METRICS_BODY_BYTES} bytes"),
-        );
     }
-    let samples = match crate::openmetrics::parse(&body) {
+    let body = match std::str::from_utf8(&body) {
+        Ok(body) => body,
+        Err(e) => {
+            return Observation::failed(
+                crate::models::FailureKind::UnexpectedContent,
+                format!("exporter body is not UTF-8: {e}"),
+            )
+        }
+    };
+    let samples = match crate::openmetrics::parse(body) {
         Ok(s) => s,
         Err(e) => {
             return Observation::failed(
@@ -199,6 +213,29 @@ mod tests {
 
         assert_eq!(obs.metric, None);
         assert_eq!(obs.failure, Some(FailureKind::UnexpectedContent));
+    }
+
+    #[tokio::test]
+    async fn accepts_exporter_bodies_larger_than_one_megabyte() {
+        let mut body = String::from("gateway_cpu 0.32\n");
+        for i in 0..50_000 {
+            body.push_str(&format!("other_metric{{device=\"{i}\"}} 1\n"));
+        }
+        assert!(body.len() > 1_048_576);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/metrics", get(move || async move { body }));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let obs = probe_openmetrics(
+            &reqwest::Client::new(),
+            &check("gateway_cpu", &[]),
+            &format!("http://{addr}/metrics"),
+        )
+        .await;
+        assert_eq!(obs.error, None);
+        assert_eq!(obs.metric, Some(0.32));
     }
 
     #[tokio::test]
