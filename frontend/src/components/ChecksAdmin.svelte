@@ -61,7 +61,7 @@
     {:else if checks.length === 0}
       <div class="checks-empty"><h3>Start monitoring your infrastructure</h3><p class="admin-muted">Create a check to track availability, response time, or certificate health.</p><button class="btn primary" onclick={() => onopen(null)}>Create your first check</button></div>
     {:else}
-      <div class="admin-rows">
+      <div class="admin-rows inset-rail">
         <div class="row head">
           <span>Name</span>
           <span>Tag</span>

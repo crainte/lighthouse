@@ -1331,8 +1331,7 @@ button.link:hover {
   color: var(--up);
 }
 
-/* Trackless scrollbar: no groove, just a pill thumb. The -webkit- rules are the
-   Safari fallback for the standard properties above them. */
+/* Agent credentials keep the original trackless rail. */
 .admin-rows {
   max-height: 60vh;
   overflow-y: auto;
@@ -1350,6 +1349,32 @@ button.link:hover {
   border-radius: 999px;
   border: 3px solid transparent;
   background-clip: content-box;
+}
+/* Checks and Check order have a separated, colored inset rail. */
+.admin-rows.inset-rail {
+  padding-right: 12px;
+  scrollbar-gutter: stable;
+  scrollbar-width: auto;
+  scrollbar-color: #a5d2e1 #213748;
+}
+/* Chromium's standard colors override the WebKit pseudo-elements; Firefox
+   153–155 recognizes the selector without painting it, so exclude Mozilla. */
+@supports selector(::-webkit-scrollbar) and (not (-moz-appearance: none)) {
+  .admin-rows.inset-rail { scrollbar-color: auto; }
+}
+.admin-rows.inset-rail::-webkit-scrollbar {
+  width: 11px;
+}
+.admin-rows.inset-rail::-webkit-scrollbar-track {
+  background: #213748;
+  border: 1px solid #466174;
+  border-radius: 999px;
+}
+.admin-rows.inset-rail::-webkit-scrollbar-thumb {
+  background: #a5d2e1;
+  border-radius: 999px;
+  border: 2px solid #213748;
+  background-clip: padding-box;
 }
 
 /* ---- Collapsible editor sections ----
