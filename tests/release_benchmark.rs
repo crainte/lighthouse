@@ -1479,7 +1479,10 @@ async fn benchmark_startup_recovery_threshold() {
         checks,
         "the reopened catalogue must match what was seeded before the restart"
     );
-    // ~2x the measured 9.6s WAL-replay reopen at 10,000 checks / 24h history.
+    // Set at ~2x the 9.6s reopen first measured at 10,000 checks / 24h history.
+    // That time was mostly the per-check state-history baseline in
+    // `Coordinator::new`, not WAL replay; it is one statement now and the
+    // reopen measures ~0.3s (SCALING.md's "DuckDB 2.0" section).
     assert_ceiling(
         "LIGHTHOUSE_BENCH_STARTUP_MAX_MS",
         20_000,

@@ -1,19 +1,36 @@
 use super::*;
 
-/// Column names DuckDB currently has for `table`, used by `verify_schema` to
-/// diff an opened database against the schema the DDL constant declares.
-fn table_column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
-    let mut stmt =
-        conn.prepare("SELECT column_name FROM information_schema.columns WHERE table_name = ?")?;
-    let rows = stmt.query_map(duckdb::params![table], |r| r.get::<_, String>(0))?;
-    rows.collect::<std::result::Result<_, _>>()
-        .map_err(Into::into)
+/// Every `(table, column)` `SCHEMA_DDL` declares, in table then column order,
+/// computed once per process: it depends only on the DDL constant, and
+/// building it costs a whole scratch DuckDB instance.
+fn expected_columns() -> Result<&'static [(String, String)]> {
+    static EXPECTED: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    if let Some(expected) = EXPECTED.get() {
+        return Ok(expected);
+    }
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch(SCHEMA_DDL)?;
+    let mut stmt = reference.prepare(
+        "SELECT c.table_name, c.column_name
+         FROM information_schema.columns c
+         JOIN information_schema.tables t
+           ON t.table_catalog = c.table_catalog AND t.table_schema = c.table_schema
+          AND t.table_name = c.table_name
+         WHERE t.table_schema = 'main' AND t.table_type = 'BASE TABLE'
+         ORDER BY c.table_name, c.ordinal_position",
+    )?;
+    let columns = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(EXPECTED.get_or_init(|| columns))
 }
 
 /// Compare an opened database's tables and columns against what `SCHEMA_DDL`
 /// declares, by applying the same DDL to a scratch in-memory connection and
 /// diffing `information_schema.columns` rather than hand-maintaining a second
-/// list that could drift from the DDL itself.
+/// list that could drift from the DDL itself. One catalogue read per side,
+/// not one per table: DuckDB 2.0 made each statement's compile step dear
+/// enough that the per-table version was a measurable part of every open.
 ///
 /// A missing table or column fails clearly: this project runs no in-place
 /// migrations before 1.0 (see SCALING.md's "Pre-1.0 database policy"), so a
@@ -21,27 +38,17 @@ fn table_column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
 /// silently read as though the column were there. Extra columns — a rollback
 /// to an older binary reopening a newer database — are tolerated.
 pub(super) fn verify_schema(conn: &Connection) -> Result<()> {
-    let reference = Connection::open_in_memory()?;
-    reference.execute_batch(SCHEMA_DDL)?;
-    let tables: Vec<String> = {
-        let mut stmt = reference.prepare(
-            "SELECT table_name FROM information_schema.tables
-             WHERE table_schema = 'main' AND table_type = 'BASE TABLE'",
-        )?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        rows.collect::<std::result::Result<_, _>>()?
-    };
-    for table in tables {
-        let expected = table_column_names(&reference, &table)?;
-        let actual = table_column_names(conn, &table)?;
-        for column in &expected {
-            if !actual.iter().any(|c| c == column) {
-                bail!(
-                    "database schema is missing column `{table}.{column}`: this database \
-                     predates the supported schema and cannot be opened. See SCALING.md's \
-                     \"Pre-1.0 database policy\" for the rebuild procedure."
-                );
-            }
+    let actual: std::collections::HashSet<(String, String)> = conn
+        .prepare("SELECT table_name, column_name FROM information_schema.columns")?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    for (table, column) in expected_columns()? {
+        if !actual.contains(&(table.clone(), column.clone())) {
+            bail!(
+                "database schema is missing column `{table}.{column}`: this database \
+                 predates the supported schema and cannot be opened. See SCALING.md's \
+                 \"Pre-1.0 database policy\" for the rebuild procedure."
+            );
         }
     }
     Ok(())

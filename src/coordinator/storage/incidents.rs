@@ -182,14 +182,14 @@ impl Storage {
     }
 
     pub(super) fn touch_incident(&self, id: &str, millis: i64) -> Result<()> {
-        self.conn.execute(
+        self.conn.execute_cached(
             "UPDATE incidents SET version_millis = GREATEST(version_millis + 1, ?), version_node = ?
              WHERE id = ?",
             duckdb::params![millis, self.incident_node_id(), id],
         )?;
         let version: Option<i64> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT version_millis FROM incidents WHERE id = ?",
                 duckdb::params![id],
                 |row| row.get(0),
@@ -213,7 +213,7 @@ impl Storage {
     /// it instead of opening a real one, and above all must not resolve it. A
     /// maintenance notice is over when a human says so.
     pub fn open_incident_for(&self, check_id: CheckId) -> Result<Option<IncidentRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT i.id
              FROM incidents i
              JOIN incident_checks c ON c.incident_id = i.id
@@ -248,7 +248,7 @@ impl Storage {
         checks: &[IncidentCheckRow],
         first_update: Option<(&str, Option<&str>)>,
     ) -> Result<IncidentRow> {
-        self.conn.execute(
+        self.conn.execute_cached(
             "INSERT INTO incidents
                  (id, title, state, started_at, global, origin_check, version_millis, version_node)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -264,7 +264,7 @@ impl Storage {
             ],
         )?;
         for c in checks {
-            self.conn.execute(
+            self.conn.execute_cached(
                 "INSERT INTO incident_checks (incident_id, check_id, source) VALUES (?, ?, ?)",
                 duckdb::params![id, c.check_id, c.source.as_str()],
             )?;
@@ -288,7 +288,7 @@ impl Storage {
         source: AffectSource,
     ) -> Result<()> {
         let existing: Option<String> = {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = self.conn.prepare_cached(
                 "SELECT source FROM incident_checks WHERE incident_id = ? AND check_id = ?",
             )?;
             let mut rows = stmt
@@ -303,7 +303,7 @@ impl Storage {
             Some(AffectSource::Origin) => Ok(()),
             Some(current) if current == source => Ok(()),
             Some(_) => {
-                self.conn.execute(
+                self.conn.execute_cached(
                     "UPDATE incident_checks SET source = ?
                      WHERE incident_id = ? AND check_id = ?",
                     duckdb::params![source.as_str(), incident_id, check_id],
@@ -311,7 +311,7 @@ impl Storage {
                 self.touch_incident(incident_id, chrono::Utc::now().timestamp_millis())
             }
             None => {
-                self.conn.execute(
+                self.conn.execute_cached(
                     "INSERT INTO incident_checks (incident_id, check_id, source)
                      VALUES (?, ?, ?)",
                     duckdb::params![incident_id, check_id, source.as_str()],
@@ -331,12 +331,12 @@ impl Storage {
         only_source: Option<AffectSource>,
     ) -> Result<()> {
         let changed = match only_source {
-            Some(s) => self.conn.execute(
+            Some(s) => self.conn.execute_cached(
                 "DELETE FROM incident_checks
                  WHERE incident_id = ? AND check_id = ? AND source = ?",
                 duckdb::params![incident_id, check_id, s.as_str()],
             )?,
-            None => self.conn.execute(
+            None => self.conn.execute_cached(
                 "DELETE FROM incident_checks WHERE incident_id = ? AND check_id = ?",
                 duckdb::params![incident_id, check_id],
             )?,
@@ -351,7 +351,7 @@ impl Storage {
     /// rows alone. The affects editor saves through this.
     pub fn set_manual_checks(&self, incident_id: &str, checks: &[CheckId]) -> Result<()> {
         let current: std::collections::BTreeSet<CheckId> = {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = self.conn.prepare_cached(
                 "SELECT check_id FROM incident_checks WHERE incident_id = ? AND source = 'manual'",
             )?;
             stmt.query_map(duckdb::params![incident_id], |r| r.get(0))?
@@ -361,13 +361,13 @@ impl Storage {
         if current == desired {
             return Ok(());
         }
-        let mut delete = self.conn.prepare(
+        let mut delete = self.conn.prepare_cached(
             "DELETE FROM incident_checks WHERE incident_id = ? AND check_id = ? AND source = 'manual'",
         )?;
         for check_id in current.difference(&desired) {
             delete.execute(duckdb::params![incident_id, check_id])?;
         }
-        let mut insert = self.conn.prepare(
+        let mut insert = self.conn.prepare_cached(
             "INSERT INTO incident_checks (incident_id, check_id, source) VALUES (?, ?, 'manual')",
         )?;
         for check_id in desired.difference(&current) {
@@ -392,7 +392,7 @@ impl Storage {
         now_millis: i64,
     ) -> Result<IncidentUpdateRow> {
         let id = self.next_event_id("incident_updates", &format!("{incident_id}-u{now_millis}"))?;
-        self.conn.execute(
+        self.conn.execute_cached(
             "INSERT INTO incident_updates (id, incident_id, state, body, author, created_at)
              VALUES (?, ?, ?, ?, ?, ?)",
             duckdb::params![id, incident_id, state.as_str(), body, author, now_millis],
@@ -401,12 +401,12 @@ impl Storage {
         // back out of `resolved` (an operator reopening) must clear it, or the
         // incident would read as both open and finished.
         if state.is_resolved() {
-            self.conn.execute(
+            self.conn.execute_cached(
                 "UPDATE incidents SET state = ?, resolved_at = ? WHERE id = ?",
                 duckdb::params![state.as_str(), now_millis, incident_id],
             )?;
         } else {
-            self.conn.execute(
+            self.conn.execute_cached(
                 "UPDATE incidents SET state = ?, resolved_at = NULL WHERE id = ?",
                 duckdb::params![state.as_str(), incident_id],
             )?;
@@ -424,7 +424,7 @@ impl Storage {
 
     /// An incident's narrative, oldest first.
     pub fn updates_for_incident(&self, incident_id: &str) -> Result<Vec<IncidentUpdateRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, incident_id, state, body, author, created_at
              FROM incident_updates
              WHERE incident_id = ?
@@ -450,7 +450,7 @@ impl Storage {
     /// a column beside it would be a second copy of the same fact. Stays true
     /// when an operator skipped straight past `investigating`.
     pub fn is_acknowledged(&self, incident_id: &str) -> Result<bool> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT 1 FROM incident_updates
              WHERE incident_id = ? AND author IS NOT NULL LIMIT 1",
         )?;
@@ -476,7 +476,7 @@ impl Storage {
         {
             return Ok(Some(existing));
         }
-        self.conn.execute(
+        self.conn.execute_cached(
             "UPDATE incidents SET title = ?, started_at = ?, global = ? WHERE id = ?",
             duckdb::params![title, started_at, global, id],
         )?;
@@ -486,7 +486,7 @@ impl Storage {
 
     /// One incident with its affected checks.
     pub fn incident(&self, id: &str) -> Result<Option<IncidentRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, title, state, started_at, resolved_at, global, origin_check
              FROM incidents WHERE id = ?",
         )?;
@@ -503,7 +503,7 @@ impl Storage {
     }
 
     pub(super) fn checks_for_incident(&self, incident_id: &str) -> Result<Vec<IncidentCheckRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT check_id, source FROM incident_checks
              WHERE incident_id = ? ORDER BY check_id",
         )?;
@@ -556,7 +556,7 @@ impl Storage {
     /// A check's incidents, newest first — every incident it was attached to,
     /// however it got there.
     pub fn incidents_for_check(&self, check_id: CheckId, limit: usize) -> Result<Vec<IncidentRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT i.id, i.title, i.state, i.started_at, i.resolved_at, i.global, i.origin_check
              FROM incidents i
              JOIN incident_checks c ON c.incident_id = i.id
@@ -613,7 +613,7 @@ impl Storage {
             )? as u64;
         }
 
-        removed += self.conn.execute(
+        removed += self.conn.execute_cached(
             "DELETE FROM incidents
              WHERE state = 'resolved' AND resolved_at IS NOT NULL
                AND resolved_at - started_at < ?",
@@ -670,7 +670,7 @@ impl Storage {
             }
             let existing = self
                 .conn
-                .query_row(
+                .query_row_cached(
                     "SELECT id, incident_id, state, body, author, created_at
                  FROM incident_updates WHERE id = ?",
                     duckdb::params![update.id],
@@ -697,14 +697,14 @@ impl Storage {
         }
         let write = || -> Result<()> {
             self.conn
-                .execute("DELETE FROM incidents WHERE id = ?", duckdb::params![i.id])?;
+                .execute_cached("DELETE FROM incidents WHERE id = ?", duckdb::params![i.id])?;
             if superseded_tombstone {
-                self.conn.execute(
+                self.conn.execute_cached(
                     "DELETE FROM incident_tombstones WHERE id = ?",
                     duckdb::params![i.id],
                 )?;
             }
-            self.conn.execute(
+            self.conn.execute_cached(
                 "INSERT INTO incidents
                      (id, title, state, started_at, resolved_at, global, origin_check,
                       version_millis, version_node)
@@ -725,19 +725,19 @@ impl Storage {
                 i.checks.iter().map(|(check_id, _)| *check_id).collect();
             for stale in self
                 .conn
-                .prepare("SELECT check_id FROM incident_checks WHERE incident_id = ?")?
+                .prepare_cached("SELECT check_id FROM incident_checks WHERE incident_id = ?")?
                 .query_map(duckdb::params![i.id], |row| row.get::<_, CheckId>(0))?
                 .collect::<std::result::Result<Vec<_>, _>>()?
                 .into_iter()
                 .filter(|check_id| !wanted_checks.contains(check_id))
             {
-                self.conn.execute(
+                self.conn.execute_cached(
                     "DELETE FROM incident_checks WHERE incident_id = ? AND check_id = ?",
                     duckdb::params![i.id, stale],
                 )?;
             }
             for (check_id, source) in &i.checks {
-                self.conn.execute(
+                self.conn.execute_cached(
                     "INSERT INTO incident_checks (incident_id, check_id, source)
                      VALUES (?, ?, ?)
                      ON CONFLICT (incident_id, check_id) DO UPDATE SET source = excluded.source",
@@ -748,19 +748,19 @@ impl Storage {
                 i.updates.iter().map(|u| u.id.as_str()).collect();
             for stale in self
                 .conn
-                .prepare("SELECT id FROM incident_updates WHERE incident_id = ?")?
+                .prepare_cached("SELECT id FROM incident_updates WHERE incident_id = ?")?
                 .query_map(duckdb::params![i.id], |row| row.get::<_, String>(0))?
                 .collect::<std::result::Result<Vec<_>, _>>()?
                 .into_iter()
                 .filter(|id| !wanted_updates.contains(id.as_str()))
             {
-                self.conn.execute(
+                self.conn.execute_cached(
                     "DELETE FROM incident_updates WHERE id = ?",
                     duckdb::params![stale],
                 )?;
             }
             for u in &i.updates {
-                self.conn.execute(
+                self.conn.execute_cached(
                     "INSERT INTO incident_updates
                          (id, incident_id, state, body, author, created_at)
                       VALUES (?, ?, ?, ?, ?, ?)
@@ -796,7 +796,7 @@ impl Storage {
         let updates = self.updates_for_incident(id)?;
         Ok(Some(ReplicatedIncident {
             id: row.id,
-            version: self.conn.query_row(
+            version: self.conn.query_row_cached(
                 "SELECT version_millis, version_node FROM incidents WHERE id = ?",
                 duckdb::params![id],
                 |r| Ok(Hlc::new(r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
@@ -825,7 +825,7 @@ impl Storage {
     ) -> Result<Vec<ReplicatedIncident>> {
         let (since_node, since_incident_id) = since_id.split_once('\0').unwrap_or(("", since_id));
         let ids: Vec<String> = {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = self.conn.prepare_cached(
                 "SELECT id FROM incidents
                  WHERE version_millis > ?
                     OR (version_millis = ? AND (version_node > ?
@@ -861,7 +861,7 @@ impl Storage {
         since_id: &str,
         limit: usize,
     ) -> Result<Vec<IncidentTombstone>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, deleted_at, node_id FROM incident_tombstones
               WHERE deleted_at > ?
                  OR (deleted_at = ? AND node_id > ?)
@@ -939,25 +939,25 @@ impl Storage {
             false
         };
         let write = || -> Result<bool> {
-            self.conn.execute(
+            self.conn.execute_cached(
                 "DELETE FROM incident_updates WHERE incident_id = ?",
                 duckdb::params![id],
             )?;
-            self.conn.execute(
+            self.conn.execute_cached(
                 "DELETE FROM incident_checks WHERE incident_id = ?",
                 duckdb::params![id],
             )?;
-            self.conn.execute(
+            self.conn.execute_cached(
                 "UPDATE alerts SET incident_id = NULL WHERE incident_id = ?",
                 duckdb::params![id],
             )?;
             let removed = self
                 .conn
-                .execute("DELETE FROM incidents WHERE id = ?", duckdb::params![id])?;
+                .execute_cached("DELETE FROM incidents WHERE id = ?", duckdb::params![id])?;
             // The tombstone is written even when the row was already gone: a
             // peer that deletes an incident this node never received still has
             // to be able to stop it arriving afterwards.
-            self.conn.execute(
+            self.conn.execute_cached(
                 "INSERT OR REPLACE INTO incident_tombstones (id, deleted_at, node_id)
                  VALUES (?, ?, ?)",
                 duckdb::params![id, tombstone.deleted_at, tombstone.node_id],
@@ -980,9 +980,9 @@ impl Storage {
 
     /// Whether an incident id has been deleted anywhere in the cluster.
     pub fn incident_tombstone(&self, id: &str) -> Result<Option<IncidentTombstone>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, deleted_at, node_id FROM incident_tombstones WHERE id = ?")?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, deleted_at, node_id FROM incident_tombstones WHERE id = ?",
+        )?;
         let mut rows = stmt.query_map(duckdb::params![id], |row| {
             Ok(IncidentTombstone {
                 id: row.get(0)?,
@@ -994,7 +994,7 @@ impl Storage {
     }
 
     pub fn incident_tombstoned(&self, id: &str) -> Result<bool> {
-        let found: i64 = self.conn.query_row(
+        let found: i64 = self.conn.query_row_cached(
             "SELECT count(*) FROM incident_tombstones WHERE id = ?",
             duckdb::params![id],
             |r| r.get(0),
@@ -1005,7 +1005,9 @@ impl Storage {
     /// Every incident id this node knows to be deleted, for replicating the
     /// deletion to a peer that has not heard about it yet.
     pub fn list_incident_tombstones(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare("SELECT id FROM incident_tombstones")?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT id FROM incident_tombstones")?;
         let rows = stmt
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<std::result::Result<_, _>>()?;
@@ -1017,7 +1019,7 @@ impl Storage {
     /// longest outage a peer could plausibly have been down for, or that peer
     /// comes back and pushes the incident again.
     pub fn prune_incident_tombstones(&self, before_millis: i64) -> Result<usize> {
-        let n = self.conn.execute(
+        let n = self.conn.execute_cached(
             "DELETE FROM incident_tombstones WHERE deleted_at < ?",
             duckdb::params![before_millis],
         )?;

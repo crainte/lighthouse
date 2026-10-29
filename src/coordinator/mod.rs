@@ -431,16 +431,16 @@ impl Coordinator {
                 storage.set_incident_node_id(&node_id);
                 let session_key = match startup_peer_token {
                     Some(token) => token.into_bytes(),
-                    None => configplane::load_or_generate(storage, SESSION_KEY_KEY, 32).into_bytes(),
+                    None => {
+                        configplane::load_or_generate(storage, SESSION_KEY_KEY, 32).into_bytes()
+                    }
                 };
                 let cluster_members = storage.list_cluster_members().unwrap_or_default();
                 let credentials = storage.list_agent_credentials().unwrap_or_default();
                 let agent_states = storage.list_agent_check_state().unwrap_or_default();
                 let current_states = storage.list_current_state().unwrap_or_default();
-                for row in &current_states {
-                    if let Err(error) = storage.record_state(row.check_id, row.state, now) {
-                        warn!(error = %error, check = %row.check_id, "could not seed state history baseline");
-                    }
+                if let Err(error) = storage.seed_state_history_baseline(now) {
+                    warn!(error = %error, "could not seed state history baseline");
                 }
                 let rollup_policies = storage.list_rollup_policies().unwrap_or_default();
                 Ok(StartupData {

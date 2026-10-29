@@ -411,7 +411,7 @@ impl Storage {
         // statement, which makes large seeds (100k+ rows) crawl.
         self.transaction(|_| {
             let insert = || -> Result<()> {
-                let mut stmt = self.conn.prepare(
+                let mut stmt = self.conn.prepare_cached(
                     "INSERT INTO check_results
                     (check_id, agent_id, ts_millis, status, latency_ms, status_code,
                      error, failure, zone, region)
@@ -556,7 +556,8 @@ impl Storage {
         }
         // Deterministic order when several agents report the same millisecond.
         sql.push_str(" ORDER BY ts_millis DESC, agent_id ASC LIMIT ?");
-        let mut stmt = self.conn.prepare(&sql)?;
+        // At most eight shapes (three optional clauses), so caching is bounded.
+        let mut stmt = self.conn.prepare_cached(&sql)?;
         // Build params dynamically.
         let mut params: Vec<duckdb::types::Value> =
             vec![duckdb::types::Value::Text(check_id.to_string())];
@@ -624,7 +625,8 @@ impl Storage {
         }
         // Deterministic order when several agents report the same millisecond.
         sql.push_str(" ORDER BY ts_millis DESC, agent_id ASC LIMIT ?");
-        let mut stmt = self.conn.prepare(&sql)?;
+        // At most 32 shapes (five optional clauses), so caching is bounded.
+        let mut stmt = self.conn.prepare_cached(&sql)?;
         // Must be pushed in the same order the clauses were appended above.
         let mut params: Vec<duckdb::types::Value> = Vec::new();
         if let Some(c) = &filter.check_id {
@@ -681,7 +683,7 @@ impl Storage {
         pending: Option<(NodeState, i64)>,
         last_check: i64,
     ) -> Result<()> {
-        self.conn.execute(
+        self.conn.execute_cached(
             "INSERT OR REPLACE INTO current_state
                  (check_id, status, last_check, consecutive_failures, pending_state, pending_since)
              VALUES (?, ?, ?, 0, ?, ?)",
@@ -698,9 +700,9 @@ impl Storage {
 
     /// All persisted published states, for seeding the tracker on startup.
     pub fn list_current_state(&self) -> Result<Vec<CurrentStateRow>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT check_id, status, pending_state, pending_since FROM current_state")?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT check_id, status, pending_state, pending_since FROM current_state",
+        )?;
         let rows = stmt
             .query_map([], |row| {
                 let pending_state = row.get::<_, Option<String>>(2)?;
@@ -733,7 +735,7 @@ impl Storage {
         consecutive_failures: u32,
         last_check: i64,
     ) -> Result<()> {
-        self.conn.execute(
+        self.conn.execute_cached(
             "INSERT INTO agent_check_state
                  (check_id, agent_id, status, consecutive_failures, zone, region, last_check)
              VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -759,7 +761,7 @@ impl Storage {
 
     /// Every persisted per-agent belief, for seeding the tracker's leaves.
     pub fn list_agent_check_state(&self) -> Result<Vec<AgentCheckStateRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT check_id, agent_id, zone, region, status, consecutive_failures, last_check
               FROM agent_check_state",
         )?;
@@ -790,7 +792,7 @@ impl Storage {
     pub fn record_state(&self, check_id: CheckId, state: NodeState, since: i64) -> Result<()> {
         let newest: Option<String> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT state FROM state_history WHERE check_id = ?
                  ORDER BY since DESC LIMIT 1",
                 duckdb::params![check_id],
@@ -800,11 +802,39 @@ impl Storage {
         if newest.as_deref().map(NodeState::from_db) == Some(state) {
             return Ok(());
         }
-        self.conn.execute(
+        self.conn.execute_cached(
             "INSERT OR REPLACE INTO state_history (check_id, state, since) VALUES (?, ?, ?)",
             duckdb::params![check_id, state.as_str(), since],
         )?;
         Ok(())
+    }
+
+    /// `record_state(check, current_state, since)` for every row of
+    /// `current_state`, as one statement: the startup history baseline. Per
+    /// row that was two autocommitted statements per check, which at 10,000
+    /// checks made it most of a restart. States are normalised exactly as
+    /// `NodeState::from_db` does, on both sides of the comparison, so the
+    /// spans written are the ones the per-row loop would have written.
+    pub fn seed_state_history_baseline(&self, since: i64) -> Result<usize> {
+        Ok(self.conn.execute_cached(
+            "INSERT OR REPLACE INTO state_history (check_id, state, since)
+             WITH current AS (
+                 SELECT check_id,
+                        CASE WHEN status IN ('up', 'degraded', 'down') THEN status
+                             ELSE 'unknown' END AS state
+                 FROM current_state
+             ),
+             newest AS (
+                 SELECT check_id, arg_max(state, since) AS state
+                 FROM state_history GROUP BY check_id
+             )
+             SELECT c.check_id, c.state, ?
+             FROM current c LEFT JOIN newest n ON n.check_id = c.check_id
+             WHERE n.state IS NULL
+                OR c.state <> CASE WHEN n.state IN ('up', 'degraded', 'down') THEN n.state
+                                   ELSE 'unknown' END",
+            duckdb::params![since],
+        )?)
     }
 
     /// Record a peer's published state. Unlike `record_state`, a span is only
@@ -818,7 +848,7 @@ impl Storage {
     ) -> Result<()> {
         let newest: Option<(String, i64)> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT state, since FROM state_history WHERE check_id = ?
                  ORDER BY since DESC LIMIT 1",
                 duckdb::params![check_id],
@@ -830,7 +860,7 @@ impl Storage {
                 return Ok(());
             }
         }
-        self.conn.execute(
+        self.conn.execute_cached(
             "INSERT OR REPLACE INTO state_history (check_id, state, since) VALUES (?, ?, ?)",
             duckdb::params![check_id, state.as_str(), since],
         )?;
@@ -839,7 +869,7 @@ impl Storage {
 
     /// Every span for a check, oldest first.
     pub fn state_spans(&self, check_id: CheckId) -> Result<Vec<StateSpan>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT state, since FROM state_history WHERE check_id = ? ORDER BY since ASC",
         )?;
         let rows = stmt
@@ -910,20 +940,20 @@ impl Storage {
         let before = self.rollup_covered_horizon(before)?;
         self.conn
             .execute_batch("DELETE FROM prune_results_counts; DELETE FROM prune_results_min_ts;")?;
-        self.conn.execute(
+        self.conn.execute_cached(
             "INSERT INTO prune_results_counts
              SELECT check_id, COUNT(*) FROM check_results WHERE ts_millis < ?
              GROUP BY check_id",
             duckdb::params![before],
         )?;
-        let removed = self.conn.execute(
+        let removed = self.conn.execute_cached(
             "DELETE FROM check_results WHERE ts_millis < ?",
             duckdb::params![before],
         )? as u64;
         if removed == 0 {
             return Ok(0);
         }
-        self.conn.execute(
+        self.conn.execute_cached(
             "DELETE FROM latest_check_results WHERE ts_millis < ?",
             duckdb::params![before],
         )?;
@@ -965,7 +995,7 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
     /// same ingest and cover a superset of the window, so a minute gap is the
     /// first thing to appear and the strictest thing to wait for.
     pub(super) fn rollup_covered_horizon(&self, requested: i64) -> Result<i64> {
-        let uncovered: Option<i64> = self.conn.query_row(
+        let uncovered: Option<i64> = self.conn.query_row_cached(
             "SELECT MIN(raw.bucket_start) FROM (
                  SELECT check_id, agent_id,
                         ts_millis // ? * ? AS bucket_start
@@ -997,7 +1027,7 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
     pub fn oldest_result_ts(&self) -> Result<Option<i64>> {
         let oldest: Option<i64> = self
             .conn
-            .query_row("SELECT MIN(ts_millis) FROM check_results", [], |row| {
+            .query_row_cached("SELECT MIN(ts_millis) FROM check_results", [], |row| {
                 row.get(0)
             })
             .unwrap_or(None);
@@ -1040,7 +1070,7 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
     pub fn count_results(&self) -> Result<u64> {
         let n: i64 = self
             .conn
-            .query_row("SELECT COUNT(*) FROM check_results", [], |r| r.get(0))?;
+            .query_row_cached("SELECT COUNT(*) FROM check_results", [], |r| r.get(0))?;
         Ok(n as u64)
     }
 
@@ -1056,11 +1086,14 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
     /// `state_history` is deliberately NOT cleared: it is the coordinator's
     /// record of what it published, which relabelling does not invalidate.
     pub fn purge_results(&self) -> Result<u64> {
-        let mut removed = self.conn.execute("DELETE FROM check_results", [])? as u64;
+        let mut removed = self.conn.execute_cached("DELETE FROM check_results", [])? as u64;
         self.conn
-            .execute("DELETE FROM result_replication_watermarks", [])?;
-        self.conn.execute("DELETE FROM latest_check_results", [])?;
-        removed += self.conn.execute("DELETE FROM agent_check_state", [])? as u64;
+            .execute_cached("DELETE FROM result_replication_watermarks", [])?;
+        self.conn
+            .execute_cached("DELETE FROM latest_check_results", [])?;
+        removed += self
+            .conn
+            .execute_cached("DELETE FROM agent_check_state", [])? as u64;
         Ok(removed)
     }
 
@@ -1084,7 +1117,7 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
         let spans = self.state_spans(check_id)?;
         let mut result_up = vec![0_u64; buckets];
         let mut result_total = vec![0_u64; buckets];
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT ts_millis, status FROM check_results
              WHERE check_id = ? AND ts_millis > ? AND ts_millis <= ?",
         )?;
@@ -1139,7 +1172,7 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
 
         let mut spans: BTreeMap<CheckId, Vec<StateSpan>> = BTreeMap::new();
         {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = self.conn.prepare_cached(
                 "SELECT check_id, state, since FROM state_history
                  WHERE check_id IN (SELECT check_id FROM status_check_ids)
                  ORDER BY check_id, since",
@@ -1162,7 +1195,7 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
 
         let mut counts: BTreeMap<CheckId, (Vec<u64>, Vec<u64>)> = BTreeMap::new();
         {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = self.conn.prepare_cached(
                 "SELECT check_id, ((ts_millis - ? - 1) // ?)::BIGINT AS idx,
                         COUNT(*), COUNT(*) FILTER (WHERE status = 'up')
                  FROM check_results
@@ -1287,11 +1320,11 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
                ON mark.check_id = staged.check_id
              WHERE staged.ts_millis <= mark.max_ts;",
         )?;
-        let probed: i64 =
-            self.conn
-                .query_row("SELECT count(*) FROM replicate_probe_stage", [], |row| {
-                    row.get(0)
-                })?;
+        let probed: i64 = self.conn.query_row_cached(
+            "SELECT count(*) FROM replicate_probe_stage",
+            [],
+            |row| row.get(0),
+        )?;
         if probed > 0 {
             self.conn.execute_batch(
                 "INSERT INTO replicate_new_results
@@ -1319,11 +1352,11 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
              {derived}",
             derived = derived_results_sql("replicate_new_results"),
         ))?;
-        let inserted: i64 =
-            self.conn
-                .query_row("SELECT count(*) FROM replicate_new_results", [], |row| {
-                    row.get(0)
-                })?;
+        let inserted: i64 = self.conn.query_row_cached(
+            "SELECT count(*) FROM replicate_new_results",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(inserted as usize)
     }
 
@@ -1345,7 +1378,7 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
         until: i64,
         limit: usize,
     ) -> Result<Vec<(CheckResult, Status)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT agent_id, ts_millis, status, latency_ms, status_code, error,
                     failure, zone, region
              FROM check_results
@@ -1415,7 +1448,7 @@ SET min_ts = COALESCE(remaining.min_ts, result_replication_watermarks.min_ts),
         since_agent_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(CheckResult, Status)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT check_id, agent_id, ts_millis, status, latency_ms, status_code, error,
                     failure, zone, region
              FROM check_results
@@ -2816,6 +2849,77 @@ mod tests {
         assert_eq!(s.history(cid("x"), 10, None, None, None).unwrap().len(), 2);
     }
 
+    /// The set-based startup baseline must write exactly the spans the per-row
+    /// `record_state` loop it replaced did, including for values `from_db`
+    /// normalises to `unknown` and for a span already sitting at `since`.
+    #[test]
+    fn startup_state_baseline_matches_per_check_record_state() {
+        const NOW: i64 = 1_000_000;
+        // (check, current_state.status as stored, existing spans oldest first)
+        type Case<'a> = (&'a str, &'a str, &'a [(&'a str, i64)]);
+        let cases: &[Case] = &[
+            ("no-history", "down", &[]),
+            ("same-state", "up", &[("up", 10)]),
+            ("changed", "down", &[("up", 10)]),
+            ("older-span-matches", "up", &[("up", 10), ("down", 20)]),
+            ("legacy-current-no-history", "paused", &[]),
+            (
+                "legacy-current-matches-unknown",
+                "paused",
+                &[("unknown", 10)],
+            ),
+            (
+                "legacy-history-matches-unknown",
+                "unknown",
+                &[("paused", 10)],
+            ),
+            ("legacy-history-differs", "up", &[("paused", 10)]),
+            ("span-already-at-now", "down", &[("up", NOW)]),
+        ];
+        let seeded = || {
+            let s = Storage::open(":memory:").unwrap();
+            for &(check, status, existing) in cases {
+                s.conn
+                    .execute(
+                        "INSERT INTO current_state (check_id, status, last_check) VALUES (?, ?, 0)",
+                        duckdb::params![cid(check), status],
+                    )
+                    .unwrap();
+                for &(state, since) in existing {
+                    s.conn
+                        .execute(
+                            "INSERT INTO state_history (check_id, state, since) VALUES (?, ?, ?)",
+                            duckdb::params![cid(check), state, since],
+                        )
+                        .unwrap();
+                }
+            }
+            s
+        };
+        let spans = |s: &Storage| -> Vec<(String, String, i64)> {
+            let mut stmt = s
+                .conn
+                .prepare("SELECT check_id::VARCHAR, state, since FROM state_history ORDER BY ALL")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+
+        let per_row = seeded();
+        for row in per_row.list_current_state().unwrap() {
+            per_row.record_state(row.check_id, row.state, NOW).unwrap();
+        }
+        let set_based = seeded();
+        let written = set_based.seed_state_history_baseline(NOW).unwrap();
+
+        assert_eq!(spans(&set_based), spans(&per_row));
+        // no-history, changed, older-span-matches, legacy-current-no-history,
+        // legacy-history-differs, span-already-at-now.
+        assert_eq!(written, 6);
+    }
+
     /// The prune keeps each check's newest span regardless of age, because
     /// that span is not history — it is what the check reads as right now.
     #[test]
@@ -3300,7 +3404,7 @@ mod tests {
         let history_p95_ms = percentile(&mut history_samples, 95);
         let latency_p95_ms = percentile(&mut latency_samples, 95);
         println!(
-            "checks={check_count} domains={domains} retained_rows={rows} observation_secs={observation_secs} seed_ms={seed_ms} database_before_prune_bytes={database_before_prune} wal_before_prune_bytes={wal_before_prune} backup_bytes={backup_bytes} backup_ms={backup_ms} restore_ms={restore_ms} history_p95_ms={history_p95_ms} latency_p95_ms={latency_p95_ms} pruned_rows={pruned} prune_ms={prune_ms} database_after_prune_no_checkpoint_bytes={database_after_prune_no_checkpoint} wal_after_prune_no_checkpoint_bytes={wal_after_prune_no_checkpoint} checkpoint_ms={checkpoint_ms} database_after_prune_bytes={database_after_prune} wal_after_prune_bytes={wal_after_prune}"
+            "checks={check_count} domains={domains} retained_rows={rows} observation_secs={observation_secs} seed_ms={seed_ms} database_before_prune_bytes={database_before_prune} wal_before_prune_bytes={wal_before_prune} backup_bytes={backup_bytes} backup_ms={backup_ms} restore_ms={restore_ms} history_p95_ms={history_p95_ms} latency_p95_ms={latency_p95_ms} pruned_rows={pruned} prune_ms={prune_ms} database_after_prune_no_checkpoint_bytes={database_after_prune_no_checkpoint} wal_after_prune_no_checkpoint={wal_after_prune_no_checkpoint} checkpoint_ms={checkpoint_ms} database_after_prune_bytes={database_after_prune} wal_after_prune_bytes={wal_after_prune}"
         );
 
         for (name, value) in [

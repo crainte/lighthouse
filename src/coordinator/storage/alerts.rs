@@ -101,7 +101,7 @@ impl Storage {
             "alerts",
             &format!("{node_id}-{ts_millis}-{}", current_state.as_str()),
         )?;
-        self.conn.execute(
+        self.conn.execute_cached(
             "INSERT INTO alerts
                  (id, scope, node_id, previous_state, current_state, ts_millis, incident_id)
              VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -121,7 +121,7 @@ impl Storage {
 
     /// Return the most recent `limit` alerts, newest first.
     pub fn recent_alerts(&self, limit: usize) -> Result<Vec<AlertRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, scope, node_id, previous_state, current_state, ts_millis, incident_id
              FROM alerts
              ORDER BY ts_millis DESC
@@ -136,7 +136,7 @@ impl Storage {
     /// The alerts stamped as belonging to one incident, oldest first — the
     /// machine evidence behind the operator's narrative.
     pub fn alerts_for_incident(&self, incident_id: &str) -> Result<Vec<AlertRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, scope, node_id, previous_state, current_state, ts_millis, incident_id
              FROM alerts
              WHERE incident_id = ?
@@ -152,7 +152,7 @@ impl Storage {
     /// Callers creating an alert do this inside the alert transaction; a crash
     /// after commit therefore leaves an owed delivery for the next dispatcher.
     pub fn enqueue_notification(&self, row: &QueuedRow) -> Result<()> {
-        self.conn.execute(
+        self.conn.execute_cached(
             "INSERT INTO notification_queue
                  (id, notifier, check_id, previous_state, current_state,
                   attempts, next_attempt, last_error, queued_at)
@@ -179,7 +179,7 @@ impl Storage {
     /// Queued notifications whose next attempt is due, oldest first — an outage
     /// should be paged in the order it happened.
     pub fn due_notifications(&self, now_millis: i64, limit: usize) -> Result<Vec<QueuedRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, notifier, check_id, previous_state, current_state,
                     attempts, next_attempt, last_error, queued_at
              FROM notification_queue
@@ -197,7 +197,7 @@ impl Storage {
     /// Read by the notifier admin panel: "nobody was paged" is exactly the kind
     /// of failure this project keeps refusing to leave silent.
     pub fn undelivered_notifications(&self, limit: usize) -> Result<Vec<QueuedRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, notifier, check_id, previous_state, current_state,
                     attempts, next_attempt, last_error, queued_at
              FROM notification_queue
@@ -211,7 +211,7 @@ impl Storage {
     }
 
     pub fn delete_notification(&self, id: &str) -> Result<()> {
-        self.conn.execute(
+        self.conn.execute_cached(
             "DELETE FROM notification_queue WHERE id = ?",
             duckdb::params![id],
         )?;
@@ -262,7 +262,7 @@ impl Storage {
     pub fn upsert_alert(&self, a: &AlertRow) -> Result<AlertApply> {
         let existing = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT id, scope, node_id, previous_state, current_state, ts_millis, incident_id
              FROM alerts WHERE id = ?",
                 duckdb::params![a.id],
@@ -276,7 +276,7 @@ impl Storage {
                 AlertApply::Conflict
             });
         }
-        self.conn.execute(
+        self.conn.execute_cached(
             "INSERT INTO alerts
                  (id, scope, node_id, previous_state, current_state, ts_millis, incident_id)
              VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -301,7 +301,7 @@ impl Storage {
         since_id: &str,
         limit: usize,
     ) -> Result<Vec<AlertRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, scope, node_id, previous_state, current_state, ts_millis, incident_id
              FROM alerts
              WHERE ts_millis > ? OR (ts_millis = ? AND id > ?)

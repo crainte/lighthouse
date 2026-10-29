@@ -208,7 +208,7 @@ impl Storage {
     /// write maintains the watermark incrementally alongside it.
     pub(super) fn rollup_digest(&self, stream: &str) -> Result<RollupDigest> {
         self.conn
-            .query_row(
+            .query_row_cached(
                 "SELECT max_bucket_start, row_count, attempts_sum, up_sum, latency_sum_sum
                  FROM rollup_replication_watermarks WHERE stream = ?",
                 duckdb::params![stream],
@@ -251,7 +251,7 @@ impl Storage {
             &format!("DELETE FROM {table} WHERE bucket_start + ? <= ?"),
             duckdb::params![bucket_ms, before],
         )?;
-        self.conn.execute(
+        self.conn.execute_cached(
             "UPDATE rollup_replication_watermarks SET
                  row_count = row_count - ?,
                  attempts_sum = attempts_sum - ?,
@@ -481,7 +481,8 @@ impl Storage {
              ORDER BY bucket_start ASC, check_id ASC, agent_id ASC
              LIMIT ?"
         );
-        let mut stmt = self.conn.prepare(&sql)?;
+        // `table` is one of the two rollup tables, so caching is bounded.
+        let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(
             duckdb::params![
                 since_bucket,
@@ -594,7 +595,7 @@ impl Storage {
     /// than appended, because `anti_entropy_sweep` redetects a standing gap on
     /// every sweep it persists — see the table's own comment in `open`.
     pub fn record_raw_data_gap(&self, gap: &RawDataGapRow) -> Result<()> {
-        self.conn.execute(
+        self.conn.execute_cached(
             "INSERT INTO raw_data_gaps (check_id, peer, from_ts, to_ts, observed_at)
              VALUES (?, ?, ?, ?, ?)
              ON CONFLICT (check_id, peer) DO UPDATE SET
@@ -618,7 +619,7 @@ impl Storage {
     /// returning the whole table and letting the route apply `page::take` is
     /// simpler than a second cursor scheme for a table this size.
     pub fn list_raw_data_gaps(&self) -> Result<Vec<RawDataGapRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT check_id, peer, from_ts, to_ts, observed_at
              FROM raw_data_gaps ORDER BY observed_at DESC, check_id ASC, peer ASC",
         )?;

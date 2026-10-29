@@ -148,7 +148,7 @@ impl Storage {
     /// these rows, so this is what makes an agent disappear.
     pub fn purge_agent(&self, agent_id: &str) -> Result<u64> {
         self.transaction(|store| {
-            let rows = store.conn.execute(
+            let rows = store.conn.execute_cached(
                 "DELETE FROM check_results WHERE agent_id = ?",
                 duckdb::params![agent_id],
             )?;
@@ -167,7 +167,7 @@ impl Storage {
     /// and matches against them per request, so this is read at boot and after
     /// each mint or revoke rather than on the ingest path.
     pub fn list_agent_credentials(&self) -> Result<Vec<AgentCredential>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, zone, region, secret_hash, salt, created_at, revoked_at
              FROM agent_credentials ORDER BY region, zone, created_at",
         )?;
@@ -189,7 +189,7 @@ impl Storage {
 
     pub fn insert_agent_credential(&self, c: &AgentCredential) -> Result<()> {
         self.transaction(|store| {
-            store.conn.execute(
+            store.conn.execute_cached(
                 "INSERT INTO agent_credentials
                      (id, zone, region, secret_hash, salt, created_at, revoked_at)
                   VALUES (?, ?, ?, ?, ?, ?, NULL)",
@@ -204,7 +204,7 @@ impl Storage {
     /// report success twice for one already revoked.
     pub fn revoke_agent_credential(&self, id: &str, now: i64) -> Result<bool> {
         self.transaction(|store| {
-            let n = store.conn.execute(
+            let n = store.conn.execute_cached(
                 "UPDATE agent_credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
                 duckdb::params![now, id],
             )?;
@@ -222,7 +222,7 @@ impl Storage {
     pub fn agent_credential_revoked(&self, id: &str) -> Result<Option<bool>> {
         let revoked_at: Option<Option<i64>> = self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT revoked_at FROM agent_credentials WHERE id = ?",
                 duckdb::params![id],
                 |row| row.get(0),
@@ -240,7 +240,7 @@ impl Storage {
     /// agent that nobody deployed and that no pod corresponds to.
     pub fn list_agents(&self, now_millis: i64) -> Result<Vec<AgentRow>> {
         let window_start = now_millis - 86_400_000;
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT
                  agent_id,
                  max(ts_millis)                  AS last_seen,
@@ -290,7 +290,7 @@ impl Storage {
         self.transaction(|_| {
             let write = || -> Result<()> {
                 self.conn.execute_batch("DELETE FROM cluster_members")?;
-                let mut stmt = self.conn.prepare(
+                let mut stmt = self.conn.prepare_cached(
                     "INSERT INTO cluster_members (node_id, url, generation, last_seen, state)
                  VALUES (?, ?, ?, ?, ?)",
                 )?;
@@ -313,7 +313,7 @@ impl Storage {
     pub fn forget_peer_state(&self, urls: &[String]) -> Result<()> {
         let mut stmt = self
             .conn
-            .prepare("DELETE FROM raw_data_gaps WHERE peer = ?")?;
+            .prepare_cached("DELETE FROM raw_data_gaps WHERE peer = ?")?;
         for url in urls {
             stmt.execute(duckdb::params![url])?;
         }
@@ -322,9 +322,9 @@ impl Storage {
 
     /// Every persisted member, for rejoining the cluster on restart.
     pub fn list_cluster_members(&self) -> Result<Vec<crate::coordinator::cluster::Member>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT node_id, url, generation, last_seen, state FROM cluster_members")?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT node_id, url, generation, last_seen, state FROM cluster_members",
+        )?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(crate::coordinator::cluster::Member {
@@ -360,7 +360,7 @@ impl Storage {
     /// write is safe without a transaction because DuckDB is single-writer and
     /// the caller already holds the storage mutex.
     pub fn record_agent_poll(&self, row: &AgentPollRow) -> Result<()> {
-        let newer_stored: i64 = self.conn.query_row(
+        let newer_stored: i64 = self.conn.query_row_cached(
             "SELECT count(*) FROM agent_polls WHERE agent_id = ? AND polled_at >= ?",
             duckdb::params![row.agent_id, row.at],
             |r| r.get(0),
@@ -368,7 +368,7 @@ impl Storage {
         if newer_stored > 0 {
             return Ok(());
         }
-        self.conn.execute(
+        self.conn.execute_cached(
             "INSERT OR REPLACE INTO agent_polls
                  (agent_id, zone, region, polled_at, window_ms, rtt_ms, build, declared_kinds,
                   coordinator)
@@ -392,7 +392,7 @@ impl Storage {
     /// reads this table as well as the results, so a purge that left the row
     /// behind would put the agent straight back on the status page.
     pub fn delete_agent_poll(&self, agent_id: &str) -> Result<()> {
-        self.conn.execute(
+        self.conn.execute_cached(
             "DELETE FROM agent_polls WHERE agent_id = ?",
             duckdb::params![agent_id],
         )?;
@@ -402,7 +402,7 @@ impl Storage {
     /// Every agent's last-known poll, for the fleet health view and for
     /// replicating it to peers.
     pub fn list_agent_polls(&self) -> Result<Vec<AgentPollRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT agent_id, zone, region, polled_at, window_ms, rtt_ms, build, declared_kinds,
                     coordinator
              FROM agent_polls",

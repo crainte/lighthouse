@@ -612,6 +612,53 @@ HTTP-serving analog of
 which measures the same WAL-replay boundary directly against `Storage` with no
 `Coordinator` or router around it.
 
+### DuckDB 2.0 (duckdb-rs 1.20000)
+
+Moving from duckdb-rs 1.10506.1 to 1.20000.0 (DuckDB 2.0) regressed the per-row
+paths. Profiling with `perf` showed why. Per-statement compilation (parse, bind,
+plan and optimise) became about 2.8× dearer, while execution became about a quarter
+cheaper. The parser alone, now PEG-based, is ~6.6× slower. Lighthouse used
+to re-prepare every statement on every call, so the compile step dominated.
+Three changes recover it:
+
+- Static SQL goes through the connection's prepared-statement cache
+  (`storage::CachedSql`, capacity `STATEMENT_CACHE_CAPACITY`). Dynamic SQL is cached
+  only where its shapes are bounded (`history`, `recent_results`, `rollups_since`,
+  `visible_check_page` with bound `LIMIT`/`OFFSET`).
+- The startup state-history baseline is one statement
+  (`seed_state_history_baseline`) instead of two autocommitted statements per check.
+  That loop, not WAL replay, was nearly all of the startup-recovery benchmark's
+  reopen time, on 1.x too.
+- `verify_schema` reads each catalogue once rather than twice per table, and
+  builds its reference column set once per process.
+
+Release build, same 16-thread workstation, 2026-10-29, medians of three
+interleaved runs:
+
+| Benchmark | duckdb 1.10506.1 | 1.20000.0 unchanged | 1.20000.0 with the above |
+|---|---:|---:|---:|
+| Sustained ingest | 29,245 results/s | 28,408 results/s | 28,708 results/s |
+| Status page p50 / p99 | 18 / 24 ms | 23 / 27 ms | 16 / 20 ms |
+| 24h uptime strips p50 / p99 | 10 / 13 ms | 12 / 15 ms | 9 / 13 ms |
+| Single-check history p50 / p99 | 3 / 4 ms | 3 / 5 ms | 3 / 4 ms |
+| Latency-points p50 / p99 | 15 / 19 ms | 11 / 14 ms | 10 / 13 ms |
+| Anti-entropy catalogue / full | 54.2 / 85.0 s | 86.5 / 136.5 s | 57.6 / 91.6 s |
+| Retention prune | 65 ms | 65 ms | 66 ms |
+| Startup recovery reopen | 8.8 s | 13.4 s | 0.29 s |
+
+Seeding 10,000 checks through `apply_config_entries` (the setup inside each
+benchmark) costs ~48 s, ~72 s and ~51 s respectively. That per-check config
+apply is the remaining 2.0 cost, about +8% on anti-entropy.
+
+libduckdb-sys ≥ 1.20000 compiles the bundled engine with DuckDB's `DEBUG` (its
+`D_ASSERT` and verification paths) whenever its package has any debuginfo.
+`Cargo.toml` therefore sets `[profile.dev.package.libduckdb-sys] debug = false`, so
+`cargo test` exercises an `NDEBUG` engine as release does. Profile and benchmark
+with `CARGO_PROFILE_RELEASE_DEBUG=false` too: frame pointers, `perf record
+--call-graph fp` and `perf report --no-inline` give usable stacks. Even
+`line-tables-only` turns the engine into a debug build and makes every
+measurement several times slower.
+
 The remaining measured stall is the config plane, not the data plane: applying a bulk
 config push still costs one upsert per entry and holds the worker for up to ~4.6 s per
 batch while provisioning 10,000 checks, and a peer's full `config_entries` read costs

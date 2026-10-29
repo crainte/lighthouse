@@ -59,5 +59,12 @@ lettre = { version = "0.11.23", default-features = false, features = ["tokio1", 
 uuid = { version = "1", features = ["v7", "v5", "serde"] }
 futures-util = "0.3"
 
+# libduckdb-sys >= 1.20000 compiles bundled DuckDB with DEBUG (D_ASSERT and its
+# debug-only verification paths) whenever this package has any debuginfo, so
+# every dev-profile `cargo test` would exercise a several-times-slower engine
+# than production. Release (no debuginfo) is unaffected; keep the two alike.
+[profile.dev.package.libduckdb-sys]
+debug = false
+
 [dev-dependencies]
 tokio-tungstenite = "0.30"

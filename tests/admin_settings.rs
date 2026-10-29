@@ -267,11 +267,16 @@ async fn a_hanging_notification_endpoint_cannot_stall_ingest() {
     let sink_addr = listener.local_addr().unwrap();
     listener.set_nonblocking(true).unwrap();
     let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+    let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
     // Accepts the connection, then never answers: the realistic failure, and
     // worse than a refusal because it consumes the full client timeout.
     tokio::spawn(async move {
         let mut held = Vec::new();
+        let mut connected_tx = Some(connected_tx);
         while let Ok((s, _)) = listener.accept().await {
+            if let Some(tx) = connected_tx.take() {
+                let _ = tx.send(());
+            }
             held.push(s);
         }
     });
@@ -324,13 +329,23 @@ async fn a_hanging_notification_endpoint_cannot_stall_ingest() {
     // This one transitions UP -> DOWN, so it fires a notification.
     let started = std::time::Instant::now();
     coord.ingest(vec![result(500, 2_000)]).await;
-    let blocked = started.elapsed();
+    let ingest_time = started.elapsed();
 
+    // This tests decoupling, not database latency: persistence time varies by
+    // engine and runner. A synchronous webhook would hang for the 10s dispatch
+    // timeout, whereas the outbox-backed ingest must return sooner.
     assert!(
-        blocked < std::time::Duration::from_secs(2),
-        "ingest waited {blocked:?} on an unresponsive notification endpoint; \
+        ingest_time < std::time::Duration::from_secs(5),
+        "ingest waited {ingest_time:?} on an unresponsive notification endpoint; \
          at 20 agents that backpressures the whole fleet"
     );
+
+    // Prove the worker attempted delivery; otherwise a skipped notifier could
+    // make the ingest assertion pass without exercising the hanging endpoint.
+    tokio::time::timeout(std::time::Duration::from_secs(5), connected_rx)
+        .await
+        .expect("the notification worker did not connect to the hanging endpoint")
+        .expect("the notification sink exited before accepting a connection");
 
     // Decoupling must not lose the alert: it is still recorded for the UI.
     let mine: Vec<_> = coord

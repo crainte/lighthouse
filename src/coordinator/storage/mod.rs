@@ -14,6 +14,41 @@ use duckdb::{Connection, OptionalExt, Statement};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Prepared statements this connection keeps compiled. DuckDB 2.0 made
+/// parse/bind/plan/optimise several times dearer while execution got cheaper,
+/// so for the short per-row and per-request statements that dominate here the
+/// compile step is most of the cost. Sized above the number of distinct static
+/// statements `CachedSql` callers use, so the LRU never evicts a hot one.
+const STATEMENT_CACHE_CAPACITY: usize = 512;
+
+/// `Connection::execute`/`query_row` that reuse a compiled statement from the
+/// connection's cache instead of re-preparing `sql` on every call. Only for
+/// static SQL: dynamic (`format!`-built) text would churn the cache. Same
+/// signatures and error type as the uncached methods, so call sites keep
+/// their `?` and `.optional()` handling unchanged.
+pub(crate) trait CachedSql {
+    fn execute_cached<P: duckdb::Params>(&self, sql: &str, params: P) -> duckdb::Result<usize>;
+
+    fn query_row_cached<T, P, F>(&self, sql: &str, params: P, f: F) -> duckdb::Result<T>
+    where
+        P: duckdb::Params,
+        F: FnOnce(&duckdb::Row<'_>) -> duckdb::Result<T>;
+}
+
+impl CachedSql for Connection {
+    fn execute_cached<P: duckdb::Params>(&self, sql: &str, params: P) -> duckdb::Result<usize> {
+        self.prepare_cached(sql)?.execute(params)
+    }
+
+    fn query_row_cached<T, P, F>(&self, sql: &str, params: P, f: F) -> duckdb::Result<T>
+    where
+        P: duckdb::Params,
+        F: FnOnce(&duckdb::Row<'_>) -> duckdb::Result<T>,
+    {
+        self.prepare_cached(sql)?.query_row(params, f)
+    }
+}
+
 const MILLIS_PER_MINUTE: i64 = 60_000;
 
 const MILLIS_PER_HOUR: i64 = 60 * MILLIS_PER_MINUTE;
@@ -270,6 +305,7 @@ impl Storage {
         } else {
             Connection::open(path)?
         };
+        conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
         conn.execute_batch(SCHEMA_DDL)?;
         if path != ":memory:" {
             verify_schema(&conn)?;
@@ -313,7 +349,7 @@ impl Storage {
             limits.memory_limit.replace('\'', ""),
             limits.threads
         ))?;
-        Ok(self.conn.query_row(
+        Ok(self.conn.query_row_cached(
             "SELECT current_setting('memory_limit'), current_setting('threads')::UINTEGER",
             [],
             |row| {
@@ -345,7 +381,7 @@ impl Storage {
     }
 
     fn stream_digest(&self, stream: &str) -> Result<StreamDigest> {
-        self.conn.query_row(
+        self.conn.query_row_cached(
             "SELECT max_millis, max_id, item_count FROM replication_stream_watermarks WHERE stream = ?",
             duckdb::params![stream],
             |row| Ok(StreamDigest { max_millis: row.get(0)?, max_id: row.get(1)?, count: row.get(2)? }),
@@ -397,7 +433,7 @@ impl Storage {
     /// IDs are persisted and replicated as written, so replication retains the
     /// exact event identity rather than generating another one.
     fn record_stream_item(&self, stream: &str, millis: i64, id: &str, delta: i64) -> Result<()> {
-        self.conn.execute(
+        self.conn.execute_cached(
             "INSERT INTO replication_stream_watermarks (stream, max_millis, max_id, item_count)
              VALUES (?, ?, ?, ?)
              ON CONFLICT (stream) DO UPDATE SET
@@ -460,31 +496,31 @@ impl Storage {
         let results_before = now_millis - (results_days as i64) * 86_400_000;
         let alerts_before = now_millis - (alerts_days as i64) * 86_400_000;
         let mut removed = 0u64;
-        removed += self.conn.execute(
+        removed += self.conn.execute_cached(
             "DELETE FROM alerts WHERE ts_millis < ?",
             duckdb::params![alerts_before],
         )? as u64;
         // Closed incidents take their narrative and their affects rows with
         // them: DuckDB has no ON DELETE CASCADE, so leaving these behind would
         // accumulate updates pointing at incidents that no longer exist.
-        removed += self.conn.execute(
+        removed += self.conn.execute_cached(
             "DELETE FROM incident_updates WHERE incident_id IN
                  (SELECT id FROM incidents WHERE state = 'resolved' AND resolved_at < ?)",
             duckdb::params![alerts_before],
         )? as u64;
-        removed += self.conn.execute(
+        removed += self.conn.execute_cached(
             "DELETE FROM incident_checks WHERE incident_id IN
                  (SELECT id FROM incidents WHERE state = 'resolved' AND resolved_at < ?)",
             duckdb::params![alerts_before],
         )? as u64;
-        removed += self.conn.execute(
+        removed += self.conn.execute_cached(
             "DELETE FROM incidents WHERE state = 'resolved' AND resolved_at < ?",
             duckdb::params![alerts_before],
         )? as u64;
         // Given-up notifications are history of the same kind as an alert, so
         // they age out on the same window. Rows still waiting are current work
         // and are never pruned — dropping one silently un-pages an outage.
-        removed += self.conn.execute(
+        removed += self.conn.execute_cached(
             "DELETE FROM notification_queue
              WHERE next_attempt IS NULL AND queued_at < ?",
             duckdb::params![alerts_before],
@@ -501,7 +537,7 @@ impl Storage {
         // spread over 10,000 checks or concentrated in 100 flapping ones. This
         // form is kept for saying what it means, not for the 10%. See
         // `benchmark_state_history_prune`.
-        removed += self.conn.execute(
+        removed += self.conn.execute_cached(
             "DELETE FROM state_history
              WHERE since < ?
                AND NOT EXISTS (
@@ -521,7 +557,7 @@ impl Storage {
         // snapshot restore, an extended catch-up store) or the peer that
         // reported it is gone; either way it stops being operationally
         // useful to keep past the horizon everything else here ages out on.
-        removed += self.conn.execute(
+        removed += self.conn.execute_cached(
             "DELETE FROM raw_data_gaps WHERE observed_at < ?",
             duckdb::params![alerts_before],
         )? as u64;
@@ -545,9 +581,9 @@ impl Storage {
     /// is empty. Idempotent: a no-op when check_results already has rows.
     /// Returns true if seeding occurred.
     pub fn seed_mock(&self, now_millis: i64) -> Result<bool> {
-        let count: i64 = self
-            .conn
-            .query_row("SELECT count(*) FROM check_results", [], |r| r.get(0))?;
+        let count: i64 =
+            self.conn
+                .query_row_cached("SELECT count(*) FROM check_results", [], |r| r.get(0))?;
         if count > 0 {
             return Ok(false);
         }

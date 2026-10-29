@@ -135,19 +135,24 @@ impl Storage {
             "FROM checks c LEFT JOIN sections s ON s.name = c.group_name
              WHERE c.visible AND (c.latency_graph OR NOT {latency_graph_only}) AND {scope_sql}"
         );
-        let params: Vec<&dyn duckdb::ToSql> = section.iter().map(|s| s as _).collect();
-        let total: i64 = self.conn.query_row(
+        // Six shapes (scope x latency_graph_only), with paging bound rather
+        // than inlined, so both statements stay in the connection's cache.
+        let mut params: Vec<&dyn duckdb::ToSql> = section.iter().map(|s| s as _).collect();
+        let total: i64 = self.conn.query_row_cached(
             &format!("SELECT COUNT(*) {from}"),
             params.as_slice(),
             |row| row.get(0),
         )?;
         let limit = limit.min(i64::MAX as usize);
-        let offset = page.saturating_mul(limit).min(i64::MAX as usize);
+        let offset = i64::try_from(page.saturating_mul(limit)).unwrap_or(i64::MAX);
+        let limit = limit as i64;
+        params.push(&limit);
+        params.push(&offset);
         let ids = self
             .conn
-            .prepare(&format!(
+            .prepare_cached(&format!(
                 "SELECT c.id {from} ORDER BY COALESCE(c.position, 0), c.name, c.id
-                 LIMIT {limit} OFFSET {offset}"
+                 LIMIT ? OFFSET ?"
             ))?
             .query_map(params.as_slice(), |row| row.get::<_, CheckId>(0))?
             .collect::<std::result::Result<_, _>>()?;
@@ -173,7 +178,7 @@ impl Storage {
         self.stage_check_ids(checks)?;
         let mut spans_by_check = BTreeMap::<CheckId, Vec<StateSpan>>::new();
         {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = self.conn.prepare_cached(
                 "SELECT h.check_id, h.state, h.since
                  FROM state_history h SEMI JOIN status_check_ids i ON i.check_id = h.check_id
                  WHERE h.since >= ?
@@ -198,7 +203,7 @@ impl Storage {
                 spans_by_check.entry(check_id).or_default().push(span);
             }
         }
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT i.check_id, i.degraded_is_downtime, cs.status, latest.status,
                     latest.latency_ms, latest.ts_millis, latest.status_code,
                     latest.error, latest.failure
@@ -245,7 +250,7 @@ impl Storage {
     /// build per check.
     pub fn section_states(&self) -> Result<BTreeMap<String, SectionStates>> {
         let mut sections = BTreeMap::<String, SectionStates>::new();
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT c.group_name, COALESCE(cs.status, latest.status) AS state, COUNT(*),
                     CASE WHEN COALESCE(cs.status, latest.status) IS NULL
                          THEN string_agg(c.id::VARCHAR, ',') END
@@ -294,7 +299,7 @@ impl Storage {
             .collect();
         let ids: Vec<(CheckId, bool)> = self
             .conn
-            .prepare("SELECT check_id FROM latest_check_results ORDER BY check_id")?
+            .prepare_cached("SELECT check_id FROM latest_check_results ORDER BY check_id")?
             .query_map([], |row| row.get::<_, CheckId>(0))?
             .map(|id| id.map(|id| (id, degraded.contains(&id))))
             .collect::<std::result::Result<_, _>>()?;
