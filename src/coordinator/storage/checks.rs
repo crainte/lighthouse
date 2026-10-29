@@ -136,7 +136,7 @@ impl Storage {
     /// Every configured check, by name. Includes disabled ones: the admin UI has
     /// to show them to re-enable them.
     pub fn list_checks(&self) -> Result<Vec<CheckConfig>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT config FROM checks WHERE config IS NOT NULL ORDER BY position, name",
         )?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -159,7 +159,9 @@ impl Storage {
     /// `list_checks()`'s per-document scan, and stays cheap however many
     /// checks are held.
     pub fn check_ids(&self) -> Result<Vec<CheckId>> {
-        let mut stmt = self.conn.prepare("SELECT id FROM checks ORDER BY id")?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT id FROM checks ORDER BY id")?;
         let rows = stmt.query_map([], |r| r.get::<_, CheckId>(0))?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
@@ -170,7 +172,7 @@ impl Storage {
     /// find what to push and what to unplace. See `check_placement_regions`'s
     /// table comment for the "no rows means every region" rule this mirrors.
     pub fn check_ids_for_region(&self, region: &str) -> Result<Vec<CheckId>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT c.id FROM checks c
              WHERE NOT EXISTS (
                        SELECT 1 FROM check_placement_regions r WHERE r.check_id = c.id
@@ -199,7 +201,7 @@ impl Storage {
     }
 
     pub(super) fn upsert_check_uncommitted(&self, c: &CheckConfig, now_millis: i64) -> Result<()> {
-        self.conn.execute(
+        self.conn.execute_cached(
             "INSERT INTO checks
                 (id, name, kind, target, interval_secs, timeout_secs, group_name,
                  latency_graph, enabled, expect_status, expect_body_contains,
@@ -255,17 +257,17 @@ impl Storage {
         let wanted: BTreeSet<&str> = regions.iter().map(String::as_str).collect();
         let existing: BTreeSet<String> = self
             .conn
-            .prepare("SELECT region FROM check_placement_regions WHERE check_id = ?")?
+            .prepare_cached("SELECT region FROM check_placement_regions WHERE check_id = ?")?
             .query_map(duckdb::params![check_id], |row| row.get(0))?
             .collect::<std::result::Result<_, _>>()?;
         for stale in existing.iter().filter(|r| !wanted.contains(r.as_str())) {
-            self.conn.execute(
+            self.conn.execute_cached(
                 "DELETE FROM check_placement_regions WHERE check_id = ? AND region = ?",
                 duckdb::params![check_id, stale],
             )?;
         }
         for added in wanted.into_iter().filter(|r| !existing.contains(*r)) {
-            self.conn.execute(
+            self.conn.execute_cached(
                 "INSERT INTO check_placement_regions (check_id, region) VALUES (?, ?)",
                 duckdb::params![check_id, added],
             )?;
@@ -276,7 +278,7 @@ impl Storage {
     /// Position a new check after everything else, so creating one never
     /// silently reshuffles the status page.
     pub fn next_check_position(&self) -> Result<i32> {
-        Ok(self.conn.query_row(
+        Ok(self.conn.query_row_cached(
             "SELECT COALESCE(MAX(position), -1) + 1 FROM checks",
             [],
             |r| r.get(0),
@@ -318,19 +320,19 @@ impl Storage {
     /// Returns how many result rows went, so the UI can say what it did.
     pub fn purge_check_data(&self, check_id: CheckId) -> Result<u64> {
         self.transaction(|store| {
-            let rows = store.conn.execute(
+            let rows = store.conn.execute_cached(
                 "DELETE FROM check_results WHERE check_id = ?",
                 duckdb::params![check_id],
             )?;
-            store.conn.execute(
+            store.conn.execute_cached(
                 "DELETE FROM result_replication_watermarks WHERE check_id = ?",
                 duckdb::params![check_id],
             )?;
-            store.conn.execute(
+            store.conn.execute_cached(
                 "DELETE FROM latest_check_results WHERE check_id = ?",
                 duckdb::params![check_id],
             )?;
-            store.conn.execute(
+            store.conn.execute_cached(
                 "DELETE FROM alerts WHERE node_id = ?",
                 duckdb::params![check_id.to_string()],
             )?;
@@ -346,19 +348,19 @@ impl Storage {
         self.transaction(|store| {
             let removed = store
                 .conn
-                .execute("DELETE FROM checks WHERE id = ?", duckdb::params![check_id])?;
+                .execute_cached("DELETE FROM checks WHERE id = ?", duckdb::params![check_id])?;
             if removed == 0 {
                 return Ok(false);
             }
-            store.conn.execute(
+            store.conn.execute_cached(
                 "DELETE FROM current_state WHERE check_id = ?",
                 duckdb::params![check_id],
             )?;
-            store.conn.execute(
+            store.conn.execute_cached(
                 "DELETE FROM agent_check_state WHERE check_id = ?",
                 duckdb::params![check_id],
             )?;
-            store.conn.execute(
+            store.conn.execute_cached(
                 "DELETE FROM check_placement_regions WHERE check_id = ?",
                 duckdb::params![check_id],
             )?;
@@ -373,8 +375,8 @@ impl Storage {
         self.transaction(|store| {
             let n = store
                 .conn
-                .execute("DELETE FROM checks WHERE id = ?", duckdb::params![check_id])?;
-            store.conn.execute(
+                .execute_cached("DELETE FROM checks WHERE id = ?", duckdb::params![check_id])?;
+            store.conn.execute_cached(
                 "DELETE FROM check_placement_regions WHERE check_id = ?",
                 duckdb::params![check_id],
             )?;
@@ -387,7 +389,7 @@ impl Storage {
 
     /// Sections in display order.
     pub fn list_sections(&self) -> Result<Vec<Section>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT name, position, collapsed, display FROM sections ORDER BY position, name",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -412,7 +414,7 @@ impl Storage {
         display: SectionDisplay,
     ) -> Result<bool> {
         self.transaction(|store| {
-            let exists: i64 = store.conn.query_row(
+            let exists: i64 = store.conn.query_row_cached(
                 "SELECT COUNT(*) FROM sections WHERE name = ?",
                 duckdb::params![name],
                 |r| r.get(0),
@@ -420,12 +422,12 @@ impl Storage {
             if exists > 0 {
                 return Ok(false);
             }
-            let next: i32 = store.conn.query_row(
+            let next: i32 = store.conn.query_row_cached(
                 "SELECT COALESCE(MAX(position), -1) + 1 FROM sections",
                 [],
                 |r| r.get(0),
             )?;
-            store.conn.execute(
+            store.conn.execute_cached(
                 "INSERT INTO sections (name, position, collapsed, display) VALUES (?, ?, ?, ?)",
                 duckdb::params![name, next, collapsed, display.as_str()],
             )?;
@@ -438,7 +440,7 @@ impl Storage {
     /// every check in the section would silently become loose.
     pub fn rename_section(&self, from: &str, to: &str, now_millis: i64) -> Result<bool> {
         self.transaction(|store| {
-            let n = store.conn.execute(
+            let n = store.conn.execute_cached(
                 "UPDATE sections SET name = ? WHERE name = ?",
                 duckdb::params![to, from],
             )?;
@@ -463,7 +465,7 @@ impl Storage {
     /// Set whether a section starts collapsed on the public page.
     pub fn set_section_collapsed(&self, name: &str, collapsed: bool) -> Result<bool> {
         self.transaction(|store| {
-            let n = store.conn.execute(
+            let n = store.conn.execute_cached(
                 "UPDATE sections SET collapsed = ? WHERE name = ?",
                 duckdb::params![collapsed, name],
             )?;
@@ -477,7 +479,7 @@ impl Storage {
     /// Set whether the public page renders a section inline or as its own page.
     pub fn set_section_display(&self, name: &str, display: SectionDisplay) -> Result<bool> {
         self.transaction(|store| {
-            let n = store.conn.execute(
+            let n = store.conn.execute_cached(
                 "UPDATE sections SET display = ? WHERE name = ?",
                 duckdb::params![display.as_str(), name],
             )?;
@@ -494,7 +496,7 @@ impl Storage {
         self.transaction(|store| {
             let n = store
                 .conn
-                .execute("DELETE FROM sections WHERE name = ?", duckdb::params![name])?;
+                .execute_cached("DELETE FROM sections WHERE name = ?", duckdb::params![name])?;
             if n == 0 {
                 return Ok(false);
             }
@@ -517,7 +519,7 @@ impl Storage {
                 order.iter().map(String::as_str).collect();
             let mut position = 0i32;
             for name in order {
-                let changed = store.conn.execute(
+                let changed = store.conn.execute_cached(
                     "UPDATE sections SET position = ? WHERE name = ? AND position <> ?",
                     duckdb::params![position, name, position],
                 )?;
@@ -533,7 +535,7 @@ impl Storage {
                 .filter(|name| !listed.contains(name.as_str()))
                 .collect();
             for name in remaining {
-                let changed = store.conn.execute(
+                let changed = store.conn.execute_cached(
                     "UPDATE sections SET position = ? WHERE name = ? AND position <> ?",
                     duckdb::params![position, name, position],
                 )?;
@@ -549,7 +551,7 @@ impl Storage {
     /// Adopt the section names already present on checks, so a deployment that
     /// predates the sections table doesn't start with an empty list.
     pub fn seed_sections_from_checks(&self) -> Result<()> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT DISTINCT group_name FROM checks
              WHERE group_name IS NOT NULL
                AND group_name NOT IN (SELECT name FROM sections)
@@ -569,7 +571,7 @@ impl Storage {
     /// Every stored policy. Nodes without a row use their level's default, so
     /// this is usually short and is cached by the caller.
     pub fn list_rollup_policies(&self) -> Result<Vec<RollupPolicyRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT node_id, node_type, degraded_when, down_when, config, updated_at, updated_by
              FROM rollup_policy ORDER BY node_id",
         )?;
@@ -639,7 +641,7 @@ impl Storage {
         } else {
             Some(serde_json::Value::Object(config).to_string())
         };
-        self.conn.execute(
+        self.conn.execute_cached(
             "INSERT INTO rollup_policy
                  (node_id, node_type, degraded_when, down_when, config, updated_at, updated_by)
               VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -663,7 +665,7 @@ impl Storage {
     /// Drop a node's policy, returning it to its level's default.
     pub fn delete_rollup_policy(&self, node_id: &str) -> Result<bool> {
         self.transaction(|store| {
-            let n = store.conn.execute(
+            let n = store.conn.execute_cached(
                 "DELETE FROM rollup_policy WHERE node_id = ?",
                 duckdb::params![node_id],
             )?;
@@ -692,7 +694,7 @@ impl Storage {
         let owned: Vec<String> = {
             let mut stmt = self
                 .conn
-                .prepare("SELECT id FROM incidents WHERE origin_check = ?")?;
+                .prepare_cached("SELECT id FROM incidents WHERE origin_check = ?")?;
             stmt.query_map(duckdb::params![check_id], |r| r.get::<_, String>(0))?
                 .collect::<std::result::Result<_, _>>()?
         };
@@ -708,7 +710,7 @@ impl Storage {
         let memberships: Vec<String> = {
             let mut stmt = self
                 .conn
-                .prepare("SELECT incident_id FROM incident_checks WHERE check_id = ?")?;
+                .prepare_cached("SELECT incident_id FROM incident_checks WHERE check_id = ?")?;
             stmt.query_map(duckdb::params![check_id], |r| r.get(0))?
                 .collect::<std::result::Result<_, _>>()?
         };

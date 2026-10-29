@@ -142,16 +142,16 @@ impl Storage {
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT value FROM settings WHERE key = ?")?;
+            .prepare_cached("SELECT value FROM settings WHERE key = ?")?;
         let mut rows = stmt.query_map(duckdb::params![key], |r| r.get::<_, String>(0))?;
         Ok(rows.next().transpose()?)
     }
 
     /// Every setting whose key starts with `prefix`, as `(key, value)`.
     pub fn settings_with_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT key, value FROM settings WHERE starts_with(key, ?) ORDER BY key")?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT key, value FROM settings WHERE starts_with(key, ?) ORDER BY key",
+        )?;
         let rows = stmt
             .query_map(duckdb::params![prefix], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<std::result::Result<_, _>>()?;
@@ -160,7 +160,7 @@ impl Storage {
 
     pub fn put_setting(&self, key: &str, value: &str) -> Result<()> {
         self.transaction(|store| {
-            store.conn.execute(
+            store.conn.execute_cached(
                 "INSERT INTO settings (key, value) VALUES (?, ?)
                  ON CONFLICT (key) DO UPDATE SET
                      value = excluded.value, updated_at = NULL, updated_by = NULL",
@@ -225,7 +225,7 @@ impl Storage {
         )?;
         let mut stage = self
             .conn
-            .prepare("INSERT OR IGNORE INTO config_watermark_touched VALUES (?, ?)")?;
+            .prepare_cached("INSERT OR IGNORE INTO config_watermark_touched VALUES (?, ?)")?;
         for (kind, id) in touched {
             stage.execute(duckdb::params![kind.as_str(), id])?;
         }
@@ -256,7 +256,7 @@ impl Storage {
         )?;
         let affected = self
             .conn
-            .prepare("SELECT kind, scope_kind, scope_region FROM config_watermark_affected")?
+            .prepare_cached("SELECT kind, scope_kind, scope_region FROM config_watermark_affected")?
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -266,7 +266,7 @@ impl Storage {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         for (kind, scope_kind, scope_region) in affected {
-            let previous: (i64, i64, String) = self.conn.query_row(
+            let previous: (i64, i64, String) = self.conn.query_row_cached(
                 "SELECT COUNT(*), COALESCE(MAX(millis), 0),
                         COALESCE(MAX_BY(node, (millis, node)), '')
                  FROM config_watermark_previous
@@ -274,7 +274,7 @@ impl Storage {
                 duckdb::params![kind, scope_kind, scope_region],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
-            let replacement: (i64, i64, String) = self.conn.query_row(
+            let replacement: (i64, i64, String) = self.conn.query_row_cached(
                 "SELECT COUNT(*), COALESCE(MAX(e.millis), 0),
                         COALESCE(MAX_BY(e.node, (e.millis, e.node)), '')
                  FROM config_watermark_entries e
@@ -285,7 +285,7 @@ impl Storage {
             )?;
             let watermark: Option<(i64, i64, String)> = self
                 .conn
-                .query_row(
+                .query_row_cached(
                     "SELECT count, max_millis, max_node FROM config_watermarks
                  WHERE kind = ? AND scope_kind = ? AND scope_region = ?",
                     duckdb::params![kind, scope_kind, scope_region],
@@ -295,7 +295,7 @@ impl Storage {
             let count =
                 watermark.as_ref().map_or(0, |watermark| watermark.0) - previous.0 + replacement.0;
             if count == 0 {
-                self.conn.execute(
+                self.conn.execute_cached(
                     "DELETE FROM config_watermarks WHERE kind = ? AND scope_kind = ? AND scope_region = ?",
                     duckdb::params![kind, scope_kind, scope_region],
                 )?;
@@ -310,7 +310,7 @@ impl Storage {
             });
             let old_max_survives = if previous_removed_max && !replacement_reaches_old_max {
                 if let Some((millis, node)) = old_max.as_ref() {
-                    self.conn.query_row(
+                    self.conn.query_row_cached(
                         "SELECT EXISTS(
                              SELECT 1 FROM config_watermark_entries
                              WHERE kind = ? AND scope_kind = ? AND scope_region = ?
@@ -327,7 +327,7 @@ impl Storage {
             };
             let (max_millis, max_node) =
                 if previous_removed_max && !replacement_reaches_old_max && !old_max_survives {
-                    self.conn.query_row(
+                    self.conn.query_row_cached(
                         "SELECT MAX(millis), MAX_BY(node, (millis, node))
                      FROM config_watermark_entries
                      WHERE kind = ? AND scope_kind = ? AND scope_region = ?",
@@ -341,7 +341,7 @@ impl Storage {
                         .max()
                         .unwrap()
                 };
-            self.conn.execute(
+            self.conn.execute_cached(
                 "INSERT INTO config_watermarks VALUES (?, ?, ?, ?, ?, ?)
                  ON CONFLICT (kind, scope_kind, scope_region) DO UPDATE SET
                      count = excluded.count, max_millis = excluded.max_millis, max_node = excluded.max_node",
@@ -418,7 +418,7 @@ impl Storage {
     /// missing an edit — the digest must not be able to look "caught up" while
     /// still missing a tombstone.
     pub(super) fn config_digest_for(&self, kind: ConfigKind) -> Result<ConfigDigest> {
-        Ok(self.conn.query_row(
+        Ok(self.conn.query_row_cached(
             "SELECT count, max_millis, max_node FROM config_watermarks WHERE kind = ? AND scope_kind = 0 AND scope_region = ''",
             duckdb::params![kind.as_str()],
             |row| {
@@ -451,7 +451,7 @@ impl Storage {
     pub fn config_digest_for_region(&self, region: &str) -> Result<ConfigDigest> {
         let mut count = 0;
         let mut max_hlc = None;
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT count, max_millis, max_node FROM config_watermarks
               WHERE kind = 'check' AND ((scope_kind = 1 AND scope_region = '') OR scope_kind = 3 OR (scope_kind = 2 AND scope_region = ?))",
         )?;
@@ -595,7 +595,7 @@ impl Storage {
                     );
                 }
                 self.upsert_check_uncommitted(&config, hlc.millis)?;
-                self.conn.execute(
+                self.conn.execute_cached(
                     "UPDATE checks SET updated_by = ? WHERE id = ?",
                     duckdb::params![hlc.node_id, id],
                 )?;
@@ -603,7 +603,7 @@ impl Storage {
             ConfigKind::Section => {
                 let s: Section = serde_json::from_str(doc)
                     .map_err(|e| anyhow::anyhow!("malformed section document for {id}: {e}"))?;
-                self.conn.execute(
+                self.conn.execute_cached(
                     "INSERT INTO sections (name, position, collapsed, display, updated_at, updated_by)
                      VALUES (?, ?, ?, ?, ?, ?)
                      ON CONFLICT (name) DO UPDATE SET
@@ -623,7 +623,7 @@ impl Storage {
             ConfigKind::Setting => {
                 let value: String = serde_json::from_str(doc)
                     .map_err(|e| anyhow::anyhow!("malformed setting document for {id}: {e}"))?;
-                self.conn.execute(
+                self.conn.execute_cached(
                     "INSERT INTO settings (key, value, updated_at, updated_by)
                      VALUES (?, ?, ?, ?)
                      ON CONFLICT (key) DO UPDATE SET
@@ -635,7 +635,7 @@ impl Storage {
             ConfigKind::Credential => {
                 let c: CredentialDoc = serde_json::from_str(doc)
                     .map_err(|e| anyhow::anyhow!("malformed credential document for {id}: {e}"))?;
-                self.conn.execute(
+                self.conn.execute_cached(
                     "INSERT INTO agent_credentials
                          (id, zone, region, secret_hash, salt, created_at, revoked_at,
                           updated_at, updated_by)
@@ -695,8 +695,8 @@ impl Storage {
                 let mut deletes = self.prepare_config_delete_statements()?;
                 let mut tombstone_deletes = self
                     .conn
-                    .prepare("DELETE FROM config_tombstones WHERE kind = ? AND id = ?")?;
-                let mut tombstone_inserts = self.conn.prepare(
+                    .prepare_cached("DELETE FROM config_tombstones WHERE kind = ? AND id = ?")?;
+                let mut tombstone_inserts = self.conn.prepare_cached(
                     "INSERT INTO config_tombstones (kind, id, deleted_at, node_id)
                  VALUES (?, ?, ?, ?)
                  ON CONFLICT (kind, id) DO UPDATE SET
@@ -764,7 +764,7 @@ impl Storage {
                 // Bypasses `delete_check`, which does this too, because a
                 // replicated tombstone applies straight through the prepared
                 // per-kind statement above rather than that helper.
-                self.conn.execute(
+                self.conn.execute_cached(
                     "DELETE FROM check_placement_regions WHERE check_id = ?",
                     duckdb::params![check_id],
                 )?;
@@ -806,9 +806,9 @@ impl Storage {
                 let Ok(id) = id.parse::<CheckId>() else {
                     return Ok(None);
                 };
-                let mut stmt = self
-                    .conn
-                    .prepare("SELECT config, updated_at, updated_by FROM checks WHERE id = ?")?;
+                let mut stmt = self.conn.prepare_cached(
+                    "SELECT config, updated_at, updated_by FROM checks WHERE id = ?",
+                )?;
                 let mut rows = stmt.query_map(duckdb::params![id], |r| {
                     Ok((
                         r.get::<_, Option<String>>(0)?,
@@ -821,7 +821,7 @@ impl Storage {
                     .and_then(|(doc, at, by)| doc.map(|doc| (doc, at, by)))
             }
             ConfigKind::Section => {
-                let mut stmt = self.conn.prepare(
+                let mut stmt = self.conn.prepare_cached(
                     "SELECT name, position, collapsed, display, updated_at, updated_by
                      FROM sections WHERE name = ?",
                 )?;
@@ -847,9 +847,9 @@ impl Storage {
                 }
             }
             ConfigKind::Setting => {
-                let mut stmt = self
-                    .conn
-                    .prepare("SELECT value, updated_at, updated_by FROM settings WHERE key = ?")?;
+                let mut stmt = self.conn.prepare_cached(
+                    "SELECT value, updated_at, updated_by FROM settings WHERE key = ?",
+                )?;
                 let mut rows = stmt.query_map(duckdb::params![id], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -863,7 +863,7 @@ impl Storage {
                 }
             }
             ConfigKind::Credential => {
-                let mut stmt = self.conn.prepare(
+                let mut stmt = self.conn.prepare_cached(
                     "SELECT id, zone, region, secret_hash, salt, created_at, revoked_at,
                             updated_at, updated_by
                      FROM agent_credentials WHERE id = ?",
@@ -890,7 +890,7 @@ impl Storage {
                 }
             }
             ConfigKind::RollupPolicy => {
-                let mut stmt = self.conn.prepare(
+                let mut stmt = self.conn.prepare_cached(
                     "SELECT node_id, node_type, degraded_when, down_when, config,
                             updated_at, updated_by
                      FROM rollup_policy WHERE node_id = ?",
@@ -1005,7 +1005,7 @@ impl Storage {
     pub fn config_tombstone(&self, kind: ConfigKind, id: &str) -> Result<Option<ConfigEntry>> {
         Ok(self
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT deleted_at, node_id FROM config_tombstones WHERE kind = ? AND id = ?",
                 duckdb::params![kind.as_str(), id],
                 |r| {
@@ -1040,9 +1040,9 @@ impl Storage {
                 out.push(e);
             }
         }
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, deleted_at, node_id FROM config_tombstones WHERE kind = ?")?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, deleted_at, node_id FROM config_tombstones WHERE kind = ?",
+        )?;
         let tombstones = stmt
             .query_map(duckdb::params![kind.as_str()], |r| {
                 Ok(ConfigEntry {
@@ -1098,7 +1098,7 @@ impl Storage {
     pub(super) fn prune_tombstones_uncommitted(&self, before_millis: i64) -> Result<usize> {
         let removed = self
             .conn
-            .prepare("SELECT kind, id FROM config_tombstones WHERE deleted_at < ?")?
+            .prepare_cached("SELECT kind, id FROM config_tombstones WHERE deleted_at < ?")?
             .query_map(duckdb::params![before_millis], |row| {
                 Ok((
                     ConfigKind::from_db(&row.get::<_, String>(0)?).unwrap(),
@@ -1106,7 +1106,7 @@ impl Storage {
                 ))
             })?
             .collect::<std::result::Result<Vec<(ConfigKind, String)>, _>>()?;
-        let n = self.conn.execute(
+        let n = self.conn.execute_cached(
             "DELETE FROM config_tombstones WHERE deleted_at < ?",
             duckdb::params![before_millis],
         )?;
