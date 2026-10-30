@@ -368,6 +368,32 @@ window forward; global-tier config re-replicates the same way regional
 peers do. Do not delete the moved-aside file until the rebuilt node has
 caught up.
 
+**The one sanctioned on-open rebuild: keyless rollup tables.** The two latency
+rollup tables used to declare `PRIMARY KEY (check_id, agent_id, bucket_start)`.
+DuckDB backs that with an ART index, which was ~80% of the database file on
+DuckDB 1.5 and ~68% larger again on 2.0. It also slowed every merge. Writers
+now merge by that key with set-based `UPDATE ... FROM` plus an anti-join
+`INSERT`, so the key is no longer declared. DuckDB 2.0's `MERGE INTO` was
+measured faster but intermittently aborted at process teardown in CI.
+DuckDB cannot drop a constraint in place, so `Storage::open` rebuilds each
+still-keyed rollup table once (`schema::drop_rollup_primary_keys`).
+
+This is allowed, unlike the identity migrations above, because it is
+physical only. Every row is copied unchanged, ids are untouched, and a
+rebuilt and a not-yet-rebuilt replica hold identical contents. Each table is
+rebuilt in one transaction, so a crash leaves it either untouched or done,
+and the next open finishes the rest. Expect a one-off open delay
+proportional to the rollup rows, and transient disk for one copy of the
+rollup columns (small; the index is what is being removed).
+
+The freed index blocks are reused by later writes. DuckDB does not shrink
+the file, and Lighthouse's backup is a byte copy, so neither reclaims the
+space. Reclaiming it now means the rebuild procedure above, or, with the node
+stopped, `ATTACH` the old file and a new one in the `duckdb` CLI, run
+`COPY FROM DATABASE old TO new`, and swap the files. A build from before this change cannot
+write rollups into a rebuilt database: its `ON CONFLICT` names the key the
+table no longer has.
+
 ## UUIDv7 implementation plan
 
 The identity migration must remain coherent across all components. Partial conversion would create checks whose configuration, results, incidents, or global summaries cannot be joined.
