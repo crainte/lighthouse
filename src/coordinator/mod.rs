@@ -1342,6 +1342,23 @@ const SESSION_KEY_KEY: &str = "cluster.session_key";
 
 #[cfg(test)]
 mod tests {
+    /// Dropping the last coordinator must close its DuckDB worker rather than
+    /// leaving a background task holding the database alive until process exit.
+    #[tokio::test]
+    async fn dropping_coordinator_closes_database_worker() {
+        let coord = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let closed = coord.inner.database.closed();
+        drop(coord);
+        tokio::time::timeout(std::time::Duration::from_secs(15), closed)
+            .await
+            .expect("the database worker should close when its coordinator is dropped");
+    }
+
     /// Slicing is a scheduling change, never a semantic one: a sliced run must
     /// remove exactly what a single-shot prune removes, and leave the same
     /// rows behind. Runs a day's worth of history through both.

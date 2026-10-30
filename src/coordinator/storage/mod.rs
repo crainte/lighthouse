@@ -194,20 +194,16 @@ fn rollup_merge_from_raw_sql(table: &str, stream: &str, bucket_ms: i64, staged: 
              attempts_sum = rollup_replication_watermarks.attempts_sum + excluded.attempts_sum,
              up_sum = rollup_replication_watermarks.up_sum + excluded.up_sum,
              latency_sum_sum = rollup_replication_watermarks.latency_sum_sum + excluded.latency_sum_sum;
-         UPDATE {table} r SET
+         MERGE INTO {table} r
+         USING ({bucketed}) b
+           ON r.check_id = b.check_id AND r.agent_id = b.agent_id AND r.bucket_start = b.bucket_start
+         WHEN MATCHED THEN UPDATE SET
              attempts = r.attempts + b.attempts,
              up = r.up + b.up,
              latency_sum = r.latency_sum + b.latency_sum,
              latency_min = LEAST(r.latency_min, b.latency_min),
              latency_max = GREATEST(r.latency_max, b.latency_max)
-         FROM ({bucketed}) b
-         WHERE r.check_id = b.check_id AND r.agent_id = b.agent_id
-           AND r.bucket_start = b.bucket_start;
-         INSERT INTO {table}
-         SELECT b.* FROM ({bucketed}) b
-         ANTI JOIN {table} r
-           ON r.check_id = b.check_id AND r.agent_id = b.agent_id
-          AND r.bucket_start = b.bucket_start;"
+         WHEN NOT MATCHED THEN INSERT *;"
     )
 }
 
@@ -267,20 +263,16 @@ fn rollup_merge_from_backfill_sql(table: &str, stream: &str, staged: &str) -> St
              attempts_sum = rollup_replication_watermarks.attempts_sum + excluded.attempts_sum,
              up_sum = rollup_replication_watermarks.up_sum + excluded.up_sum,
              latency_sum_sum = rollup_replication_watermarks.latency_sum_sum + excluded.latency_sum_sum;
-         UPDATE {table} r SET
+         MERGE INTO {table} r
+         USING {staged} s
+           ON r.check_id = s.check_id AND r.agent_id = s.agent_id AND r.bucket_start = s.bucket_start
+         WHEN MATCHED THEN UPDATE SET
              attempts = GREATEST(r.attempts, s.attempts),
              up = GREATEST(r.up, s.up),
              latency_sum = GREATEST(r.latency_sum, s.latency_sum),
              latency_min = LEAST(r.latency_min, s.latency_min),
              latency_max = GREATEST(r.latency_max, s.latency_max)
-         FROM {staged} s
-         WHERE r.check_id = s.check_id AND r.agent_id = s.agent_id
-           AND r.bucket_start = s.bucket_start;
-         INSERT INTO {table}
-         SELECT s.* FROM {staged} s
-         ANTI JOIN {table} r
-           ON r.check_id = s.check_id AND r.agent_id = s.agent_id
-          AND r.bucket_start = s.bucket_start;"
+         WHEN NOT MATCHED THEN INSERT *;"
     )
 }
 

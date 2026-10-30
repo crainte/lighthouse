@@ -42,7 +42,10 @@ fn backoff_ms(attempts: i32) -> i64 {
 
 impl Coordinator {
     pub(in crate::coordinator) fn spawn_dispatcher(&self, mut rx: tokio::sync::mpsc::Receiver<()>) {
-        let coord = self.clone();
+        // The dispatcher must not own the sender it is waiting on: Inner owns
+        // notify_tx, so retaining a Coordinator here would keep the channel
+        // open forever after the last external handle is dropped.
+        let inner = Arc::downgrade(&self.inner);
         tokio::spawn(async move {
             // A wedged peer must not pin this sweep (or the periodic task that
             // owns it) indefinitely. Every digest and backfill request shares the
@@ -58,11 +61,16 @@ impl Coordinator {
                 }
             };
             while rx.recv().await.is_some() {
+                let Some(inner) = inner.upgrade() else {
+                    break;
+                };
+                let coord = Coordinator { inner };
                 // `retry_due` scans the durable outbox and bounds concurrent
                 // sends, so one slow backend cannot head-of-line block others.
                 coord
                     .retry_due_with_client(chrono::Utc::now().timestamp_millis(), &client)
                     .await;
+                drop(coord);
             }
         });
     }
