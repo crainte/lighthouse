@@ -595,22 +595,54 @@ impl Storage {
     /// than appended, because `anti_entropy_sweep` redetects a standing gap on
     /// every sweep it persists — see the table's own comment in `open`.
     pub fn record_raw_data_gap(&self, gap: &RawDataGapRow) -> Result<()> {
-        self.conn.execute_cached(
-            "INSERT INTO raw_data_gaps (check_id, peer, from_ts, to_ts, observed_at)
-             VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT (check_id, peer) DO UPDATE SET
-                 from_ts = excluded.from_ts,
-                 to_ts = excluded.to_ts,
-                 observed_at = excluded.observed_at",
-            duckdb::params![
-                gap.check_id,
-                gap.peer,
-                gap.from_ts,
-                gap.to_ts,
-                gap.observed_at
-            ],
-        )?;
-        Ok(())
+        self.record_raw_data_gaps(std::slice::from_ref(gap))
+    }
+
+    /// `record_raw_data_gap` for a whole sweep's gaps in one transaction and a
+    /// fixed number of statements. A sweep can find a gap on every check, and
+    /// on DuckDB 2.0 each upsert re-plans even when cached, so one per gap was
+    /// a full compile and an autocommit each. When a `(check_id, peer)`
+    /// repeats, the latest `observed_at` wins, as applying them in order did
+    /// for a monotonic clock.
+    pub fn record_raw_data_gaps(&self, gaps: &[RawDataGapRow]) -> Result<()> {
+        if gaps.is_empty() {
+            return Ok(());
+        }
+        self.transaction(|store| {
+            store.conn.execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS raw_data_gap_stage (
+                     ordinal BIGINT, check_id UUID, peer VARCHAR,
+                     from_ts BIGINT, to_ts BIGINT, observed_at BIGINT
+                 );
+                 DELETE FROM raw_data_gap_stage;",
+            )?;
+            {
+                let mut appender = store.conn.appender("raw_data_gap_stage")?;
+                for (ordinal, gap) in gaps.iter().enumerate() {
+                    appender.append_row(duckdb::params![
+                        ordinal as i64,
+                        gap.check_id,
+                        gap.peer,
+                        gap.from_ts,
+                        gap.to_ts,
+                        gap.observed_at
+                    ])?;
+                }
+                appender.flush()?;
+            }
+            store.conn.execute_batch(
+                "INSERT INTO raw_data_gaps (check_id, peer, from_ts, to_ts, observed_at)
+                 SELECT check_id, peer, from_ts, to_ts, observed_at FROM raw_data_gap_stage
+                  QUALIFY row_number() OVER (
+                      PARTITION BY check_id, peer ORDER BY observed_at DESC, ordinal DESC
+                  ) = 1
+                 ON CONFLICT (check_id, peer) DO UPDATE SET
+                     from_ts = excluded.from_ts,
+                     to_ts = excluded.to_ts,
+                     observed_at = excluded.observed_at;",
+            )?;
+            Ok(())
+        })
     }
 
     /// Every standing raw-data gap, newest-observed first, for the admin
@@ -1264,5 +1296,49 @@ mod tests {
             vec![refreshed],
             "redetecting a standing gap must update it in place"
         );
+    }
+
+    /// A sweep's gaps land in one call: existing keys refresh in place, new
+    /// ones are added, and a key repeated within the batch keeps its newest
+    /// observation, as applying the rows one at a time in order did.
+    #[test]
+    fn a_sweeps_raw_data_gaps_are_recorded_as_one_batch() {
+        let s = Storage::open(":memory:").unwrap();
+        let gap = |check: &str, peer: &str, observed_at: i64| RawDataGapRow {
+            check_id: cid(check),
+            peer: peer.into(),
+            from_ts: observed_at - 10,
+            to_ts: observed_at - 5,
+            observed_at,
+        };
+        s.record_raw_data_gap(&gap("a", "p1", 100)).unwrap();
+        s.record_raw_data_gaps(&[
+            gap("a", "p1", 200),
+            gap("b", "p1", 150),
+            gap("b", "p1", 250),
+            // Equal timestamp: the last input row wins, as the old loop did.
+            RawDataGapRow {
+                from_ts: 222,
+                to_ts: 240,
+                ..gap("b", "p1", 250)
+            },
+            gap("a", "p2", 120),
+        ])
+        .unwrap();
+        s.record_raw_data_gaps(&[]).unwrap();
+
+        let mut stored = s.list_raw_data_gaps().unwrap();
+        stored.sort_by(|x, y| (x.check_id, &x.peer).cmp(&(y.check_id, &y.peer)));
+        let mut expected = vec![
+            gap("a", "p1", 200),
+            gap("a", "p2", 120),
+            RawDataGapRow {
+                from_ts: 222,
+                to_ts: 240,
+                ..gap("b", "p1", 250)
+            },
+        ];
+        expected.sort_by(|x, y| (x.check_id, &x.peer).cmp(&(y.check_id, &y.peer)));
+        assert_eq!(stored, expected);
     }
 }

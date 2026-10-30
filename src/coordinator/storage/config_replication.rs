@@ -135,6 +135,34 @@ struct ConfigStamps {
     tombstoned: std::collections::HashSet<(ConfigKind, String)>,
 }
 
+/// Check documents `apply_config_entries` accepted but has not written yet,
+/// keyed by id, holding only the newest accepted entry for each.
+type PendingChecks = std::collections::HashMap<String, PendingCheck>;
+
+struct PendingCheck {
+    config: CheckConfig,
+    hlc: Hlc,
+    /// The id carried a tombstone when this document, or one it superseded
+    /// in the same batch, was accepted; the flush must clear it.
+    clears_tombstone: bool,
+}
+
+/// Parse a replicated check document. `doc` IS `checks.config` verbatim — the
+/// whole `CheckConfig`, authoritative already; `upsert_checks_uncommitted` is
+/// the one place that projects it into the flat columns SQL filters and orders
+/// by, so no second hand-maintained field list can drift from it.
+fn parse_check_document(id: &str, doc: &str) -> Result<CheckConfig> {
+    let config: CheckConfig = serde_json::from_str(doc)
+        .map_err(|e| anyhow::anyhow!("malformed check document for {id}: {e}"))?;
+    if config.id.to_string() != id {
+        bail!(
+            "check document id {} does not match config key {id}",
+            config.id
+        );
+    }
+    Ok(config)
+}
+
 impl Storage {
     /// A settings document, or `None` when the key has never been written.
     /// `None` is what makes the config file a seed rather than a default that
@@ -216,7 +244,7 @@ impl Storage {
         self.sync_config_watermarks(&[(kind, id.to_owned())])
     }
 
-    fn sync_config_watermarks(&self, touched: &[(ConfigKind, String)]) -> Result<()> {
+    pub(super) fn sync_config_watermarks(&self, touched: &[(ConfigKind, String)]) -> Result<()> {
         if touched.is_empty() {
             return Ok(());
         }
@@ -581,24 +609,12 @@ impl Storage {
     ) -> Result<()> {
         match kind {
             ConfigKind::Check => {
-                // `doc` IS `checks.config` verbatim — the whole `CheckConfig`,
-                // authoritative already. `upsert_check` is the one place that
-                // projects it into the flat columns SQL filters and orders by,
-                // so reusing it is what keeps this from becoming a second,
-                // hand-maintained field list that drifts from the first.
-                let config: CheckConfig = serde_json::from_str(doc)
-                    .map_err(|e| anyhow::anyhow!("malformed check document for {id}: {e}"))?;
-                if config.id.to_string() != id {
-                    bail!(
-                        "check document id {} does not match config key {id}",
-                        config.id
-                    );
-                }
-                self.upsert_check_uncommitted(&config, hlc.millis)?;
-                self.conn.execute_cached(
-                    "UPDATE checks SET updated_by = ? WHERE id = ?",
-                    duckdb::params![hlc.node_id, id],
-                )?;
+                let config = parse_check_document(id, doc)?;
+                self.upsert_checks_uncommitted(std::iter::once((
+                    &config,
+                    hlc.millis,
+                    Some(hlc.node_id.as_str()),
+                )))?;
             }
             ConfigKind::Section => {
                 let s: Section = serde_json::from_str(doc)
@@ -702,7 +718,8 @@ impl Storage {
                  ON CONFLICT (kind, id) DO UPDATE SET
                      deleted_at = excluded.deleted_at, node_id = excluded.node_id",
                 )?;
-                entries
+                let mut pending_checks = PendingChecks::default();
+                let applied = entries
                     .iter()
                     .map(|entry| {
                         self.apply_config_entry_uncommitted(
@@ -711,9 +728,13 @@ impl Storage {
                             &mut deletes[entry.kind as usize],
                             &mut tombstone_deletes,
                             &mut tombstone_inserts,
+                            &mut pending_checks,
                         )
                     })
-                    .collect()
+                    .collect::<Result<Vec<_>>>()?;
+                drop((deletes, tombstone_deletes, tombstone_inserts));
+                self.flush_pending_checks(pending_checks)?;
+                Ok(applied)
             };
             match write() {
                 Ok(applied) => {
@@ -738,6 +759,7 @@ impl Storage {
         delete: &mut Statement<'_>,
         tombstone_delete: &mut Statement<'_>,
         tombstone_insert: &mut Statement<'_>,
+        pending_checks: &mut PendingChecks,
     ) -> Result<bool> {
         let key = (e.kind, e.id.clone());
         if let Some(local) = stamps.newest.get(&key) {
@@ -757,6 +779,11 @@ impl Storage {
             stamps.tombstoned.remove(&key);
         }
         if e.is_tombstone() {
+            // A later tombstone supersedes a document still waiting in this
+            // batch; without this the flush would resurrect the check.
+            if e.kind == ConfigKind::Check {
+                pending_checks.remove(&e.id);
+            }
             if e.kind != ConfigKind::Check {
                 delete.execute(duckdb::params![e.id])?;
             } else if let Ok(check_id) = e.id.parse::<CheckId>() {
@@ -785,6 +812,28 @@ impl Storage {
                     e.id
                 )
             })?;
+            if e.kind == ConfigKind::Check {
+                // Deferred to `flush_pending_checks`, which writes every
+                // accepted check document in a fixed number of statements and
+                // clears their tombstones. Parsed now, so a malformed document
+                // still fails the batch before anything is written. A later
+                // accepted entry for the same id replaces this one, exactly as
+                // applying them one at a time would.
+                let config = parse_check_document(&e.id, doc)?;
+                let clears_tombstone = tombstoned
+                    || pending_checks
+                        .get(&e.id)
+                        .is_some_and(|superseded| superseded.clears_tombstone);
+                pending_checks.insert(
+                    e.id.clone(),
+                    PendingCheck {
+                        config,
+                        hlc: e.hlc.clone(),
+                        clears_tombstone,
+                    },
+                );
+                return Ok(true);
+            }
             self.apply_config_document(e.kind, &e.id, doc, &e.hlc)?;
             // The edit supersedes any tombstone for this id — leaving one
             // behind would make the next digest sweep look inconsistent.
@@ -793,6 +842,28 @@ impl Storage {
             }
         }
         Ok(true)
+    }
+
+    /// Write the check documents `apply_config_entries` accepted, then drop
+    /// any tombstone they supersede — the deferred half of
+    /// `apply_config_entry_uncommitted` for `ConfigKind::Check` documents.
+    fn flush_pending_checks(&self, pending: PendingChecks) -> Result<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        self.upsert_checks_uncommitted(
+            pending
+                .values()
+                .map(|p| (&p.config, p.hlc.millis, Some(p.hlc.node_id.as_str()))),
+        )?;
+        // Rare (a check recreated after deletion), so per id is fine.
+        for (id, _) in pending.iter().filter(|(_, p)| p.clears_tombstone) {
+            self.conn.execute_cached(
+                "DELETE FROM config_tombstones WHERE kind = 'check' AND id = ?",
+                duckdb::params![id],
+            )?;
+        }
+        Ok(())
     }
 
     /// Read back the entry a row would replicate as, for pushing to peers
@@ -1119,6 +1190,155 @@ impl Storage {
 mod tests {
     use super::*;
     use crate::coordinator::storage::test_support::*;
+
+    fn check_doc(config: &CheckConfig, millis: i64) -> ConfigEntry {
+        ConfigEntry {
+            kind: ConfigKind::Check,
+            id: config.id.to_string(),
+            hlc: Hlc::new(millis, "peer"),
+            document: Some(serde_json::to_string(config).unwrap()),
+        }
+    }
+
+    fn check_tombstone(config: &CheckConfig, millis: i64) -> ConfigEntry {
+        ConfigEntry {
+            kind: ConfigKind::Check,
+            id: config.id.to_string(),
+            hlc: Hlc::new(millis, "peer"),
+            document: None,
+        }
+    }
+
+    /// Everything a check's config apply writes, in a comparable form.
+    fn check_state(s: &Storage) -> Vec<String> {
+        let mut out = Vec::new();
+        for sql in [
+            "SELECT id::VARCHAR || '|' || name || '|' || target || '|' || updated_at || '|' ||
+                    COALESCE(updated_by, '') || '|' || config FROM checks ORDER BY ALL",
+            "SELECT 'placement|' || check_id::VARCHAR || '|' || region FROM check_placement_regions ORDER BY ALL",
+            "SELECT 'tomb|' || kind || '|' || id || '|' || deleted_at || '|' || node_id FROM config_tombstones ORDER BY ALL",
+            "SELECT 'wm|' || kind || '|' || id || '|' || origin || '|' || scope_kind || '|' ||
+                    scope_region || '|' || millis || '|' || node FROM config_watermark_entries ORDER BY ALL",
+        ] {
+            let mut stmt = s.conn.prepare(sql).unwrap();
+            out.extend(
+                stmt.query_map([], |r| r.get::<_, String>(0))
+                    .unwrap()
+                    .map(|row| row.unwrap()),
+            );
+        }
+        out
+    }
+
+    /// Batching accepted check documents must not change what a batch means:
+    /// one `apply_config_entries` call has to leave exactly the state the same
+    /// entries leave when applied one call at a time, including in-batch LWW
+    /// between two entries for one id, tombstones on either side of a document,
+    /// placement changes, and a stale entry that must lose.
+    #[test]
+    fn one_config_batch_matches_applying_each_entry_alone() {
+        let mut a = check_config("a", "https://a.example");
+        let b = check_config("b", "https://b.example");
+        let c = check_config("c", "https://c.example");
+        let d = check_config("d", "https://d.example");
+        a.placement.regions = vec!["eu".into(), "us".into()];
+        let base = vec![check_doc(&a, 10), check_doc(&b, 10), check_doc(&d, 10)];
+
+        let mut a2 = a.clone();
+        a2.name = "a-renamed".into();
+        a2.placement.regions = vec!["us".into(), "ap".into()];
+        let mut a3 = a2.clone();
+        a3.target = "https://a3.example".into();
+        let mut b2 = b.clone();
+        b2.target = "https://b2.example".into();
+        let mut d2 = d.clone();
+        d2.target = "https://d2.example".into();
+        let batch = vec![
+            check_doc(&a2, 20),
+            check_doc(&a3, 30),
+            check_doc(&a, 25), // older than a3, must lose
+            check_doc(&b2, 20),
+            check_tombstone(&b, 40), // supersedes the pending b2
+            check_doc(&c, 20),
+            check_tombstone(&d, 20),
+            check_doc(&d2, 30), // resurrects d, clearing its tombstone
+        ];
+
+        let batched = Storage::open(":memory:").unwrap();
+        batched.apply_config_entries(&base).unwrap();
+        let batched_flags = batched.apply_config_entries(&batch).unwrap();
+
+        let single = Storage::open(":memory:").unwrap();
+        single.apply_config_entries(&base).unwrap();
+        let single_flags: Vec<bool> = batch
+            .iter()
+            .map(|entry| single.apply_config_entry(entry).unwrap())
+            .collect();
+
+        assert_eq!(batched_flags, single_flags);
+        assert_eq!(
+            batched_flags,
+            vec![true, true, false, true, true, true, true, true]
+        );
+        let (in_batch, one_by_one) = (check_state(&batched), check_state(&single));
+        let only_batched: Vec<_> = in_batch
+            .iter()
+            .filter(|row| !one_by_one.contains(row))
+            .collect();
+        let only_single: Vec<_> = one_by_one
+            .iter()
+            .filter(|row| !in_batch.contains(row))
+            .collect();
+        assert!(
+            only_batched.is_empty() && only_single.is_empty(),
+            "batched only: {only_batched:#?}\none at a time only: {only_single:#?}"
+        );
+        let names: Vec<String> = batched
+            .list_checks()
+            .unwrap()
+            .into_iter()
+            .map(|check| check.name)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(names, vec!["a-renamed", "c", "d"]);
+    }
+
+    /// Renames that only work as a set (here a swap, which no one-at-a-time
+    /// order can apply) are accepted in one batch; a genuinely duplicated
+    /// name is still refused and leaves nothing half-applied.
+    #[test]
+    fn a_config_batch_applies_renames_as_a_set() {
+        let s = Storage::open(":memory:").unwrap();
+        let x = check_config("x", "https://x.example");
+        let y = check_config("y", "https://y.example");
+        s.apply_config_entries(&[check_doc(&x, 10), check_doc(&y, 10)])
+            .unwrap();
+
+        let (mut x2, mut y2) = (x.clone(), y.clone());
+        x2.name = "y".into();
+        y2.name = "x".into();
+        s.apply_config_entries(&[check_doc(&x2, 20), check_doc(&y2, 20)])
+            .unwrap();
+        let mut renamed: Vec<(String, String)> = s
+            .list_checks()
+            .unwrap()
+            .into_iter()
+            .map(|check| (check.id.to_string(), check.name))
+            .collect();
+        renamed.sort();
+        let mut expected = vec![
+            (x.id.to_string(), "y".to_string()),
+            (y.id.to_string(), "x".to_string()),
+        ];
+        expected.sort();
+        assert_eq!(renamed, expected);
+
+        let before = check_state(&s);
+        let z = check_config("x", "https://z.example");
+        assert!(s.apply_config_entries(&[check_doc(&z, 30)]).is_err());
+        assert_eq!(check_state(&s), before);
+    }
 
     // ---- Clustering: config replication ----
 
