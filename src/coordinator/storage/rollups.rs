@@ -184,9 +184,9 @@ impl Storage {
     /// Recompute `rollup_replication_watermarks` from the rollup tables
     /// themselves. Unlike the incremental maintenance in
     /// `rollup_merge_from_raw_sql`/`rollup_merge_from_backfill_sql`, this
-    /// scans both tables in full, so it is reserved for `rebuild_latency_rollups`
-    /// re-seeding both tables wholesale, never every write or every restart.
-    #[cfg(test)]
+    /// scans both tables in full, so it is reserved for a wholesale physical
+    /// rewrite: test-only `rebuild_latency_rollups`, or the one-time on-open
+    /// removal of the old primary-key indexes. Never every write or restart.
     pub(super) fn rebuild_rollup_watermarks(&self) -> Result<()> {
         self.conn.execute_batch(
             "DELETE FROM rollup_replication_watermarks
@@ -550,33 +550,35 @@ impl Storage {
         if rows.is_empty() {
             return Ok(());
         }
-        self.conn.execute_batch(&format!(
-            "CREATE TEMP TABLE IF NOT EXISTS ingest_rollup_stage AS
-                 SELECT * FROM {table} WITH NO DATA;
-             DELETE FROM ingest_rollup_stage;"
-        ))?;
-        {
-            let mut appender = self.conn.appender("ingest_rollup_stage")?;
-            for row in rows {
-                appender.append_row(duckdb::params![
-                    row.check_id,
-                    row.agent_id,
-                    row.bucket_start,
-                    row.attempts,
-                    row.up,
-                    row.latency_sum,
-                    row.latency_min,
-                    row.latency_max,
-                ])?;
+        self.transaction(|store| {
+            store.conn.execute_batch(&format!(
+                "CREATE TEMP TABLE IF NOT EXISTS ingest_rollup_stage AS
+                     SELECT * FROM {table} WITH NO DATA;
+                 DELETE FROM ingest_rollup_stage;"
+            ))?;
+            {
+                let mut appender = store.conn.appender("ingest_rollup_stage")?;
+                for row in rows {
+                    appender.append_row(duckdb::params![
+                        row.check_id,
+                        row.agent_id,
+                        row.bucket_start,
+                        row.attempts,
+                        row.up,
+                        row.latency_sum,
+                        row.latency_min,
+                        row.latency_max,
+                    ])?;
+                }
+                appender.flush()?;
             }
-            appender.flush()?;
-        }
-        self.conn.execute_batch(&rollup_merge_from_backfill_sql(
-            table,
-            table,
-            "ingest_rollup_stage",
-        ))?;
-        Ok(())
+            store.conn.execute_batch(&rollup_merge_from_backfill_sql(
+                table,
+                table,
+                "ingest_rollup_stage",
+            ))?;
+            Ok(())
+        })
     }
 
     pub fn apply_minute_rollups(&self, rows: &[RollupRow]) -> Result<()> {

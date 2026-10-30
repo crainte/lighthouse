@@ -54,6 +54,83 @@ pub(super) fn verify_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Rollup tables whose `PRIMARY KEY` this build no longer declares. DuckDB
+/// cannot drop a constraint in place, so each is rebuilt once.
+const ROLLUP_TABLES: [&str; 2] = ["check_latency_minute_rollups", "check_latency_hour_rollups"];
+
+/// Column definitions shared by both rollup tables, exactly as `SCHEMA_DDL`
+/// declares them; `rebuilt_rollup_table_matches_a_fresh_one` holds the two
+/// in step.
+const ROLLUP_COLUMNS_DDL: &str = "check_id UUID NOT NULL,
+    agent_id VARCHAR NOT NULL,
+    bucket_start BIGINT NOT NULL,
+    attempts BIGINT NOT NULL,
+    up BIGINT NOT NULL,
+    latency_sum BIGINT NOT NULL,
+    latency_min BIGINT,
+    latency_max BIGINT";
+
+/// One-time, node-local rebuild of rollup tables created with the old
+/// `PRIMARY KEY (check_id, agent_id, bucket_start)`. Returns how many tables
+/// were rebuilt; a database already without the key costs one catalogue read.
+///
+/// This is a physical change, not the identity migration SCALING.md's
+/// "Pre-1.0 database policy" rules out: every row is copied unchanged, so
+/// replicas converge whether or not they have rebuilt yet. Each table is
+/// rebuilt in its own transaction as a streaming copy: DuckDB preserves
+/// insertion order, and ingest appends rollups roughly chronologically, so the
+/// min/max statistics `MERGE INTO` and range reads rely on stay as tight as
+/// they were, without sorting what can be a billion-row table. A crash leaves
+/// that table either untouched or fully rebuilt; the next open finishes the
+/// rest. Older builds cannot write to a rebuilt table (their `ON CONFLICT`
+/// names a key it no longer has).
+pub(super) fn drop_rollup_primary_keys(conn: &Connection) -> Result<usize> {
+    let mut rebuilt = 0;
+    for table in ROLLUP_TABLES {
+        let keyed: bool = conn.query_row(
+            "SELECT count(*) > 0 FROM duckdb_constraints()
+             WHERE schema_name = 'main' AND table_name = ? AND constraint_type = 'PRIMARY KEY'",
+            duckdb::params![table],
+            |row| row.get(0),
+        )?;
+        if !keyed {
+            continue;
+        }
+        let started = std::time::Instant::now();
+        conn.execute_batch(&format!(
+            "BEGIN;
+             DROP TABLE IF EXISTS {table}__rebuild;
+             CREATE TABLE {table}__rebuild ({ROLLUP_COLUMNS_DDL});
+             INSERT INTO {table}__rebuild
+             SELECT check_id, agent_id, bucket_start, attempts, up, latency_sum,
+                    latency_min, latency_max
+             FROM {table};
+             DROP TABLE {table};
+             ALTER TABLE {table}__rebuild RENAME TO {table};
+             COMMIT;"
+        ))
+        .inspect_err(|_| {
+            let _ = conn.execute_batch("ROLLBACK");
+        })?;
+        let rows: i64 = conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })?;
+        tracing::info!(
+            table,
+            rows,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "rebuilt rollup table without its primary key index"
+        );
+        rebuilt += 1;
+    }
+    if rebuilt > 0 {
+        // Hand the dropped index blocks back to the free list now rather than
+        // at the next automatic checkpoint.
+        conn.execute_batch("CHECKPOINT")?;
+    }
+    Ok(rebuilt)
+}
+
 /// The complete table schema, applied verbatim to every opened database.
 /// `CREATE TABLE IF NOT EXISTS` is a no-op wherever a table already exists,
 /// so this changes nothing on a currently-running production database: every
@@ -82,6 +159,11 @@ pub(super) const SCHEMA_DDL: &str = "CREATE TABLE IF NOT EXISTS check_results (
 -- One row per check, probe domain, and UTC minute/hour. `agent_id`
 -- is the independent observation domain: replicas in a domain must
 -- deduplicate, while distinct domains must never be averaged away.
+-- `(check_id, agent_id, bucket_start)` is unique but deliberately not a
+-- PRIMARY KEY: its ART index was ~80% of the database file (more again on
+-- DuckDB 2.0) and made every merge slower. Every writer merges by that key
+-- (`MERGE INTO` in `rollup_merge_from_*_sql`, wholesale replace in
+-- `rebuild_latency_rollups`); see `drop_rollup_primary_keys`.
 CREATE TABLE IF NOT EXISTS check_latency_minute_rollups (
     check_id UUID NOT NULL,
     agent_id VARCHAR NOT NULL,
@@ -90,8 +172,7 @@ CREATE TABLE IF NOT EXISTS check_latency_minute_rollups (
     up BIGINT NOT NULL,
     latency_sum BIGINT NOT NULL,
     latency_min BIGINT,
-    latency_max BIGINT,
-    PRIMARY KEY (check_id, agent_id, bucket_start)
+    latency_max BIGINT
 );
 CREATE TABLE IF NOT EXISTS check_latency_hour_rollups (
     check_id UUID NOT NULL,
@@ -101,8 +182,7 @@ CREATE TABLE IF NOT EXISTS check_latency_hour_rollups (
     up BIGINT NOT NULL,
     latency_sum BIGINT NOT NULL,
     latency_min BIGINT,
-    latency_max BIGINT,
-    PRIMARY KEY (check_id, agent_id, bucket_start)
+    latency_max BIGINT
 );
 CREATE TABLE IF NOT EXISTS latest_check_results (
     check_id    UUID PRIMARY KEY,
@@ -505,6 +585,283 @@ CREATE TABLE IF NOT EXISTS incident_tombstones (
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_db(label: &str) -> String {
+        std::env::temp_dir()
+            .join(format!(
+                "lighthouse-{label}-{}.duckdb",
+                uuid::Uuid::now_v7()
+            ))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn remove_db(path: &str) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{path}.wal"));
+    }
+
+    fn primary_keys(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM duckdb_constraints()
+             WHERE table_name = ? AND constraint_type = 'PRIMARY KEY'",
+            duckdb::params![table],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn columns(conn: &Connection, table: &str) -> Vec<(String, String, bool)> {
+        conn.prepare(
+            "SELECT column_name, data_type, is_nullable FROM duckdb_columns()
+             WHERE table_name = ? ORDER BY column_index",
+        )
+        .unwrap()
+        .query_map(duckdb::params![table], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap()
+    }
+
+    fn rows(conn: &Connection, table: &str) -> Vec<(String, String, i64, i64, i64, i64)> {
+        conn.prepare(&format!(
+            "SELECT check_id::VARCHAR, agent_id, bucket_start, attempts, up, latency_sum
+             FROM {table} ORDER BY ALL"
+        ))
+        .unwrap()
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap()
+    }
+
+    /// A database written before the rollup key was dropped opens with both
+    /// rollup tables rebuilt keyless, every row intact, and merges still
+    /// folding into the existing bucket rather than duplicating it.
+    #[test]
+    fn opening_a_database_with_keyed_rollups_rebuilds_them_once() {
+        let path = temp_db("keyed-rollups");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_DDL).unwrap();
+            for table in ROLLUP_TABLES {
+                conn.execute_batch(&format!(
+                    "DROP TABLE {table};
+                     CREATE TABLE {table} ({ROLLUP_COLUMNS_DDL},
+                         PRIMARY KEY (check_id, agent_id, bucket_start));
+                     INSERT INTO {table}
+                     SELECT md5('check-' || c::VARCHAR)::UUID, 'agent-' || a::VARCHAR,
+                            b * 60000, 2, 1, 30, 10, 20
+                     FROM range(5) t(c), range(2) u(a), range(50) v(b);"
+                ))
+                .unwrap();
+                assert_eq!(primary_keys(&conn, table), 1);
+            }
+        }
+        let before: Vec<_> = {
+            let conn = Connection::open(&path).unwrap();
+            ROLLUP_TABLES.iter().map(|t| rows(&conn, t)).collect()
+        };
+
+        let store = Storage::open(&path).unwrap();
+        for (table, before) in ROLLUP_TABLES.iter().zip(&before) {
+            assert_eq!(primary_keys(&store.conn, table), 0, "{table} still keyed");
+            assert_eq!(&rows(&store.conn, table), before, "{table} rows changed");
+            assert_eq!(
+                store
+                    .conn
+                    .query_row(
+                        &format!("SELECT count(*) FROM duckdb_tables() WHERE table_name = '{table}__rebuild'"),
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+        assert_eq!(drop_rollup_primary_keys(&store.conn).unwrap(), 0);
+
+        // A bucket that already exists must be folded into, not duplicated.
+        store
+            .conn
+            .execute_batch(&format!(
+                "CREATE TEMP TABLE probe_stage AS SELECT * FROM check_results WITH NO DATA;
+                 INSERT INTO probe_stage VALUES
+                     (md5('check-0')::UUID, 'agent-0', 30, 'up', 40, 200, NULL, NULL, NULL, NULL);
+                 {}",
+                rollup_merge_from_raw_sql(
+                    "check_latency_minute_rollups",
+                    "check_latency_minute_rollups",
+                    MILLIS_PER_MINUTE,
+                    "probe_stage"
+                )
+            ))
+            .unwrap();
+        let (count, attempts): (i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT count(*), sum(attempts) FROM check_latency_minute_rollups
+                 WHERE check_id = md5('check-0')::UUID AND agent_id = 'agent-0' AND bucket_start = 0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((count, attempts), (1, 3));
+        for (stream, table) in [
+            (
+                "check_latency_minute_rollups",
+                "check_latency_minute_rollups",
+            ),
+            ("check_latency_hour_rollups", "check_latency_hour_rollups"),
+        ] {
+            let expected: (i64, i64, i64, i64, i64) = store
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT COALESCE(MAX(bucket_start), 0), COUNT(*),
+                                COALESCE(SUM(attempts), 0), COALESCE(SUM(up), 0),
+                                COALESCE(SUM(latency_sum), 0) FROM {table}"
+                    ),
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .unwrap();
+            let watermark: (i64, i64, i64, i64, i64) = store
+                .conn
+                .query_row(
+                    "SELECT max_bucket_start, row_count, attempts_sum, up_sum, latency_sum_sum
+                     FROM rollup_replication_watermarks WHERE stream = ?",
+                    duckdb::params![stream],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .unwrap();
+            assert_eq!(watermark, expected, "{stream} watermark was not rebuilt");
+        }
+        drop(store);
+        remove_db(&path);
+    }
+
+    /// One-time cost of `drop_rollup_primary_keys` on a database written with
+    /// the old keyed rollups: `LIGHTHOUSE_BENCH_CHECKS` (default 10,000) ×
+    /// 3 domains × `LIGHTHOUSE_BENCH_ROLLUP_MINUTES` (default 1,440) minute
+    /// rollups, plus their hour rollups. Reports the reopen time and the
+    /// database's used bytes before and after (the file itself does not shrink).
+    #[test]
+    #[ignore = "production-scale benchmark; run explicitly with --ignored --nocapture"]
+    fn benchmark_rollup_primary_key_rebuild() {
+        let env = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let checks = env("LIGHTHOUSE_BENCH_CHECKS", 10_000);
+        let minutes = env("LIGHTHOUSE_BENCH_ROLLUP_MINUTES", 1_440);
+        let path = temp_db("rollup-rebuild-bench");
+        let used_bytes = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT used_blocks * block_size FROM pragma_database_size()",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let seed_started = std::time::Instant::now();
+        let keyed_bytes = {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_DDL).unwrap();
+            for (table, bucket_ms, buckets) in [
+                ("check_latency_minute_rollups", 60_000u64, minutes),
+                (
+                    "check_latency_hour_rollups",
+                    3_600_000,
+                    minutes.div_ceil(60),
+                ),
+            ] {
+                conn.execute_batch(&format!(
+                    "DROP TABLE {table};
+                     CREATE TABLE {table} ({ROLLUP_COLUMNS_DDL},
+                         PRIMARY KEY (check_id, agent_id, bucket_start));
+                     INSERT INTO {table}
+                     SELECT md5('check-' || c::VARCHAR)::UUID, 'agent-' || a::VARCHAR,
+                            b * {bucket_ms}, 2, 2, 30, 10, 20
+                     FROM range({buckets}) w(b), range({checks}) t(c), range(3) u(a);
+                     CHECKPOINT;"
+                ))
+                .unwrap();
+            }
+            used_bytes(&conn)
+        };
+        let seed_ms = seed_started.elapsed().as_millis();
+        let file_bytes = std::fs::metadata(&path).unwrap().len();
+
+        let started = std::time::Instant::now();
+        let store = Storage::open(&path).unwrap();
+        let reopen_ms = started.elapsed().as_millis();
+        let rebuilt_bytes = used_bytes(&store.conn);
+        for table in ROLLUP_TABLES {
+            assert_eq!(primary_keys(&store.conn, table), 0);
+        }
+        let rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM check_latency_minute_rollups",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows as u64, checks * 3 * minutes);
+        drop(store);
+        let second = std::time::Instant::now();
+        drop(Storage::open(&path).unwrap());
+        let second_open_ms = second.elapsed().as_millis();
+        println!(
+            "rollup_rebuild checks={checks} minute_rows={rows} seed_ms={seed_ms} \
+             keyed_used_bytes={keyed_bytes} file_bytes={file_bytes} rebuild_open_ms={reopen_ms} \
+             rebuilt_used_bytes={rebuilt_bytes} second_open_ms={second_open_ms}"
+        );
+        remove_db(&path);
+    }
+
+    /// The rebuild's column list must not drift from `SCHEMA_DDL`: same
+    /// names, order, types and nullability as a freshly created table.
+    #[test]
+    fn rebuilt_rollup_table_matches_a_fresh_one() {
+        let fresh = Connection::open_in_memory().unwrap();
+        fresh.execute_batch(SCHEMA_DDL).unwrap();
+        let rebuilt = Connection::open_in_memory().unwrap();
+        rebuilt.execute_batch(SCHEMA_DDL).unwrap();
+        for table in ROLLUP_TABLES {
+            rebuilt
+                .execute_batch(&format!(
+                    "DROP TABLE {table};
+                     CREATE TABLE {table} ({ROLLUP_COLUMNS_DDL},
+                         PRIMARY KEY (check_id, agent_id, bucket_start));"
+                ))
+                .unwrap();
+        }
+        assert_eq!(drop_rollup_primary_keys(&rebuilt).unwrap(), 2);
+        for table in ROLLUP_TABLES {
+            assert_eq!(columns(&rebuilt, table), columns(&fresh, table), "{table}");
+            assert_eq!(
+                primary_keys(&fresh, table),
+                0,
+                "{table} declared keyed again"
+            );
+        }
+    }
+
     /// A database missing a column the current schema requires must fail
     /// `Storage::open` clearly, not silently read the check back with a
     /// default it never had. Regression test for `verify_schema`.

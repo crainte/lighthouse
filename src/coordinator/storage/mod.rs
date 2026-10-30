@@ -194,14 +194,16 @@ fn rollup_merge_from_raw_sql(table: &str, stream: &str, bucket_ms: i64, staged: 
              attempts_sum = rollup_replication_watermarks.attempts_sum + excluded.attempts_sum,
              up_sum = rollup_replication_watermarks.up_sum + excluded.up_sum,
              latency_sum_sum = rollup_replication_watermarks.latency_sum_sum + excluded.latency_sum_sum;
-         INSERT INTO {table}
-         SELECT * FROM ({bucketed}) b
-         ON CONFLICT (check_id, agent_id, bucket_start) DO UPDATE SET
-             attempts = {table}.attempts + excluded.attempts,
-             up = {table}.up + excluded.up,
-             latency_sum = {table}.latency_sum + excluded.latency_sum,
-             latency_min = LEAST({table}.latency_min, excluded.latency_min),
-             latency_max = GREATEST({table}.latency_max, excluded.latency_max);"
+         MERGE INTO {table} r
+         USING ({bucketed}) b
+           ON r.check_id = b.check_id AND r.agent_id = b.agent_id AND r.bucket_start = b.bucket_start
+         WHEN MATCHED THEN UPDATE SET
+             attempts = r.attempts + b.attempts,
+             up = r.up + b.up,
+             latency_sum = r.latency_sum + b.latency_sum,
+             latency_min = LEAST(r.latency_min, b.latency_min),
+             latency_max = GREATEST(r.latency_max, b.latency_max)
+         WHEN NOT MATCHED THEN INSERT *;"
     )
 }
 
@@ -231,7 +233,18 @@ fn rollup_merge_from_raw_sql(table: &str, stream: &str, bucket_ms: i64, staged: 
 /// is a non-issue for the buckets this function exists to recover — closed,
 /// out-of-raw-retention buckets that no longer change — and merely harmless
 /// for a live one, which the raw-derived path keeps advancing regardless.
+///
+/// `staged` is collapsed to one row per key first, with the same field-wise
+/// rules, so a page that repeats a key (never sent by a correct peer, but not
+/// something to trust) merges deterministically rather than matching one
+/// target row twice.
 fn rollup_merge_from_backfill_sql(table: &str, stream: &str, staged: &str) -> String {
+    let staged = format!(
+        "(SELECT check_id, agent_id, bucket_start, MAX(attempts) AS attempts, MAX(up) AS up,
+                 MAX(latency_sum) AS latency_sum, MIN(latency_min) AS latency_min,
+                 MAX(latency_max) AS latency_max
+          FROM {staged} GROUP BY check_id, agent_id, bucket_start)"
+    );
     format!(
         "INSERT INTO rollup_replication_watermarks
              (stream, max_bucket_start, row_count, attempts_sum, up_sum, latency_sum_sum)
@@ -250,14 +263,16 @@ fn rollup_merge_from_backfill_sql(table: &str, stream: &str, staged: &str) -> St
              attempts_sum = rollup_replication_watermarks.attempts_sum + excluded.attempts_sum,
              up_sum = rollup_replication_watermarks.up_sum + excluded.up_sum,
              latency_sum_sum = rollup_replication_watermarks.latency_sum_sum + excluded.latency_sum_sum;
-         INSERT INTO {table}
-         SELECT * FROM {staged}
-         ON CONFLICT (check_id, agent_id, bucket_start) DO UPDATE SET
-             attempts = GREATEST({table}.attempts, excluded.attempts),
-             up = GREATEST({table}.up, excluded.up),
-             latency_sum = GREATEST({table}.latency_sum, excluded.latency_sum),
-             latency_min = LEAST({table}.latency_min, excluded.latency_min),
-             latency_max = GREATEST({table}.latency_max, excluded.latency_max);"
+         MERGE INTO {table} r
+         USING {staged} s
+           ON r.check_id = s.check_id AND r.agent_id = s.agent_id AND r.bucket_start = s.bucket_start
+         WHEN MATCHED THEN UPDATE SET
+             attempts = GREATEST(r.attempts, s.attempts),
+             up = GREATEST(r.up, s.up),
+             latency_sum = GREATEST(r.latency_sum, s.latency_sum),
+             latency_min = LEAST(r.latency_min, s.latency_min),
+             latency_max = GREATEST(r.latency_max, s.latency_max)
+         WHEN NOT MATCHED THEN INSERT *;"
     )
 }
 
@@ -280,7 +295,7 @@ pub use fleet::*;
 pub use incidents::*;
 pub use results::*;
 pub use rollups::*;
-use schema::{verify_schema, SCHEMA_DDL};
+use schema::{drop_rollup_primary_keys, verify_schema, SCHEMA_DDL};
 pub use status::*;
 
 impl Storage {
@@ -307,9 +322,12 @@ impl Storage {
         };
         conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
         conn.execute_batch(SCHEMA_DDL)?;
-        if path != ":memory:" {
+        let rebuilt_rollups = if path != ":memory:" {
             verify_schema(&conn)?;
-        }
+            drop_rollup_primary_keys(&conn)?
+        } else {
+            0
+        };
         let store = Self {
             conn,
             incident_node_id: parking_lot::RwLock::new("local".to_string()),
@@ -321,6 +339,13 @@ impl Storage {
         // transaction. Cheap: the streams it covers (alerts, incidents,
         // incident_tombstones) are retention-bounded, unlike `check_results`.
         store.rebuild_stream_watermarks()?;
+        if rebuilt_rollups > 0 {
+            // Old databases can predate incremental rollup watermarks, and a
+            // keyed-table rebuild preserves rows rather than synthesising
+            // their digest. Recompute after both physical copies complete so
+            // anti-entropy never sees zero counters for non-empty rollups.
+            store.rebuild_rollup_watermarks()?;
+        }
         // Self-heals `latest_check_results`: ordinary ingest keeps it exactly
         // in step with `check_results` inside one transaction, but nothing
         // stops a direct SQL statement (an operator, a future maintenance
