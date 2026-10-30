@@ -79,7 +79,7 @@ const ROLLUP_COLUMNS_DDL: &str = "check_id UUID NOT NULL,
 /// replicas converge whether or not they have rebuilt yet. Each table is
 /// rebuilt in its own transaction as a streaming copy: DuckDB preserves
 /// insertion order, and ingest appends rollups roughly chronologically, so the
-/// min/max statistics `MERGE INTO` and range reads rely on stay as tight as
+/// min/max statistics the set-based merges and range reads rely on stay as tight as
 /// they were, without sorting what can be a billion-row table. A crash leaves
 /// that table either untouched or fully rebuilt; the next open finishes the
 /// rest. Older builds cannot write to a rebuilt table (their `ON CONFLICT`
@@ -162,8 +162,8 @@ pub(super) const SCHEMA_DDL: &str = "CREATE TABLE IF NOT EXISTS check_results (
 -- `(check_id, agent_id, bucket_start)` is unique but deliberately not a
 -- PRIMARY KEY: its ART index was ~80% of the database file (more again on
 -- DuckDB 2.0) and made every merge slower. Every writer merges by that key
--- (`MERGE INTO` in `rollup_merge_from_*_sql`, wholesale replace in
--- `rebuild_latency_rollups`); see `drop_rollup_primary_keys`.
+-- (set-based UPDATE + anti-join INSERT in `rollup_merge_from_*_sql`, wholesale
+-- replace in `rebuild_latency_rollups`); see `drop_rollup_primary_keys`.
 CREATE TABLE IF NOT EXISTS check_latency_minute_rollups (
     check_id UUID NOT NULL,
     agent_id VARCHAR NOT NULL,
