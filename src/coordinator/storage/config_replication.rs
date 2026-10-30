@@ -2168,11 +2168,12 @@ mod tests {
                  SELECT md5('check-' || check_number::VARCHAR)::UUID,
                         'agent-' || (observation_number % 3)::VARCHAR,
                         observation_number,
-                        'up', 1, 200, NULL, NULL, 'zone', 'region'
+                        'up', 1, 200, NULL, 'zone', 'region', NULL
                  FROM range({check_count}) checks(check_number)
                  CROSS JOIN range({observations_per_check}) observations(observation_number);
-                 INSERT INTO result_replication_watermarks
+                 INSERT INTO result_replication_watermarks (check_id, min_ts, max_ts, result_count)
                  SELECT md5('check-' || check_number::VARCHAR)::UUID,
+                        0,
                         {observations_per_check} - 1,
                         {observations_per_check}
                  FROM range({check_count}) checks(check_number);
