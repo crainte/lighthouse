@@ -372,9 +372,10 @@ caught up.
 rollup tables used to declare `PRIMARY KEY (check_id, agent_id, bucket_start)`.
 DuckDB backs that with an ART index, which was ~80% of the database file on
 DuckDB 1.5 and ~68% larger again on 2.0. It also slowed every merge. Writers
-now merge by that key with set-based `UPDATE ... FROM` plus an anti-join
-`INSERT`, so the key is no longer declared. DuckDB 2.0's `MERGE INTO` was
-measured faster but intermittently aborted at process teardown in CI.
+now merge by that key with set-based `MERGE INTO`, so the key is no longer
+declared. An initial CI teardown abort was attributed to `MERGE INTO`, but the
+same abort recurred after switching to `UPDATE ... FROM` plus anti-join `INSERT`.
+That workaround did not establish a cause; `MERGE INTO` was measured faster.
 DuckDB cannot drop a constraint in place, so `Storage::open` rebuilds each
 still-keyed rollup table once (`schema::drop_rollup_primary_keys`).
 

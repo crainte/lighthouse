@@ -43,11 +43,14 @@ local linters = new Mapping<String, Step> {
 
 // CI-only gates. Frontend steps expect `bun install --frozen-lockfile` to have run.
 local slow = new Mapping<String, Step> {
-  // Unset: several tests assert behaviour for an agent with no ambient credential
-  // (see tests/ws_api.rs), so an exported token would make them flaky.
+  // Unset: several tests assert behaviour for an agent with no ambient
+  // credential (see tests/ws_api.rs), so an exported token would make them flaky.
+  // Script rather than bare `cargo test`: it loads a native backtrace hook into
+  // test binaries, because this gate intermittently dies with a libstdc++
+  // `pure virtual method called` abort at teardown that names no component.
   ["test"] {
     profiles = List("slow")
-    check = "env -u LIGHTHOUSE_AGENT_TOKEN cargo test --locked"
+    check = "bash scripts/ci-test.sh"
   }
   ["frontend-build"] {
     profiles = List("slow")
@@ -91,7 +94,7 @@ hooks {
     steps = new Mapping<String, Step> {
       ["test"] {
         glob = rust
-        check = "cargo test --locked"
+        check = "bash scripts/ci-test.sh"
       }
     }
   }

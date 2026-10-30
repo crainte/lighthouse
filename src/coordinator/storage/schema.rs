@@ -162,7 +162,7 @@ pub(super) const SCHEMA_DDL: &str = "CREATE TABLE IF NOT EXISTS check_results (
 -- `(check_id, agent_id, bucket_start)` is unique but deliberately not a
 -- PRIMARY KEY: its ART index was ~80% of the database file (more again on
 -- DuckDB 2.0) and made every merge slower. Every writer merges by that key
--- (set-based UPDATE + anti-join INSERT in `rollup_merge_from_*_sql`, wholesale
+-- (set-based MERGE INTO in `rollup_merge_from_*_sql`, wholesale
 -- replace in `rebuild_latency_rollups`); see `drop_rollup_primary_keys`.
 CREATE TABLE IF NOT EXISTS check_latency_minute_rollups (
     check_id UUID NOT NULL,
