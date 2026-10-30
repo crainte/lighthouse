@@ -68,11 +68,14 @@ jobs:
     runs-on: ${{ github.event_name != 'pull_request' && vars.RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v7
-      - name: Ensure a C linker
+      # `c++` and `addr2line` as well as `cc`: scripts/ci-test.sh builds the
+      # pure-virtual backtrace hook and symbolizes frames before the runner
+      # discards the binary. No-op on GitHub-hosted.
+      - name: Ensure C/C++ toolchain and binutils
         run: |
-          command -v cc >/dev/null && exit 0
+          command -v cc >/dev/null && command -v c++ >/dev/null && command -v addr2line >/dev/null && exit 0
           sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends build-essential
+          sudo apt-get install -y -q --no-install-recommends build-essential binutils
       - run: rustup toolchain install
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
