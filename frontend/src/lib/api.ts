@@ -19,6 +19,9 @@ export interface Check {
    *  `check_id` or orphan any history, alert or incident. */
   name: string;
   status: Status;
+  /** False when the operator deliberately paused probing. The status page
+   *  retains the row and its history, but it is not live service health. */
+  enabled?: boolean;
   latency_ms: number | null;
   last_check: number;
   /** `null` when nothing was measured in the window — a check configured on
@@ -147,6 +150,9 @@ export interface SectionRollup {
   checks: number;
   degraded: number;
   down: number;
+  /** Members the operator has paused. They keep their rows and history but
+   *  are excluded from live health. */
+  paused?: number;
 }
 
 export interface HistoryPoint {

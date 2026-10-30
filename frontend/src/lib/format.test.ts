@@ -41,6 +41,9 @@ describe('overallStatus', () => {
     expect(overallStatus([])).toBe('operational');
     expect(overallStatus([{ status: 'up' }, { status: 'unknown' }])).toBe('operational');
   });
+  it('ignores disabled checks even when their last state was down', () => {
+    expect(overallStatus([{ status: 'up', enabled: true }, { status: 'down', enabled: false }])).toBe('operational');
+  });
   it('is partial when some but not all are down', () => {
     expect(overallStatus([{ status: 'up' }, { status: 'down' }])).toBe('partial');
   });
@@ -59,6 +62,10 @@ describe('worstStatus', () => {
     expect(worstStatus([{ status: 'up' }, { status: 'unknown' }])).toBe('unknown');
     expect(worstStatus([{ status: 'unknown' }, { status: 'degraded' }])).toBe('degraded');
     expect(worstStatus([{ status: 'degraded' }, { status: 'down' }])).toBe('down');
+  });
+  it('ignores paused checks when summarizing a group', () => {
+    expect(worstStatus([{ status: 'up', enabled: true }, { status: 'unknown', enabled: false }])).toBe('up');
+    expect(worstStatus([{ status: 'up', enabled: true }, { status: 'down', enabled: false }])).toBe('up');
   });
 });
 

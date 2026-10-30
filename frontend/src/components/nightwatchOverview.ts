@@ -3,7 +3,7 @@ import type { Alert, Check, Incident, IncidentGroup } from '../lib/api';
 export type OverviewTone = 'up' | 'degraded' | 'down' | 'unknown';
 
 export function attentionChecks(checks: Check[]): Check[] {
-  return checks.filter((check) => check.status !== 'up');
+  return checks.filter((check) => check.enabled !== false && check.status !== 'up');
 }
 
 export function observedLabel(totalChecks: number, shown: number, hasMore: boolean): string {

@@ -1835,6 +1835,7 @@ mod tests {
                 name.as_bytes(),
             ),
             name: name.into(),
+            enabled: true,
             state,
             latency_ms: 1,
             last_check: chrono::Utc::now().timestamp_millis(),
@@ -1847,6 +1848,74 @@ mod tests {
             position: 0,
             depends_on: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn global_status_keeps_paused_rows_but_excludes_them_from_section_health() {
+        use crate::models::NodeState::{Down, Up};
+        let node = GlobalNode::new(&GlobalConfig {
+            db_path: ":memory:".into(),
+            region_staleness_secs: 3600,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let created = node
+            .inner
+            .store
+            .create_section(
+                "network",
+                false,
+                crate::coordinator::storage::SectionDisplay::default(),
+            )
+            .await;
+        assert!(created.is_ok());
+        let mut paused = summary("paused", Down);
+        paused.enabled = false;
+        paused.group = Some("network".into());
+        let mut healthy = summary("healthy", Up);
+        healthy.group = Some("network".into());
+        let now = chrono::Utc::now().timestamp_millis();
+        node.inner.cache.apply_push(
+            wire::RegionStatePush {
+                region: "us".into(),
+                origin: "test".into(),
+                advertise_url: None,
+                pushed_at: now,
+                region_health: Up,
+                agents_healthy: 1,
+                agents_total: 1,
+                checks: vec![paused, healthy],
+                epoch: 1,
+                seq: 1,
+                delta_base: None,
+                removed: Vec::new(),
+            },
+            now,
+        );
+        let addr = serve_router(node.router()).await;
+        let response: serde_json::Value =
+            reqwest::get(format!("http://{addr}/api/v1/status?all=true"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        let checks = response["checks"].as_array().unwrap();
+        assert_eq!(checks.len(), 2, "paused rows remain in public inventory");
+        let paused = checks
+            .iter()
+            .find(|check| check["name"] == "paused")
+            .unwrap();
+        assert_eq!(paused["enabled"], false);
+        let healthy = checks
+            .iter()
+            .find(|check| check["name"] == "healthy")
+            .unwrap();
+        assert_eq!(healthy["enabled"], true);
+        assert_eq!(response["sections"][0]["status"], "up");
+        assert_eq!(response["sections"][0]["paused"], 1);
+        assert_eq!(response["sections"][0]["checks"], 2);
     }
 
     fn peer_cfg(id: &str, peers: Vec<String>) -> GlobalConfig {

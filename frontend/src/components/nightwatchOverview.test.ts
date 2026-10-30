@@ -40,6 +40,9 @@ describe('nightwatch overview helpers', () => {
     ]);
   });
 
+  it('does not flag intentionally disabled checks as requiring attention', () => {
+    expect(attentionChecks([{ ...check('unknown'), enabled: false }, check('down')]).map((c) => c.status)).toEqual(['down']);
+  });
   it('labels a partial check page as an observed subset', () => {
     expect(observedLabel(40, 20, true)).toBe('Observed subset: 20 of 40 monitors');
     expect(observedLabel(20, 20, false)).toBe('20 monitored checks');

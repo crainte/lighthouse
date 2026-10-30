@@ -90,33 +90,34 @@
   let stripsRequest = 0;
 
   const attention = $derived(attentionChecks(checks));
-  const down = $derived(checks.filter((check) => check.status === 'down').length);
-  const degraded = $derived(checks.filter((check) => check.status === 'degraded').length);
-  const unknown = $derived(checks.filter((check) => check.status === 'unknown').length);
-  const up = $derived(checks.length - down - degraded - unknown);
+  const activeChecks = $derived(checks.filter((check) => check.enabled !== false));
+  const down = $derived(activeChecks.filter((check) => check.status === 'down').length);
+  const degraded = $derived(activeChecks.filter((check) => check.status === 'degraded').length);
+  const unknown = $derived(activeChecks.filter((check) => check.status === 'unknown').length);
+  const up = $derived(activeChecks.length - down - degraded - unknown);
   const feed = $derived(incidentFeed(incidents, groups));
   const activeCount = $derived(activeIncidentCount(incidents, groups));
   const checkNames = $derived(new Map(checks.map((check) => [check.check_id, check.name])));
   const disconnected = $derived(!!error || wsStatus === 'closed');
-  const updatedAt = $derived(checks.reduce((latest, check) => Math.max(latest, check.last_check ?? 0), 0));
+  const updatedAt = $derived(activeChecks.reduce((latest, check) => Math.max(latest, check.last_check ?? 0), 0));
   const modeLabel = $derived(nodeMode === 'global' ? 'Global' : 'Coordinator');
   const lighthouseHealth = $derived.by(() => {
     if (loading || disconnected) return 'unknown' as const;
     if (down > 0 || feed.some((item) => item.state !== 'monitoring')) return 'down' as const;
     if (degraded > 0) return 'degraded' as const;
-    if (unknown > 0 && unknown === checks.length) return 'unknown' as const;
+    if (!activeChecks.length || (unknown > 0 && unknown === activeChecks.length)) return 'unknown' as const;
     return 'operational' as const;
   });
 
   const sortedChecks = $derived(
     checks
       .map((check, index) => ({ check, index }))
-      .sort((a, b) => SEVERITY[a.check.status] - SEVERITY[b.check.status] || a.index - b.index)
+      .sort((a, b) => Number(a.check.enabled === false) - Number(b.check.enabled === false) || SEVERITY[a.check.status] - SEVERITY[b.check.status] || a.index - b.index)
       .map(({ check }) => check),
   );
   const filteredChecks = $derived(
     sortedChecks
-      .filter((check) => filter === 'all' || check.status !== 'up')
+      .filter((check) => filter === 'all' || (check.enabled !== false && check.status !== 'up'))
       .filter((check) => `${check.name} ${check.type ?? ''} ${check.group ?? ''}`.toLowerCase().includes(query.trim().toLowerCase())),
   );
   const featuredChecks = $derived(filteredChecks.slice(0, FEATURED));
@@ -139,6 +140,7 @@
 
   const stations = $derived.by((): Station[] => {
     const byRegion = new Map<string, { affected: Set<string>; failing: Set<string>; known: boolean; zones: Set<string>; staleness: number | null }>();
+    const pausedIds = new Set(checks.filter((check) => check.enabled === false).map((check) => check.check_id));
     const entry = (name: string) => {
       let value = byRegion.get(name);
       if (!value) {
@@ -150,6 +152,7 @@
     for (const check of regionTree?.checks ?? []) {
       for (const region of check.regions) {
         const value = entry(region.region);
+        if (pausedIds.has(check.check_id)) continue;
         if (region.state !== 'unknown') value.known = true;
         if (region.state === 'degraded' || region.state === 'down') value.affected.add(check.check_id);
         if (region.state === 'down') value.failing.add(check.check_id);
@@ -184,7 +187,7 @@
           location: value.zones.size ? `${value.zones.size} ${value.zones.size === 1 ? 'zone' : 'zones'}` : nodeMode === 'global' ? 'Regional coordinator' : 'Region',
           affected: value.affected.size,
           failing: value.failing.size,
-          unknownOnly: !value.known && !regionTree,
+          unknownOnly: !value.known,
           agentsLive,
           agentsTotal,
           freshness,
@@ -257,18 +260,19 @@
     if (error) return { tone: 'warn', title: 'Visibility interrupted', text: 'The status feed could not be refreshed. Current health cannot be confirmed.', action: { label: 'Retry', run: onRetry } };
     if (wsStatus === 'closed') return { tone: 'warn', title: 'Visibility interrupted', text: 'Live updates are disconnected. Showing the most recent snapshot.', action: { label: 'Refresh now', run: onRetry } };
     if (!checks.length) return { tone: 'good', title: 'Your watch starts here', text: 'Add a monitor to begin tracking availability, response time, and certificate health.', action: { label: 'Add your first monitor', run: onAddCheck } };
+    if (!activeChecks.length) return { tone: 'quiet', title: 'Monitoring paused', text: 'No monitors are active. Resume a monitor to confirm current health.', action: { label: 'View all monitors', run: () => onPanel('checks') } };
     if (attention.length) {
       const regions = affectedStations.map((station) => station.name);
       const where = regions.length && regions.length < stations.length ? ` in ${regions.join(', ')}` : '';
       const others = regions.length && regions.length < stations.length ? ' Your other regions are operating normally.' : '';
       const count = attention.length === 1 ? 'One monitor needs' : `${attention.length} monitors need`;
-      const title = down === 0 ? 'Degraded performance' : down === checks.length ? 'Major service disruption' : 'Partial service disruption';
+      const title = down === 0 ? 'Degraded performance' : down === activeChecks.length ? 'Major service disruption' : 'Partial service disruption';
       const action = feed[0]
         ? { label: 'Review active incident', run: () => openIncident(feed[0]) }
         : { label: 'Review affected monitors', run: showAttention };
       return { tone: down ? 'bad' : 'warn', title, text: `${count} attention${where}.${others}`, action };
     }
-    const scope = hasMore ? `All ${checks.length} shown monitors are` : `All ${checks.length} ${checks.length === 1 ? 'monitor is' : 'monitors are'}`;
+    const scope = hasMore ? `All ${activeChecks.length} shown active monitors are` : `All ${activeChecks.length} active ${activeChecks.length === 1 ? 'monitor is' : 'monitors are'}`;
     const regions = stations.length ? ` ${reportingStations} of ${stations.length} ${stations.length === 1 ? 'region is' : 'regions are'} reporting.` : '';
     return {
       tone: 'good',
@@ -410,9 +414,9 @@
   <section class="metric-rail" aria-label="Monitoring summary">
     <div class="metric">
       <div class="metric-label">Operational monitors</div>
-      <div class="metric-value">{loading || error ? '—' : up}<small>{' / '}{loading || error ? '—' : checks.length}</small></div>
+      <div class="metric-value">{loading || error ? '—' : up}<small>{' / '}{loading || error ? '—' : activeChecks.length}</small></div>
       <div class="metric-meta">
-        {#if loading}Loading…{:else if error}Current states unknown{:else if !checks.length}No monitors yet{:else if !attention.length}<span class="good">✓ All operational</span>{:else}
+        {#if loading}Loading…{:else if error}Current states unknown{:else if !checks.length}No monitors yet{:else if !activeChecks.length}<span class="quiet">No active monitors</span>{:else if !attention.length}<span class="good">✓ All operational</span>{:else}
           <span class="good">{up} operational</span>
           {#if degraded}<span class="warn">{degraded} degraded</span>{/if}
           {#if down}<span class="bad">{down} down</span>{/if}
@@ -532,15 +536,15 @@
             <button
               class="monitor-row"
               onclick={() => onOpenCheck(check.check_id)}
-              aria-label="{check.name}, {STATE_LABELS[check.status]}, response {formatLatency(check.latency_ms)}, 24-hour uptime {formatUptime(check.uptime_24h)}. Open details"
+              aria-label={check.enabled === false ? `${check.name}, Paused. Open details` : `${check.name}, ${STATE_LABELS[check.status]}, response ${formatLatency(check.latency_ms)}, 24-hour uptime ${formatUptime(check.uptime_24h)}. Open details`}
             >
               <span>
                 <span class="monitor-name">{check.name}</span>
                 <span class="monitor-type">{TYPE_LABELS[check.type ?? ''] ?? 'Monitor'}{#if check.group} <span aria-hidden="true">·</span> {check.group}{/if}</span>
               </span>
-              <span class="monitor-status {TONES[check.status]}"><span aria-hidden="true">{MARKS[check.status]}</span>{STATE_LABELS[check.status]}</span>
-              <span class="number"><span class="mobile-label">Response </span>{formatLatency(check.latency_ms)}</span>
-              <span class="number uptime"><span class="mobile-label">24h </span>{formatUptime(check.uptime_24h)}</span>
+              <span class="monitor-status {check.enabled === false ? 'quiet' : TONES[check.status]}"><span aria-hidden="true">{check.enabled === false ? '○' : MARKS[check.status]}</span>{check.enabled === false ? 'Paused' : STATE_LABELS[check.status]}</span>
+              <span class="number"><span class="mobile-label">Response </span>{check.enabled === false ? '—' : formatLatency(check.latency_ms)}</span>
+              <span class="number uptime"><span class="mobile-label">24h </span>{check.enabled === false ? '—' : formatUptime(check.uptime_24h)}</span>
               <span class="monitor-history" aria-hidden="true">
                 <span class="history-label">24h ago</span>
                 <span class="uptime-strip">{#each bars(check) as tone, index (index)}<span class="uptime-bar {tone}"></span>{/each}</span>

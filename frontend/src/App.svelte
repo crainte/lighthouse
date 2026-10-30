@@ -670,6 +670,10 @@
   const groupRollupBanner = $derived.by(() => {
     const rollup = groupPage?.rollup;
     if (!rollup) return null;
+    // A section whose members are all paused has no live health to assert.
+    if (rollup.paused && rollup.paused === rollup.checks) {
+      return { ...rollup, tone: 'unknown', label: 'Monitoring paused' };
+    }
     const tone = rollup.status === 'up' ? 'operational' : rollup.status === 'down' ? 'outage' : rollup.status === 'degraded' ? 'degraded' : 'unknown';
     const label =
       rollup.status === 'up'
@@ -1169,6 +1173,7 @@
             <CollapsibleGroup
               name={g.name}
               status={worstStatus(g.checks)}
+              paused={g.checks.length > 0 && g.checks.every((check) => check.enabled === false)}
               count={g.checks.length}
               collapsed={g.collapsed}
             >

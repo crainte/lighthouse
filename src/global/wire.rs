@@ -59,6 +59,10 @@ pub struct RegionStatePush {
     pub removed: Vec<CheckId>,
 }
 
+fn enabled_by_default() -> bool {
+    true
+}
+
 /// A single check's current state within a region. Fields mirror the public
 /// `CheckStatusDto` the dashboard already renders, so the global node can serve
 /// an aggregated `/api/v1/status` without inventing a new frontend contract.
@@ -72,6 +76,10 @@ pub struct CheckSummary {
     /// never has to render a UUID as a label.
     #[serde(default)]
     pub name: String,
+    /// A paused check is still published with history, but it cannot change
+    /// live health. Older coordinators omitted this field and remain active.
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
     /// This region's rolled-up state for the check.
     pub state: NodeState,
     pub latency_ms: u64,
@@ -119,6 +127,26 @@ impl CheckSummary {
             }
         }
         material(self) != material(previous)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paused_flag_defaults_to_enabled_for_old_pushes_and_triggers_a_delta() {
+        let id = CheckId::new_v5(&CheckId::NAMESPACE_OID, b"paused-check");
+        let old = serde_json::json!({
+            "check_id": id, "state": "up", "latency_ms": 0, "last_check": 0,
+        });
+        let active: CheckSummary = serde_json::from_value(old.clone()).unwrap();
+        assert!(active.enabled, "a pre-upgrade regional push stays active");
+        let mut new = old;
+        new["enabled"] = serde_json::json!(false);
+        let paused: CheckSummary = serde_json::from_value(new).unwrap();
+        assert!(!paused.enabled);
+        assert!(paused.materially_differs(&active));
     }
 }
 

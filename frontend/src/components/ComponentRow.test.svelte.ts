@@ -48,6 +48,16 @@ describe('compact public service rows', () => {
     expect(screen.queryByText('Latency over selected window')).not.toBeInTheDocument();
   });
 
+  it('labels an intentionally disabled public monitor as paused rather than unknown', () => {
+    const paused: Check = { ...mkCheck(false), enabled: false, status: 'unknown' };
+    render(ComponentRow, { props: {
+      compact: true, check: paused, uptime: undefined, sparkline: null,
+      onselect: vi.fn(),
+    } });
+    expect(screen.getByRole('button', { name: /DNS/ })).toHaveTextContent('Paused');
+    expect(screen.getByRole('button', { name: /DNS/ })).not.toHaveTextContent('Unknown ·');
+  });
+
   it('preserves no-data buckets as unknown rather than labeling them failures', () => {
     const check = mkCheck(false);
     render(ComponentRow, {

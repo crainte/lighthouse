@@ -114,13 +114,13 @@
   .row {
     display: grid;
     grid-template-columns:
-      minmax(8rem, 1.4fr) minmax(0, 0.8fr) 5rem 5.5rem 4.5rem
-      minmax(8rem, 1fr) 6rem;
+      minmax(10rem, 1.4fr) minmax(6rem, 0.8fr) 9rem 6rem 4.5rem
+      9rem 6rem;
     gap: 0.6rem;
     align-items: center;
     font-size: 0.8rem;
     padding: 12px 4px;
-    min-width: 760px;
+    min-width: 880px;
     border-bottom: 1px solid var(--ad-line-soft);
   }
   .row:not(.head):hover { background: var(--ad-panel-2); }

@@ -459,12 +459,25 @@ impl Coordinator {
         &self,
         entries: &[storage::ConfigEntry],
     ) -> Result<()> {
+        // A check that goes away (or is paused) stops being probed. Its
+        // machine-opened incident therefore can never be resolved by an UP
+        // observation, so the config transition has to end it. Capture the
+        // transition before the cache is swapped, then close only incidents
+        // this check *owns*: an operator's incident, or one where it is only a
+        // dependency, is not the pause's to resolve.
+        let was_enabled: std::collections::HashMap<_, _> = {
+            let cached = self.inner.checks.read();
+            cached
+                .iter()
+                .map(|(id, check)| (*id, check.enabled))
+                .collect()
+        };
         let (checks, credentials, policies, settings) =
             self.apply_config_entries(entries.to_vec()).await?;
         if !checks.is_empty() {
             let mut cached = self.inner.checks.write();
             let mut catalogue = self.inner.check_catalogue.write();
-            for entry in checks {
+            for entry in &checks {
                 if entry.is_tombstone() {
                     if let Ok(id) = entry.id.parse() {
                         cached.remove(&id);
@@ -504,6 +517,61 @@ impl Coordinator {
         }
         for id in settings {
             self.reload_setting_cache(&id).await?;
+        }
+        // Derive the pause set from what actually won the merge, never from the
+        // requested batch: a stale entry rejected by HLC, or a pause superseded
+        // by a resume in the same batch, must not close an incident.
+        let mut applied_enabled = std::collections::HashMap::new();
+        for entry in &checks {
+            if entry.is_tombstone() {
+                continue;
+            }
+            let Ok(id) = entry.id.parse() else {
+                continue;
+            };
+            if let Some(check) = entry
+                .document
+                .as_deref()
+                .and_then(|document| serde_json::from_str::<CheckConfig>(document).ok())
+                .filter(|check| check.id == id)
+            {
+                applied_enabled.insert(id, check.enabled);
+            }
+        }
+        let paused: Vec<_> = applied_enabled
+            .into_iter()
+            .filter(|(id, enabled)| !enabled && was_enabled.get(id).copied().unwrap_or(false))
+            .map(|(id, _)| id)
+            .collect();
+        if !paused.is_empty() {
+            let now = chrono::Utc::now().timestamp_millis();
+            self.db(move |store| {
+                for check_id in paused {
+                    let Some(incident) = store.open_incident_for(check_id)? else {
+                        continue;
+                    };
+                    // `open_incident_for` matches any attachment; a pause only
+                    // owns the incident the check itself opened.
+                    if incident.origin_check != Some(check_id)
+                        || incident.state.is_resolved()
+                    {
+                        continue;
+                    }
+                    let latest = store
+                        .updates_for_incident(&incident.id)?
+                        .last()
+                        .map_or(i64::MIN, |update| update.created_at);
+                    store.add_update(
+                        &incident.id,
+                        storage::IncidentState::Resolved,
+                        "Monitoring paused: the check was disabled by configuration. This outage was closed administratively, not by a passing probe.",
+                        None,
+                        now.max(latest.saturating_add(1)),
+                    )?;
+                }
+                Ok(())
+            })
+            .await?;
         }
         Ok(())
     }
@@ -1815,6 +1883,141 @@ mod tests {
         let catalogue = coord.inner.check_catalogue.read();
         assert_eq!(catalogue.len(), 1);
         assert_eq!(catalogue[0].id, second.id);
+    }
+
+    /// The identical entry shape a peer receives over `/internal/config` must
+    /// also settle the incident the check opened, otherwise a pause replicated
+    /// from another region leaves an outage "active" on this node forever.
+    #[tokio::test]
+    async fn replicated_pause_closes_the_check_origin_incident_without_recovery() {
+        use crate::coordinator::storage::IncidentState;
+
+        let coord = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let check = CheckConfig {
+            id: crate::models::new_check_id(),
+            name: "replicated".into(),
+            target: "https://replicated.invalid".into(),
+            ..Default::default()
+        };
+        coord.create_check_for_test(check.clone()).await;
+        let now = chrono::Utc::now().timestamp_millis();
+        coord
+            .ingest(vec![CheckResult {
+                check_id: check.id,
+                agent_id: "peer-agent".into(),
+                zone: "test-zone".into(),
+                region: "test-region".into(),
+                kind: check.kind,
+                timestamp: chrono::DateTime::from_timestamp_millis(now).unwrap(),
+                latency_ms: 1,
+                status_code: Some(500),
+                body_matched: None,
+                error: None,
+                failure: None,
+                body: None,
+                headers: None,
+                metric: None,
+                metrics: None,
+            }])
+            .await;
+        let incident = coord
+            .incidents_for_test(100)
+            .await
+            .into_iter()
+            .find(|incident| incident.origin_check == Some(check.id))
+            .expect("the DOWN observation opens an incident");
+        assert!(incident.resolved_at.is_none());
+
+        let mut paused = check;
+        paused.enabled = false;
+        coord
+            .apply_config_batch(&[super::storage::ConfigEntry {
+                kind: super::storage::ConfigKind::Check,
+                id: paused.id.to_string(),
+                hlc: super::hlc::Hlc::new(now + 1, "peer"),
+                document: Some(serde_json::to_string(&paused).unwrap()),
+            }])
+            .await
+            .unwrap();
+
+        let row = coord
+            .incidents_for_test(100)
+            .await
+            .into_iter()
+            .find(|row| row.id == incident.id)
+            .unwrap();
+        assert_eq!(row.state, IncidentState::Resolved);
+        assert!(row.resolved_at.is_some());
+        let updates = coord.updates_for_test(&incident.id).await;
+        assert_eq!(updates.len(), 2, "history is preserved, not erased");
+        assert!(updates[1].body.contains("Monitoring paused"));
+        assert!(!updates[1].body.to_lowercase().contains("recover"));
+    }
+
+    /// A pause that loses the LWW merge must not close the incident: only the
+    /// entry that actually replaced the check may do that.
+    #[tokio::test]
+    async fn an_lww_rejected_pause_does_not_close_the_open_incident() {
+        let coord = Coordinator::new(&CoordinatorConfig {
+            db_path: ":memory:".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let check = CheckConfig {
+            id: crate::models::new_check_id(),
+            name: "stale-pause".into(),
+            target: "https://stale.invalid".into(),
+            ..Default::default()
+        };
+        coord.create_check_for_test(check.clone()).await;
+        let now = chrono::Utc::now().timestamp_millis();
+        coord
+            .ingest(vec![CheckResult {
+                check_id: check.id,
+                agent_id: "peer-agent".into(),
+                zone: "test-zone".into(),
+                region: "test-region".into(),
+                kind: check.kind,
+                timestamp: chrono::DateTime::from_timestamp_millis(now).unwrap(),
+                latency_ms: 1,
+                status_code: Some(500),
+                body_matched: None,
+                error: None,
+                failure: None,
+                body: None,
+                headers: None,
+                metric: None,
+                metrics: None,
+            }])
+            .await;
+        let mut paused = check.clone();
+        paused.enabled = false;
+        // Stamp from the distant past: this loses to the existing row.
+        coord
+            .apply_config_batch(&[super::storage::ConfigEntry {
+                kind: super::storage::ConfigKind::Check,
+                id: paused.id.to_string(),
+                hlc: super::hlc::Hlc::new(1, "peer"),
+                document: Some(serde_json::to_string(&paused).unwrap()),
+            }])
+            .await
+            .unwrap();
+        let incident = coord
+            .incidents_for_test(100)
+            .await
+            .into_iter()
+            .find(|incident| incident.origin_check == Some(check.id))
+            .expect("the incident exists");
+        assert!(
+            incident.resolved_at.is_none(),
+            "a rejected pause must leave the incident open"
+        );
     }
 
     /// Regression for the release benchmark's "huge warnings every check"

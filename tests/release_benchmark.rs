@@ -1019,6 +1019,7 @@ async fn status_pagination_covers_over_100_checks_regionally_and_globally() {
                 |(number, check_id)| lighthouse::global::wire::CheckSummary {
                     check_id: *check_id,
                     name: format!("bench-check-{number}"),
+                    enabled: true,
                     state: lighthouse::models::NodeState::Unknown,
                     latency_ms: 0,
                     last_check: 0,

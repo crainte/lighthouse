@@ -29,21 +29,23 @@ export function formatUptime(fraction: number | null | undefined): string {
 // Overall system state from all checks, for the status banner.
 export type Overall = 'operational' | 'degraded' | 'partial' | 'major';
 
-export function overallStatus(checks: Pick<Check, 'status'>[]): Overall {
-  if (checks.length === 0) return 'operational';
-  const down = checks.filter((c) => c.status === 'down').length;
-  if (down === checks.length) return 'major';
+export function overallStatus(checks: Pick<Check, 'status' | 'enabled'>[]): Overall {
+  const active = checks.filter((c) => c.enabled !== false);
+  if (active.length === 0) return 'operational';
+  const down = active.filter((c) => c.status === 'down').length;
+  if (down === active.length) return 'major';
   if (down > 0) return 'partial';
-  if (checks.some((c) => c.status === 'degraded')) return 'degraded';
+  if (active.some((c) => c.status === 'degraded')) return 'degraded';
   return 'operational';
 }
 
 // Worst status across a set of checks, for a group header: DOWN wins, then
 // DEGRADED, then UNKNOWN, else UP. An empty set reads as UP.
-export function worstStatus(checks: Pick<Check, 'status'>[]): Status {
-  if (checks.some((c) => c.status === 'down')) return 'down';
-  if (checks.some((c) => c.status === 'degraded')) return 'degraded';
-  if (checks.some((c) => c.status === 'unknown')) return 'unknown';
+export function worstStatus(checks: Pick<Check, 'status' | 'enabled'>[]): Status {
+  const active = checks.filter((c) => c.enabled !== false);
+  if (active.some((c) => c.status === 'down')) return 'down';
+  if (active.some((c) => c.status === 'degraded')) return 'degraded';
+  if (active.some((c) => c.status === 'unknown')) return 'unknown';
   return 'up';
 }
 

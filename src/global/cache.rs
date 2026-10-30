@@ -78,6 +78,8 @@ pub struct AggregatedCheck {
     pub check_id: CheckId,
     /// Mutable display name from the freshest reporting region.
     pub name: String,
+    /// True if any live region is actively probing this published check.
+    pub enabled: bool,
     /// Cross-region rolled-up state: the worst state any live region reports.
     pub state: NodeState,
     /// Per-region state for this check, region name -> state, live regions only.
@@ -333,6 +335,7 @@ impl GlobalCache {
                 let agg = merged.entry(*check_id).or_insert_with(|| AggregatedCheck {
                     check_id: *check_id,
                     name: summary.name.clone(),
+                    enabled: false,
                     state: NodeState::Unknown,
                     per_region: HashMap::new(),
                     latency_ms: 0,
@@ -345,8 +348,11 @@ impl GlobalCache {
                     latency_graph: false,
                     position: i32::MAX,
                 });
-                agg.per_region.insert((*region_name).clone(), summary.state);
-                agg.state = worst(agg.state, summary.state);
+                if summary.enabled {
+                    agg.enabled = true;
+                    agg.per_region.insert((*region_name).clone(), summary.state);
+                    agg.state = worst(agg.state, summary.state);
+                }
                 agg.latency_graph = agg.latency_graph || summary.latency_graph;
                 if summary.position != i32::MAX {
                     agg.position = agg.position.min(summary.position);
@@ -370,13 +376,24 @@ impl GlobalCache {
                 .iter()
                 .filter(|(_, region)| !region.is_stale(now, self.staleness_ms))
                 .filter_map(|(_, region)| region.checks.get(&agg.check_id))
-                .filter(|summary| summary.state == agg.state)
+                .filter(|summary| summary.enabled && summary.state == agg.state)
                 .max_by_key(|summary| summary.last_check);
             if let Some(summary) = evidence {
                 agg.last_check = summary.last_check;
                 if !summary.name.is_empty() {
                     agg.name = summary.name.clone();
                 }
+                // Presentation metadata follows a live region, so a paused
+                // region's divergent section or ordering cannot reshape an
+                // actively probed check.
+                // A live region is authoritative even when its value is
+                // absent (a loose check has no group).
+                agg.kind = summary.kind;
+                agg.group = summary.group.clone();
+                if summary.position != i32::MAX {
+                    agg.position = summary.position;
+                }
+                agg.latency_graph = summary.latency_graph;
                 agg.latency_ms = summary.latency_ms;
                 agg.uptime_24h = summary.uptime_24h;
                 agg.status_code = summary.status_code;
@@ -604,6 +621,7 @@ mod tests {
                 .map(|(name, st)| CheckSummary {
                     check_id: id(name),
                     name: (*name).to_string(),
+                    enabled: true,
                     state: *st,
                     latency_ms: 10,
                     last_check: at,
@@ -622,6 +640,67 @@ mod tests {
             delta_base: None,
             removed: Vec::new(),
         }
+    }
+
+    #[test]
+    fn paused_regional_checks_do_not_poison_global_health() {
+        let cache = GlobalCache::new(20);
+        let mut paused = push(
+            "us",
+            "a",
+            1,
+            NodeState::Unknown,
+            &[
+                ("api", NodeState::Down),
+                ("paused-only", NodeState::Unknown),
+            ],
+        );
+        for check in &mut paused.checks {
+            check.enabled = false;
+        }
+        cache.apply_push(paused, 1_000);
+        cache.apply_push(
+            push("eu", "b", 1, NodeState::Up, &[("api", NodeState::Up)]),
+            1_000,
+        );
+        let all = cache.aggregate(1_000);
+        let api = all.iter().find(|check| check.name == "api").unwrap();
+        assert_eq!(api.state, NodeState::Up);
+        assert_eq!(api.per_region.len(), 1);
+        let paused_only = all
+            .iter()
+            .find(|check| check.name == "paused-only")
+            .unwrap();
+        assert_eq!(paused_only.state, NodeState::Unknown);
+        assert!(paused_only.per_region.is_empty());
+    }
+
+    #[test]
+    fn active_region_metadata_wins_over_a_paused_regions_divergent_section() {
+        let cache = GlobalCache::new(20);
+        let mut paused = push(
+            "us",
+            "a",
+            1,
+            NodeState::Unknown,
+            &[("api", NodeState::Unknown)],
+        );
+        paused.checks[0].enabled = false;
+        paused.checks[0].group = Some("wrong".into());
+        paused.checks[0].position = 0;
+        let mut active = push("eu", "b", 2, NodeState::Up, &[("api", NodeState::Up)]);
+        active.checks[0].group = Some("right".into());
+        active.checks[0].position = 7;
+        cache.apply_push(paused, 1_000);
+        cache.apply_push(active, 1_000);
+        let api = cache
+            .aggregate(1_000)
+            .into_iter()
+            .find(|check| check.name == "api")
+            .unwrap();
+        assert!(api.enabled);
+        assert_eq!(api.group.as_deref(), Some("right"));
+        assert_eq!(api.position, 7);
     }
 
     #[test]

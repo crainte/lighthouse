@@ -229,6 +229,13 @@ impl GlobalAlerter {
                     continue;
                 }
             }
+            // Pausing a check removes it from every region's live set, so a
+            // down-everywhere condition clears without any probe recovering.
+            // Record the clear, but never page a recovery that did not happen;
+            // resuming the check re-evaluates from scratch.
+            if cleared_by_pause(condition, &aggregate) {
+                continue;
+            }
             self.page(condition, &record.title, NodeState::Up).await;
         }
         entries
@@ -269,6 +276,18 @@ impl GlobalAlerter {
 /// A check is down everywhere when it is reported by at least one region and
 /// every region reporting it reads Down. A single Up or Degraded region means
 /// the service is reachable from somewhere, which the regions handle alone.
+/// True when a firing check condition disappeared only because the operator
+/// paused the check. Clearing the record is correct; paging `Up` would claim a
+/// recovery no probe observed.
+fn cleared_by_pause(condition: &Condition, aggregate: &[AggregatedCheck]) -> bool {
+    let Condition::CheckDownEverywhere(check_id) = condition else {
+        return false;
+    };
+    aggregate
+        .iter()
+        .any(|check| check.check_id == *check_id && !check.enabled)
+}
+
 fn is_down_everywhere(check: &AggregatedCheck) -> bool {
     let per_region: &HashMap<String, NodeState> = &check.per_region;
     !per_region.is_empty() && per_region.values().all(|s| *s == NodeState::Down)
@@ -292,6 +311,7 @@ mod tests {
         AggregatedCheck {
             check_id: cid(id),
             name: id.into(),
+            enabled: true,
             state: NodeState::Down,
             per_region: regions.iter().map(|(r, s)| ((*r).into(), *s)).collect(),
             latency_ms: 0,
@@ -304,6 +324,25 @@ mod tests {
             latency_graph: false,
             position: 0,
         }
+    }
+
+    #[test]
+    fn a_paused_check_clears_down_everywhere_without_paging_recovery() {
+        let mut paused = check("api", &[]);
+        paused.enabled = false;
+        let aggregate = vec![paused];
+        assert!(cleared_by_pause(
+            &Condition::CheckDownEverywhere(cid("api")),
+            &aggregate
+        ));
+        assert!(!cleared_by_pause(
+            &Condition::CheckDownEverywhere(cid("missing")),
+            &aggregate
+        ));
+        assert!(!cleared_by_pause(
+            &Condition::RegionDark("us".into()),
+            &aggregate
+        ));
     }
 
     #[test]

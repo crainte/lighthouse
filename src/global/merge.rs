@@ -542,6 +542,7 @@ mod tests {
         cache::AggregatedCheck {
             check_id: crate::models::new_check_id(),
             name: group.unwrap_or("loose").to_string(),
+            enabled: true,
             state: crate::models::NodeState::Up,
             per_region: HashMap::new(),
             latency_ms: 1,

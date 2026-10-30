@@ -159,9 +159,9 @@
     <h2 class="mono">{check?.name ?? checkId}</h2>
     {#if check?.type}<span class="kind-pill">{check.type}</span>{/if}
     {#if check}
-      <span class="status-chip" style="color:{statusColor(check.status)}">
-        <span class="chip-dot" style="background:{statusColor(check.status)}"></span>
-        {check.status}
+      <span class="status-chip" style="color:{statusColor(check.enabled === false ? 'unknown' : check.status)}">
+        <span class="chip-dot" style="background:{statusColor(check.enabled === false ? 'unknown' : check.status)}"></span>
+        {check.enabled === false ? 'Paused' : check.status}
       </span>
     {/if}
   </div>

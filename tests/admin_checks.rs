@@ -208,6 +208,24 @@ async fn an_authenticated_admin_can_round_trip_a_check() {
         row["enabled"], false,
         "a disabled check is kept, not dropped"
     );
+    let published: Value = admin
+        .get(format!("{base}/api/v1/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let public_row = published["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "docs-site")
+        .expect("a visible disabled check keeps its public row and history");
+    assert_eq!(
+        public_row["enabled"], false,
+        "public status must distinguish a paused check from unknown health"
+    );
 
     // --- Agents receive targets, but only the checks they should run. ---
     let agent = reqwest::Client::new();

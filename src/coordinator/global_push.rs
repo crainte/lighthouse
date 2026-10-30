@@ -161,8 +161,6 @@ impl Coordinator {
     /// status source as the public `/api/v1/status`, so the global dashboard
     /// shows exactly what a regional dashboard would.
     pub(in crate::coordinator) async fn build_state_push(&self) -> RegionStatePush {
-        use crate::global::cache::worst;
-
         let now = chrono::Utc::now().timestamp_millis();
         let reader = self.clone();
         let (statuses, polls) = self
@@ -196,6 +194,7 @@ impl Coordinator {
                     Some(CheckSummary {
                         check_id,
                         name: meta.name.clone(),
+                        enabled: meta.enabled,
                         state: r.state,
                         latency_ms: r.latency_ms,
                         last_check: r.last_check,
@@ -213,9 +212,7 @@ impl Coordinator {
                 })
                 .collect()
         };
-        let region_health = summaries
-            .iter()
-            .fold(NodeState::Unknown, |acc, c| worst(acc, c.state));
+        let region_health = region_health_for(&summaries);
         // Truthful agent counts for this region: an agent is healthy when its
         // last contact is inside its own silence window. Local `seen` alone
         // undercounts in a cluster, so union it with the persisted
@@ -260,6 +257,14 @@ impl Coordinator {
     }
 }
 
+fn region_health_for(summaries: &[CheckSummary]) -> NodeState {
+    use crate::global::cache::worst;
+    summaries
+        .iter()
+        .filter(|check| check.enabled)
+        .fold(NodeState::Unknown, |acc, check| worst(acc, check.state))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +273,7 @@ mod tests {
         CheckSummary {
             check_id: CheckId::new_v5(&CheckId::NAMESPACE_OID, name.as_bytes()),
             name: name.into(),
+            enabled: true,
             state,
             latency_ms,
             last_check: latency_ms as i64,
@@ -304,6 +310,15 @@ mod tests {
             accepted: true,
             resync: false,
         })
+    }
+
+    #[test]
+    fn disabled_checks_do_not_change_region_health() {
+        let mut paused = summary("paused", NodeState::Down, 0);
+        paused.enabled = false;
+        let active = summary("active", NodeState::Up, 1);
+        assert_eq!(region_health_for(&[paused.clone(), active]), NodeState::Up);
+        assert_eq!(region_health_for(&[paused]), NodeState::Unknown);
     }
 
     #[test]

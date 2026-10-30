@@ -33,9 +33,12 @@
   } = $props();
 
   const placeholders = Array.from({ length: 90 }, (_, i) => i);
+  const paused = $derived(check.enabled === false);
 
   const statusLabel = $derived(
-    check.status === 'up'
+    paused
+      ? 'Paused'
+      : check.status === 'up'
       ? 'Operational'
       : check.status === 'degraded'
         ? 'Degraded'
@@ -45,7 +48,7 @@
   );
 
   // Why the latest attempt failed, shown under the header when there is one.
-  const reason = $derived(failureReason(check));
+  const reason = $derived(paused ? null : failureReason(check));
 
   const dateFmt = new Intl.DateTimeFormat(undefined, {
     month: 'short',
@@ -115,9 +118,9 @@
 </script>
 
 {#if compact}
-  <button class="public-service-row" data-status={check.status} onclick={() => onselect(check.check_id)}>
+  <button class="public-service-row" data-status={paused ? 'unknown' : check.status} onclick={() => onselect(check.check_id)}>
     <span class="public-service-name">
-      <span class="public-service-dot" style:background={statusColor(check.status)} aria-hidden="true"></span>
+      <span class="public-service-dot" style:background={statusColor(paused ? 'unknown' : check.status)} aria-hidden="true"></span>
       <span><strong>{check.name}</strong><small>{check.group ?? check.type?.toUpperCase() ?? 'Service monitor'}</small></span>
     </span>
     <span class="public-service-history">
@@ -136,8 +139,8 @@
       {#if incident}<small class="public-service-incident">Incident: {incident.title}</small>{/if}
     </span>
     <span class="public-service-stats">
-      <strong>{formatUptime(uptime?.overall_uptime ?? null)}</strong>
-      <small>{statusLabel} · {formatLatency(check.latency_ms)}</small>
+      <strong>{paused ? '—' : formatUptime(uptime?.overall_uptime ?? null)}</strong>
+      <small>{paused ? 'Paused · Monitoring disabled' : `${statusLabel} · ${formatLatency(check.latency_ms)}`}</small>
     </span>
     <span class="public-service-chevron" aria-hidden="true">›</span>
     {#if check.latency_graph && sparkline && sparkline.length > 1}
@@ -150,12 +153,12 @@
 <button class="component" onclick={() => onselect(check.check_id)}>
   <div class="component-head">
     <span class="component-name">
-      <span class="status-dot" style="background:{statusColor(check.status)}"></span>
+      <span class="status-dot" style="background:{statusColor(paused ? 'unknown' : check.status)}"></span>
       {check.name}
     </span>
     <span class="component-meta">
-      <span class="component-uptime">{formatUptime(uptime?.overall_uptime ?? null)}</span>
-      <span class="component-latency">{formatLatency(check.latency_ms)} · {statusLabel}</span>
+      <span class="component-uptime">{paused ? '—' : formatUptime(uptime?.overall_uptime ?? null)}</span>
+      <span class="component-latency">{paused ? statusLabel : `${formatLatency(check.latency_ms)} · ${statusLabel}`}</span>
     </span>
   </div>
 

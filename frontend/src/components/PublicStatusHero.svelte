@@ -13,7 +13,7 @@
     waitingForRegions?: boolean;
   } = $props();
   const summary = $derived(summarizePublicStatus(checks, incidents, sections, waitingForRegions));
-  const observedAt = $derived(Math.max(0, ...checks.map((check) => check.last_check ?? 0)));
+  const observedAt = $derived(Math.max(0, ...checks.filter((check) => check.enabled !== false).map((check) => check.last_check ?? 0)));
 </script>
 
 <section
