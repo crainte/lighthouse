@@ -1071,18 +1071,10 @@ impl Coordinator {
             // Durable, not just a counter and a log line: an operator needs
             // to know *which* checks have holes and over what range, and a
             // restart must not lose that a gap was ever seen.
-            // `record_raw_data_gap` upserts on `(check_id, peer)`, so a
+            // `record_raw_data_gaps` upserts on `(check_id, peer)`, so a
             // standing gap redetected every sweep does not grow this table
             // without bound.
-            if let Err(error) = self
-                .db(move |s| {
-                    for gap in &gaps {
-                        s.record_raw_data_gap(gap)?;
-                    }
-                    Ok(())
-                })
-                .await
-            {
+            if let Err(error) = self.db(move |s| s.record_raw_data_gaps(&gaps)).await {
                 tracing::warn!(%error, "anti-entropy: failed to record a raw-data gap");
             }
         }

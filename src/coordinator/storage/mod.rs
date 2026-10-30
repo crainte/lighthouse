@@ -367,6 +367,7 @@ impl Storage {
         // interleaved with DML there is a needless thing to depend on.
         store.prepare_ingest()?;
         store.prepare_config_watermarks()?;
+        store.prepare_check_stage()?;
         store.prepare_status()?;
         Ok(store)
     }

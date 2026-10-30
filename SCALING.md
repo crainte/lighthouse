@@ -673,8 +673,14 @@ interleaved runs:
 | Startup recovery reopen | 8.8 s | 13.4 s | 0.29 s |
 
 Seeding 10,000 checks through `apply_config_entries` (the setup inside each
-benchmark) costs ~48 s, ~72 s and ~51 s respectively. That per-check config
-apply is the remaining 2.0 cost, about +8% on anti-entropy.
+benchmark) originally cost ~48 s, ~72 s and ~51 s respectively. The follow-up
+set-based config apply stages accepted check documents and their placement rows,
+then writes each table in one operation. On DuckDB 2.0 the same benchmark fell
+from 38.8 s to 11.3 s (median of three), and the regression-gated anti-entropy
+benchmark from 90.6 s to 14.3 s full convergence. A single-check edit keeps a
+small direct-write fast path; bulk reorder, rename and section-delete paths use
+the staged writer. Raw-data gaps found by one anti-entropy sweep are staged and
+upserted as one batch too.
 
 libduckdb-sys ≥ 1.20000 compiles the bundled engine with DuckDB's `DEBUG` (its
 `D_ASSERT` and verification paths) whenever its package has any debuginfo.
@@ -685,11 +691,9 @@ with `CARGO_PROFILE_RELEASE_DEBUG=false` too: frame pointers, `perf record
 `line-tables-only` turns the engine into a debug build and makes every
 measurement several times slower.
 
-The remaining measured stall is the config plane, not the data plane: applying a bulk
-config push still costs one upsert per entry and holds the worker for up to ~4.6 s per
-batch while provisioning 10,000 checks, and a peer's full `config_entries` read costs
-~2.2 s at that cardinality. Both are provisioning-time, not steady-state, so they are
-tracked as follow-up work rather than as part of this gate.
+The remaining measured config-plane cost is a peer's full `config_entries` read,
+~2.2 s at 10,000 checks. Bulk apply is set-based now; the read is provisioning-time,
+not steady-state, so it remains follow-up work rather than part of this gate.
 
 ### What the gate did not remove: dedup cost grows with retained history
 

@@ -1,5 +1,76 @@
 use super::*;
 
+/// One `checks` row as projected from its `CheckConfig`: the single place the
+/// definition maps onto the flat columns SQL filters and orders by, shared by
+/// the one-check upsert and the staged bulk path so the two cannot drift.
+pub(super) struct CheckRow<'a> {
+    config: &'a CheckConfig,
+    kind: &'static str,
+    interval_secs: i64,
+    timeout_secs: i64,
+    expect_status: Option<i32>,
+    agents: String,
+    document: String,
+    updated_at: i64,
+    updated_by: Option<&'a str>,
+}
+
+impl<'a> CheckRow<'a> {
+    fn new(config: &'a CheckConfig, updated_at: i64, updated_by: Option<&'a str>) -> Result<Self> {
+        Ok(Self {
+            config,
+            kind: config.kind.as_db(),
+            // Legacy column, kept populated so an older binary rolled back
+            // onto this database still finds a usable interval.
+            interval_secs: cron_to_seconds(&config.cron) as i64,
+            timeout_secs: config.timeout_secs as i64,
+            expect_status: config.expect.status.map(|s| s as i32),
+            agents: serde_json::to_string(&config.agents).unwrap_or_else(|_| "[]".into()),
+            document: serde_json::to_string(config)?,
+            updated_at,
+            updated_by,
+        })
+    }
+
+    /// Values in `checks` column order: id, name, kind, target,
+    /// interval_secs, timeout_secs, group_name, latency_graph, enabled,
+    /// expect_status, expect_body_contains, visible, eval, position, agents,
+    /// config, updated_at, updated_by.
+    fn params(&self) -> [&dyn duckdb::ToSql; 18] {
+        let c = self.config;
+        [
+            &c.id,
+            &c.name,
+            &self.kind,
+            &c.target,
+            &self.interval_secs,
+            &self.timeout_secs,
+            &c.group,
+            &c.latency_graph,
+            &c.enabled,
+            &self.expect_status,
+            &c.expect.body_contains,
+            &c.visible,
+            &c.eval,
+            &c.position,
+            &self.agents,
+            &self.document,
+            &self.updated_at,
+            &self.updated_by,
+        ]
+    }
+
+    /// Distinct placement regions; empty means every region, stored as no rows.
+    fn regions(&self) -> std::collections::BTreeSet<&'a str> {
+        self.config
+            .placement
+            .regions
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+}
+
 /// A stored rollup policy for one node of the tree.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RollupPolicyRow {
@@ -194,19 +265,84 @@ impl Storage {
     /// `config` is the definition; the other columns are a projection of it so
     /// SQL can order and filter without parsing every document.
     pub fn upsert_check(&self, c: &CheckConfig, now_millis: i64) -> Result<()> {
+        self.upsert_checks(std::slice::from_ref(c), now_millis)
+    }
+
+    /// `upsert_check` for many checks in one transaction, with one config
+    /// watermark sync for all of them rather than one per check.
+    pub fn upsert_checks(&self, checks: &[CheckConfig], now_millis: i64) -> Result<()> {
+        if checks.is_empty() {
+            return Ok(());
+        }
         self.transaction(|store| {
-            store.upsert_check_uncommitted(c, now_millis)?;
-            store.sync_config_watermark(ConfigKind::Check, &c.id.to_string())
+            store.upsert_checks_uncommitted(checks.iter().map(|c| (c, now_millis, None)))?;
+            let touched: Vec<(ConfigKind, String)> = checks
+                .iter()
+                .map(|c| (ConfigKind::Check, c.id.to_string()))
+                .collect();
+            store.sync_config_watermarks(&touched)
         })
     }
 
-    pub(super) fn upsert_check_uncommitted(&self, c: &CheckConfig, now_millis: i64) -> Result<()> {
+    /// Temp staging for `upsert_checks_uncommitted`, created once per
+    /// connection in `Storage::open`, like the other staging tables.
+    pub(super) fn prepare_check_stage(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS check_upsert_stage AS
+                 SELECT id, name, kind, target, interval_secs, timeout_secs, group_name,
+                        latency_graph, enabled, expect_status, expect_body_contains,
+                        visible, eval, position, agents, config, updated_at, updated_by
+                 FROM checks WITH NO DATA;
+             CREATE TEMP TABLE IF NOT EXISTS check_placement_stage AS
+                 SELECT check_id, region FROM check_placement_regions WITH NO DATA;",
+        )?;
+        Ok(())
+    }
+
+    /// Create or replace every check in `checks` — `(definition, updated_at,
+    /// updated_by)` — and its `check_placement_regions` projection, in a fixed
+    /// number of statements however many checks there are. DuckDB 2.0 re-binds
+    /// and re-plans any statement that reads a table on every execution, even
+    /// a cached one, so per-check upserts cost a full compile each; staging
+    /// them is what keeps bulk config apply linear in rows, not statements.
+    ///
+    /// Each id must appear at most once (callers collapse to the last accepted
+    /// entry). One multi-row upsert is also order-independent for the
+    /// `UNIQUE(name)` constraint: a batch whose final names are distinct is
+    /// accepted whichever order its renames arrive in, while a genuinely
+    /// duplicated name is still rejected.
+    ///
+    /// Placement rows that are no longer named are deleted and only new ones
+    /// inserted, so no key is deleted and re-inserted within one transaction
+    /// (a DuckDB ART-index fault pattern). An empty list leaves no rows behind,
+    /// matching `Placement`'s "empty means every region" rule.
+    ///
+    /// A single check skips the staging tables: on DuckDB 2.0 every statement
+    /// that reads a table re-plans per execution, and clearing two stages plus
+    /// three set statements is more of those than one upsert and one
+    /// placement read.
+    pub(super) fn upsert_checks_uncommitted<'a>(
+        &self,
+        checks: impl IntoIterator<Item = (&'a CheckConfig, i64, Option<&'a str>)>,
+    ) -> Result<()> {
+        let rows = checks
+            .into_iter()
+            .map(|(c, updated_at, updated_by)| CheckRow::new(c, updated_at, updated_by))
+            .collect::<Result<Vec<_>>>()?;
+        match rows.as_slice() {
+            [] => Ok(()),
+            [row] => self.upsert_check_row(row),
+            _ => self.upsert_check_rows(&rows),
+        }
+    }
+
+    fn upsert_check_row(&self, row: &CheckRow<'_>) -> Result<()> {
         self.conn.execute_cached(
             "INSERT INTO checks
                 (id, name, kind, target, interval_secs, timeout_secs, group_name,
                  latency_graph, enabled, expect_status, expect_body_contains,
                  visible, eval, position, agents, config, updated_at, updated_by)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (id) DO UPDATE SET
                  name = excluded.name, kind = excluded.kind, target = excluded.target,
                  interval_secs = excluded.interval_secs, timeout_secs = excluded.timeout_secs,
@@ -216,50 +352,15 @@ impl Storage {
                  visible = excluded.visible, eval = excluded.eval, position = excluded.position,
                  agents = excluded.agents, config = excluded.config,
                  updated_at = excluded.updated_at, updated_by = excluded.updated_by",
-            duckdb::params![
-                c.id,
-                c.name,
-                c.kind.as_db(),
-                c.target,
-                // Legacy column, kept populated so an older binary rolled back
-                // onto this database still finds a usable interval.
-                cron_to_seconds(&c.cron) as i64,
-                c.timeout_secs as i64,
-                c.group,
-                c.latency_graph,
-                c.enabled,
-                c.expect.status.map(|s| s as i32),
-                c.expect.body_contains,
-                c.visible,
-                c.eval,
-                c.position,
-                serde_json::to_string(&c.agents).unwrap_or_else(|_| "[]".into()),
-                serde_json::to_string(c)?,
-                now_millis,
-            ],
+            &row.params()[..],
         )?;
-        self.project_placement_regions(c.id, &c.placement.regions)?;
-        Ok(())
-    }
-
-    /// Rewrites `check_placement_regions` for one check from its placement's
-    /// `regions` list: regions no longer named are deleted and the rest are
-    /// inserted idempotently, so no key is deleted and re-inserted within one
-    /// transaction (a DuckDB ART-index fault pattern). An empty list leaves no rows behind, matching
-    /// `Placement`'s "empty means every region" rule so a reader never has to
-    /// special-case "no rows yet" against "explicitly no regions".
-    pub(super) fn project_placement_regions(
-        &self,
-        check_id: CheckId,
-        regions: &[String],
-    ) -> Result<()> {
-        use std::collections::BTreeSet;
-        let wanted: BTreeSet<&str> = regions.iter().map(String::as_str).collect();
-        let existing: BTreeSet<String> = self
+        let check_id = row.config.id;
+        let existing: std::collections::BTreeSet<String> = self
             .conn
             .prepare_cached("SELECT region FROM check_placement_regions WHERE check_id = ?")?
-            .query_map(duckdb::params![check_id], |row| row.get(0))?
+            .query_map(duckdb::params![check_id], |r| r.get(0))?
             .collect::<std::result::Result<_, _>>()?;
+        let wanted = row.regions();
         for stale in existing.iter().filter(|r| !wanted.contains(r.as_str())) {
             self.conn.execute_cached(
                 "DELETE FROM check_placement_regions WHERE check_id = ? AND region = ?",
@@ -272,6 +373,51 @@ impl Storage {
                 duckdb::params![check_id, added],
             )?;
         }
+        Ok(())
+    }
+
+    fn upsert_check_rows(&self, rows: &[CheckRow<'_>]) -> Result<()> {
+        self.conn
+            .execute_batch("DELETE FROM check_upsert_stage; DELETE FROM check_placement_stage;")?;
+        {
+            let mut stage = self.conn.appender("check_upsert_stage")?;
+            let mut placement = self.conn.appender("check_placement_stage")?;
+            for row in rows {
+                stage.append_row(&row.params()[..])?;
+                for region in row.regions() {
+                    placement.append_row(duckdb::params![row.config.id, region])?;
+                }
+            }
+            stage.flush()?;
+            placement.flush()?;
+        }
+        self.conn.execute_batch(
+            "INSERT INTO checks
+                (id, name, kind, target, interval_secs, timeout_secs, group_name,
+                 latency_graph, enabled, expect_status, expect_body_contains,
+                 visible, eval, position, agents, config, updated_at, updated_by)
+             SELECT id, name, kind, target, interval_secs, timeout_secs, group_name,
+                    latency_graph, enabled, expect_status, expect_body_contains,
+                    visible, eval, position, agents, config, updated_at, updated_by
+             FROM check_upsert_stage
+             ON CONFLICT (id) DO UPDATE SET
+                 name = excluded.name, kind = excluded.kind, target = excluded.target,
+                 interval_secs = excluded.interval_secs, timeout_secs = excluded.timeout_secs,
+                 group_name = excluded.group_name, latency_graph = excluded.latency_graph,
+                 enabled = excluded.enabled, expect_status = excluded.expect_status,
+                 expect_body_contains = excluded.expect_body_contains,
+                 visible = excluded.visible, eval = excluded.eval, position = excluded.position,
+                 agents = excluded.agents, config = excluded.config,
+                 updated_at = excluded.updated_at, updated_by = excluded.updated_by;
+             DELETE FROM check_placement_regions r
+             WHERE r.check_id IN (SELECT id FROM check_upsert_stage)
+               AND NOT EXISTS (SELECT 1 FROM check_placement_stage p
+                               WHERE p.check_id = r.check_id AND p.region = r.region);
+             INSERT INTO check_placement_regions (check_id, region)
+             SELECT p.check_id, p.region FROM check_placement_stage p
+             WHERE NOT EXISTS (SELECT 1 FROM check_placement_regions r
+                               WHERE r.check_id = p.check_id AND r.region = p.region);",
+        )?;
         Ok(())
     }
 
@@ -305,14 +451,18 @@ impl Storage {
                     .then_with(|| a.position.cmp(&b.position))
                     .then_with(|| a.name.cmp(&b.name))
             });
-            for (position, mut check) in checks.into_iter().enumerate() {
-                let position = position as i32;
-                if check.position != position {
-                    check.position = position;
-                    store.upsert_check(&check, now_millis)?;
-                }
-            }
-            Ok(())
+            let moved: Vec<CheckConfig> = checks
+                .into_iter()
+                .enumerate()
+                .filter_map(|(position, mut check)| {
+                    let position = position as i32;
+                    (check.position != position).then(|| {
+                        check.position = position;
+                        check
+                    })
+                })
+                .collect();
+            store.upsert_checks(&moved, now_millis)
         })
     }
 
@@ -452,12 +602,16 @@ impl Storage {
             // Each affected check is rewritten whole: its group lives in the
             // document, so updating only the column would leave readers on the old
             // name and the check apparently orphaned.
-            for mut check in store.list_checks()? {
-                if check.group.as_deref() == Some(from) {
+            let moved: Vec<CheckConfig> = store
+                .list_checks()?
+                .into_iter()
+                .filter(|check| check.group.as_deref() == Some(from))
+                .map(|mut check| {
                     check.group = Some(to.to_string());
-                    store.upsert_check(&check, now_millis)?;
-                }
-            }
+                    check
+                })
+                .collect();
+            store.upsert_checks(&moved, now_millis)?;
             Ok(true)
         })
     }
@@ -501,12 +655,16 @@ impl Storage {
                 return Ok(false);
             }
             store.sync_config_watermark(ConfigKind::Section, name)?;
-            for mut check in store.list_checks()? {
-                if check.group.as_deref() == Some(name) {
+            let loosened: Vec<CheckConfig> = store
+                .list_checks()?
+                .into_iter()
+                .filter(|check| check.group.as_deref() == Some(name))
+                .map(|mut check| {
                     check.group = None;
-                    store.upsert_check(&check, now_millis)?;
-                }
-            }
+                    check
+                })
+                .collect();
+            store.upsert_checks(&loosened, now_millis)?;
             Ok(true)
         })
     }
