@@ -91,6 +91,8 @@ pub struct ResolvedStatus {
 pub struct SectionStates {
     pub states: Vec<(NodeState, usize)>,
     pub pending: Vec<CheckId>,
+    /// Visible members the operator paused: inventory, not live health.
+    pub paused: usize,
 }
 
 impl Storage {
@@ -245,7 +247,8 @@ impl Storage {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
-    /// Per-section state counts over every visible check, aggregated in SQL so
+    /// Per-section state counts over every enabled, visible check, aggregated
+    /// in SQL so paused checks cannot turn a healthy section unknown/down and
     /// section tiles cost one grouped scan of the catalogue, not a status
     /// build per check.
     pub fn section_states(&self) -> Result<BTreeMap<String, SectionStates>> {
@@ -257,7 +260,7 @@ impl Storage {
              FROM checks c
              LEFT JOIN current_state cs ON cs.check_id = c.id
              LEFT JOIN latest_check_results latest ON latest.check_id = c.id
-             WHERE c.visible AND c.group_name IS NOT NULL
+             WHERE c.visible AND c.enabled AND c.group_name IS NOT NULL
              GROUP BY 1, 2",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -282,6 +285,21 @@ impl Storage {
                         .filter_map(|id| id.trim().parse::<CheckId>().ok()),
                 ),
             }
+        }
+        // Paused members keep their section membership and rows but never
+        // contribute a live state. Counted separately so a tile can say
+        // "Paused" instead of inventing unknown health for the section.
+        let mut paused_stmt = self.conn.prepare_cached(
+            "SELECT c.group_name, COUNT(*) FROM checks c
+             WHERE c.visible AND NOT c.enabled AND c.group_name IS NOT NULL
+             GROUP BY 1",
+        )?;
+        let paused_rows = paused_stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in paused_rows {
+            let (section, count) = row?;
+            sections.entry(section).or_default().paused = count as usize;
         }
         Ok(sections)
     }
@@ -457,14 +475,18 @@ mod tests {
     }
 
     #[test]
-    fn section_states_count_every_visible_check_and_list_pending_ones() {
+    fn section_states_count_enabled_visible_checks_and_list_pending_ones() {
         let s = Storage::open(":memory:").unwrap();
         let now = 1_000_000_000_000i64;
         let down = check("down", 0, Some("web"), true);
         let up = check("up", 1, Some("web"), true);
         let pending = check("pending", 2, Some("web"), true);
         let hidden = check("hidden", 3, Some("web"), false);
-        for c in [&down, &up, &pending, &hidden] {
+        let mut paused_down = check("paused-down", 4, Some("web"), true);
+        paused_down.enabled = false;
+        let mut paused_unknown = check("paused-unknown", 5, Some("web"), true);
+        paused_unknown.enabled = false;
+        for c in [&down, &up, &pending, &hidden, &paused_down, &paused_unknown] {
             s.upsert_check(c, 1).unwrap();
         }
         s.update_current_state(down.id, NodeState::Down, None, now)
@@ -472,6 +494,8 @@ mod tests {
         s.update_current_state(up.id, NodeState::Up, None, now)
             .unwrap();
         s.update_current_state(hidden.id, NodeState::Down, None, now)
+            .unwrap();
+        s.update_current_state(paused_down.id, NodeState::Down, None, now)
             .unwrap();
 
         let mut web = s.section_states().unwrap().remove("web").unwrap();
@@ -481,6 +505,7 @@ mod tests {
             SectionStates {
                 states: vec![(NodeState::Down, 1), (NodeState::Up, 1)],
                 pending: vec![pending.id],
+                paused: 2,
             }
         );
     }

@@ -72,6 +72,9 @@ struct SectionRollupDto {
     checks: usize,
     degraded: usize,
     down: usize,
+    /// Members paused by the operator. When this equals `checks`, the section
+    /// has no live health to report and the tile says Paused.
+    paused: usize,
 }
 
 #[derive(Serialize)]
@@ -79,6 +82,9 @@ struct CheckStatusDto {
     check_id: CheckId,
     /// Mutable display name. The status page renders this, never `check_id`.
     name: String,
+    /// A paused check stays published with its history but does not contribute
+    /// to current service health. Distinct from `visible`.
+    enabled: bool,
     #[serde(rename = "status")]
     state: NodeState,
     latency_ms: u64,
@@ -439,6 +445,7 @@ pub(in crate::coordinator) async fn status_handler(
                 Some(CheckStatusDto {
                     check_id,
                     name: meta.name.clone(),
+                    enabled: meta.enabled,
                     state: r.state,
                     latency_ms: r.latency_ms,
                     last_check: r.last_check,
@@ -513,7 +520,8 @@ fn section_rollups(
                 .unwrap_or(crate::rollup::RollupPolicy::CHECK_DEFAULT);
             SectionRollupDto {
                 state: crate::rollup::rollup_counts(&policy, states.iter().copied()),
-                checks: states.iter().map(|(_, n)| n).sum(),
+                checks: states.iter().map(|(_, n)| n).sum::<usize>() + counts.paused,
+                paused: counts.paused,
                 degraded: count(NodeState::Degraded),
                 down: count(NodeState::Down),
                 name,

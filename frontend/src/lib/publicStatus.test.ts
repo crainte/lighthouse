@@ -28,6 +28,22 @@ describe('public status summary', () => {
     expect(summarizePublicStatus([], []).tone).toBe('unknown');
   });
 
+  it('ignores deliberately disabled monitors, including stale failures and unknowns', () => {
+    const status = summarizePublicStatus([
+      { status: 'up', enabled: true },
+      { status: 'unknown', enabled: false },
+      { status: 'down', enabled: false },
+    ], []);
+    expect(status.tone).toBe('operational');
+    expect(status.title).toBe('All systems operational');
+  });
+
+  it('does not invent an all-clear when every visible monitor is disabled', () => {
+    const status = summarizePublicStatus([{ status: 'unknown', enabled: false }], []);
+    expect(status.tone).toBe('unknown');
+    expect(status.title).toBe('No status data available');
+  });
+
   it('distinguishes degraded service from partial and complete outages', () => {
     expect(summarizePublicStatus([{ status: 'up' }, { status: 'degraded' }], []).tone).toBe('degraded');
     expect(summarizePublicStatus([{ status: 'up' }, { status: 'down' }], []).title).toBe('Partial service outage');
@@ -38,6 +54,15 @@ describe('public status summary', () => {
     expect(summarizePublicStatus([{ status: 'up' }], [], [{ status: 'down' }]).tone).toBe('outage');
     expect(summarizePublicStatus([{ status: 'up' }], [], [{ status: 'degraded' }]).tone).toBe('degraded');
     expect(summarizePublicStatus([{ status: 'up' }], [], [{ status: 'unknown' }]).tone).toBe('unknown');
+  });
+
+  it('ignores a section whose members are all paused', () => {
+    const status = summarizePublicStatus([{ status: 'up' }], [], [
+      { status: 'unknown', checks: 3, paused: 3 },
+      { status: 'down', checks: 4, paused: 0 },
+    ]);
+    expect(status.tone).toBe('outage');
+    expect(summarizePublicStatus([{ status: 'up' }], [], [{ status: 'unknown', checks: 3, paused: 3 }]).tone).toBe('operational');
   });
 
   it('gives actual open incidents priority and does not fabricate an ETA', () => {

@@ -6,6 +6,7 @@
   let {
     name,
     status = 'up',
+    paused = false,
     count,
     noun = 'monitor',
     collapsed = false,
@@ -13,6 +14,8 @@
   }: {
     name: string;
     status?: Status;
+    /** All checks in this group are intentionally disabled. */
+    paused?: boolean;
     /** Shown beside the name, e.g. "4 monitors". Omitted when undefined. */
     count?: number;
     /** Singular noun for the count label; pluralized with a trailing "s". */
@@ -29,7 +32,9 @@
   let open = $state(!collapsed);
 
   const statusLabel = $derived(
-    status === 'up'
+    paused
+      ? 'Paused'
+      : status === 'up'
       ? 'Operational'
       : status === 'degraded'
         ? 'Degraded'
@@ -46,14 +51,14 @@
     aria-expanded={open}
   >
     <span class="group-name">
-      <span class="status-dot" style="background:{statusColor(status)}"></span>
+      <span class="status-dot" style="background:{statusColor(paused ? 'unknown' : status)}"></span>
       {name}
       {#if count !== undefined}
         <span class="group-count">{count} {count === 1 ? noun : `${noun}s`}</span>
       {/if}
     </span>
     <span class="group-meta">
-      <span class="group-status {status}">{statusLabel}</span>
+      <span class="group-status {paused ? 'paused' : status}">{statusLabel}</span>
       <svg class="chevron" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
         <path
           d="M9 6l6 6-6 6"

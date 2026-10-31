@@ -6,13 +6,13 @@ const checks = [
   { check_id: 'database', name: 'Database', status: 'up', latency_ms: 18, last_check: now, uptime_24h: 100, type: 'tcp', position: 1 },
 ];
 
-async function mockStatusApi(page, spacers = [{ id: 'middle', after: 'check:api' }], statusChecks = checks, sections = []) {
+async function mockStatusApi(page, spacers = [{ id: 'middle', after: 'check:api' }], statusChecks = checks, sections = [], rollups = sections.map((section) => ({ name: section.name, status: 'up', checks: 1, down: 0, degraded: 0 }))) {
   page.routeWebSocket('**/api/v1/ws', () => {});
   await page.route('**/api/v1/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
     let payload = {};
     if (path === '/api/v1/status') {
-      payload = { checks: statusChecks, page: 0, limit: 100, total_checks: statusChecks.length, has_more: false, agents: [], maintenance: [], sections: sections.map((section) => ({ name: section.name, status: 'up', checks: 1, down: 0, degraded: 0 })) };
+      payload = { checks: statusChecks, page: 0, limit: 100, total_checks: statusChecks.length, has_more: false, agents: [], maintenance: [], sections: rollups };
     } else if (path === '/api/v1/sections') {
       payload = { sections };
     } else if (path === '/api/v1/homepage/spacers') {
@@ -66,6 +66,46 @@ test('without spacers adjacent service rows form one flush panel', async ({ page
   expect(layout.secondTopBorder).toBe('0px');
   expect(layout.firstBottomBorder).toBe('1px');
   await page.locator('.public-services').screenshot({ path: testInfo.outputPath('flush-services.png') });
+});
+
+test('three intentionally paused monitors stay visible without changing public health', async ({ page }, testInfo) => {
+  const paused = ['UniFi WAN primary', 'UniFi gateway CPU', 'UniFi WAN backup'].map((name, position) => ({
+    check_id: `paused-${position}`, name, group: 'Network', enabled: false, status: 'unknown',
+    latency_ms: 0, last_check: 0, uptime_24h: null, type: 'openmetrics', position: position + 1,
+  }));
+  await mockStatusApi(page, [], [{ ...checks[0], enabled: true, uptime_24h: 1 }, ...paused], [{ name: 'Network', position: 0, display: 'inline', collapsed: false }]);
+  await page.goto('/');
+  const hero = page.getByRole('region', { name: 'Current service status' });
+  await expect(hero).toHaveAttribute('data-health', 'operational');
+  await expect(hero).toContainText('All systems operational');
+  await expect(hero).not.toContainText('3 monitors have no known observation');
+  for (const check of paused) {
+    await expect(page.getByRole('button', { name: new RegExp(check.name) })).toContainText('Paused');
+  }
+  await expect(page.locator('.group-head').filter({ hasText: 'Network' })).toContainText('Paused');
+  await page.locator('.public-services').screenshot({ path: testInfo.outputPath('paused-monitors.png') });
+});
+
+test('an all-paused page section reports Paused rather than Operational or Unknown', async ({ page }, testInfo) => {
+  const paused = [
+    { check_id: 'p1', name: 'Paused one', group: 'Network', enabled: false, status: 'down', latency_ms: 0, last_check: 0, uptime_24h: null, type: 'openmetrics', position: 1 },
+    { check_id: 'p2', name: 'Paused two', group: 'Network', enabled: false, status: 'unknown', latency_ms: 0, last_check: 0, uptime_24h: null, type: 'openmetrics', position: 2 },
+  ];
+  await mockStatusApi(
+    page,
+    [],
+    [{ ...checks[0], enabled: true, uptime_24h: 1 }, ...paused],
+    [{ name: 'Network', position: 0, display: 'page', collapsed: false }],
+    [{ name: 'Network', status: 'unknown', checks: 2, paused: 2, down: 0, degraded: 0 }],
+  );
+  await page.goto('/');
+  const hero = page.getByRole('region', { name: 'Current service status' });
+  await expect(hero).toHaveAttribute('data-health', 'operational');
+  const tile = page.locator('.group.tile').filter({ hasText: 'Network' });
+  await expect(tile).toContainText('Paused');
+  await expect(tile).not.toContainText('Unknown');
+  await expect(tile).toContainText('2 checks');
+  await page.locator('.public-services').screenshot({ path: testInfo.outputPath('paused-section-tile.png') });
 });
 
 test('only an explicit spacer creates a dark gap and rounded panel boundaries', async ({ page }, testInfo) => {

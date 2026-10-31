@@ -33,6 +33,20 @@ describe('public status lighthouse hero', () => {
     expect(region).toHaveTextContent('Latest monitor observation');
   });
 
+  it('does not use a disabled monitor as the latest service observation', () => {
+    const now = Date.now();
+    render(PublicStatusHero, { props: {
+      checks: [
+        { ...check('dns', 'up'), enabled: true, last_check: now - 330_000 },
+        { ...check('paused', 'unknown'), enabled: false, last_check: now - 1_000 },
+      ],
+      incidents: [],
+    } });
+    const region = screen.getByRole('region', { name: 'Current service status' });
+    expect(region).toHaveTextContent('Latest monitor observation 5m ago');
+    expect(region).not.toHaveTextContent('just now');
+  });
+
   it('changes to an incident treatment when the public API reports one', () => {
     render(PublicStatusHero, { props: { checks: [check('dns', 'up')], incidents: [incident] } });
     const region = screen.getByRole('region', { name: 'Current service status' });

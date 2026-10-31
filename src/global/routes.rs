@@ -339,6 +339,7 @@ struct CheckStatusDto {
     name: String,
     #[serde(rename = "status")]
     state: NodeState,
+    enabled: bool,
     latency_ms: u64,
     last_check: i64,
     /// `None` when no region measured anything in the window; see the
@@ -395,22 +396,32 @@ async fn status_handler(State(node): State<GlobalNode>, uri: Uri) -> Response {
     // Section rollups cover *all* reporting checks, not merely the bounded
     // public page. A paged section must not become "0 checks" or "unknown".
     let mut grouped = std::collections::BTreeMap::<String, Vec<NodeState>>::new();
+    let mut paused = std::collections::BTreeMap::<String, usize>::new();
     for check in &all_checks {
-        if let Some(name) = &check.group {
+        let Some(name) = &check.group else { continue };
+        if check.enabled {
             grouped.entry(name.clone()).or_default().push(check.state);
+        } else {
+            *paused.entry(name.clone()).or_default() += 1;
         }
     }
     let section_rollups: Vec<serde_json::Value> = defined_sections
         .iter()
         .filter_map(|section| {
-            let states = grouped.get(&section.name)?;
+            let states = grouped.get(&section.name);
+            if states.is_none() && !paused.contains_key(&section.name) {
+                return None;
+            }
+            let states = states.map(Vec::as_slice).unwrap_or_default();
+            let paused = paused.get(&section.name).copied().unwrap_or(0);
             let counts = states.iter().copied().map(|state| (state, 1usize));
             let status =
                 crate::rollup::rollup_counts(&crate::rollup::RollupPolicy::CHECK_DEFAULT, counts);
             Some(serde_json::json!({
                 "name": section.name,
                 "status": status,
-                "checks": states.len(),
+                "checks": states.len() + paused,
+                "paused": paused,
                 "down": states.iter().filter(|&&s| s == NodeState::Down).count(),
                 "degraded": states.iter().filter(|&&s| s == NodeState::Degraded).count(),
             }))
@@ -423,6 +434,7 @@ async fn status_handler(State(node): State<GlobalNode>, uri: Uri) -> Response {
             check_id: c.check_id,
             name: c.name,
             state: c.state,
+            enabled: c.enabled,
             latency_ms: c.latency_ms,
             last_check: c.last_check,
             uptime_24h: c.uptime_24h,
@@ -1337,6 +1349,7 @@ mod tests {
         AggregatedCheck {
             check_id: id,
             name: "api".into(),
+            enabled: true,
             state: NodeState::Down,
             per_region: per_region
                 .iter()

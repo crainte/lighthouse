@@ -19,15 +19,19 @@
   } = $props();
 
   const status = $derived<Status>(rollup?.status ?? 'unknown');
+  // A section whose members are all paused has no live health to assert.
+  const paused = $derived(!!rollup?.paused && rollup.paused === rollup.checks && rollup.checks > 0);
 
   const statusLabel = $derived(
-    status === 'up'
-      ? 'Operational'
-      : status === 'degraded'
-        ? 'Degraded'
-        : status === 'down'
-          ? 'Down'
-          : 'Unknown',
+    paused
+      ? 'Paused'
+      : status === 'up'
+        ? 'Operational'
+        : status === 'degraded'
+          ? 'Degraded'
+          : status === 'down'
+            ? 'Down'
+            : 'Unknown',
   );
 
   // What the tile says instead of a history strip. A red tile an operator can
@@ -37,6 +41,7 @@
     const parts = [`${count} ${count === 1 ? 'check' : 'checks'}`];
     if (rollup?.down) parts.push(`${rollup.down} down`);
     if (rollup?.degraded) parts.push(`${rollup.degraded} degraded`);
+    if (rollup?.paused) parts.push(`${rollup.paused} paused`);
     return parts.join(' · ');
   });
 </script>
@@ -44,12 +49,12 @@
 <div class="group tile">
   <button class="group-head" onclick={() => onopen(name)}>
     <span class="group-name">
-      <span class="status-dot" style="background:{statusColor(status)}"></span>
+      <span class="status-dot" style="background:{statusColor(paused ? 'unknown' : status)}"></span>
       {name}
       <span class="group-count">{caption}</span>
     </span>
     <span class="group-meta">
-      <span class="group-status {status}">{statusLabel}</span>
+      <span class="group-status {paused ? 'paused' : status}">{statusLabel}</span>
       <svg class="chevron" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
         <path
           d="M9 6l6 6-6 6"

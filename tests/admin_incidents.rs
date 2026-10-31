@@ -16,6 +16,56 @@ use common::*;
 use lighthouse::coordinator::Coordinator;
 use lighthouse::models::{CheckId, NodeState};
 
+/// Pausing an unhealthy monitor ends its machine-owned incident without
+/// inventing a recovery; an operator's incident remains their responsibility.
+#[tokio::test]
+async fn pausing_down_check_closes_only_automatic_incident_without_claiming_recovery() {
+    use lighthouse::coordinator::storage::IncidentState;
+
+    let coord = coordinator_with(vec![http_check("db")]).await;
+    let addr = spawn_server(coord.clone());
+    let base = format!("http://{addr}");
+    let session = login(&base).await;
+    let manual_id =
+        create_incident(&base, &session, "Planned work", &[cid("db").to_string()]).await;
+    let now = chrono::Utc::now().timestamp_millis();
+    coord.ingest(vec![probe("db", now, 500)]).await;
+    let automatic = coord
+        .incidents_for_test(100)
+        .await
+        .into_iter()
+        .find(|i| i.origin_check == Some(cid("db")))
+        .expect("DOWN opened incident");
+    assert!(automatic.resolved_at.is_none());
+
+    let mut body = check_body("db", "http://db.test/");
+    body["enabled"] = json!(false);
+    let response = reqwest::Client::new()
+        .put(format!("{base}/api/v1/admin/checks/{}", cid("db")))
+        .header(reqwest::header::COOKIE, &session)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "{}",
+        response.text().await.unwrap()
+    );
+
+    let after = coord.incidents_for_test(100).await;
+    let automatic_after = after.iter().find(|i| i.id == automatic.id).unwrap();
+    assert_eq!(automatic_after.state, IncidentState::Resolved);
+    assert!(automatic_after.resolved_at.is_some());
+    let updates = coord.updates_for_test(&automatic.id).await;
+    assert_eq!(updates.len(), 2, "preserve detection and explain closure");
+    assert!(updates[1].body.to_lowercase().contains("monitoring paused"));
+    assert!(!updates[1].body.to_lowercase().contains("recover"));
+    let manual = after.iter().find(|i| i.id == manual_id).unwrap();
+    assert!(manual.resolved_at.is_none(), "manual incident stays open");
+}
+
 /// The incident lifecycle is driven by observations, not transitions: the open
 /// incident is the source of truth. A check whose first-ever observation is
 /// DOWN still opens an incident (the outage is real even though the alerts feed
