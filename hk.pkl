@@ -6,6 +6,7 @@
 // Steps tagged `slow` (audits, builds, full test suite) stay out of the hooks.
 // `backup-restore-smoke` is in the local-only `smoke` profile and never runs in CI:
 //   hk check -p smoke -S backup-restore-smoke
+// `conventional-commits` is in the `pr` profile and runs only on pull requests.
 amends "package://github.com/jdx/hk/releases/download/v1.49.0/hk@1.49.0#/Config.pkl"
 import "package://github.com/jdx/hk/releases/download/v1.49.0/hk@1.49.0#/Builtins.pkl"
 
@@ -76,6 +77,14 @@ local slow = new Mapping<String, Step> {
   ["actionlint"] {
     profiles = List("slow")
     check = "actionlint"
+  }
+  // Pull-request commit messages and title, via .github/workflows/commit-lint.yml:
+  //   hk check -p pr -S conventional-commits
+  // Its own profile because it needs a commit range (BASE_REF/HEAD_SHA/PR_TITLE),
+  // not the working tree, so a plain `hk check --all --slow` leaves it out.
+  ["conventional-commits"] {
+    profiles = List("pr")
+    check = "bash scripts/check-conventional-commits.sh"
   }
   // Starts a real node and round-trips `lighthouse backup` / `restore`.
   ["backup-restore-smoke"] {

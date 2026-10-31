@@ -1,0 +1,40 @@
+name: Commit messages
+
+# Requires conventional commits on every commit a pull request would land and
+# on its title (a squash merge uses the title as the commit message).
+# git-cliff builds the version and changelog from these messages and drops the
+# rest, so a non-conventional one breaks the release script. The check is the
+# `conventional-commits` step in hk.pkl; run it locally with
+#   BASE_REF=main HEAD_SHA=<head> PR_TITLE='<title>' hk check -p pr -S conventional-commits
+#
+# Separate from ci.yml because it must re-run when only the title is edited,
+# and re-running the whole build and test matrix for that would be wasteful.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: commit-lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  conventional-commits:
+    name: conventional-commits
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The commits between the base and the head must be present.
+          fetch-depth: 0
+      - uses: jdx/mise-action@v4
+      # Event data goes through env, never interpolated into the script: a PR
+      # title is attacker-controlled text.
+      - run: hk check -p pr -S conventional-commits
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
