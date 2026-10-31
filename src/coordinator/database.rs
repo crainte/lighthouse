@@ -11,6 +11,120 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+/// How long a process that is exiting waits for database workers to finish
+/// closing DuckDB. Generous for a checkpoint, short enough that a handle
+/// leaked for the life of the process cannot hang an exit.
+const EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Database worker threads that have not yet finished closing DuckDB.
+///
+/// A worker closes DuckDB on its own thread, after the last `Database` handle
+/// drops, so a process whose last act is dropping a handle can reach `exit()`
+/// while that close is still running. `exit()` then destroys C++ globals under
+/// the running thread, and DuckDB's teardown can hit a half-destroyed object:
+/// libstdc++'s `pure virtual method called`, observed at the end of otherwise
+/// passing integration-test binaries, with the abort on a non-main thread.
+struct OpenWorkers {
+    live: parking_lot::Mutex<usize>,
+    changed: parking_lot::Condvar,
+}
+
+impl OpenWorkers {
+    const fn new() -> Self {
+        Self {
+            live: parking_lot::Mutex::new(0),
+            changed: parking_lot::Condvar::new(),
+        }
+    }
+
+    /// Count a worker until the returned slot drops. Take it before spawning
+    /// the thread and move it in, so it is released last, after DuckDB closes.
+    fn register(&'static self) -> WorkerSlot {
+        *self.live.lock() += 1;
+        WorkerSlot(self)
+    }
+
+    fn pending(&self) -> usize {
+        *self.live.lock()
+    }
+
+    /// Wait until no worker is open or `timeout` passes; returns how many remain.
+    fn wait_idle(&self, timeout: std::time::Duration) -> usize {
+        let deadline = Instant::now() + timeout;
+        let mut live = self.live.lock();
+        while *live > 0 {
+            if self.changed.wait_until(&mut live, deadline).timed_out() {
+                break;
+            }
+        }
+        *live
+    }
+}
+
+struct WorkerSlot(&'static OpenWorkers);
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        *self.0.live.lock() -= 1;
+        self.0.changed.notify_all();
+    }
+}
+
+static WORKERS: OpenWorkers = OpenWorkers::new();
+
+/// Block until every database worker has finished closing DuckDB, or
+/// `timeout` passes; returns how many were still open. A process normally
+/// needs no call to this: the first `Database::open` arranges one at exit.
+pub fn wait_for_database_workers(timeout: std::time::Duration) -> usize {
+    WORKERS.wait_idle(timeout)
+}
+
+#[cfg(unix)]
+extern "C" fn wait_for_workers_at_exit() {
+    use std::io::Write;
+    let pending = WORKERS.pending();
+    if pending == 0 {
+        return;
+    }
+    let mut stderr = std::io::stderr();
+    let _ = writeln!(
+        stderr,
+        "lighthouse: waiting for {pending} database worker(s) to finish closing before exit"
+    );
+    let left = WORKERS.wait_idle(EXIT_WAIT);
+    if left > 0 {
+        let _ = writeln!(
+            stderr,
+            "lighthouse: exiting with {left} database worker(s) still open after {EXIT_WAIT:?}"
+        );
+    }
+}
+
+/// Make a normal process exit (`main` returning, `process::exit`) wait for
+/// workers that are closing DuckDB.
+///
+/// Order matters, and it is the reverse of intuition: `exit()` runs `atexit`
+/// handlers and C++ static destructors as one list, last registered first. A
+/// handler registered *before* DuckDB lazily constructs a static (its PEG
+/// keyword helper, for one) therefore runs *after* that static is destroyed,
+/// which is exactly the window this wait exists to close. So this is called by
+/// a worker after its `Storage::open` has run real statements, and again for
+/// every worker, never once per process. Each registration is a cheap no-op
+/// at exit once the count is zero.
+fn wait_for_workers_at_process_exit() {
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn atexit(callback: extern "C" fn()) -> std::os::raw::c_int;
+        }
+        // SAFETY: `atexit` is given a valid `extern "C"` function that never
+        // unwinds. A failure to register only loses the wait.
+        unsafe {
+            atexit(wait_for_workers_at_exit);
+        }
+    }
+}
+
 const QUEUE_CAPACITY: usize = 256;
 const TIMING_REPORT_EVERY: u64 = 128;
 /// A job holding the single worker this long starves every other reader and
@@ -122,9 +236,12 @@ impl Database {
         let metrics = Arc::new(Metrics::default());
         let database_path = Arc::new(std::path::PathBuf::from(&path));
         let (closed_tx, closed) = tokio::sync::watch::channel(false);
+        let slot = WORKERS.register();
         std::thread::Builder::new()
             .name("lighthouse-database".to_string())
             .spawn(move || {
+                // Held to the end of the thread, past the close below.
+                let _slot = slot;
                 let opened = Storage::open(&path).and_then(|storage| {
                     let effective = storage.apply_limits(&limits)?;
                     tracing::info!(
@@ -136,6 +253,9 @@ impl Database {
                 });
                 let storage = match opened {
                     Ok(storage) => {
+                        // After the open's queries, so after DuckDB's lazily
+                        // built statics. See `wait_for_workers_at_process_exit`.
+                        wait_for_workers_at_process_exit();
                         let _ = ready_tx.send(Ok(()));
                         storage
                     }
@@ -313,6 +433,57 @@ impl Database {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// The exit wait must block exactly as long as a worker is still closing,
+    /// and give up (reporting how many remain) rather than hang. A private
+    /// registry: the global one is shared with every test running beside this.
+    #[test]
+    fn exit_wait_blocks_until_the_last_worker_slot_drops() {
+        let workers: &'static OpenWorkers = Box::leak(Box::new(OpenWorkers::new()));
+        assert_eq!(workers.wait_idle(Duration::ZERO), 0);
+
+        let held = workers.register();
+        let also_held = workers.register();
+        assert_eq!(workers.pending(), 2);
+        assert_eq!(
+            workers.wait_idle(Duration::from_millis(30)),
+            2,
+            "a timeout reports the workers still open"
+        );
+
+        drop(also_held);
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(held);
+        });
+        let started = Instant::now();
+        assert_eq!(workers.wait_idle(Duration::from_secs(10)), 0);
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "returned before the slot was released: {:?}",
+            started.elapsed()
+        );
+        closer.join().unwrap();
+    }
+
+    /// `Database::open` registers its worker with the exit wait, and the worker
+    /// still closes once its only handle drops. (The registry is global and
+    /// shared with concurrent tests, so this can only check "at least one".)
+    #[tokio::test]
+    async fn opening_a_database_registers_its_worker() {
+        let database = Database::open(
+            ":memory:".to_string(),
+            DatabaseLimits::resolve(&Default::default()).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(WORKERS.pending() >= 1);
+        let closed = database.closed();
+        drop(database);
+        tokio::time::timeout(Duration::from_secs(15), closed)
+            .await
+            .expect("the worker should close once its only handle drops");
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn slow_database_work_does_not_block_tokio() {

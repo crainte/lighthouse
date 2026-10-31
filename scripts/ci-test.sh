@@ -87,7 +87,10 @@ if grep -q '^\[pure-virtual-debug\] pid=' "$log"; then
         printf '%s %s: ' "$object" "$offset" >&2
         addr2line -C -f -i -p -e "$object" "$offset" >&2 || true
       fi
-    done < <(sed -nE 's|^([^ ()]+)\(\+(0x[0-9a-fA-F]+)\) \[.*|\1 \2|p' "$log")
+    # backtrace_symbols_fd prints `object(+0xOFFSET)[0xADDR]`, with no space
+    # before the bracket. An earlier version of this pattern required one,
+    # matched nothing, and left this section empty on a real failure.
+    done < <(sed -nE 's|^([^ ()]+)\(\+(0x[0-9a-fA-F]+)\) ?\[.*|\1 \2|p' "$log")
   else
     echo 'warning: addr2line unavailable; raw frames above remain in test output' >&2
   fi
