@@ -246,6 +246,17 @@ impl GlobalStore {
         Ok((checks, total, has_more))
     }
 
+    /// Id and name of every check in the catalogue, by name. Regions hold
+    /// only the checks their placement admits, so a region's own list is
+    /// never the whole picker.
+    pub async fn check_options(&self) -> Result<Vec<(CheckId, String)>> {
+        let checks = self.db(|storage| storage.list_checks()).await?;
+        let mut options: Vec<(CheckId, String)> =
+            checks.into_iter().map(|c| (c.id, c.name)).collect();
+        options.sort_by(|a, b| a.1.cmp(&b.1));
+        Ok(options)
+    }
+
     pub async fn create_check(
         &self,
         body: serde_json::Value,

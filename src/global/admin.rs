@@ -1,8 +1,11 @@
 //! Admin handlers for the two catalogue kinds the global tier holds
 //! authoritatively in Phase 1: checks and sections. See `store`'s module doc
 //! for why the rest of the admin surface (notifiers, credentials, rollup
-//! policies, incidents, maintenance…) is not here — those still fall through
-//! `relay_handler` to a region, unchanged from before this phase.
+//! policies, incidents…) is not here — those still fall through
+//! `relay_handler` to a region, unchanged from before this phase. Maintenance
+//! is the one hybrid: its windows still go through the relay, but the check
+//! picker is filled from this catalogue, since a region holds only the checks
+//! its placement admits.
 //!
 //! Every handler here follows the same shape: authenticate, ask
 //! `GlobalStore` to do the whole thing (validate, persist, stamp), and on
@@ -19,12 +22,13 @@
 //! hit it.
 
 use super::store::AdminError;
-use super::{error_response, reconcile, GlobalNode};
+use super::{error_response, reconcile, relay, GlobalNode};
 use crate::coordinator::storage::{Section, SectionDisplay};
-use crate::http::{AdminJson, AdminSession};
+use crate::http::{AdminBytes, AdminJson, AdminSession};
 use crate::models::CheckId;
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -157,6 +161,78 @@ pub(super) async fn reorder_checks_handler(
         }
         Err(e) => admin_error(AdminError::Internal(e)),
     }
+}
+
+// ---- Maintenance ----
+
+/// Replaces the `checks` picker list in a region's maintenance response with
+/// the global catalogue's. `windows` is left as the region returned it. A body
+/// that is not an object carrying a `checks` field is returned unchanged.
+fn with_catalogue_checks(
+    mut body: serde_json::Value,
+    options: &[(CheckId, String)],
+) -> serde_json::Value {
+    if let Some(checks) = body.as_object_mut().filter(|o| o.contains_key("checks")) {
+        checks.insert(
+            "checks".to_string(),
+            options
+                .iter()
+                .map(|(id, name)| serde_json::json!({ "id": id.to_string(), "name": name }))
+                .collect(),
+        );
+    }
+    body
+}
+
+/// Swaps in the catalogue's check list on a successful regional answer; every
+/// other response, including errors and unparseable bodies, passes through.
+async fn maintenance_with_catalogue(node: &GlobalNode, resp: Response) -> Response {
+    if !resp.status().is_success() {
+        return resp;
+    }
+    let (parts, body) = resp.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await else {
+        return error_response(StatusCode::BAD_GATEWAY, "region response was unreadable");
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Response::from_parts(parts, axum::body::Body::from(bytes));
+    };
+    match node.inner.store.check_options().await {
+        Ok(options) => Json(with_catalogue_checks(value, &options)).into_response(),
+        Err(e) => admin_error(AdminError::Internal(e)),
+    }
+}
+
+pub(super) async fn maintenance_handler(
+    State(node): State<GlobalNode>,
+    _admin: AdminSession,
+    uri: Uri,
+) -> Response {
+    let now = chrono::Utc::now().timestamp_millis();
+    let pq = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or_else(|| uri.path());
+    let resp = relay::relay_single_path(
+        &node,
+        &Method::GET,
+        pq,
+        &Bytes::new(),
+        &node.inner.cache.all_endpoints(now),
+        true,
+    )
+    .await;
+    maintenance_with_catalogue(&node, resp).await
+}
+
+pub(super) async fn update_maintenance_handler(
+    State(node): State<GlobalNode>,
+    uri: Uri,
+    AdminBytes(body): AdminBytes,
+) -> Response {
+    let now = chrono::Utc::now().timestamp_millis();
+    let resp = relay::fan_out_write(&node, &Method::PUT, &uri, &body, now).await;
+    maintenance_with_catalogue(&node, resp).await
 }
 
 // ---- Sections ----
@@ -386,4 +462,43 @@ pub(super) async fn decommission_member_handler(
     _admin: AdminSession,
 ) -> Response {
     crate::coordinator::cluster::Cluster::decommission(node.inner.cluster.as_deref(), &node_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn id(n: u128) -> CheckId {
+        CheckId::from_u128(n)
+    }
+
+    #[test]
+    fn regional_picker_list_is_replaced_by_the_catalogue_and_windows_are_kept() {
+        let region = json!({
+            "windows": [{"title": "w", "checks": [id(2).to_string()]}],
+            "checks": [{"id": id(1).to_string(), "name": "api"}],
+        });
+        let options = vec![
+            (id(1), "api".to_string()),
+            (id(2), "unraid-ping".to_string()),
+        ];
+        let out = with_catalogue_checks(region.clone(), &options);
+        assert_eq!(out["windows"], region["windows"]);
+        assert_eq!(
+            out["checks"],
+            json!([
+                {"id": id(1).to_string(), "name": "api"},
+                {"id": id(2).to_string(), "name": "unraid-ping"},
+            ])
+        );
+    }
+
+    #[test]
+    fn bodies_without_a_checks_field_pass_through() {
+        let options = vec![(id(1), "api".to_string())];
+        for body in [json!({"error": "nope"}), json!([1, 2]), json!("x")] {
+            assert_eq!(with_catalogue_checks(body.clone(), &options), body);
+        }
+    }
 }

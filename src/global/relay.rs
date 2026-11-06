@@ -24,8 +24,8 @@ use tracing::warn;
 ///   the region authorizes it. De-duplication of list results is left to the
 ///   region: they run identical config, so any one region's list is the fleet's.
 /// * **Admin writes** (`POST`/`PUT`/`PATCH`/`DELETE`) not covered by
-///   `global::admin` — notifiers, credentials, rollup policies, maintenance —
-///   are fanned out to *every* region so the fleet stays uniform. Incidents
+///   `global::admin` — notifiers, credentials, rollup policies, maintenance
+///   windows — are fanned out to *every* region so the fleet stays uniform. Incidents
 ///   are the exception: they are regional, so a write to a composite id goes
 ///   only to its owner, and a create goes to the region the operator names
 ///   (`routes::create_incident_handler`).
@@ -582,7 +582,7 @@ async fn relay_single(
 /// the fix to notifiers, credentials, rollup policies, maintenance and
 /// incidents is Phase 2/3 work (see `store`'s module doc for why each of
 /// those is not simply added to the authoritative list today).
-async fn fan_out_write(
+pub(super) async fn fan_out_write(
     node: &GlobalNode,
     method: &Method,
     uri: &Uri,
