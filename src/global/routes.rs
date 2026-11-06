@@ -94,6 +94,10 @@ pub(super) fn router(node: GlobalNode) -> Router {
             "/api/v1/admin/sections/{name}",
             put(admin::rename_section_handler).delete(admin::delete_section_handler),
         )
+        .route(
+            "/api/v1/admin/maintenance",
+            get(admin::maintenance_handler).put(admin::update_maintenance_handler),
+        )
         .route("/api/v1/sections", get(admin::public_sections_handler))
         .route(
             "/api/v1/homepage/spacers",
