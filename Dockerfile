@@ -16,7 +16,7 @@ RUN --mount=type=cache,id=lighthouse-bun-cache,target=/root/.bun/install/cache \
 # changes then reuse the cached dependency build (notably bundled DuckDB)
 # from the layer cache. No cache mounts here: their contents are not exported
 # to CI layer caches, and a target mount would hide the cooked dependencies.
-FROM lukemathwalker/cargo-chef:0.1.78-rust-1.99.0-bookworm AS chef
+FROM lukemathwalker/cargo-chef:0.1.78-rust-1.99.1-bookworm AS chef
 WORKDIR /app
 
 FROM chef AS planner
