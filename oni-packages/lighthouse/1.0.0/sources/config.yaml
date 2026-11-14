@@ -1,0 +1,13 @@
+config-maps:
+  - name: lighthouse-coordinator-config
+    data:
+      lighthouse.toml:
+        $ref: inputs.coordinatorConfig
+  - name: lighthouse-global-config
+    data:
+      lighthouse.toml:
+        $ref: inputs.globalConfig
+  - name: lighthouse-agent-config
+    data:
+      lighthouse.toml:
+        $ref: inputs.agentConfig

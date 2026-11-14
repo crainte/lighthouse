@@ -1,0 +1,133 @@
+services:
+  - name: lighthouse-coordinator-headless
+    target: lighthouse-coordinator
+    spec:
+      clusterIP: None
+      publishNotReadyAddresses: true
+      ports:
+      - name: http
+        port: 8080
+        targetPort: http
+        protocol: TCP
+  - name: lighthouse-coordinator
+    target: lighthouse-coordinator
+    spec:
+      ports:
+      - name: http
+        port: 8080
+        targetPort: http
+        protocol: TCP
+  - name: lighthouse-global-headless
+    target: lighthouse-global
+    spec:
+      clusterIP: None
+      publishNotReadyAddresses: true
+      ports:
+      - name: http
+        port: 8080
+        targetPort: http
+        protocol: TCP
+  - name: lighthouse-global
+    target: lighthouse-global
+    spec:
+      ports:
+        - name: http
+          port: 80
+          targetPort: http
+          protocol: TCP
+  - name: lighthouse-gateway-backend
+    target: lighthouse-global
+    spec:
+      ports:
+        - port: 80
+          targetPort: 8080
+          protocol: TCP
+  - name: lighthouse-coordinator-gateway-backend
+    target: lighthouse-coordinator
+    spec:
+      ports:
+        - port: 80
+          targetPort: 8080
+          protocol: TCP
+
+certificates:
+  - name: lighthouse
+    spec:
+      secretName: lighthouse-tls
+      dnsNames:
+        - $ref: inputs.hostname
+      issuerRef:
+        name:
+          $ref: inputs.clusterIssuer
+        kind: ClusterIssuer
+        group: cert-manager.io
+
+ingresses:
+  - name: lighthouse
+    metadata:
+      annotations:
+        ingress.cilium.io/loadbalancer-mode: shared
+        ingress.cilium.io/force-https: enabled
+    spec:
+      ingressClassName: cilium
+      rules:
+        - host:
+            $ref: inputs.hostname
+          http:
+            paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: lighthouse-global
+                    port:
+                      name: http
+      tls:
+        - hosts:
+            - $ref: inputs.hostname
+          secretName: lighthouse-tls
+
+pod-disruption-budgets:
+  - name: lighthouse-coordinator
+    target: lighthouse-coordinator
+    spec:
+      minAvailable: 2
+  - name: lighthouse-global
+    target: lighthouse-global
+    spec:
+      minAvailable: 2
+
+http-routes:
+  - name: lighthouse
+    spec:
+      parentRefs:
+        - name:
+            $ref: inputs.gatewayName
+          namespace:
+            $ref: inputs.gatewayNamespace
+      hostnames:
+        - $ref: inputs.hostname
+      rules:
+        - backendRefs:
+            - name: lighthouse-gateway-backend
+              port: 80
+  - name: lighthouse-agent
+    spec:
+      parentRefs:
+        - name:
+            $ref: inputs.agentGatewayName
+          namespace:
+            $ref: inputs.agentGatewayNamespace
+      hostnames:
+        - $ref: inputs.agentHostname
+      rules:
+        - matches:
+            - path:
+                type: PathPrefix
+                value: /api/v1/agent/
+            - path:
+                type: Exact
+                value: /api/v1/results
+          backendRefs:
+            - name: lighthouse-coordinator-gateway-backend
+              port: 80

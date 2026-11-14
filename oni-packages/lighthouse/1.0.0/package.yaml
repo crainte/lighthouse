@@ -1,0 +1,92 @@
+format: 2
+name: lighthouse
+version: "0.4.3"
+revision: 1.0.0
+
+requires:
+  cert-manager: ^1.21.0
+  external-secrets: ^2.12.0
+  letsencrypt-cloudflare: ^1.0.0
+  gateway-api: ^1.6.3
+
+imports:
+  configMap: ">=1.32"
+  deployment: ">=1.32"
+  statefulSet: ">=1.32"
+  service: ">=1.32"
+  podDisruptionBudget: ">=1.32"
+
+sources:
+  - sources/config.yaml
+  - sources/secrets.yaml
+  - sources/workloads.yaml
+  - sources/network.yaml
+
+inputs:
+  hostname:
+    type: string
+    required: true
+  agentHostname:
+    type: string
+    description: Legacy agent hostname retained for configuration compatibility.
+    required: true
+  gatewayName:
+    type: string
+    description: Legacy gateway name retained for configuration compatibility.
+    required: true
+  gatewayNamespace:
+    type: string
+    description: Legacy gateway namespace retained for configuration compatibility.
+    required: true
+  agentGatewayName:
+    type: string
+    default: internal
+  agentGatewayNamespace:
+    type: string
+    default: gateway
+  clusterIssuer:
+    type: string
+    default: letsencrypt
+  coordinatorReplicas:
+    type: integer
+    default: 3
+  globalReplicas:
+    type: integer
+    default: 3
+  coordinatorStorageSize:
+    type: string
+    default: 5Gi
+  globalStorageSize:
+    type: string
+    default: 1Gi
+  secretStore:
+    name:
+      type: string
+      required: true
+    kind:
+      type: string
+      default: ClusterSecretStore
+  adminPasswordRemoteKey:
+    type: string
+    default: LIGHTHOUSE_ADMIN_PASSWORD
+  coordinatorPeerTokenRemoteKey:
+    type: string
+    default: LIGHTHOUSE_COORDINATOR_PEER_TOKEN
+  globalPeerTokenRemoteKey:
+    type: string
+    default: LIGHTHOUSE_GLOBAL_PEER_TOKEN
+  regionKeyRemoteKey:
+    type: string
+    default: LIGHTHOUSE_REGION_KEY_US
+  agentTokenRemoteKey:
+    type: string
+    default: LIGHTHOUSE_AGENT_TOKEN_YGGDRASIL
+  coordinatorConfig:
+    type: string
+    required: true
+  globalConfig:
+    type: string
+    required: true
+  agentConfig:
+    type: string
+    required: true
