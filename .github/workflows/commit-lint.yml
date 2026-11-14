@@ -30,7 +30,7 @@ jobs:
         with:
           # The commits between the base and the head must be present.
           fetch-depth: 0
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@v5
       # Event data goes through env, never interpolated into the script: a PR
       # title is attacker-controlled text.
       - run: hk check -p pr -S conventional-commits
